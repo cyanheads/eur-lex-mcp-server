@@ -1,7 +1,7 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "cyanheads/eur-lex-mcp-server",
-  "description": "Access EU CELLAR — search and retrieve EU legislation, CJEU case law, and treaty texts via SPARQL.",
+  "name": "io.github.cyanheads/eur-lex-mcp-server",
+  "description": "Search EU legislation, CJEU case law, and treaties; traverse CELLAR graph; browse EuroVoc concepts.",
   "repository": {
     "url": "https://github.com/cyanheads/eur-lex-mcp-server",
     "source": "github"
@@ -11,8 +11,8 @@
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
-      "identifier": "eur-lex-mcp-server",
-      "runtimeHint": "node",
+      "identifier": "@cyanheads/eur-lex-mcp-server",
+      "runtimeHint": "bun",
       "version": "0.1.0",
       "packageArguments": [
         {
@@ -25,6 +25,34 @@
         }
       ],
       "environmentVariables": [
+        {
+          "name": "CELLAR_SPARQL_ENDPOINT",
+          "description": "CELLAR SPARQL endpoint URL override (e.g., for a local Virtuoso mirror).",
+          "format": "string",
+          "isRequired": false,
+          "default": "http://publications.europa.eu/webapi/rdf/sparql"
+        },
+        {
+          "name": "EURLEX_CONTENT_BASE_URL",
+          "description": "EUR-Lex content API base URL override.",
+          "format": "string",
+          "isRequired": false,
+          "default": "https://eur-lex.europa.eu"
+        },
+        {
+          "name": "SPARQL_QUERY_TIMEOUT_MS",
+          "description": "Client-side timeout for SPARQL requests in milliseconds.",
+          "format": "string",
+          "isRequired": false,
+          "default": "55000"
+        },
+        {
+          "name": "MAX_SPARQL_RESULTS",
+          "description": "Enforced ceiling on LIMIT in all generated SPARQL queries.",
+          "format": "string",
+          "isRequired": false,
+          "default": "100"
+        },
         {
           "name": "MCP_LOG_LEVEL",
           "description": "Sets the minimum log level for output (e.g., 'debug', 'info', 'warn').",
@@ -40,8 +68,8 @@
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
-      "identifier": "eur-lex-mcp-server",
-      "runtimeHint": "node",
+      "identifier": "@cyanheads/eur-lex-mcp-server",
+      "runtimeHint": "bun",
       "version": "0.1.0",
       "packageArguments": [
         {
@@ -76,6 +104,12 @@
           "default": "/mcp"
         },
         {
+          "name": "MCP_PUBLIC_URL",
+          "description": "Public origin for deployments behind a TLS-terminating reverse proxy (e.g. https://mcp.example.com).",
+          "format": "string",
+          "isRequired": false
+        },
+        {
           "name": "MCP_AUTH_MODE",
           "description": "Authentication mode to use: 'none', 'jwt', or 'oauth'.",
           "format": "string",
@@ -88,6 +122,34 @@
           "format": "string",
           "isRequired": false,
           "default": "info"
+        },
+        {
+          "name": "CELLAR_SPARQL_ENDPOINT",
+          "description": "CELLAR SPARQL endpoint URL override (e.g., for a local Virtuoso mirror).",
+          "format": "string",
+          "isRequired": false,
+          "default": "http://publications.europa.eu/webapi/rdf/sparql"
+        },
+        {
+          "name": "EURLEX_CONTENT_BASE_URL",
+          "description": "EUR-Lex content API base URL override.",
+          "format": "string",
+          "isRequired": false,
+          "default": "https://eur-lex.europa.eu"
+        },
+        {
+          "name": "SPARQL_QUERY_TIMEOUT_MS",
+          "description": "Client-side timeout for SPARQL requests in milliseconds.",
+          "format": "string",
+          "isRequired": false,
+          "default": "55000"
+        },
+        {
+          "name": "MAX_SPARQL_RESULTS",
+          "description": "Enforced ceiling on LIMIT in all generated SPARQL queries.",
+          "format": "string",
+          "isRequired": false,
+          "default": "100"
         }
       ],
       "transport": {

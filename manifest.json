@@ -2,8 +2,14 @@
   "manifest_version": "0.3",
   "name": "eur-lex-mcp-server",
   "version": "0.1.0",
-  "description": "",
-  "author": { "name": "" },
+  "description": "Search EU legislation, CJEU case law, and treaties; traverse CELLAR graph; browse EuroVoc concepts.",
+  "author": { "name": "cyanheads" },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cyanheads/eur-lex-mcp-server"
+  },
+  "homepage": "https://github.com/cyanheads/eur-lex-mcp-server#readme",
+  "license": "Apache-2.0",
   "server": {
     "type": "node",
     "entry_point": "dist/index.js",

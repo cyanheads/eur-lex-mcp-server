@@ -1,7 +1,7 @@
 {
-  "eur-lex-mcp-server": {
+  "@cyanheads/eur-lex-mcp-server": {
     "command": "npx",
-    "args": ["-y", "eur-lex-mcp-server"],
+    "args": ["-y", "@cyanheads/eur-lex-mcp-server"],
     "env": {
       "MCP_TRANSPORT_TYPE": "stdio"
     }

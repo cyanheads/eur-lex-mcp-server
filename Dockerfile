@@ -37,9 +37,10 @@ WORKDIR /usr/src/app
 ENV NODE_ENV=production
 
 # OCI image metadata (https://github.com/opencontainers/image-spec/blob/main/annotations.md)
-LABEL org.opencontainers.image.title="eur-lex-mcp-server"
-LABEL org.opencontainers.image.description=""
+LABEL org.opencontainers.image.title="@cyanheads/eur-lex-mcp-server"
+LABEL org.opencontainers.image.description="Search EU legislation, CJEU case law, and treaties; traverse the CELLAR relationship graph; resolve EuroVoc concepts via MCP. STDIO or Streamable HTTP."
 LABEL org.opencontainers.image.licenses="Apache-2.0"
+LABEL org.opencontainers.image.source="https://github.com/cyanheads/eur-lex-mcp-server"
 
 # Copy dependency manifests
 COPY package.json bun.lock ./
