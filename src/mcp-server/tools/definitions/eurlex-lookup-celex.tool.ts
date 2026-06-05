@@ -121,7 +121,7 @@ SELECT ?work ?celexNumber ?type ?date WHERE {
   ?work cdm:resource_legal_id_celex ?celexNumber .
   OPTIONAL { ?work cdm:work_has_resource-type ?type . }
   OPTIONAL { ?work cdm:work_date_document ?date . }
-  FILTER(?celexNumber = "${identifier}")
+  FILTER(STR(?celexNumber) = "${identifier}")
 } LIMIT 5`;
     } else if (effectiveType === 'eli') {
       // ELI URIs are mapped via cdm:work_id_document_official-journal or owl:sameAs

@@ -136,7 +136,7 @@ export const eurlex_get_document = tool('eurlex_get_document', {
     const metaSparql = `
 SELECT ?work ?celexNumber ?type ?date ?title ?inForce ?author ?legalBasis ?eurovoc WHERE {
   ?work cdm:resource_legal_id_celex ?celexNumber .
-  FILTER(?celexNumber = "${celexNumber}")
+  FILTER(STR(?celexNumber) = "${celexNumber}")
   OPTIONAL { ?work cdm:work_has_resource-type ?type . }
   OPTIONAL { ?work cdm:work_date_document ?date . }
   OPTIONAL { ?work cdm:work_title ?titleNode . ?titleNode cdm:expression_title ?title . FILTER(LANG(?title) = "en") }

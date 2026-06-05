@@ -79,6 +79,13 @@ export class CellarSparqlService {
         const text = await response.text();
 
         if (!response.ok) {
+          if (response.status === 400) {
+            // HTTP 400 = client error (malformed query) — not retryable
+            throw invalidParams(`CELLAR SPARQL error: ${text.slice(0, 300)}`, {
+              reason: 'sparql_error',
+              retryable: false,
+            });
+          }
           throw serviceUnavailable(`CELLAR SPARQL HTTP ${response.status}`, {
             status: response.status,
           });

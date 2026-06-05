@@ -51,7 +51,7 @@ export const eurlex_document_relations_resource = resource(
       const resolveSparql = `
 SELECT ?work WHERE {
   ?work cdm:resource_legal_id_celex ?celex .
-  FILTER(?celex = "${celexNumber}")
+  FILTER(STR(?celex) = "${celexNumber}")
 } LIMIT 1`;
 
       const resolveBindings = await svc.query(resolveSparql, ctx);
