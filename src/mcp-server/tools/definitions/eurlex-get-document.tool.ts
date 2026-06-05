@@ -43,6 +43,7 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       ),
     language: z
       .string()
+      .regex(/^[A-Za-z]{2,3}$/)
       .default('EN')
       .describe(
         'Language code for document content (ISO 639-1 uppercase, e.g. EN, FR, DE). ' +
@@ -131,12 +132,13 @@ export const eurlex_get_document = tool('eurlex_get_document', {
     const celexNumber = input.celex_number.trim();
     const language = (input.language.trim().toUpperCase() || 'EN') as EurLexLanguage;
     const format = input.format as ContentFormat;
+    const safeCelexNumber = celexNumber.replace(/"/g, '\\"');
 
     // Step 1: Fetch metadata via SPARQL
     const metaSparql = `
 SELECT ?work ?celexNumber ?type ?date ?title ?inForce ?author ?legalBasis ?eurovoc WHERE {
   ?work cdm:resource_legal_id_celex ?celexNumber .
-  FILTER(STR(?celexNumber) = "${celexNumber}")
+  FILTER(STR(?celexNumber) = "${safeCelexNumber}")
   OPTIONAL { ?work cdm:work_has_resource-type ?type . }
   OPTIONAL { ?work cdm:work_date_document ?date . }
   OPTIONAL { ?work cdm:work_title ?titleNode . ?titleNode cdm:expression_title ?title . FILTER(LANG(?title) = "en") }

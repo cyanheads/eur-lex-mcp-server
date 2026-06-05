@@ -49,14 +49,20 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
       ),
     date_from: z
       .string()
+      .regex(/^\d{4}-\d{2}-\d{2}$/)
       .optional()
       .describe('Start of date range in ISO 8601 format (YYYY-MM-DD). Matches document date.'),
     date_to: z
       .string()
+      .regex(/^\d{4}-\d{2}-\d{2}$/)
       .optional()
       .describe('End of date range in ISO 8601 format (YYYY-MM-DD). Matches document date.'),
     eurovoc_concept: z
       .string()
+      .startsWith('http')
+      .refine((v) => !v.includes('>') && !v.includes('"') && !v.includes(' '), {
+        message: 'EuroVoc URI must be a valid http URI with no angle brackets, quotes, or spaces.',
+      })
       .optional()
       .describe(
         'EuroVoc concept URI to filter by subject (e.g. http://eurovoc.europa.eu/2828). ' +

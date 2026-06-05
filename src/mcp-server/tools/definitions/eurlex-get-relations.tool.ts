@@ -115,12 +115,13 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
   async handler(input, ctx) {
     const svc = getCellarSparqlService();
     const celexNumber = input.celex_number.trim();
+    const safeCelexNumber = celexNumber.replace(/"/g, '\\"');
 
     // Step 1: Resolve CELEX to work URI
     const resolveSparql = `
 SELECT ?work WHERE {
   ?work cdm:resource_legal_id_celex ?celex .
-  FILTER(STR(?celex) = "${celexNumber}")
+  FILTER(STR(?celex) = "${safeCelexNumber}")
 } LIMIT 1`;
 
     const resolveBindings = await svc.query(resolveSparql, ctx);

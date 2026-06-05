@@ -114,6 +114,9 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
       effectiveType = input.identifier_type;
     }
 
+    // Escape double-quotes in all identifier values before interpolating into SPARQL literals.
+    const safeIdentifier = identifier.replace(/"/g, '\\"');
+
     let sparql: string;
     if (effectiveType === 'celex') {
       sparql = `
@@ -121,7 +124,7 @@ SELECT ?work ?celexNumber ?type ?date WHERE {
   ?work cdm:resource_legal_id_celex ?celexNumber .
   OPTIONAL { ?work cdm:work_has_resource-type ?type . }
   OPTIONAL { ?work cdm:work_date_document ?date . }
-  FILTER(STR(?celexNumber) = "${identifier}")
+  FILTER(STR(?celexNumber) = "${safeIdentifier}")
 } LIMIT 5`;
     } else if (effectiveType === 'eli') {
       // ELI URIs are mapped via cdm:work_id_document_official-journal or owl:sameAs
@@ -130,7 +133,7 @@ SELECT ?work ?celexNumber ?type ?date WHERE {
   ?work cdm:resource_legal_id_celex ?celexNumber .
   OPTIONAL { ?work cdm:work_has_resource-type ?type . }
   OPTIONAL { ?work cdm:work_date_document ?date . }
-  FILTER(CONTAINS(STR(?work), "${identifier.replace(/"/g, '\\"')}"))
+  FILTER(CONTAINS(STR(?work), "${safeIdentifier}"))
 } LIMIT 5`;
     } else {
       // OJ reference: extract year and number for a loose filter on CELEX
@@ -139,7 +142,7 @@ SELECT ?work ?celexNumber ?type ?date WHERE {
   ?work cdm:resource_legal_id_celex ?celexNumber .
   OPTIONAL { ?work cdm:work_has_resource-type ?type . }
   OPTIONAL { ?work cdm:work_date_document ?date . }
-  FILTER(CONTAINS(LCASE(STR(?celexNumber)), LCASE("${identifier.replace(/"/g, '\\"')}")))
+  FILTER(CONTAINS(LCASE(STR(?celexNumber)), LCASE("${safeIdentifier}")))
 } LIMIT 5`;
     }
 

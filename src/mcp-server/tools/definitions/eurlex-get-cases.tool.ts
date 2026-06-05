@@ -51,9 +51,14 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
       ),
     date_from: z
       .string()
+      .regex(/^\d{4}-\d{2}-\d{2}$/)
       .optional()
       .describe('Start of date range in ISO 8601 format (YYYY-MM-DD).'),
-    date_to: z.string().optional().describe('End of date range in ISO 8601 format (YYYY-MM-DD).'),
+    date_to: z
+      .string()
+      .regex(/^\d{4}-\d{2}-\d{2}$/)
+      .optional()
+      .describe('End of date range in ISO 8601 format (YYYY-MM-DD).'),
     offset: z
       .number()
       .int()
