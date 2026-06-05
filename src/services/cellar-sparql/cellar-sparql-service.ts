@@ -127,14 +127,6 @@ export class CellarSparqlService {
     );
   }
 
-  /**
-   * Execute a SPARQL query and return bindings with automatic prefix injection
-   * and LIMIT enforcement. Convenience wrapper around `query`.
-   */
-  async queryWithPrefixes(sparql: string, ctx: Context): Promise<SparqlBinding[]> {
-    return this.query(sparql, ctx);
-  }
-
   /** Extract a string value from a binding field, returning undefined if absent. */
   static bindingValue(binding: SparqlBinding | undefined, field: string): string | undefined {
     return binding?.[field]?.value;

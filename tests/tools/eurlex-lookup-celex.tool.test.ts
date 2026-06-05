@@ -145,10 +145,10 @@ describe('eurlex_lookup_celex', () => {
     expect(text).toContain('REG');
   });
 
-  it('format shows not-found message when found is false', () => {
-    const output = { found: false };
+  it('format renders found flag with sparse output (no optional fields)', () => {
+    const output = { found: true };
     const blocks = eurlex_lookup_celex.format!(output);
     const text = (blocks[0] as { text: string }).text;
-    expect(text).toContain('No CELLAR work found');
+    expect(text).toContain('**Found:** true');
   });
 });

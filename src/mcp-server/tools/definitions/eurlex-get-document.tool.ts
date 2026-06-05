@@ -9,11 +9,11 @@ import {
   CellarSparqlService,
   getCellarSparqlService,
 } from '@/services/cellar-sparql/cellar-sparql-service.js';
-import type {
-  ContentFormat,
-  EurLexLanguage,
+import {
+  type ContentFormat,
+  type EurLexLanguage,
+  getEurLexContentService,
 } from '@/services/eurlex-content/eurlex-content-service.js';
-import { getEurLexContentService } from '@/services/eurlex-content/eurlex-content-service.js';
 
 export const eurlex_get_document = tool('eurlex_get_document', {
   title: 'Get EU Document',

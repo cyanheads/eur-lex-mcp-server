@@ -164,10 +164,6 @@ SELECT ?work ?celexNumber ?type ?date WHERE {
 
   format: (result) => {
     const lines: string[] = [`## CELLAR Work Resolved\n**Found:** ${result.found}`];
-    if (!result.found) {
-      lines.push('No CELLAR work found for the given identifier.');
-      return [{ type: 'text', text: lines.join('\n') }];
-    }
     if (result.celex_number) lines.push(`**CELEX:** ${result.celex_number}`);
     if (result.work_uri) lines.push(`**Work URI:** ${result.work_uri}`);
     if (result.resource_type) lines.push(`**Type:** ${result.resource_type}`);
