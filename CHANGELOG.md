@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.3](changelog/0.1.x/0.1.3.md) — 2026-06-06
+
+Keyword title search, case number resolution, filter echo, and human-readable type labels across CELLAR tools
+
 ## [0.1.2](changelog/0.1.x/0.1.2.md) — 2026-06-06
 
 Public hosted endpoint — server.json remotes + README hosted instance docs
