@@ -5,6 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { ENG_LANGUAGE_URI, resolveResourceTypeLabel } from '@/services/cellar-sparql/cdm-labels.js';
 import {
   CellarSparqlService,
   getCellarSparqlService,
@@ -27,9 +28,9 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
   description:
     'Search EU legislation, treaties, and preparatory acts across the CELLAR corpus of 2.7M+ works. ' +
     'Filters by document type, date range, EuroVoc subject concept, author institution, and in-force status. ' +
-    'Keyword search applies to document titles and CELEX strings only — full-text body search is not available via this API. ' +
+    'Keyword search matches against English expression titles and CELEX strings — full-text body search is not available via this API. ' +
     'For multi-word searches, supply a single dominant keyword; use other filters to narrow results. ' +
-    'Returns CELEX numbers, work URIs, document types, and dates — use these with eurlex_get_document to fetch full content. ' +
+    'Returns CELEX numbers, work URIs, human-readable document type labels, and dates — use these with eurlex_get_document to fetch full content. ' +
     'To filter by EuroVoc subject, first call eurlex_browse_subjects to obtain the concept URI. ' +
     'Case law (CJEU/GC judgments) is better searched via eurlex_get_cases which has court-specific parameters.',
   annotations: { readOnlyHint: true, openWorldHint: true },
@@ -105,14 +106,14 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
               .string()
               .optional()
               .describe(
-                'CDM resource type URI indicating the document category (e.g. .../resource-type/REG for Regulation). Absent for some older works.',
+                'Human-readable document type label (e.g. "Regulation", "Directive"). Absent for some older works.',
               ),
             date: z.string().optional().describe('Document date in ISO 8601 format (YYYY-MM-DD).'),
             title: z
               .string()
               .optional()
               .describe(
-                'Document title in English where available; absent for many older works and judgments.',
+                'English expression title where available; absent for many older works and judgments.',
               ),
           })
           .describe('A single EU legislative work with its CELEX number, type, and date.'),
@@ -122,6 +123,17 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
       .number()
       .describe('Number of documents returned in this page (not a corpus-wide count).'),
     offset: z.number().describe('Pagination offset used for this response.'),
+    query_echo: z
+      .object({
+        keyword: z.string().optional().describe('Keyword filter applied.'),
+        document_type: z.string().optional().describe('Document type filter applied.'),
+        date_from: z.string().optional().describe('Start date filter applied.'),
+        date_to: z.string().optional().describe('End date filter applied.'),
+        eurovoc_concept: z.string().optional().describe('EuroVoc concept URI filter applied.'),
+        author_institution: z.string().optional().describe('Author institution filter applied.'),
+        in_force: z.boolean().optional().describe('In-force filter applied.'),
+      })
+      .describe('Echo of filters applied to this search. Useful for diagnosing empty results.'),
   }),
 
   errors: [
@@ -179,17 +191,35 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
     const inForceClause =
       input.in_force === true ? `OPTIONAL { ?work cdm:resource_legal_in-force ?inForce . }` : '';
 
+    // Titles live on expressions, not works. Traverse the expression graph:
+    // ?expr cdm:expression_belongs_to_work ?work  (inverse of cdm:work_has_expression)
+    // ?expr cdm:expression_uses_language <.../ENG>
+    // ?expr cdm:expression_title ?title
     const sparql = `
 SELECT DISTINCT ?work ?celexNumber ?type ?date ?title WHERE {
   ?work cdm:resource_legal_id_celex ?celexNumber .
   OPTIONAL { ?work cdm:work_has_resource-type ?type . }
   OPTIONAL { ?work cdm:work_date_document ?date . }
-  OPTIONAL { ?work cdm:work_title ?titleNode . ?titleNode cdm:expression_title ?title . FILTER(LANG(?title) = "en") }
+  OPTIONAL {
+    ?expr cdm:expression_belongs_to_work ?work .
+    ?expr cdm:expression_uses_language <${ENG_LANGUAGE_URI}> .
+    ?expr cdm:expression_title ?title .
+  }
   ${eurovocClause}
   ${authorClause}
   ${inForceClause}
   ${filters.join('\n  ')}
 } ORDER BY DESC(?date) LIMIT ${input.limit} OFFSET ${input.offset}`;
+
+    const queryEcho = {
+      ...(input.keyword ? { keyword: input.keyword } : {}),
+      ...(input.document_type ? { document_type: input.document_type } : {}),
+      ...(input.date_from ? { date_from: input.date_from } : {}),
+      ...(input.date_to ? { date_to: input.date_to } : {}),
+      ...(input.eurovoc_concept ? { eurovoc_concept: input.eurovoc_concept } : {}),
+      ...(input.author_institution ? { author_institution: input.author_institution } : {}),
+      ...(input.in_force !== undefined ? { in_force: input.in_force } : {}),
+    };
 
     const bindings = await svc.query(sparql, ctx);
     ctx.log.info('Document search', {
@@ -200,9 +230,14 @@ SELECT DISTINCT ?work ?celexNumber ?type ?date ?title WHERE {
     });
 
     if (bindings.length === 0) {
-      throw ctx.fail('no_results', 'No documents matched the search criteria.', {
-        ...ctx.recoveryFor('no_results'),
-      });
+      const filterSummary = Object.entries(queryEcho)
+        .map(([k, v]) => `${k}=${String(v)}`)
+        .join(', ');
+      throw ctx.fail(
+        'no_results',
+        `No documents matched the search criteria${filterSummary ? `. Filters: ${filterSummary}` : '.'}`,
+        { ...ctx.recoveryFor('no_results') },
+      );
     }
 
     const documents = bindings.map((b) => {
@@ -216,8 +251,8 @@ SELECT DISTINCT ?work ?celexNumber ?type ?date ?title WHERE {
         work_uri: CellarSparqlService.bindingValue(b, 'work') ?? '',
         celex_number: CellarSparqlService.bindingValue(b, 'celexNumber') ?? '',
       };
-      const type = CellarSparqlService.bindingValue(b, 'type');
-      if (type) doc.resource_type = type;
+      const typeUri = CellarSparqlService.bindingValue(b, 'type');
+      if (typeUri) doc.resource_type = resolveResourceTypeLabel(typeUri);
       const date = CellarSparqlService.bindingValue(b, 'date');
       if (date) doc.date = date;
       const title = CellarSparqlService.bindingValue(b, 'title');
@@ -225,13 +260,19 @@ SELECT DISTINCT ?work ?celexNumber ?type ?date ?title WHERE {
       return doc;
     });
 
-    return { documents, total: documents.length, offset: input.offset };
+    return { documents, total: documents.length, offset: input.offset, query_echo: queryEcho };
   },
 
   format: (result) => {
     const lines: string[] = [
       `## EU Documents (${result.total} results, offset ${result.offset})\n`,
     ];
+    const echoEntries = Object.entries(result.query_echo);
+    if (echoEntries.length > 0) {
+      lines.push(
+        `*Filters: ${echoEntries.map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(', ')}*\n`,
+      );
+    }
     for (const doc of result.documents) {
       lines.push(`### ${doc.celex_number}${doc.title ? ` — ${doc.title}` : ''}`);
       if (doc.date) lines.push(`**Date:** ${doc.date}`);

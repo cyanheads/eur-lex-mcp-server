@@ -46,6 +46,7 @@ describe('eurlex_get_cases', () => {
       makeCaseBinding('62013CJ0131', {
         date: '2014-05-13',
         title: 'Google Spain SL v AEPD',
+        type: 'http://publications.europa.eu/resource/authority/resource-type/JUDG',
       }),
     ]);
 
@@ -56,6 +57,8 @@ describe('eurlex_get_cases', () => {
     expect(result.cases[0]?.celex_number).toBe('62013CJ0131');
     expect(result.cases[0]?.title).toBe('Google Spain SL v AEPD');
     expect(result.cases[0]?.date).toBe('2014-05-13');
+    // resource_type should be resolved to a human-readable label
+    expect(result.cases[0]?.resource_type).toBe('Judgment');
   });
 
   it('includes sector 6 filter in SPARQL for all case searches', async () => {
@@ -116,6 +119,58 @@ describe('eurlex_get_cases', () => {
     expect(sparql).toContain('OFFSET 10');
   });
 
+  // --- case_number conversion ---
+
+  it('converts C-131/12 to CELEX fragment 2012CJ0131 in SPARQL', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+    mockQuery.mockResolvedValue([makeCaseBinding('62012CJ0131')]);
+
+    const input = eurlex_get_cases.input.parse({ case_number: 'C-131/12' });
+    const result = await eurlex_get_cases.handler(input, ctx);
+
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    // Should search for the CELEX substring, not the raw case number
+    expect(sparql).toContain('2012CJ0131');
+    expect(sparql).not.toContain('131/12');
+    expect(result.query_echo.celex_fragment).toBe('2012CJ0131');
+    expect(result.query_echo.case_number).toBe('C-131/12');
+  });
+
+  it('converts T-22/20 to CELEX fragment 2020TJ0022 in SPARQL', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+    mockQuery.mockResolvedValue([makeCaseBinding('62020TJ0022')]);
+
+    const input = eurlex_get_cases.input.parse({ case_number: 'T-22/20' });
+    await eurlex_get_cases.handler(input, ctx);
+
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    expect(sparql).toContain('2020TJ0022');
+  });
+
+  it('includes query_echo in the response', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+    mockQuery.mockResolvedValue([makeCaseBinding('62013CJ0131')]);
+
+    const input = eurlex_get_cases.input.parse({ keyword: 'google', court: 'CJEU' });
+    const result = await eurlex_get_cases.handler(input, ctx);
+
+    expect(result.query_echo.keyword).toBe('google');
+    expect(result.query_echo.court).toBe('CJEU');
+  });
+
+  it('SPARQL uses expression_belongs_to_work path for title', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+    mockQuery.mockResolvedValue([makeCaseBinding('62013CJ0131')]);
+
+    const input = eurlex_get_cases.input.parse({ keyword: 'google' });
+    await eurlex_get_cases.handler(input, ctx);
+
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    expect(sparql).toContain('cdm:expression_belongs_to_work');
+    expect(sparql).toContain('cdm:expression_title');
+    expect(sparql).not.toContain('cdm:work_title');
+  });
+
   // --- Error contract: no_results ---
 
   it('throws ctx.fail("no_results") when query returns empty bindings', async () => {
@@ -131,7 +186,7 @@ describe('eurlex_get_cases', () => {
 
   // --- Format ---
 
-  it('format renders celex, date, and title', () => {
+  it('format renders celex, date, type label, and title', () => {
     const output = {
       cases: [
         {
@@ -139,10 +194,12 @@ describe('eurlex_get_cases', () => {
           celex_number: '62013CJ0131',
           date: '2014-05-13',
           title: 'Google Spain SL v AEPD',
+          resource_type: 'Judgment',
         },
       ],
       total: 1,
       offset: 0,
+      query_echo: { keyword: 'google' },
     };
     const blocks = eurlex_get_cases.format!(output);
     expect(blocks[0]?.type).toBe('text');
@@ -150,6 +207,8 @@ describe('eurlex_get_cases', () => {
     expect(text).toContain('62013CJ0131');
     expect(text).toContain('Google Spain SL v AEPD');
     expect(text).toContain('2014-05-13');
+    expect(text).toContain('Judgment');
+    expect(text).toContain('keyword="google"');
   });
 
   it('format handles sparse case (no title or type)', () => {
@@ -162,6 +221,7 @@ describe('eurlex_get_cases', () => {
       ],
       total: 1,
       offset: 0,
+      query_echo: {},
     };
     const blocks = eurlex_get_cases.format!(output);
     const text = (blocks[0] as { text: string }).text;

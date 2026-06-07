@@ -60,6 +60,8 @@ describe('eurlex_search_documents', () => {
     expect(result.documents[0]?.celex_number).toBe('32016R0679');
     expect(result.documents[0]?.title).toBe('General Data Protection Regulation');
     expect(result.documents[0]?.date).toBe('2016-04-27');
+    // resource_type should be resolved to a human-readable label
+    expect(result.documents[0]?.resource_type).toBe('Regulation');
     // Sparse row: no type/date/title
     expect(result.documents[1]?.resource_type).toBeUndefined();
   });
@@ -117,6 +119,37 @@ describe('eurlex_search_documents', () => {
     });
   });
 
+  it('includes query_echo in the response', async () => {
+    const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+    mockQuery.mockResolvedValue([makeDocBinding('32016R0679')]);
+
+    const input = eurlex_search_documents.input.parse({
+      keyword: 'privacy',
+      document_type: 'REG',
+      date_from: '2020-01-01',
+    });
+    const result = await eurlex_search_documents.handler(input, ctx);
+
+    expect(result.query_echo.keyword).toBe('privacy');
+    expect(result.query_echo.document_type).toBe('REG');
+    expect(result.query_echo.date_from).toBe('2020-01-01');
+    expect(result.query_echo.date_to).toBeUndefined();
+  });
+
+  it('SPARQL uses expression_belongs_to_work path for title', async () => {
+    const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+    mockQuery.mockResolvedValue([makeDocBinding('32016R0679')]);
+
+    const input = eurlex_search_documents.input.parse({ keyword: 'regulation' });
+    await eurlex_search_documents.handler(input, ctx);
+
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    expect(sparql).toContain('cdm:expression_belongs_to_work');
+    expect(sparql).toContain('cdm:expression_title');
+    // Old broken path must not be present
+    expect(sparql).not.toContain('cdm:work_title');
+  });
+
   it('applies eurovoc_concept filter to SPARQL when provided', async () => {
     const ctx = createMockContext({ errors: eurlex_search_documents.errors });
     mockQuery.mockResolvedValue([makeDocBinding('32016R0679')]);
@@ -133,27 +166,29 @@ describe('eurlex_search_documents', () => {
 
   // --- Format ---
 
-  it('format renders celex, date, type, and work_uri', () => {
+  it('format renders celex, date, type label, and work_uri', () => {
     const output = {
       documents: [
         {
           work_uri: 'http://publications.europa.eu/resource/cellar/gdpr',
           celex_number: '32016R0679',
-          resource_type: 'http://publications.europa.eu/resource/authority/resource-type/REG',
+          resource_type: 'Regulation',
           date: '2016-04-27',
           title: 'GDPR',
         },
       ],
       total: 1,
       offset: 0,
+      query_echo: { keyword: 'gdpr' },
     };
     const blocks = eurlex_search_documents.format!(output);
     expect(blocks[0]?.type).toBe('text');
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('32016R0679');
     expect(text).toContain('2016-04-27');
-    expect(text).toContain('REG');
+    expect(text).toContain('Regulation');
     expect(text).toContain('http://publications.europa.eu/resource/cellar/gdpr');
+    expect(text).toContain('keyword="gdpr"');
   });
 
   it('format handles sparse documents (no type, date, or title)', () => {
@@ -166,6 +201,7 @@ describe('eurlex_search_documents', () => {
       ],
       total: 1,
       offset: 0,
+      query_echo: {},
     };
     const blocks = eurlex_search_documents.format!(output);
     const text = (blocks[0] as { text: string }).text;

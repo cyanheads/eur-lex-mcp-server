@@ -6,6 +6,10 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import {
+  resolveCorporateBodyLabel,
+  resolveResourceTypeLabel,
+} from '@/services/cellar-sparql/cdm-labels.js';
+import {
   CellarSparqlService,
   getCellarSparqlService,
 } from '@/services/cellar-sparql/cellar-sparql-service.js';
@@ -70,13 +74,13 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .string()
       .optional()
       .describe(
-        'CDM resource type URI indicating the document category (e.g. .../resource-type/REG for Regulation). Absent for some older works.',
+        'Human-readable document type label (e.g. "Regulation", "Directive"). Absent for some older works.',
       ),
     author_institution: z
       .string()
       .optional()
       .describe(
-        'URI of the originating EU institution in the CDM authority register. Resolve against eurlex_query_sparql for a human-readable label.',
+        'Human-readable name of the originating EU institution (e.g. "European Parliament", "Council of the EU"). Absent when not recorded.',
       ),
     legal_basis: z
       .array(z.string().describe('CELEX number or URI of a legal basis act.'))
@@ -205,8 +209,8 @@ SELECT ?work ?celexNumber ?type ?date ?title ?inForce ?author ?legalBasis ?eurov
     if (workUri) result.work_uri = workUri;
     if (title) result.title = title;
     if (date) result.date = date;
-    if (resourceType) result.resource_type = resourceType;
-    if (authorUri) result.author_institution = authorUri;
+    if (resourceType) result.resource_type = resolveResourceTypeLabel(resourceType);
+    if (authorUri) result.author_institution = resolveCorporateBodyLabel(authorUri);
     if (legalBases.size > 0) result.legal_basis = [...legalBases];
     if (eurovocConcepts.size > 0) result.eurovoc_subjects = [...eurovocConcepts];
     if (typeof inForce === 'boolean') result.in_force = inForce;

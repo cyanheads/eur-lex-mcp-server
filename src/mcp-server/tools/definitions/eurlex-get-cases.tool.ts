@@ -5,6 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { ENG_LANGUAGE_URI, resolveResourceTypeLabel } from '@/services/cellar-sparql/cdm-labels.js';
 import {
   CellarSparqlService,
   getCellarSparqlService,
@@ -17,15 +18,35 @@ const CASE_TYPE_PATTERN: Record<string, string> = {
   ag_opinion: 'CC',
 };
 
+/**
+ * Convert a standard EU case number (C-131/12 or T-131/12) into a CELEX substring
+ * suitable for a CONTAINS filter.
+ *
+ * CELEX format for case law: 6{year4d}{court}{num4d}
+ *   e.g. C-131/12 → 62012CJ0131, T-22/20 → 62020TJ0022
+ *
+ * 2-digit year heuristic: yy ≤ 60 → 20yy, else → 19yy.
+ * Returns null if the input doesn't match the expected pattern.
+ */
+function caseNumberToCelexFragment(caseNumber: string): string | null {
+  const m = /^([CT])-(\d+)\/(\d{2,4})$/.exec(caseNumber.trim().toUpperCase());
+  if (!m) return null;
+  const court = m[1] === 'C' ? 'CJ' : 'TJ';
+  const caseNum = m[2]!.padStart(4, '0');
+  const rawYear = parseInt(m[3]!, 10);
+  const year4 = m[3]!.length === 2 ? (rawYear <= 60 ? 2000 + rawYear : 1900 + rawYear) : rawYear;
+  return `${year4}${court}${caseNum}`;
+}
+
 export const eurlex_get_cases = tool('eurlex_get_cases', {
   title: 'Search CJEU/GC Case Law',
   description:
     'Search CJEU (Court of Justice of the EU) and General Court case law — judgments, orders, and Advocate General opinions. ' +
     'Distinct from eurlex_search_documents because case law uses CELEX sector 6 and practitioners search it differently: ' +
     'by case number, court, party name, or AG opinion type. ' +
-    'Keyword search applies to case titles and CELEX strings only — full-text body search is not available. ' +
-    'Case numbers follow the pattern C-{num}/{year} for CJEU and T-{num}/{year} for General Court. ' +
-    'Returns case identifier, court, date, document type, and title (where available). ' +
+    'Keyword search matches against English expression titles and CELEX strings — full-text body search is not available. ' +
+    'Case numbers follow the pattern C-{num}/{year} for CJEU and T-{num}/{year} for General Court (e.g. C-131/12). ' +
+    'Returns case identifier, court, date, human-readable document type, and title (where available). ' +
     'Use eurlex_get_document with the CELEX number to fetch the full judgment text.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
@@ -84,14 +105,14 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
               .string()
               .optional()
               .describe(
-                'CDM resource type URI indicating the case type (e.g. .../resource-type/JUDG for Judgment). Absent for some older cases.',
+                'Human-readable case type label (e.g. "Judgment", "Order", "AG Opinion"). Absent for some older cases.',
               ),
             date: z.string().optional().describe('Judgment/opinion date in ISO 8601 format.'),
             title: z
               .string()
               .optional()
               .describe(
-                'Case title where available (e.g. "Google Spain SL v AEPD"). Absent for many older cases.',
+                'English expression title where available (e.g. "Google Spain SL v AEPD"). Absent for many older cases.',
               ),
           })
           .describe('A single CJEU or General Court case law record.'),
@@ -99,6 +120,17 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
       .describe('Matching case law records ordered by date descending.'),
     total: z.number().describe('Number of cases returned in this page (not a corpus-wide count).'),
     offset: z.number().describe('Pagination offset used for this response.'),
+    query_echo: z
+      .object({
+        case_number: z.string().optional().describe('Case number filter applied.'),
+        celex_fragment: z.string().optional().describe('CELEX substring derived from case_number.'),
+        keyword: z.string().optional().describe('Keyword filter applied.'),
+        court: z.string().optional().describe('Court filter applied.'),
+        case_type: z.string().optional().describe('Case type filter applied.'),
+        date_from: z.string().optional().describe('Start date filter applied.'),
+        date_to: z.string().optional().describe('End date filter applied.'),
+      })
+      .describe('Echo of filters applied to this search. Useful for diagnosing empty results.'),
   }),
 
   errors: [
@@ -123,13 +155,19 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
     // All case law is in CELEX sector 6
     const filters: string[] = [`FILTER(STRSTARTS(STR(?celexNumber), "6"))`];
 
+    let celexFragment: string | undefined;
     if (input.case_number && input.case_number.trim()) {
-      // Convert standard case number format to CELEX substring
-      // e.g. C-131/12 → search for "131" and "12" in celex
-      const cn = input.case_number.trim().replace(/"/g, '\\"');
-      filters.push(
-        `FILTER(CONTAINS(LCASE(STR(?title)), LCASE("${cn}")) || CONTAINS(LCASE(STR(?celexNumber)), LCASE("${cn}")))`,
-      );
+      // Convert standard case number (C-131/12) to CELEX substring (2012CJ0131).
+      // The old approach — searching for the raw "131/12" string in the CELEX — is
+      // inverted: CELEX stores year before case number, so "131/12" never matches.
+      celexFragment = caseNumberToCelexFragment(input.case_number) ?? undefined;
+      if (celexFragment) {
+        filters.push(`FILTER(CONTAINS(STR(?celexNumber), "${celexFragment}"))`);
+      } else {
+        // Fallback for non-standard formats: substring match on CELEX
+        const cn = input.case_number.trim().replace(/"/g, '\\"');
+        filters.push(`FILTER(CONTAINS(LCASE(STR(?celexNumber)), LCASE("${cn}")))`);
+      }
     }
 
     if (input.keyword && input.keyword.trim()) {
@@ -165,18 +203,37 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
       filters.push(`FILTER(?date <= "${input.date_to.trim()}"^^xsd:date)`);
     }
 
+    // Titles live on expressions, not works. Traverse the expression graph:
+    // ?expr cdm:expression_belongs_to_work ?work (inverse of cdm:work_has_expression)
+    // ?expr cdm:expression_uses_language <.../ENG>
+    // ?expr cdm:expression_title ?title
     const sparql = `
 SELECT DISTINCT ?work ?celexNumber ?type ?date ?title WHERE {
   ?work cdm:resource_legal_id_celex ?celexNumber .
   OPTIONAL { ?work cdm:work_has_resource-type ?type . }
   OPTIONAL { ?work cdm:work_date_document ?date . }
-  OPTIONAL { ?work cdm:work_title ?titleNode . ?titleNode cdm:expression_title ?title . FILTER(LANG(?title) = "en") }
+  OPTIONAL {
+    ?expr cdm:expression_belongs_to_work ?work .
+    ?expr cdm:expression_uses_language <${ENG_LANGUAGE_URI}> .
+    ?expr cdm:expression_title ?title .
+  }
   ${filters.join('\n  ')}
 } ORDER BY DESC(?date) LIMIT ${input.limit} OFFSET ${input.offset}`;
+
+    const queryEcho = {
+      ...(input.case_number ? { case_number: input.case_number } : {}),
+      ...(celexFragment ? { celex_fragment: celexFragment } : {}),
+      ...(input.keyword ? { keyword: input.keyword } : {}),
+      ...(input.court ? { court: input.court } : {}),
+      ...(input.case_type ? { case_type: input.case_type } : {}),
+      ...(input.date_from ? { date_from: input.date_from } : {}),
+      ...(input.date_to ? { date_to: input.date_to } : {}),
+    };
 
     const bindings = await svc.query(sparql, ctx);
     ctx.log.info('Case law search', {
       caseNumber: input.case_number,
+      celexFragment,
       keyword: input.keyword,
       court: input.court,
       caseType: input.case_type,
@@ -184,9 +241,14 @@ SELECT DISTINCT ?work ?celexNumber ?type ?date ?title WHERE {
     });
 
     if (bindings.length === 0) {
-      throw ctx.fail('no_results', 'No case law records matched the search criteria.', {
-        ...ctx.recoveryFor('no_results'),
-      });
+      const filterSummary = Object.entries(queryEcho)
+        .map(([k, v]) => `${k}=${String(v)}`)
+        .join(', ');
+      throw ctx.fail(
+        'no_results',
+        `No case law records matched the search criteria${filterSummary ? `. Filters: ${filterSummary}` : '.'}`,
+        { ...ctx.recoveryFor('no_results') },
+      );
     }
 
     const cases = bindings.map((b) => {
@@ -200,8 +262,8 @@ SELECT DISTINCT ?work ?celexNumber ?type ?date ?title WHERE {
         work_uri: CellarSparqlService.bindingValue(b, 'work') ?? '',
         celex_number: CellarSparqlService.bindingValue(b, 'celexNumber') ?? '',
       };
-      const type = CellarSparqlService.bindingValue(b, 'type');
-      if (type) c.resource_type = type;
+      const typeUri = CellarSparqlService.bindingValue(b, 'type');
+      if (typeUri) c.resource_type = resolveResourceTypeLabel(typeUri);
       const date = CellarSparqlService.bindingValue(b, 'date');
       if (date) c.date = date;
       const title = CellarSparqlService.bindingValue(b, 'title');
@@ -209,13 +271,19 @@ SELECT DISTINCT ?work ?celexNumber ?type ?date ?title WHERE {
       return c;
     });
 
-    return { cases, total: cases.length, offset: input.offset };
+    return { cases, total: cases.length, offset: input.offset, query_echo: queryEcho };
   },
 
   format: (result) => {
     const lines: string[] = [
       `## CJEU/GC Case Law (${result.total} results, offset ${result.offset})\n`,
     ];
+    const echoEntries = Object.entries(result.query_echo);
+    if (echoEntries.length > 0) {
+      lines.push(
+        `*Filters: ${echoEntries.map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(', ')}*\n`,
+      );
+    }
     for (const c of result.cases) {
       lines.push(`### ${c.celex_number}${c.title ? ` — ${c.title}` : ''}`);
       if (c.date) lines.push(`**Date:** ${c.date}`);
