@@ -14,6 +14,8 @@ import { initCellarSparqlService } from './services/cellar-sparql/cellar-sparql-
 import { initEurLexContentService } from './services/eurlex-content/eurlex-content-service.js';
 
 await createApp({
+  name: 'eur-lex-mcp-server',
+  title: 'eur-lex-mcp-server',
   tools: allToolDefinitions,
   resources: allResourceDefinitions,
   prompts: allPromptDefinitions,
