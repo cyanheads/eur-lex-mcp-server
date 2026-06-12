@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.4](changelog/0.1.x/0.1.4.md) — 2026-06-11
+
+Framework upgrade to mcp-ts-core ^0.10.6, server identity pair, SPARQL errors reclassified to ValidationError, bundle cleaner, Dockerfile hardening
+
 ## [0.1.3](changelog/0.1.x/0.1.3.md) — 2026-06-06
 
 Keyword title search, case number resolution, filter echo, and human-readable type labels across CELLAR tools
