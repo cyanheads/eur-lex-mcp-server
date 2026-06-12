@@ -63,7 +63,7 @@ export const eurlex_query_sparql = tool('eurlex_query_sparql', {
   errors: [
     {
       reason: 'sparql_error',
-      code: JsonRpcErrorCode.InvalidParams,
+      code: JsonRpcErrorCode.ValidationError,
       when: 'Virtuoso returned a syntax or semantic error — the query is malformed.',
       recovery:
         'Fix the SPARQL query syntax, ensure predicates use the cdm: prefix, and verify variable names.',

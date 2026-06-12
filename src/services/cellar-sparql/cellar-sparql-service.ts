@@ -7,7 +7,7 @@
 
 import type { Context } from '@cyanheads/mcp-ts-core';
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
-import { invalidParams, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
+import { serviceUnavailable, validationError } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { withRetry } from '@cyanheads/mcp-ts-core/utils';
 import type { ServerConfig } from '@/config/server-config.js';
@@ -81,7 +81,7 @@ export class CellarSparqlService {
         if (!response.ok) {
           if (response.status === 400) {
             // HTTP 400 = client error (malformed query) — not retryable
-            throw invalidParams(`CELLAR SPARQL error: ${text.slice(0, 300)}`, {
+            throw validationError(`CELLAR SPARQL error: ${text.slice(0, 300)}`, {
               reason: 'sparql_error',
               retryable: false,
             });
@@ -99,7 +99,7 @@ export class CellarSparqlService {
             });
           }
           // Syntax / semantic error — not transient, fail immediately
-          throw invalidParams(`CELLAR SPARQL error: ${text.slice(0, 300)}`, {
+          throw validationError(`CELLAR SPARQL error: ${text.slice(0, 300)}`, {
             reason: 'sparql_error',
             retryable: false,
           });

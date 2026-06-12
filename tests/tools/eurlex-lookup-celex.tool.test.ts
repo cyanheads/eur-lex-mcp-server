@@ -107,7 +107,7 @@ describe('eurlex_lookup_celex', () => {
       identifier_type: 'auto',
     });
     await expect(eurlex_lookup_celex.handler(input, ctx)).rejects.toMatchObject({
-      code: JsonRpcErrorCode.InvalidParams,
+      code: JsonRpcErrorCode.ValidationError,
       data: { reason: 'ambiguous_identifier' },
     });
     // Should not have called the SPARQL service

@@ -86,7 +86,7 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
     },
     {
       reason: 'ambiguous_identifier',
-      code: JsonRpcErrorCode.InvalidParams,
+      code: JsonRpcErrorCode.ValidationError,
       when: 'identifier_type is "auto" and the identifier format could not be determined.',
       recovery:
         'Supply identifier_type explicitly as "celex", "eli", or "oj" to resolve the ambiguity.',
