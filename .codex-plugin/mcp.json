@@ -1,5 +1,5 @@
 {
-  "@cyanheads/eur-lex-mcp-server": {
+  "eur-lex-mcp-server": {
     "command": "npx",
     "args": ["-y", "@cyanheads/eur-lex-mcp-server"],
     "env": {

@@ -1,5 +1,5 @@
 {
-  "name": "@cyanheads/eur-lex-mcp-server",
+  "name": "eur-lex-mcp-server",
   "version": "0.1.4",
   "description": "Search EU legislation, CJEU case law, and treaties; traverse the CELLAR relationship graph; resolve EuroVoc concepts via MCP. STDIO or Streamable HTTP.",
   "author": {
@@ -9,7 +9,7 @@
   "repository": "git+https://github.com/cyanheads/eur-lex-mcp-server.git",
   "license": "Apache-2.0",
   "mcpServers": {
-    "@cyanheads/eur-lex-mcp-server": {
+    "eur-lex-mcp-server": {
       "command": "npx",
       "args": ["-y", "@cyanheads/eur-lex-mcp-server"],
       "env": {

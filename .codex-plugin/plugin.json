@@ -1,5 +1,5 @@
 {
-  "name": "@cyanheads/eur-lex-mcp-server",
+  "name": "eur-lex-mcp-server",
   "version": "0.1.4",
   "description": "Search EU legislation, CJEU case law, and treaties; traverse the CELLAR relationship graph; resolve EuroVoc concepts via MCP. STDIO or Streamable HTTP.",
   "author": {
@@ -31,7 +31,7 @@
   ],
   "mcpServers": "./.codex-plugin/mcp.json",
   "interface": {
-    "displayName": "@cyanheads/eur-lex-mcp-server",
+    "displayName": "eur-lex-mcp-server",
     "shortDescription": "Search EU legislation, CJEU case law, and treaties; traverse the CELLAR relationship graph; resolve EuroVoc concepts.",
     "longDescription": "EUR-Lex MCP server wraps the CELLAR semantic repository — the EU Publications Office's authoritative database of 2.7M+ EU legal works. Access EU legislation, CJEU/General Court case law, treaties, and preparatory acts. Traverse the CDM relationship graph for amendment chains, consolidated versions, legal basis, and citation networks. Resolve human-readable subjects to EuroVoc concept IDs. Execute raw SPARQL against the Virtuoso endpoint for advanced CDM ontology traversal. No API key required.",
     "developerName": "cyanheads",
