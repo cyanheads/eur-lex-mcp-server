@@ -1,6 +1,6 @@
 # eur-lex-mcp-server - Directory Structure
 
-Generated on: 2026-06-12 03:36:02
+Generated on: 2026-06-20 11:09:16
 
 ```text
 eur-lex-mcp-server/
@@ -28,6 +28,7 @@ eur-lex-mcp-server/
 ├── scripts/
 │   ├── build-changelog.ts
 │   ├── build.ts
+│   ├── check-dependency-specifiers.ts
 │   ├── check-docs-sync.ts
 │   ├── check-framework-antipatterns.ts
 │   ├── check-skill-versions.ts

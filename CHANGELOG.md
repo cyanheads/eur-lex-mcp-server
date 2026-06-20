@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.5](changelog/0.1.x/0.1.5.md) — 2026-06-20
+
+Framework upgrade to mcp-ts-core ^0.10.9 (ctx.content media collector, sharper Canvas SQL-gate errors, fresh-scaffold devcheck guards), new dependency-specifier devcheck step, plugin-manifest lint, re-synced skills + scripts
+
 ## [0.1.4](changelog/0.1.x/0.1.4.md) — 2026-06-11
 
 Framework upgrade to mcp-ts-core ^0.10.6, server identity pair, SPARQL errors reclassified to ValidationError, bundle cleaner, Dockerfile hardening
