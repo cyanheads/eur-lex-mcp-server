@@ -90,6 +90,12 @@ describe('eurlex_get_document', () => {
     expect(result.content).toBe('<html>GDPR full text</html>');
     expect(result.language).toBe('EN');
     expect(result.content_format).toBe('html');
+    // Default "paged" mode returns a small body whole, with the navigation floor populated.
+    expect(result.content_mode).toBe('paged');
+    expect(result.content_chars_total).toBe('<html>GDPR full text</html>'.length);
+    expect(result.content_chars_returned).toBe('<html>GDPR full text</html>'.length);
+    expect(result.content_offset).toBe(0);
+    expect(result.has_more).toBe(false);
   });
 
   it('aggregates legal_basis and eurovoc_subjects from multi-row result', async () => {
@@ -280,9 +286,157 @@ describe('eurlex_get_document', () => {
     });
   });
 
-  // --- Format ---
+  // --- Content shaping floor (issue #12) ---
 
-  it('format renders celex, date, type, language, and content_available flag', () => {
+  it('content_mode "metadata_only" returns metadata with no body and skips the content fetch', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_document.errors });
+    mockSparqlQuery.mockResolvedValue([
+      makeMetaBinding({ celex: '32016R0679', title: 'GDPR', date: '2016-04-27' }),
+    ]);
+
+    const input = eurlex_get_document.input.parse({
+      celex_number: '32016R0679',
+      content_mode: 'metadata_only',
+    });
+    const result = await eurlex_get_document.handler(input, ctx);
+
+    expect(result.title).toBe('GDPR');
+    expect(result.content_mode).toBe('metadata_only');
+    expect(result.content).toBeUndefined();
+    expect(result.content_available).toBe(false);
+    expect(result.has_more).toBe(false);
+    expect(result.content_chars_total).toBeUndefined();
+    // No body fetch is attempted — the whole point of metadata_only.
+    expect(mockFetchContent).not.toHaveBeenCalled();
+  });
+
+  it('content_mode "full" returns the entire body with content_chars_total set and has_more false', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_document.errors });
+    const body = 'A'.repeat(50_000);
+    mockSparqlQuery.mockResolvedValue([makeMetaBinding({ celex: '32016R0679' })]);
+    mockFetchContent.mockResolvedValue({
+      content: body,
+      contentAvailable: true,
+      format: 'html',
+      language: 'EN',
+    });
+
+    const input = eurlex_get_document.input.parse({
+      celex_number: '32016R0679',
+      content_mode: 'full',
+    });
+    const result = await eurlex_get_document.handler(input, ctx);
+
+    expect(result.content).toBe(body);
+    expect(result.content_chars_total).toBe(50_000);
+    expect(result.content_chars_returned).toBe(50_000);
+    expect(result.content_offset).toBe(0);
+    expect(result.has_more).toBe(false);
+  });
+
+  it('content_mode "paged" returns contiguous windows that reconstruct the full body; has_more flips on the last page', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_document.errors });
+    const body = 'abcdefghij'.repeat(2_500); // 25,000 chars
+    mockSparqlQuery.mockResolvedValue([makeMetaBinding({ celex: '32016R0679' })]);
+    mockFetchContent.mockResolvedValue({
+      content: body,
+      contentAvailable: true,
+      format: 'html',
+      language: 'EN',
+    });
+
+    const page = (offset: number) =>
+      eurlex_get_document.handler(
+        eurlex_get_document.input.parse({
+          celex_number: '32016R0679',
+          content_mode: 'paged',
+          offset,
+          limit: 10_000,
+        }),
+        ctx,
+      );
+
+    const p1 = await page(0);
+    expect(p1.content_offset).toBe(0);
+    expect(p1.content_chars_returned).toBe(10_000);
+    expect(p1.content_chars_total).toBe(25_000);
+    expect(p1.has_more).toBe(true);
+
+    // Page 2 starts exactly where page 1 ended — no gap, no overlap.
+    const next2 = (p1.content_offset ?? 0) + (p1.content_chars_returned ?? 0);
+    expect(next2).toBe(10_000);
+    const p2 = await page(next2);
+    expect(p2.content_offset).toBe(10_000);
+    expect(p2.content_chars_returned).toBe(10_000);
+    expect(p2.has_more).toBe(true);
+
+    // Final page.
+    const next3 = (p2.content_offset ?? 0) + (p2.content_chars_returned ?? 0);
+    expect(next3).toBe(20_000);
+    const p3 = await page(next3);
+    expect(p3.content_offset).toBe(20_000);
+    expect(p3.content_chars_returned).toBe(5_000);
+    expect(p3.has_more).toBe(false);
+
+    // Contiguous pages reconstruct 100% of the act, and the last page's tail is the true end.
+    const reconstructed = (p1.content ?? '') + (p2.content ?? '') + (p3.content ?? '');
+    expect(reconstructed).toBe(body);
+    expect(p3.content?.endsWith(body.slice(-100))).toBe(true);
+    expect((p3.content_offset ?? 0) + (p3.content_chars_returned ?? 0)).toBe(
+      p3.content_chars_total,
+    );
+  });
+
+  it('a small act returns its whole body in one page with has_more false (default paged mode)', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_document.errors });
+    const body = '<html>Short act</html>';
+    mockSparqlQuery.mockResolvedValue([makeMetaBinding({ celex: '32013R0001' })]);
+    mockFetchContent.mockResolvedValue({
+      content: body,
+      contentAvailable: true,
+      format: 'html',
+      language: 'EN',
+    });
+
+    const input = eurlex_get_document.input.parse({ celex_number: '32013R0001' }); // default content_mode
+    const result = await eurlex_get_document.handler(input, ctx);
+
+    expect(result.content_mode).toBe('paged');
+    expect(result.content).toBe(body);
+    expect(result.content_chars_total).toBe(body.length);
+    expect(result.content_chars_returned).toBe(body.length);
+    expect(result.has_more).toBe(false);
+  });
+
+  it('paged offset past the end returns an empty window with has_more false (clamped, not an error)', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_document.errors });
+    const body = 'z'.repeat(1_000);
+    mockSparqlQuery.mockResolvedValue([makeMetaBinding({ celex: '32016R0679' })]);
+    mockFetchContent.mockResolvedValue({
+      content: body,
+      contentAvailable: true,
+      format: 'html',
+      language: 'EN',
+    });
+
+    const input = eurlex_get_document.input.parse({
+      celex_number: '32016R0679',
+      content_mode: 'paged',
+      offset: 5_000,
+      limit: 10_000,
+    });
+    const result = await eurlex_get_document.handler(input, ctx);
+
+    expect(result.content).toBeUndefined();
+    expect(result.content_offset).toBe(1_000); // clamped to total
+    expect(result.content_chars_returned).toBe(0);
+    expect(result.has_more).toBe(false);
+    expect(result.content_chars_total).toBe(1_000);
+  });
+
+  // --- Format: unified sizing across structuredContent and the text view ---
+
+  it('format renders metadata and an unavailable-content note', () => {
     const output = {
       celex_number: '32016R0679',
       work_uri: 'http://publications.europa.eu/resource/cellar/gdpr',
@@ -292,7 +446,9 @@ describe('eurlex_get_document', () => {
       in_force: true,
       legal_basis: ['http://lb1'],
       eurovoc_subjects: ['http://ev1', 'http://ev2'],
+      content_mode: 'paged',
       content_available: false,
+      has_more: false,
       language: 'EN',
       content_format: 'html',
     };
@@ -303,20 +459,57 @@ describe('eurlex_get_document', () => {
     expect(text).toContain('2016-04-27');
     expect(text).toContain('EN');
     expect(text).toContain('html');
-    expect(text).toContain('false'); // content_available
+    expect(text).toContain('not available');
   });
 
-  it('format truncates large content at 8000 chars', () => {
-    const longContent = 'x'.repeat(9000);
+  it('format() and structuredContent.content honor the same window (no separate 8000-char cut)', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_document.errors });
+    const body = 'Q'.repeat(12_000); // larger than the removed 8000-char format() cut
+    mockSparqlQuery.mockResolvedValue([makeMetaBinding({ celex: '32016R0679' })]);
+    mockFetchContent.mockResolvedValue({
+      content: body,
+      contentAvailable: true,
+      format: 'html',
+      language: 'EN',
+    });
+
+    const input = eurlex_get_document.input.parse({
+      celex_number: '32016R0679',
+      content_mode: 'paged',
+      offset: 0,
+      limit: 9_000,
+    });
+    const result = await eurlex_get_document.handler(input, ctx);
+    expect(result.content_chars_returned).toBe(9_000);
+
+    const text = (eurlex_get_document.format!(result)[0] as { text: string }).text;
+    // The text view carries exactly the structured window — no old cut, no full body.
+    expect(text).toContain(result.content!);
+    expect(result.content?.length).toBe(9_000);
+    expect(text).not.toContain('truncated');
+    expect(text).toContain('characters 0');
+    expect(text).toContain('of 12000');
+    expect(text).toContain('offset=9000');
+  });
+
+  it('format renders a "full" body verbatim with no truncation', () => {
+    const body = 'x'.repeat(9_000);
     const output = {
       celex_number: '32016R0679',
+      content_mode: 'full',
       content_available: true,
-      content: longContent,
+      content: body,
+      content_offset: 0,
+      content_chars_returned: 9_000,
+      content_chars_total: 9_000,
+      has_more: false,
       language: 'EN',
       content_format: 'html',
     };
     const blocks = eurlex_get_document.format!(output);
     const text = (blocks[0] as { text: string }).text;
-    expect(text).toContain('Content truncated');
+    expect(text).not.toContain('truncated');
+    expect(text).toContain(body); // full body present, uncut
+    expect(text).toContain('full body');
   });
 });
