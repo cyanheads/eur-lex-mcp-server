@@ -18,20 +18,26 @@ vi.mock('@/services/cellar-sparql/cellar-sparql-service.js', () => ({
   },
 }));
 
+/**
+ * Build a minimal SPARQL binding for a case-law result. Field names mirror the
+ * GROUP BY projection the handler reads: `celex`, `types` (space-separated
+ * resource-type URIs from GROUP_CONCAT), `docDate`, `docTitle`. Pass `types` a
+ * space-joined list to simulate a multi-resource-type work (e.g. a corrigendum).
+ */
 function makeCaseBinding(
   celex: string,
-  opts: { workUri?: string; type?: string; date?: string; title?: string } = {},
+  opts: { workUri?: string; types?: string; date?: string; title?: string } = {},
 ): Record<string, { type: string; value: string }> {
   const b: Record<string, { type: string; value: string }> = {
-    celexNumber: { type: 'literal', value: celex },
+    celex: { type: 'literal', value: celex },
     work: {
       type: 'uri',
       value: opts.workUri ?? `http://publications.europa.eu/resource/cellar/${celex}`,
     },
   };
-  if (opts.type) b.type = { type: 'uri', value: opts.type };
-  if (opts.date) b.date = { type: 'literal', value: opts.date };
-  if (opts.title) b.title = { type: 'literal', value: opts.title };
+  if (opts.types) b.types = { type: 'literal', value: opts.types };
+  if (opts.date) b.docDate = { type: 'literal', value: opts.date };
+  if (opts.title) b.docTitle = { type: 'literal', value: opts.title };
   return b;
 }
 
@@ -46,7 +52,7 @@ describe('eurlex_get_cases', () => {
       makeCaseBinding('62013CJ0131', {
         date: '2014-05-13',
         title: 'Google Spain SL v AEPD',
-        type: 'http://publications.europa.eu/resource/authority/resource-type/JUDG',
+        types: 'http://publications.europa.eu/resource/authority/resource-type/JUDG',
       }),
     ]);
 
@@ -182,6 +188,99 @@ describe('eurlex_get_cases', () => {
       code: JsonRpcErrorCode.NotFound,
       data: { reason: 'no_results' },
     });
+  });
+
+  // --- Dedup of multi-resource-type works (issue #14) ---
+
+  it('groups by work and concatenates resource-types instead of SELECT DISTINCT', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+    mockQuery.mockResolvedValue([makeCaseBinding('62013CJ0131')]);
+
+    const input = eurlex_get_cases.input.parse({ keyword: 'google' });
+    await eurlex_get_cases.handler(input, ctx);
+
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    expect(sparql).toContain('GROUP BY ?work');
+    expect(sparql).toContain('GROUP_CONCAT(DISTINCT STR(?type)');
+    expect(sparql).not.toContain('SELECT DISTINCT ?work ?celexNumber ?type');
+  });
+
+  it('a multi-resource-type case yields one row listing all type labels', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+    // A corrigendum to a judgment carries multiple resource-types; GROUP_CONCAT
+    // delivers them space-separated in a single binding.
+    mockQuery.mockResolvedValue([
+      makeCaseBinding('62013CJ0131R(01)', {
+        date: '2014-05-13',
+        types:
+          'http://publications.europa.eu/resource/authority/resource-type/JUDG ' +
+          'http://publications.europa.eu/resource/authority/resource-type/CORRIGENDUM',
+      }),
+    ]);
+
+    const input = eurlex_get_cases.input.parse({ keyword: 'google' });
+    const result = await eurlex_get_cases.handler(input, ctx);
+
+    expect(result.total).toBe(1);
+    expect(result.cases).toHaveLength(1);
+    // Both types resolve, de-duplicate, sort, and join. JUDG maps to "Judgment";
+    // CORRIGENDUM is unmapped and falls back to its raw code, sorting first (ASCII).
+    expect(result.cases[0]?.resource_type).toBe('CORRIGENDUM, Judgment');
+  });
+
+  it('the limit bounds distinct works (cap applied after GROUP BY)', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+    mockQuery.mockResolvedValue([
+      makeCaseBinding('62013CJ0131R(01)', {
+        types:
+          'http://publications.europa.eu/resource/authority/resource-type/JUDG ' +
+          'http://publications.europa.eu/resource/authority/resource-type/CORRIGENDUM',
+      }),
+      makeCaseBinding('62020TJ0022R(01)', {
+        types:
+          'http://publications.europa.eu/resource/authority/resource-type/JUDG ' +
+          'http://publications.europa.eu/resource/authority/resource-type/CORRIGENDUM',
+      }),
+    ]);
+
+    const input = eurlex_get_cases.input.parse({ keyword: 'corrigendum', limit: 2 });
+    const result = await eurlex_get_cases.handler(input, ctx);
+
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    expect(sparql).toMatch(/GROUP BY \?work[\s\S]*LIMIT 2/);
+    expect(result.total).toBe(2);
+    expect(new Set(result.cases.map((c) => c.work_uri)).size).toBe(2);
+  });
+
+  // --- Empty-string optional filters from form clients (issue #15) ---
+
+  it('accepts "" for every constrained optional filter and runs unfiltered', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+    mockQuery.mockResolvedValue([makeCaseBinding('62013CJ0131')]);
+
+    const input = eurlex_get_cases.input.parse({
+      keyword: 'google',
+      court: '',
+      case_type: '',
+      date_from: '',
+      date_to: '',
+    });
+    const result = await eurlex_get_cases.handler(input, ctx);
+
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    // No court/case_type/date clauses from blank filters (sector-6 filter remains).
+    expect(sparql).not.toContain('"TJ"');
+    expect(sparql).not.toContain('xsd:date');
+    expect(result.query_echo.court).toBeUndefined();
+    expect(result.query_echo.case_type).toBeUndefined();
+    expect(result.query_echo.date_from).toBeUndefined();
+    expect(result.query_echo.keyword).toBe('google');
+  });
+
+  it('keeps the format constraint for non-empty filter values', () => {
+    expect(() => eurlex_get_cases.input.parse({ court: 'SUPREME' })).toThrow();
+    expect(() => eurlex_get_cases.input.parse({ case_type: 'appeal' })).toThrow();
+    expect(() => eurlex_get_cases.input.parse({ date_from: '2016' })).toThrow();
   });
 
   // --- Format ---

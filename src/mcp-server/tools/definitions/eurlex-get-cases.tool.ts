@@ -5,7 +5,10 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { ENG_LANGUAGE_URI, resolveResourceTypeLabel } from '@/services/cellar-sparql/cdm-labels.js';
+import {
+  ENG_LANGUAGE_URI,
+  resolveResourceTypeLabels,
+} from '@/services/cellar-sparql/cdm-labels.js';
 import {
   CellarSparqlService,
   getCellarSparqlService,
@@ -61,25 +64,53 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
       .optional()
       .describe('Keyword to match against case titles and CELEX strings.'),
     court: z
-      .enum(['CJEU', 'GC'])
-      .optional()
-      .describe('Court filter: CJEU = Court of Justice of the EU, GC = General Court.'),
-    case_type: z
-      .enum(['judgment', 'order', 'ag_opinion'])
+      .union([
+        z.literal(''),
+        z.enum(['CJEU', 'GC']).describe('CJEU = Court of Justice of the EU, GC = General Court.'),
+      ])
       .optional()
       .describe(
-        'Case type filter: judgment, order (procedural decision), or ag_opinion (Advocate General opinion).',
+        'Court filter: CJEU = Court of Justice of the EU, GC = General Court. ' +
+          'Leave blank or omit to search both courts.',
+      ),
+    case_type: z
+      .union([
+        z.literal(''),
+        z
+          .enum(['judgment', 'order', 'ag_opinion'])
+          .describe(
+            'judgment, order (procedural decision), or ag_opinion (Advocate General opinion).',
+          ),
+      ])
+      .optional()
+      .describe(
+        'Case type filter: judgment, order (procedural decision), or ag_opinion (Advocate General opinion). ' +
+          'Leave blank or omit to search all case types.',
       ),
     date_from: z
-      .string()
-      .regex(/^\d{4}-\d{2}-\d{2}$/)
+      .union([
+        z.literal(''),
+        z
+          .string()
+          .regex(/^\d{4}-\d{2}-\d{2}$/)
+          .describe('Start date in ISO 8601 format (YYYY-MM-DD).'),
+      ])
       .optional()
-      .describe('Start of date range in ISO 8601 format (YYYY-MM-DD).'),
+      .describe(
+        'Start of date range in ISO 8601 format (YYYY-MM-DD). Leave blank or omit for no lower bound.',
+      ),
     date_to: z
-      .string()
-      .regex(/^\d{4}-\d{2}-\d{2}$/)
+      .union([
+        z.literal(''),
+        z
+          .string()
+          .regex(/^\d{4}-\d{2}-\d{2}$/)
+          .describe('End date in ISO 8601 format (YYYY-MM-DD).'),
+      ])
       .optional()
-      .describe('End of date range in ISO 8601 format (YYYY-MM-DD).'),
+      .describe(
+        'End of date range in ISO 8601 format (YYYY-MM-DD). Leave blank or omit for no upper bound.',
+      ),
     offset: z
       .number()
       .int()
@@ -105,7 +136,9 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
               .string()
               .optional()
               .describe(
-                'Human-readable case type label (e.g. "Judgment", "Order", "AG Opinion"). Absent for some older cases.',
+                'Human-readable case type label (e.g. "Judgment", "Order", "AG Opinion"). ' +
+                  'Cases classified under several resource-types (e.g. corrigenda) list all labels, comma-separated. ' +
+                  'Absent for some older cases.',
               ),
             date: z.string().optional().describe('Judgment/opinion date in ISO 8601 format.'),
             title: z
@@ -207,8 +240,20 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
     // ?expr cdm:expression_belongs_to_work ?work (inverse of cdm:work_has_expression)
     // ?expr cdm:expression_uses_language <.../ENG>
     // ?expr cdm:expression_title ?title
+    //
+    // GROUP BY ?work collapses each work to one row. A work can carry several
+    // cdm:work_has_resource-type values (corrigenda hold 2–3); without grouping these
+    // cross-product into duplicate rows that SELECT DISTINCT cannot merge (?type
+    // differs per row), and LIMIT/OFFSET would then page over raw rows rather than
+    // works. GROUP_CONCAT gathers every resource-type URI per work; SAMPLE picks the
+    // single-valued display fields. Aggregate aliases are renamed (?celex/?docDate/
+    // ?docTitle) because a projected AS-variable cannot reuse a name already in scope.
     const sparql = `
-SELECT DISTINCT ?work ?celexNumber ?type ?date ?title WHERE {
+SELECT ?work
+  (SAMPLE(?celexNumber) AS ?celex)
+  (GROUP_CONCAT(DISTINCT STR(?type); SEPARATOR=" ") AS ?types)
+  (SAMPLE(?date) AS ?docDate)
+  (SAMPLE(?title) AS ?docTitle) WHERE {
   ?work cdm:resource_legal_id_celex ?celexNumber .
   OPTIONAL { ?work cdm:work_has_resource-type ?type . }
   OPTIONAL { ?work cdm:work_date_document ?date . }
@@ -218,7 +263,7 @@ SELECT DISTINCT ?work ?celexNumber ?type ?date ?title WHERE {
     ?expr cdm:expression_title ?title .
   }
   ${filters.join('\n  ')}
-} ORDER BY DESC(?date) LIMIT ${input.limit} OFFSET ${input.offset}`;
+} GROUP BY ?work ORDER BY DESC(?docDate) LIMIT ${input.limit} OFFSET ${input.offset}`;
 
     const queryEcho = {
       ...(input.case_number ? { case_number: input.case_number } : {}),
@@ -260,13 +305,13 @@ SELECT DISTINCT ?work ?celexNumber ?type ?date ?title WHERE {
         title?: string;
       } = {
         work_uri: CellarSparqlService.bindingValue(b, 'work') ?? '',
-        celex_number: CellarSparqlService.bindingValue(b, 'celexNumber') ?? '',
+        celex_number: CellarSparqlService.bindingValue(b, 'celex') ?? '',
       };
-      const typeUri = CellarSparqlService.bindingValue(b, 'type');
-      if (typeUri) c.resource_type = resolveResourceTypeLabel(typeUri);
-      const date = CellarSparqlService.bindingValue(b, 'date');
+      const resourceType = resolveResourceTypeLabels(CellarSparqlService.bindingValue(b, 'types'));
+      if (resourceType) c.resource_type = resourceType;
+      const date = CellarSparqlService.bindingValue(b, 'docDate');
       if (date) c.date = date;
-      const title = CellarSparqlService.bindingValue(b, 'title');
+      const title = CellarSparqlService.bindingValue(b, 'docTitle');
       if (title) c.title = title;
       return c;
     });

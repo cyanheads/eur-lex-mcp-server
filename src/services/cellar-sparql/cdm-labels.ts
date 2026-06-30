@@ -40,6 +40,22 @@ export function resolveResourceTypeLabel(uri: string): string {
 }
 
 /**
+ * Resolve a whitespace-separated list of CDM resource-type URIs into a single
+ * human-readable label string. Search queries collapse each work's resource-types
+ * into one row via `GROUP_CONCAT(DISTINCT STR(?type))`, so a work carrying several
+ * types (e.g. a corrigendum classified as both CORRIGENDUM and a base type) arrives
+ * as space-separated URIs. Each URI is resolved, de-duplicated, sorted for stable
+ * output, and joined with ", ". Returns undefined when no type URI is present.
+ */
+export function resolveResourceTypeLabels(concatenated: string | undefined): string | undefined {
+  if (!concatenated) return;
+  const labels = [
+    ...new Set(concatenated.split(/\s+/).filter(Boolean).map(resolveResourceTypeLabel)),
+  ].sort();
+  return labels.length > 0 ? labels.join(', ') : undefined;
+}
+
+/**
  * CDM corporate-body URI → human-readable institution name.
  * Falls back to the last URI path segment when not in the map.
  */

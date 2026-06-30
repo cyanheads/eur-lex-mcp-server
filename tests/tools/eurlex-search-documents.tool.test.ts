@@ -18,21 +18,26 @@ vi.mock('@/services/cellar-sparql/cellar-sparql-service.js', () => ({
   },
 }));
 
-/** Build a minimal SPARQL binding for a document result. */
+/**
+ * Build a minimal SPARQL binding for a document result. Field names mirror the
+ * GROUP BY projection the handler reads: `celex`, `types` (space-separated
+ * resource-type URIs from GROUP_CONCAT), `docDate`, `docTitle`. Pass `types` a
+ * space-joined list to simulate a multi-resource-type work (e.g. a corrigendum).
+ */
 function makeDocBinding(
   celex: string,
-  opts: { workUri?: string; type?: string; date?: string; title?: string } = {},
+  opts: { workUri?: string; types?: string; date?: string; title?: string } = {},
 ): Record<string, { type: string; value: string }> {
   const b: Record<string, { type: string; value: string }> = {
-    celexNumber: { type: 'literal', value: celex },
+    celex: { type: 'literal', value: celex },
     work: {
       type: 'uri',
       value: opts.workUri ?? `http://publications.europa.eu/resource/cellar/${celex}`,
     },
   };
-  if (opts.type) b.type = { type: 'uri', value: opts.type };
-  if (opts.date) b.date = { type: 'literal', value: opts.date };
-  if (opts.title) b.title = { type: 'literal', value: opts.title };
+  if (opts.types) b.types = { type: 'literal', value: opts.types };
+  if (opts.date) b.docDate = { type: 'literal', value: opts.date };
+  if (opts.title) b.docTitle = { type: 'literal', value: opts.title };
   return b;
 }
 
@@ -47,7 +52,7 @@ describe('eurlex_search_documents', () => {
       makeDocBinding('32016R0679', {
         date: '2016-04-27',
         title: 'General Data Protection Regulation',
-        type: 'http://publications.europa.eu/resource/authority/resource-type/REG',
+        types: 'http://publications.europa.eu/resource/authority/resource-type/REG',
       }),
       makeDocBinding('32022R0868', { date: '2022-05-30' }),
     ]);
@@ -223,6 +228,127 @@ describe('eurlex_search_documents', () => {
       code: JsonRpcErrorCode.NotFound,
       data: { reason: 'no_results' },
     });
+  });
+
+  // --- Dedup of multi-resource-type works (issue #14) ---
+
+  it('groups by work and concatenates resource-types instead of SELECT DISTINCT', async () => {
+    const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+    mockQuery.mockResolvedValue([makeDocBinding('32016R0679')]);
+
+    const input = eurlex_search_documents.input.parse({ keyword: 'data' });
+    await eurlex_search_documents.handler(input, ctx);
+
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    expect(sparql).toContain('GROUP BY ?work');
+    expect(sparql).toContain('GROUP_CONCAT(DISTINCT STR(?type)');
+    // The old shape — DISTINCT over a projected ?type — could not collapse a work
+    // that differs only by resource-type. It must be gone.
+    expect(sparql).not.toContain('SELECT DISTINCT ?work ?celexNumber ?type');
+  });
+
+  it('a multi-resource-type work yields one row listing all type labels', async () => {
+    const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+    // A corrigendum carries several resource-types; GROUP_CONCAT delivers them
+    // space-separated in a single binding (one row per work, not a cross-product).
+    mockQuery.mockResolvedValue([
+      makeDocBinding('32015B0367R(01)', {
+        date: '2015-06-09',
+        types:
+          'http://publications.europa.eu/resource/authority/resource-type/BUDGET ' +
+          'http://publications.europa.eu/resource/authority/resource-type/CORRIGENDUM',
+      }),
+    ]);
+
+    const input = eurlex_search_documents.input.parse({ keyword: 'budget' });
+    const result = await eurlex_search_documents.handler(input, ctx);
+
+    expect(result.total).toBe(1);
+    expect(result.documents).toHaveLength(1);
+    // Both types resolve, de-duplicate, sort, and join — neither is silently dropped.
+    // BUDGET and CORRIGENDUM aren't in the curated label map, so each falls back to
+    // its raw authority code (the pre-existing single-type behavior).
+    expect(result.documents[0]?.resource_type).toBe('BUDGET, CORRIGENDUM');
+  });
+
+  it('the limit bounds distinct works (cap applied after GROUP BY)', async () => {
+    const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+    // Two multi-type works. Pre-fix these would cross-product into 4 rows and a
+    // limit of 2 would return a partial page; grouped, each work is exactly one row.
+    mockQuery.mockResolvedValue([
+      makeDocBinding('32025R2605R(01)', {
+        types:
+          'http://publications.europa.eu/resource/authority/resource-type/REG ' +
+          'http://publications.europa.eu/resource/authority/resource-type/CORRIGENDUM',
+      }),
+      makeDocBinding('32025R2143R(01)', {
+        types:
+          'http://publications.europa.eu/resource/authority/resource-type/REG ' +
+          'http://publications.europa.eu/resource/authority/resource-type/CORRIGENDUM',
+      }),
+    ]);
+
+    const input = eurlex_search_documents.input.parse({ keyword: 'corrigendum', limit: 2 });
+    const result = await eurlex_search_documents.handler(input, ctx);
+
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    // GROUP BY precedes LIMIT, so the cap bounds works rather than raw rows.
+    expect(sparql).toMatch(/GROUP BY \?work[\s\S]*LIMIT 2/);
+    expect(result.total).toBe(2);
+    const uris = result.documents.map((d) => d.work_uri);
+    expect(new Set(uris).size).toBe(2);
+  });
+
+  // --- Empty-string optional filters from form clients (issue #15) ---
+
+  it('accepts "" for every constrained optional filter and runs unfiltered', async () => {
+    const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+    mockQuery.mockResolvedValue([makeDocBinding('32016R0679')]);
+
+    // The shape a form client sends when optional fields are left blank — must not
+    // throw -32602.
+    const input = eurlex_search_documents.input.parse({
+      keyword: 'data protection',
+      document_type: '',
+      date_from: '',
+      date_to: '',
+      eurovoc_concept: '',
+    });
+    const result = await eurlex_search_documents.handler(input, ctx);
+
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    // Blank filters contribute no clauses.
+    expect(sparql).not.toContain('FILTER(?type =');
+    expect(sparql).not.toContain('xsd:date');
+    expect(sparql).not.toContain('cdm:work_is_about_concept_eurovoc');
+    // Blank filters are absent from the echo; the real keyword survives.
+    expect(result.query_echo.document_type).toBeUndefined();
+    expect(result.query_echo.date_from).toBeUndefined();
+    expect(result.query_echo.date_to).toBeUndefined();
+    expect(result.query_echo.eurovoc_concept).toBeUndefined();
+    expect(result.query_echo.keyword).toBe('data protection');
+  });
+
+  it('a real eurovoc_concept and document_type still filter', async () => {
+    const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+    mockQuery.mockResolvedValue([makeDocBinding('32016R0679')]);
+
+    const input = eurlex_search_documents.input.parse({
+      eurovoc_concept: 'http://eurovoc.europa.eu/2828',
+      document_type: 'REG',
+    });
+    await eurlex_search_documents.handler(input, ctx);
+
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    expect(sparql).toContain('cdm:work_is_about_concept_eurovoc <http://eurovoc.europa.eu/2828>');
+    expect(sparql).toContain('resource-type/REG');
+  });
+
+  it('keeps the format constraint for non-empty filter values', () => {
+    // "" is accepted, but a non-empty value must still satisfy its constraint.
+    expect(() => eurlex_search_documents.input.parse({ eurovoc_concept: 'not-a-uri' })).toThrow();
+    expect(() => eurlex_search_documents.input.parse({ date_from: '2016' })).toThrow();
+    expect(() => eurlex_search_documents.input.parse({ document_type: 'NOPE' })).toThrow();
   });
 
   // --- Format ---

@@ -5,7 +5,10 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { ENG_LANGUAGE_URI, resolveResourceTypeLabel } from '@/services/cellar-sparql/cdm-labels.js';
+import {
+  ENG_LANGUAGE_URI,
+  resolveResourceTypeLabels,
+} from '@/services/cellar-sparql/cdm-labels.js';
 import {
   CellarSparqlService,
   getCellarSparqlService,
@@ -42,32 +45,64 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
         'Keyword to match against document titles. Single dominant word recommended; multi-word phrase uses substring match.',
       ),
     document_type: z
-      .enum(['REG', 'DIR', 'DEC', 'TREATY', 'JUDG', 'OPIN_AG', 'PROP', 'REC'])
+      .union([
+        z.literal(''),
+        z
+          .enum(['REG', 'DIR', 'DEC', 'TREATY', 'JUDG', 'OPIN_AG', 'PROP', 'REC'])
+          .describe(
+            'Document type: REG=Regulation, DIR=Directive, DEC=Decision, TREATY=Treaty, ' +
+              'JUDG=Judgment, OPIN_AG=AG Opinion, PROP=Proposal, REC=Recommendation.',
+          ),
+      ])
       .optional()
       .describe(
         'Document type filter: REG=Regulation, DIR=Directive, DEC=Decision, TREATY=Treaty, ' +
-          'JUDG=Judgment, OPIN_AG=AG Opinion, PROP=Proposal, REC=Recommendation.',
+          'JUDG=Judgment, OPIN_AG=AG Opinion, PROP=Proposal, REC=Recommendation. ' +
+          'Leave blank or omit to search all document types.',
       ),
     date_from: z
-      .string()
-      .regex(/^\d{4}-\d{2}-\d{2}$/)
+      .union([
+        z.literal(''),
+        z
+          .string()
+          .regex(/^\d{4}-\d{2}-\d{2}$/)
+          .describe('Start date in ISO 8601 format (YYYY-MM-DD).'),
+      ])
       .optional()
-      .describe('Start of date range in ISO 8601 format (YYYY-MM-DD). Matches document date.'),
+      .describe(
+        'Start of date range in ISO 8601 format (YYYY-MM-DD). Matches document date. ' +
+          'Leave blank or omit for no lower bound.',
+      ),
     date_to: z
-      .string()
-      .regex(/^\d{4}-\d{2}-\d{2}$/)
+      .union([
+        z.literal(''),
+        z
+          .string()
+          .regex(/^\d{4}-\d{2}-\d{2}$/)
+          .describe('End date in ISO 8601 format (YYYY-MM-DD).'),
+      ])
       .optional()
-      .describe('End of date range in ISO 8601 format (YYYY-MM-DD). Matches document date.'),
+      .describe(
+        'End of date range in ISO 8601 format (YYYY-MM-DD). Matches document date. ' +
+          'Leave blank or omit for no upper bound.',
+      ),
     eurovoc_concept: z
-      .string()
-      .startsWith('http')
-      .refine((v) => !v.includes('>') && !v.includes('"') && !v.includes(' '), {
-        message: 'EuroVoc URI must be a valid http URI with no angle brackets, quotes, or spaces.',
-      })
+      .union([
+        z.literal(''),
+        z
+          .string()
+          .startsWith('http')
+          .refine((v) => !v.includes('>') && !v.includes('"') && !v.includes(' '), {
+            message:
+              'EuroVoc URI must be a valid http URI with no angle brackets, quotes, or spaces.',
+          })
+          .describe('EuroVoc concept URI (e.g. http://eurovoc.europa.eu/2828).'),
+      ])
       .optional()
       .describe(
         'EuroVoc concept URI to filter by subject (e.g. http://eurovoc.europa.eu/2828). ' +
-          'Obtain concept URIs from eurlex_browse_subjects first.',
+          'Obtain concept URIs from eurlex_browse_subjects first. ' +
+          'Leave blank or omit for no subject filter.',
       ),
     author_institution: z
       .string()
@@ -107,7 +142,9 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
               .string()
               .optional()
               .describe(
-                'Human-readable document type label (e.g. "Regulation", "Directive"). Absent for some older works.',
+                'Human-readable document type label (e.g. "Regulation", "Directive"). ' +
+                  'Works classified under several resource-types (e.g. corrigenda) list all labels, comma-separated. ' +
+                  'Absent for some older works.',
               ),
             date: z.string().optional().describe('Document date in ISO 8601 format (YYYY-MM-DD).'),
             title: z
@@ -226,8 +263,20 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
     // ?expr cdm:expression_belongs_to_work ?work  (inverse of cdm:work_has_expression)
     // ?expr cdm:expression_uses_language <.../ENG>
     // ?expr cdm:expression_title ?title
+    //
+    // GROUP BY ?work collapses each work to one row. A work can carry several
+    // cdm:work_has_resource-type values (corrigenda hold 2–3); without grouping these
+    // cross-product into duplicate rows that SELECT DISTINCT cannot merge (?type
+    // differs per row), and LIMIT/OFFSET would then page over raw rows rather than
+    // works. GROUP_CONCAT gathers every resource-type URI per work; SAMPLE picks the
+    // single-valued display fields. Aggregate aliases are renamed (?celex/?docDate/
+    // ?docTitle) because a projected AS-variable cannot reuse a name already in scope.
     const sparql = `
-SELECT DISTINCT ?work ?celexNumber ?type ?date ?title WHERE {
+SELECT ?work
+  (SAMPLE(?celexNumber) AS ?celex)
+  (GROUP_CONCAT(DISTINCT STR(?type); SEPARATOR=" ") AS ?types)
+  (SAMPLE(?date) AS ?docDate)
+  (SAMPLE(?title) AS ?docTitle) WHERE {
   ?work cdm:resource_legal_id_celex ?celexNumber .
   OPTIONAL { ?work cdm:work_has_resource-type ?type . }
   OPTIONAL { ?work cdm:work_date_document ?date . }
@@ -240,7 +289,7 @@ SELECT DISTINCT ?work ?celexNumber ?type ?date ?title WHERE {
   ${authorClause}
   ${inForceClause}
   ${filters.join('\n  ')}
-} ORDER BY DESC(?date) LIMIT ${input.limit} OFFSET ${input.offset}`;
+} GROUP BY ?work ORDER BY DESC(?docDate) LIMIT ${input.limit} OFFSET ${input.offset}`;
 
     const queryEcho = {
       ...(input.keyword ? { keyword: input.keyword } : {}),
@@ -280,13 +329,13 @@ SELECT DISTINCT ?work ?celexNumber ?type ?date ?title WHERE {
         title?: string;
       } = {
         work_uri: CellarSparqlService.bindingValue(b, 'work') ?? '',
-        celex_number: CellarSparqlService.bindingValue(b, 'celexNumber') ?? '',
+        celex_number: CellarSparqlService.bindingValue(b, 'celex') ?? '',
       };
-      const typeUri = CellarSparqlService.bindingValue(b, 'type');
-      if (typeUri) doc.resource_type = resolveResourceTypeLabel(typeUri);
-      const date = CellarSparqlService.bindingValue(b, 'date');
+      const resourceType = resolveResourceTypeLabels(CellarSparqlService.bindingValue(b, 'types'));
+      if (resourceType) doc.resource_type = resourceType;
+      const date = CellarSparqlService.bindingValue(b, 'docDate');
       if (date) doc.date = date;
-      const title = CellarSparqlService.bindingValue(b, 'title');
+      const title = CellarSparqlService.bindingValue(b, 'docTitle');
       if (title) doc.title = title;
       return doc;
     });
