@@ -73,7 +73,8 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
       .string()
       .optional()
       .describe(
-        'Author institution name filter (e.g. "European Parliament", "Council"). Substring match.',
+        'Author institution name (e.g. "European Parliament", "Council", "European Commission"). ' +
+          'Matched against the English names of EU corporate bodies; only works created by a matching institution are returned.',
       ),
     in_force: z
       .boolean()
@@ -183,10 +184,40 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
         ? `?work cdm:work_is_about_concept_eurovoc <${input.eurovoc_concept.trim()}> .`
         : '';
 
-    const authorClause =
-      input.author_institution && input.author_institution.trim()
-        ? `OPTIONAL { ?work cdm:work_created_by_agent ?agent . ?agent cdm:corporate-body_label ?agentLabel . FILTER(LANG(?agentLabel) = "en") FILTER(CONTAINS(LCASE(STR(?agentLabel)), "${input.author_institution.trim().toLowerCase().replace(/"/g, '\\"')}")) }`
-        : '';
+    /**
+     * Author institution filter — a REQUIRED graph pattern (not OPTIONAL) so the
+     * author participates in result selection. An OPTIONAL author only binds
+     * optional values and never excludes non-matching works, so an impossible
+     * author still returned normal rows (issue #6).
+     *
+     * Two CELLAR realities shape this:
+     *   1. Corporate-body names live on `skos:prefLabel` (language-tagged), not
+     *      `cdm:corporate-body_label`, which CELLAR does not expose — so the old
+     *      label match never bound even for real authors.
+     *   2. A `CONTAINS` scan over every `prefLabel` cannot prove a non-match
+     *      within the query timeout, so an unknown author would hang. Virtuoso's
+     *      `bif:contains` full-text index resolves both hits and misses in well
+     *      under a second and scales to every corporate body, not a fixed list.
+     */
+    let authorClause = '';
+    const authorInput = input.author_institution?.trim();
+    if (authorInput) {
+      // Keep only letters, digits, and spaces so the value cannot break out of
+      // the bif:contains phrase or inject full-text operators.
+      const authorPhrase = authorInput
+        .replace(/[^\p{L}\p{N}\s]+/gu, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (!authorPhrase) {
+        throw ctx.fail('no_results', `No EU institution matches author "${authorInput}".`, {
+          ...ctx.recoveryFor('no_results'),
+        });
+      }
+      authorClause = `?work cdm:work_created_by_agent ?agent .
+  ?agent skos:prefLabel ?agentLabel .
+  ?agentLabel bif:contains "'${authorPhrase}'" .
+  FILTER(LANG(?agentLabel) = "en")`;
+    }
 
     const inForceClause =
       input.in_force === true ? `OPTIONAL { ?work cdm:resource_legal_in-force ?inForce . }` : '';

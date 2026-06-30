@@ -164,6 +164,67 @@ describe('eurlex_search_documents', () => {
     expect(sparql).toContain('cdm:work_is_about_concept_eurovoc');
   });
 
+  // --- Author institution filter (issue #6) ---
+
+  it('author_institution is a REQUIRED constraint, not an OPTIONAL binding', async () => {
+    const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+    mockQuery.mockResolvedValue([makeDocBinding('32016R0679')]);
+
+    const input = eurlex_search_documents.input.parse({
+      author_institution: 'European Parliament',
+    });
+    await eurlex_search_documents.handler(input, ctx);
+
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    // Constrains selection via corporate-body prefLabel + the full-text index.
+    expect(sparql).toContain('?work cdm:work_created_by_agent ?agent');
+    expect(sparql).toContain('skos:prefLabel');
+    expect(sparql).toContain(`bif:contains "'European Parliament'"`);
+    // The bug was an OPTIONAL author block over a predicate CELLAR doesn't expose.
+    expect(sparql).not.toMatch(/OPTIONAL\s*\{[^}]*work_created_by_agent/);
+    expect(sparql).not.toContain('cdm:corporate-body_label');
+  });
+
+  it('sanitizes author_institution so it cannot break out of the full-text phrase', async () => {
+    const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+    mockQuery.mockResolvedValue([makeDocBinding('32016R0679')]);
+
+    const input = eurlex_search_documents.input.parse({
+      author_institution: 'European "Parliament"; DROP',
+    });
+    await eurlex_search_documents.handler(input, ctx);
+
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    // Punctuation (quotes, semicolons) stripped, whitespace collapsed.
+    expect(sparql).toContain(`bif:contains "'European Parliament DROP'"`);
+    expect(sparql).not.toContain('"Parliament"');
+  });
+
+  it('throws no_results for an author that sanitizes to empty (no queryable institution)', async () => {
+    const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+
+    const input = eurlex_search_documents.input.parse({ author_institution: '!!!' });
+    await expect(eurlex_search_documents.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: { reason: 'no_results' },
+    });
+    // Degenerate author short-circuits before hitting CELLAR.
+    expect(mockQuery).not.toHaveBeenCalled();
+  });
+
+  it('an impossible author yields no_results when the constrained query returns no rows', async () => {
+    const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+    mockQuery.mockResolvedValue([]);
+
+    const input = eurlex_search_documents.input.parse({
+      author_institution: 'zzzxxy-no-such-eu-author',
+    });
+    await expect(eurlex_search_documents.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: { reason: 'no_results' },
+    });
+  });
+
   // --- Format ---
 
   it('format renders celex, date, type label, and work_uri', () => {
