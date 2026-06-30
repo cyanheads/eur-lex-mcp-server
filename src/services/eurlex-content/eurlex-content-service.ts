@@ -30,8 +30,19 @@ import { serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { withRetry } from '@cyanheads/mcp-ts-core/utils';
 import type { ServerConfig } from '@/config/server-config.js';
+import { htmlToMarkdown } from './html-to-markdown.js';
 
-export type ContentFormat = 'html' | 'xml';
+/**
+ * Output formats a caller can request. `markdown` is not served by EUR-Lex — it is
+ * rendered server-side from the HTML body (see {@link WireFormat}).
+ */
+export type ContentFormat = 'html' | 'xml' | 'markdown';
+
+/**
+ * Formats actually negotiated over the wire from CELLAR. `markdown` maps to `html`
+ * (the act is fetched as HTML, then converted); it is never requested directly.
+ */
+type WireFormat = 'html' | 'xml';
 
 /** Language codes supported by EUR-Lex (24 official EU languages). */
 export type EurLexLanguage =
@@ -98,10 +109,18 @@ const LANGUAGE_TO_ISO_639_2: Record<EurLexLanguage, string> = {
  * for OJ legislation and `text/html` for CJEU judgments; the first to return a body
  * wins. XML requests Formex 4 only.
  */
-const ACCEPT_BY_FORMAT: Record<ContentFormat, readonly string[]> = {
+const ACCEPT_BY_FORMAT: Record<WireFormat, readonly string[]> = {
   html: ['application/xhtml+xml', 'text/html'],
   xml: ['application/xml;type=fmx4'],
 };
+
+/**
+ * Render a fetched wire body into the requested output format. `html`/`xml` pass
+ * through verbatim; `markdown` is converted server-side from the HTML body.
+ */
+function renderContent(body: string, format: ContentFormat): string {
+  return format === 'markdown' ? htmlToMarkdown(body) : body;
+}
 
 /**
  * AWS WAF bot-challenge signatures. `awswaf` matches the challenge.js host
@@ -164,17 +183,21 @@ export class EurLexContentService {
     format: ContentFormat,
     ctx: Context,
   ): Promise<FetchContentResult> {
-    const primary = await this.fetchForLanguage(celexNumber, language, format, ctx);
+    // `markdown` is rendered from the HTML body, so it is fetched as HTML; the
+    // returned `format` still reports `markdown` and `renderContent` converts.
+    const wireFormat: WireFormat = format === 'markdown' ? 'html' : format;
+
+    const primary = await this.fetchForLanguage(celexNumber, language, wireFormat, ctx);
     if (primary !== null) {
-      return { content: primary, language, format, contentAvailable: true };
+      return { content: renderContent(primary, format), language, format, contentAvailable: true };
     }
 
     // Language fallback: try English if primary language failed.
     if (language !== 'EN') {
-      const fallback = await this.fetchForLanguage(celexNumber, 'EN', format, ctx);
+      const fallback = await this.fetchForLanguage(celexNumber, 'EN', wireFormat, ctx);
       if (fallback !== null) {
         return {
-          content: fallback,
+          content: renderContent(fallback, format),
           language: 'EN',
           format,
           contentAvailable: true,
@@ -195,7 +218,7 @@ export class EurLexContentService {
   private async fetchForLanguage(
     celexNumber: string,
     language: EurLexLanguage,
-    format: ContentFormat,
+    format: WireFormat,
     ctx: Context,
   ): Promise<string | null> {
     const isoLanguage = LANGUAGE_TO_ISO_639_2[language];

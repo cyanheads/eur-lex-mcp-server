@@ -14,6 +14,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ServerConfig } from '@/config/server-config.js';
 import { EurLexContentService } from '@/services/eurlex-content/eurlex-content-service.js';
 import { AWS_WAF_CHALLENGE_HTML } from '../fixtures/aws-waf-challenge.js';
+import { ACT_XHTML } from '../fixtures/eurlex-act-html.js';
 
 /** A representative (non-stub) xhtml act body — well over the empty-body floor. */
 const GDPR_XHTML =
@@ -146,6 +147,51 @@ describe('EurLexContentService', () => {
 
     expect(result.contentAvailable).toBe(false);
     expect(headersOf(mockFetch.mock.calls[0]).Accept).toBe('application/xml;type=fmx4');
+  });
+
+  // --- Markdown: fetch HTML over the wire, convert server-side (issue #13) ---
+
+  it('fetches HTML and returns server-converted Markdown when format is "markdown"', async () => {
+    mockFetch.mockResolvedValue(new Response(ACT_XHTML, { status: 200 }));
+
+    const result = await makeService().fetchContent(
+      '32016R0679',
+      'EN',
+      'markdown',
+      createMockContext(),
+    );
+
+    expect(result.contentAvailable).toBe(true);
+    expect(result.format).toBe('markdown');
+    // Markdown is derived from HTML — the wire request negotiates xhtml, never a markdown media type.
+    expect(headersOf(mockFetch.mock.calls[0]).Accept).toBe('application/xhtml+xml');
+    // Recital flattened to inline-marked text; genuine data table → GFM; no raw HTML.
+    expect(result.content).toContain('(1) The protection of natural persons');
+    expect(result.content).toMatch(/\|\s*CN code\s*\|\s*Description\s*\|/);
+    expect(result.content).not.toMatch(/<table|<td|<div/i);
+  });
+
+  it('renders Markdown from the English fallback body when the requested language is unavailable', async () => {
+    mockFetch.mockImplementation((_url: string, init: { headers: Record<string, string> }) =>
+      Promise.resolve(
+        init.headers['Accept-Language'] === 'fra'
+          ? new Response('not found', { status: 404 })
+          : new Response(ACT_XHTML, { status: 200 }),
+      ),
+    );
+
+    const result = await makeService().fetchContent(
+      '32016R0679',
+      'FR',
+      'markdown',
+      createMockContext(),
+    );
+
+    expect(result.contentAvailable).toBe(true);
+    expect(result.language).toBe('EN');
+    expect(result.format).toBe('markdown');
+    expect(result.languageFallback).toContain('FR');
+    expect(result.content).toContain('(1) The protection of natural persons');
   });
 
   // --- The bug: an AWS WAF challenge must NEVER be reported as content (issue #16) ---

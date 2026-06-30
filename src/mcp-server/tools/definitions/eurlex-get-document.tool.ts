@@ -36,13 +36,14 @@ export const eurlex_get_document = tool('eurlex_get_document', {
   description:
     'Fetch the notice (metadata) and full text of an EU act by CELEX number or ELI URI. ' +
     'Returns structured metadata — title, date, document type, author institution, legal basis, EuroVoc subjects — ' +
-    'plus the HTML or Formex4 XML content in the requested language. ' +
+    'plus the act content as HTML, Markdown, or Formex4 XML in the requested language. ' +
     'Defaults to English (EN); not all works have content in all 24 official EU languages, ' +
     'especially older acts pre-2004 EU enlargement. ' +
     'If the requested language is unavailable, the server automatically falls back to English and notes the fallback. ' +
     'CELEX format: {sector}{year}{type}{number} e.g. 32016R0679 for GDPR. ' +
     'Use eurlex_lookup_celex to validate an identifier before calling this tool. ' +
-    'HTML format returns the full act text suitable for reading; XML returns Formex4 for structured processing. ' +
+    'HTML returns the full act text as served by EUR-Lex; markdown converts that HTML to clean Markdown server-side ' +
+    '(recitals and numbered points as readable text, genuine data tables as GFM tables); XML returns Formex4 for structured processing. ' +
     'Large bodies are bounded per call but never lost: content_mode "paged" (default) returns a character window ' +
     '(offset + limit) alongside content_chars_total and has_more, so you can page to the end and reconstruct the whole act; ' +
     'content_mode "full" returns the entire body in one call; content_mode "metadata_only" returns metadata with no body and skips the content fetch.',
@@ -72,10 +73,13 @@ export const eurlex_get_document = tool('eurlex_get_document', {
           'Defaults to EN. Falls back to EN if the requested language is unavailable.',
       ),
     format: z
-      .enum(['html', 'xml'])
+      .enum(['html', 'xml', 'markdown'])
       .default('html')
       .describe(
-        'Content format: "html" for readable HTML text (default), "xml" for Formex4 XML structured format.',
+        'Content format: "html" for the act text as served by EUR-Lex (default); ' +
+          '"markdown" for that HTML converted to clean Markdown server-side ' +
+          '(recitals and numbered points as readable text, genuine data tables as GFM); ' +
+          '"xml" for Formex4 XML structured format.',
       ),
     content_mode: z
       .enum(['metadata_only', 'paged', 'full'])
@@ -188,7 +192,9 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .describe(
         'Human-readable note explaining the fallback that occurred (e.g. "Requested FR content unavailable; returned EN"). Present only when a fallback happened.',
       ),
-    content_format: z.string().describe('Format of the returned content: "html" or "xml".'),
+    content_format: z
+      .string()
+      .describe('Format of the returned content: "html", "markdown", or "xml".'),
   }),
 
   errors: [

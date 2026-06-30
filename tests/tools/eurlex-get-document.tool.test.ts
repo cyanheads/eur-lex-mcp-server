@@ -492,6 +492,47 @@ describe('eurlex_get_document', () => {
     expect(text).toContain('offset=9000');
   });
 
+  // --- Markdown format composes with pagination across both render channels (issue #13) ---
+
+  it('paginates server-converted Markdown and carries the window into both channels', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_document.errors });
+    const md = `## Heading\n\n${'(1) The protection of natural persons is a fundamental right. '.repeat(1_000)}`;
+    mockSparqlQuery.mockResolvedValue([makeMetaBinding({ celex: '32016R0679' })]);
+    mockFetchContent.mockResolvedValue({
+      content: md,
+      contentAvailable: true,
+      format: 'markdown',
+      language: 'EN',
+    });
+
+    const input = eurlex_get_document.input.parse({
+      celex_number: '32016R0679',
+      format: 'markdown',
+      content_mode: 'paged',
+      offset: 0,
+      limit: 5_000,
+    });
+    const result = await eurlex_get_document.handler(input, ctx);
+
+    // content_format reports markdown; the body fetched as markdown is windowed like any other.
+    expect(result.content_format).toBe('markdown');
+    expect(result.content_chars_total).toBe(md.length);
+    expect(result.content_chars_returned).toBe(5_000);
+    expect(result.has_more).toBe(true);
+    // The fetchContent call carried 'markdown' through to the content service.
+    expect(mockFetchContent).toHaveBeenCalledWith(
+      '32016R0679',
+      'EN',
+      'markdown',
+      expect.anything(),
+    );
+
+    // Both channels carry the same markdown window: structuredContent.content and the format() text block.
+    const text = (eurlex_get_document.format!(result)[0] as { text: string }).text;
+    expect(text).toContain(result.content!);
+    expect(result.content?.length).toBe(5_000);
+  });
+
   it('format renders a "full" body verbatim with no truncation', () => {
     const body = 'x'.repeat(9_000);
     const output = {
