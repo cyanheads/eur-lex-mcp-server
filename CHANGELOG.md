@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.8](changelog/0.1.x/0.1.8.md) — 2026-06-30
+
+eurlex_lookup_celex now resolves ELI URIs via an exact cdm:resource_legal_eli match, with bare work-level ELIs retrying once with /oj; the never-functional oj identifier_type is removed
+
 ## [0.1.7](changelog/0.1.x/0.1.7.md) — 2026-06-30
 
 eurlex_search_documents author_institution now constrains results via a required skos:prefLabel/bif:contains filter, and eurlex_get_document plus the document resource return English titles through the expression-level CELLAR traversal
