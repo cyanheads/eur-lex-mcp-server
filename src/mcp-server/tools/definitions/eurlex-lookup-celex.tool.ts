@@ -1,5 +1,5 @@
 /**
- * @fileoverview eurlex_lookup_celex — Resolve any EU legal citation to a canonical CELLAR work.
+ * @fileoverview eurlex_lookup_celex — Resolve an EU legal citation (CELEX number or ELI URI) to a canonical CELLAR work.
  * @module mcp-server/tools/definitions/eurlex-lookup-celex
  */
 
@@ -20,39 +20,67 @@ function isEliUri(identifier: string): boolean {
   return identifier.trim().startsWith('http://data.europa.eu/eli/');
 }
 
-/** Detect Official Journal reference format: e.g. OJ L 119, 4.5.2016 or L:2016:119 */
-function isOjRef(identifier: string): boolean {
-  return /^OJ\s+[LC]\s+\d+/i.test(identifier.trim()) || /^[LC]:\d{4}:\d+/.test(identifier.trim());
-}
-
-type IdentifierType = 'celex' | 'eli' | 'oj' | 'auto';
+type IdentifierType = 'celex' | 'eli' | 'auto';
 
 function detectIdentifierType(identifier: string): IdentifierType | null {
   if (isCelex(identifier)) return 'celex';
   if (isEliUri(identifier)) return 'eli';
-  if (isOjRef(identifier)) return 'oj';
   return null;
+}
+
+const ELI_NAMESPACE = 'http://data.europa.eu/eli/';
+
+/**
+ * A bare work-level ELI — `…/eli/{type}/{year}/{number}` with no manifestation
+ * suffix (no `/oj`, no `/YYYY-MM-DD` consolidation date). CELLAR stores the
+ * canonical OJ-manifestation literal (`…/{number}/oj`) rather than the bare
+ * work-level form, so these never match on exact lookup and must be normalized
+ * to their `/oj` form to resolve.
+ */
+function isBareWorkLevelEli(eli: string): boolean {
+  if (!eli.startsWith(ELI_NAMESPACE)) return false;
+  const path = eli.slice(ELI_NAMESPACE.length).replace(/\/+$/, '');
+  return /^[^/]+\/\d{4}\/[^/]+$/.test(path);
+}
+
+/** Escape backslashes then double-quotes for safe interpolation into a SPARQL string literal. */
+function escapeSparqlLiteral(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
+/**
+ * ELI exact-match query: resolve the single work whose canonical ELI literal
+ * (`cdm:resource_legal_eli`, an `xsd:anyURI` literal) equals `safeEli`, reading
+ * its CELEX, type, and date. `safeEli` must be pre-escaped.
+ */
+function buildEliQuery(safeEli: string): string {
+  return `
+SELECT ?work ?celexNumber ?type ?date WHERE {
+  ?work cdm:resource_legal_eli "${safeEli}"^^xsd:anyURI .
+  ?work cdm:resource_legal_id_celex ?celexNumber .
+  OPTIONAL { ?work cdm:work_has_resource-type ?type . }
+  OPTIONAL { ?work cdm:work_date_document ?date . }
+} LIMIT 5`;
 }
 
 export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
   title: 'Resolve EU Legal Citation',
   description:
-    'Resolve any EU legal citation — CELEX number, ELI URI, or Official Journal reference — to the canonical CELLAR work. ' +
+    'Resolve an EU legal citation — a CELEX number or an ELI URI — to the canonical CELLAR work. ' +
     'Returns the work URI, confirmed CELEX number, document type, document date, and whether the work exists in the CELLAR corpus. ' +
     'Use this to validate identifiers before passing them to eurlex_get_document or eurlex_get_relations. ' +
     'CELEX format: {sector}{year}{type}{number} e.g. 32016R0679 (GDPR). ' +
-    'ELI format: http://data.europa.eu/eli/{type}/{year}/{number}/oj. ' +
-    'OJ format: OJ L 119 or L:2016:119.',
+    'ELI format: http://data.europa.eu/eli/{type}/{year}/{number} — the /oj suffix is optional.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     identifier: z
       .string()
       .min(1)
       .describe(
-        'The EU legal citation to resolve: a CELEX number (e.g. 32016R0679), ELI URI, or Official Journal reference (e.g. OJ L 119).',
+        'The EU legal citation to resolve: a CELEX number (e.g. 32016R0679) or a work-level ELI URI (e.g. http://data.europa.eu/eli/reg/2016/679, with or without the /oj suffix).',
       ),
     identifier_type: z
-      .enum(['celex', 'eli', 'oj', 'auto'])
+      .enum(['celex', 'eli', 'auto'])
       .default('auto')
       .describe(
         'Format of the identifier. Use "auto" to let the server detect the format automatically. ' +
@@ -80,16 +108,15 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
     {
       reason: 'not_found',
       code: JsonRpcErrorCode.NotFound,
-      when: 'The identifier resolves to no CELLAR work — check the CELEX/ELI/OJ format and try again.',
+      when: 'The identifier resolves to no CELLAR work — check the CELEX/ELI format and try again.',
       recovery:
-        'Verify the CELEX number format or try eurlex_search_documents to find the work by keyword.',
+        'Verify the CELEX or ELI format, or try eurlex_search_documents to find the work by keyword.',
     },
     {
       reason: 'ambiguous_identifier',
       code: JsonRpcErrorCode.ValidationError,
       when: 'identifier_type is "auto" and the identifier format could not be determined.',
-      recovery:
-        'Supply identifier_type explicitly as "celex", "eli", or "oj" to resolve the ambiguity.',
+      recovery: 'Supply identifier_type explicitly as "celex" or "eli" to resolve the ambiguity.',
     },
   ],
 
@@ -114,9 +141,6 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
       effectiveType = input.identifier_type;
     }
 
-    // Escape double-quotes in all identifier values before interpolating into SPARQL literals.
-    const safeIdentifier = identifier.replace(/"/g, '\\"');
-
     let sparql: string;
     if (effectiveType === 'celex') {
       sparql = `
@@ -124,30 +148,33 @@ SELECT ?work ?celexNumber ?type ?date WHERE {
   ?work cdm:resource_legal_id_celex ?celexNumber .
   OPTIONAL { ?work cdm:work_has_resource-type ?type . }
   OPTIONAL { ?work cdm:work_date_document ?date . }
-  FILTER(STR(?celexNumber) = "${safeIdentifier}")
-} LIMIT 5`;
-    } else if (effectiveType === 'eli') {
-      // ELI URIs are mapped via cdm:work_id_document_official-journal or owl:sameAs
-      sparql = `
-SELECT ?work ?celexNumber ?type ?date WHERE {
-  ?work cdm:resource_legal_id_celex ?celexNumber .
-  OPTIONAL { ?work cdm:work_has_resource-type ?type . }
-  OPTIONAL { ?work cdm:work_date_document ?date . }
-  FILTER(CONTAINS(STR(?work), "${safeIdentifier}"))
+  FILTER(STR(?celexNumber) = "${escapeSparqlLiteral(identifier)}")
 } LIMIT 5`;
     } else {
-      // OJ reference: extract year and number for a loose filter on CELEX
-      sparql = `
-SELECT ?work ?celexNumber ?type ?date WHERE {
-  ?work cdm:resource_legal_id_celex ?celexNumber .
-  OPTIONAL { ?work cdm:work_has_resource-type ?type . }
-  OPTIONAL { ?work cdm:work_date_document ?date . }
-  FILTER(CONTAINS(LCASE(STR(?celexNumber)), LCASE("${safeIdentifier}")))
-} LIMIT 5`;
+      sparql = buildEliQuery(escapeSparqlLiteral(identifier));
     }
 
-    const bindings = await svc.query(sparql, ctx);
-    ctx.log.info('CELEX lookup', { identifier, type: effectiveType, resultCount: bindings.length });
+    let bindings = await svc.query(sparql, ctx);
+
+    // CELLAR stores only the OJ-manifestation ELI literal (…/{number}/oj), so a
+    // bare work-level ELI (…/{type}/{year}/{number}) — the most common citation
+    // form — misses on exact match. Retry once with /oj appended: a deterministic,
+    // one-to-one normalization to the same act's canonical manifestation. Gated to
+    // bare work-level ELIs, so a manifestation-suffixed ELI (e.g. a /YYYY-MM-DD
+    // consolidated version) never silently falls back to the original act.
+    let bareEliRetry = false;
+    if (bindings.length === 0 && effectiveType === 'eli' && isBareWorkLevelEli(identifier)) {
+      const ojEli = `${identifier.replace(/\/+$/, '')}/oj`;
+      bindings = await svc.query(buildEliQuery(escapeSparqlLiteral(ojEli)), ctx);
+      bareEliRetry = true;
+    }
+
+    ctx.log.info('Citation lookup', {
+      identifier,
+      type: effectiveType,
+      bareEliRetry,
+      resultCount: bindings.length,
+    });
 
     if (bindings.length === 0) {
       throw ctx.fail('not_found', `No CELLAR work found for identifier: ${identifier}`, {
