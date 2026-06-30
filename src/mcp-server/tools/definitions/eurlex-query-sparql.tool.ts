@@ -56,7 +56,7 @@ export const eurlex_query_sparql = tool('eurlex_query_sparql', {
     'Key predicates: cdm:resource_legal_id_celex (CELEX number), cdm:work_date_document (date), ' +
     'cdm:work_has_resource-type (document type), cdm:work_is_about_concept_eurovoc (EuroVoc subject), ' +
     'cdm:work_cites_work (citation). ' +
-    'Virtuoso does not support bif:contains for multi-word phrases; use FILTER(CONTAINS(LCASE(?title), "keyword")).',
+    'For multi-word phrases, single-quote the term inside bif:contains (e.g. "\'data protection\'") to use the full-text index, or FILTER(CONTAINS(LCASE(?title), "keyword")) to scan.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
     sparql_query: z
