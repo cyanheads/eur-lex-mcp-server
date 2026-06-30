@@ -7,10 +7,46 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getCellarSparqlService } from '@/services/cellar-sparql/cellar-sparql-service.js';
 
+/**
+ * Returns the first significant SPARQL keyword (uppercased) after skipping the
+ * query prologue — leading whitespace, `#` line comments, and `BASE`/`PREFIX`
+ * declarations. Returns `undefined` for an empty or prologue-only query.
+ *
+ * Enforces the tool's read-only contract: only a leading `SELECT` is accepted;
+ * update forms (DELETE/INSERT/…) and other query forms (ASK/CONSTRUCT/DESCRIBE)
+ * are rejected before any request reaches CELLAR. IRIs in PREFIX/BASE (which
+ * routinely contain `#`, e.g. the cdm: namespace) are consumed whole, so their
+ * `#` is never mistaken for the start of a comment.
+ */
+function leadingSparqlKeyword(query: string): string | undefined {
+  let rest = query;
+  for (;;) {
+    const trimmed = rest.replace(/^\s+/, '');
+    if (trimmed.length === 0) return;
+    if (trimmed.startsWith('#')) {
+      const newline = trimmed.indexOf('\n');
+      rest = newline === -1 ? '' : trimmed.slice(newline + 1);
+      continue;
+    }
+    const base = /^BASE\s*<[^>]*>/i.exec(trimmed);
+    if (base) {
+      rest = trimmed.slice(base[0].length);
+      continue;
+    }
+    const prefix = /^PREFIX\s+[^\s:]*:\s*<[^>]*>/i.exec(trimmed);
+    if (prefix) {
+      rest = trimmed.slice(prefix[0].length);
+      continue;
+    }
+    return /^[A-Za-z]+/.exec(trimmed)?.[0]?.toUpperCase();
+  }
+}
+
 export const eurlex_query_sparql = tool('eurlex_query_sparql', {
   title: 'Raw CELLAR SPARQL Query',
   description:
-    'Execute a raw SPARQL SELECT query against the CELLAR Virtuoso endpoint. ' +
+    'Execute a raw, read-only SPARQL SELECT query against the CELLAR Virtuoso endpoint. ' +
+    'Only SELECT is accepted: update forms (DELETE, INSERT, LOAD, CLEAR, CREATE, DROP, COPY, MOVE, ADD) and other query forms (ASK, CONSTRUCT, DESCRIBE) are rejected locally before any request is sent. ' +
     'Use only when the curated tools (eurlex_search_documents, eurlex_get_relations, etc.) do not cover the needed traversal. ' +
     'The server caps all queries at 100 results — include an explicit LIMIT in your query to control the count; ' +
     'if omitted or above 100 it will be injected or capped automatically. ' +
@@ -27,7 +63,8 @@ export const eurlex_query_sparql = tool('eurlex_query_sparql', {
       .string()
       .min(10)
       .describe(
-        'A SPARQL SELECT query to execute against CELLAR. The cdm:, skos:, and xsd: prefixes are auto-injected. ' +
+        'A read-only SPARQL SELECT query to execute against CELLAR. Non-SELECT queries (updates such as DELETE/INSERT, or ASK/CONSTRUCT/DESCRIBE) are rejected before execution. ' +
+          'Leading comments and PREFIX/BASE declarations are allowed before the SELECT keyword. The cdm:, skos:, and xsd: prefixes are auto-injected. ' +
           'LIMIT is injected at 100 if absent or capped to 100 if above that threshold.',
       ),
     timeout_hint: z
@@ -37,8 +74,8 @@ export const eurlex_query_sparql = tool('eurlex_query_sparql', {
       .max(55000)
       .optional()
       .describe(
-        'Optional client-side timeout hint in milliseconds (1000–55000). ' +
-          'Defaults to server-configured SPARQL_QUERY_TIMEOUT_MS (55000). Virtuoso hard limit is 60 seconds.',
+        'Optional client-side timeout for this request, in milliseconds (1000–55000). ' +
+          'When omitted, the server-configured default (SPARQL_QUERY_TIMEOUT_MS, 55000) applies. Virtuoso hard limit is 60 seconds.',
       ),
   }),
   output: z.object({
@@ -62,6 +99,13 @@ export const eurlex_query_sparql = tool('eurlex_query_sparql', {
 
   errors: [
     {
+      reason: 'not_read_only',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'The query is not a read-only SELECT — an update or non-SELECT query form was supplied.',
+      recovery:
+        'Rewrite the request as a SPARQL SELECT query; this tool is read-only and does not run updates (DELETE/INSERT) or other query forms (ASK/CONSTRUCT/DESCRIBE).',
+    },
+    {
       reason: 'sparql_error',
       code: JsonRpcErrorCode.ValidationError,
       when: 'Virtuoso returned a syntax or semantic error — the query is malformed.',
@@ -78,9 +122,20 @@ export const eurlex_query_sparql = tool('eurlex_query_sparql', {
   ],
 
   async handler(input, ctx) {
+    const keyword = leadingSparqlKeyword(input.sparql_query);
+    if (keyword !== 'SELECT') {
+      throw ctx.fail(
+        'not_read_only',
+        keyword
+          ? `Only read-only SELECT queries are accepted; received a ${keyword} query.`
+          : 'Only read-only SELECT queries are accepted; no SELECT keyword was found.',
+        { ...ctx.recoveryFor('not_read_only') },
+      );
+    }
+
     const svc = getCellarSparqlService();
 
-    const bindings = await svc.query(input.sparql_query, ctx);
+    const bindings = await svc.query(input.sparql_query, ctx, input.timeout_hint);
     ctx.log.info('Raw SPARQL query executed', { resultCount: bindings.length });
 
     // Extract variable names from first binding or return empty

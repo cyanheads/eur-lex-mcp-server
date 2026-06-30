@@ -3,6 +3,7 @@
  * @module tests/tools/eurlex-query-sparql.tool.test
  */
 
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_query_sparql } from '@/mcp-server/tools/definitions/eurlex-query-sparql.tool.js';
@@ -68,8 +69,9 @@ describe('eurlex_query_sparql', () => {
     const input = eurlex_query_sparql.input.parse({ sparql_query: rawQuery });
     await eurlex_query_sparql.handler(input, ctx);
 
-    // Handler passes the query directly to service.query() — service enforces LIMIT
-    expect(mockQuery).toHaveBeenCalledWith(rawQuery, expect.anything());
+    // Handler passes the query directly to service.query() — service enforces LIMIT.
+    // Third arg is the per-call timeout: undefined here (no timeout_hint supplied).
+    expect(mockQuery).toHaveBeenCalledWith(rawQuery, expect.anything(), undefined);
   });
 
   it('extracts variable names from first binding row', async () => {
@@ -90,6 +92,79 @@ describe('eurlex_query_sparql', () => {
 
     expect(result.variables).toEqual(['work', 'celex', 'date']);
     expect(result.total).toBe(1);
+  });
+
+  // --- Read-only guard (#9): reject non-SELECT queries before forwarding ---
+
+  it('rejects DELETE WHERE locally with reason "not_read_only" and does not call the service', async () => {
+    const ctx = createMockContext({ errors: eurlex_query_sparql.errors });
+
+    const input = eurlex_query_sparql.input.parse({ sparql_query: 'DELETE WHERE { ?s ?p ?o }' });
+    await expect(eurlex_query_sparql.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: {
+        reason: 'not_read_only',
+        recovery: { hint: expect.stringContaining('SELECT') },
+      },
+    });
+    expect(mockQuery).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'INSERT DATA { <urn:s> <urn:p> <urn:o> }',
+    'CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }',
+    'DESCRIBE <http://publications.europa.eu/resource/cellar/gdpr>',
+    'ASK WHERE { ?s ?p ?o }',
+    'LOAD <http://example.org/data.rdf>',
+    'DROP GRAPH <http://example.org/g>',
+  ])('rejects non-SELECT form locally without calling the service: %s', async (query) => {
+    const ctx = createMockContext({ errors: eurlex_query_sparql.errors });
+
+    const input = eurlex_query_sparql.input.parse({ sparql_query: query });
+    await expect(eurlex_query_sparql.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'not_read_only' },
+    });
+    expect(mockQuery).not.toHaveBeenCalled();
+  });
+
+  it('accepts a SELECT preceded by a leading comment and PREFIX declaration', async () => {
+    const ctx = createMockContext({ errors: eurlex_query_sparql.errors });
+    mockQuery.mockResolvedValue([
+      { work: { type: 'uri', value: 'http://publications.europa.eu/resource/cellar/gdpr' } },
+    ]);
+
+    const query =
+      '# resolve GDPR\nPREFIX cdm: <http://publications.europa.eu/ontology/cdm#>\nSELECT ?work WHERE { ?work cdm:resource_legal_id_celex ?celex . } LIMIT 1';
+    const input = eurlex_query_sparql.input.parse({ sparql_query: query });
+    const result = await eurlex_query_sparql.handler(input, ctx);
+
+    expect(result.total).toBe(1);
+    expect(mockQuery).toHaveBeenCalledWith(query, expect.anything(), undefined);
+  });
+
+  // --- timeout_hint (#10): forwarded to the service as the per-call timeout ---
+
+  it('forwards timeout_hint to the service as the per-call timeout', async () => {
+    const ctx = createMockContext({ errors: eurlex_query_sparql.errors });
+    mockQuery.mockResolvedValue([]);
+
+    const query = 'SELECT ?work WHERE { ?work cdm:resource_legal_id_celex ?celex . } LIMIT 1';
+    const input = eurlex_query_sparql.input.parse({ sparql_query: query, timeout_hint: 5000 });
+    await eurlex_query_sparql.handler(input, ctx);
+
+    expect(mockQuery).toHaveBeenCalledWith(query, expect.anything(), 5000);
+  });
+
+  it('passes undefined as the per-call timeout when timeout_hint is absent', async () => {
+    const ctx = createMockContext({ errors: eurlex_query_sparql.errors });
+    mockQuery.mockResolvedValue([]);
+
+    const query = 'SELECT ?work WHERE { ?work cdm:resource_legal_id_celex ?celex . } LIMIT 1';
+    const input = eurlex_query_sparql.input.parse({ sparql_query: query });
+    await eurlex_query_sparql.handler(input, ctx);
+
+    expect(mockQuery).toHaveBeenCalledWith(query, expect.anything(), undefined);
   });
 
   // --- Format ---

@@ -55,8 +55,12 @@ export class CellarSparqlService {
   /**
    * Execute a raw SPARQL SELECT query. Prefixes are prepended automatically
    * if not already present. LIMIT is injected/capped at `maxResults`.
+   *
+   * @param timeoutMs - Optional per-call client-side timeout in milliseconds.
+   *   Falls back to the server-configured `sparqlQueryTimeoutMs` when omitted.
    */
-  async query(rawQuery: string, ctx: Context): Promise<SparqlBinding[]> {
+  async query(rawQuery: string, ctx: Context, timeoutMs?: number): Promise<SparqlBinding[]> {
+    const effectiveTimeoutMs = timeoutMs ?? this.timeoutMs;
     const withPrefixes = rawQuery.includes('PREFIX cdm:') ? rawQuery : SPARQL_PREFIXES + rawQuery;
     const cappedQuery = enforceLimitInQuery(withPrefixes, this.maxResults);
 
@@ -73,7 +77,7 @@ export class CellarSparqlService {
             Accept: 'application/sparql-results+json',
           },
           body: body.toString(),
-          signal: AbortSignal.timeout(this.timeoutMs),
+          signal: AbortSignal.timeout(effectiveTimeoutMs),
         });
 
         const text = await response.text();
