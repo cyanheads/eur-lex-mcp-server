@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.0](changelog/0.3.x/0.3.0.md) — 2026-06-30
+
+eurlex_get_document re-sources act text from the EU Publications Office CELLAR resolver and refuses AWS WAF bot-challenge stubs (previously surfaced as content); adds content_mode/offset/limit body pagination with content_* navigation fields and removes the 8,000-char text cut
+
 ## [0.2.1](changelog/0.2.x/0.2.1.md) — 2026-06-30
 
 eurlex_search_documents and eurlex_get_cases return one row per work, so multi-resource-type works (corrigenda) no longer duplicate or miscount LIMIT/total; constrained optional filters now accept empty string from form-based clients

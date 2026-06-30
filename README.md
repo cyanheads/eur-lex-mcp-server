@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.2.1-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/eur-lex-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/eur-lex-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/eur-lex-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.11-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.3.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/eur-lex-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/eur-lex-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/eur-lex-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.11-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -62,6 +62,7 @@ Fetch the notice and full text of an EU legal act.
 - Accepts CELEX numbers (e.g., `32016R0679`) or ELI URIs
 - Returns structured metadata: title, date, document type, author institution, legal basis, EuroVoc subjects, in-force flag
 - Full text in HTML (default) or Formex4 XML
+- Content shaping for large acts: `content_mode` `"paged"` (default) returns a bounded character window (`offset` + `limit`) with `content_chars_total` and `has_more` so you can page to the end; `"full"` returns the whole body in one call; `"metadata_only"` skips the body
 - Supports all 24 official EU languages; defaults to English with automatic fallback when a translation is unavailable
 - Older acts and some CJEU judgments may lack English translations
 
@@ -275,7 +276,7 @@ All configuration is validated at startup via Zod schemas in `src/config/server-
 | Variable | Description | Default |
 |:---------|:------------|:--------|
 | `CELLAR_SPARQL_ENDPOINT` | CELLAR SPARQL endpoint URL override (e.g., for a local Virtuoso mirror). | `http://publications.europa.eu/webapi/rdf/sparql` |
-| `EURLEX_CONTENT_BASE_URL` | EUR-Lex content API base URL override. | `https://eur-lex.europa.eu` |
+| `EURLEX_CONTENT_BASE_URL` | EU Publications Office CELLAR content resolver base URL override. | `http://publications.europa.eu` |
 | `SPARQL_QUERY_TIMEOUT_MS` | Client-side timeout for SPARQL requests in milliseconds. | `55000` |
 | `MAX_SPARQL_RESULTS` | Enforced ceiling on LIMIT in all generated SPARQL queries. | `100` |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |

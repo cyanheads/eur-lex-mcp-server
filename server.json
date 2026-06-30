@@ -6,7 +6,7 @@
     "url": "https://github.com/cyanheads/eur-lex-mcp-server",
     "source": "github"
   },
-  "version": "0.2.1",
+  "version": "0.3.0",
   "remotes": [
     {
       "type": "streamable-http",
@@ -19,7 +19,7 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/eur-lex-mcp-server",
       "runtimeHint": "bun",
-      "version": "0.2.1",
+      "version": "0.3.0",
       "packageArguments": [
         {
           "type": "positional",
@@ -40,10 +40,10 @@
         },
         {
           "name": "EURLEX_CONTENT_BASE_URL",
-          "description": "EUR-Lex content API base URL override.",
+          "description": "Base URL of the EU Publications Office CELLAR content-negotiation resolver that serves act full text; override e.g. for a local mirror.",
           "format": "string",
           "isRequired": false,
-          "default": "https://eur-lex.europa.eu"
+          "default": "http://publications.europa.eu"
         },
         {
           "name": "SPARQL_QUERY_TIMEOUT_MS",
@@ -76,7 +76,7 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/eur-lex-mcp-server",
       "runtimeHint": "bun",
-      "version": "0.2.1",
+      "version": "0.3.0",
       "packageArguments": [
         {
           "type": "positional",
@@ -138,10 +138,10 @@
         },
         {
           "name": "EURLEX_CONTENT_BASE_URL",
-          "description": "EUR-Lex content API base URL override.",
+          "description": "Base URL of the EU Publications Office CELLAR content-negotiation resolver that serves act full text; override e.g. for a local mirror.",
           "format": "string",
           "isRequired": false,
-          "default": "https://eur-lex.europa.eu"
+          "default": "http://publications.europa.eu"
         },
         {
           "name": "SPARQL_QUERY_TIMEOUT_MS",
