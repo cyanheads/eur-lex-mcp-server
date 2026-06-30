@@ -14,6 +14,7 @@ import {
   CellarSparqlService,
   getCellarSparqlService,
 } from '@/services/cellar-sparql/cellar-sparql-service.js';
+import { escapeSparqlLiteral, resolveEliToWork } from '@/services/cellar-sparql/eli-resolution.js';
 import {
   type ContentFormat,
   type EurLexLanguage,
@@ -36,15 +37,18 @@ export const eurlex_get_document = tool('eurlex_get_document', {
   input: z.object({
     celex_number: z
       .string()
-      .min(1)
+      .optional()
       .describe(
-        'CELEX number of the act to fetch (e.g. 32016R0679 for GDPR). Preferred over eli_uri.',
+        'CELEX number of the act to fetch (e.g. 32016R0679 for GDPR). ' +
+          'Provide exactly one of celex_number or eli_uri.',
       ),
     eli_uri: z
       .string()
       .optional()
       .describe(
-        'ELI URI as alternative to celex_number (e.g. http://data.europa.eu/eli/reg/2016/679/oj). Used only if celex_number is absent or empty.',
+        'Work-level ELI URI of the act to fetch, resolved to its CELLAR work (e.g. ' +
+          'http://data.europa.eu/eli/reg/2016/679, with or without the /oj suffix). ' +
+          'Provide exactly one of celex_number or eli_uri.',
       ),
     language: z
       .string()
@@ -109,10 +113,16 @@ export const eurlex_get_document = tool('eurlex_get_document', {
 
   errors: [
     {
+      reason: 'invalid_identifier_args',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'Neither celex_number nor eli_uri was provided, or both were.',
+      recovery: 'Provide exactly one of celex_number or eli_uri.',
+    },
+    {
       reason: 'not_found',
       code: JsonRpcErrorCode.NotFound,
-      when: 'CELEX number not found in CELLAR — the work does not exist in the corpus.',
-      recovery: 'Verify the CELEX number or use eurlex_lookup_celex to confirm it exists.',
+      when: 'CELEX number or ELI URI not found in CELLAR — the work does not exist in the corpus.',
+      recovery: 'Verify the identifier or use eurlex_lookup_celex to confirm it exists.',
     },
     {
       reason: 'language_unavailable',
@@ -134,10 +144,40 @@ export const eurlex_get_document = tool('eurlex_get_document', {
     const sparqlSvc = getCellarSparqlService();
     const contentSvc = getEurLexContentService();
 
-    const celexNumber = input.celex_number.trim();
+    // Accept exactly one identifier: a CELEX number, or an ELI URI resolved to
+    // its CELLAR work. Treat empty/whitespace as absent so form-based clients
+    // that send "" for an omitted field route to the friendly guard, not -32602.
+    // An ELI is resolved to its CELLAR work via the shared #5 resolution
+    // (cdm:resource_legal_eli exact-match + bare-work /oj retry), then the rest
+    // of the flow (metadata + content) is keyed on the confirmed CELEX.
+    const celexInput = input.celex_number?.trim();
+    const eliInput = input.eli_uri?.trim();
+
+    let celexNumber: string;
+    if (eliInput && !celexInput) {
+      const binding = await resolveEliToWork(sparqlSvc, eliInput, ctx);
+      const resolvedCelex = binding && CellarSparqlService.bindingValue(binding, 'celexNumber');
+      if (!resolvedCelex) {
+        throw ctx.fail('not_found', `No CELLAR work found for ELI: ${eliInput}`, {
+          ...ctx.recoveryFor('not_found'),
+        });
+      }
+      celexNumber = resolvedCelex;
+    } else if (celexInput && !eliInput) {
+      celexNumber = celexInput;
+    } else {
+      throw ctx.fail(
+        'invalid_identifier_args',
+        celexInput
+          ? 'Provide only one of celex_number or eli_uri, not both.'
+          : 'Provide either celex_number or eli_uri.',
+        { ...ctx.recoveryFor('invalid_identifier_args') },
+      );
+    }
+
     const language = (input.language.trim().toUpperCase() || 'EN') as EurLexLanguage;
     const format = input.format as ContentFormat;
-    const safeCelexNumber = celexNumber.replace(/"/g, '\\"');
+    const safeCelexNumber = escapeSparqlLiteral(celexNumber);
 
     // Step 1: Fetch metadata via SPARQL
     const metaSparql = `

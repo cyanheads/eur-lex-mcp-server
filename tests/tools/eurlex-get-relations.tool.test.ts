@@ -130,6 +130,83 @@ describe('eurlex_get_relations', () => {
     expect(relSparql).not.toContain('cdm:work_cites_work');
   });
 
+  // --- work_uri alternative (issue #8) ---
+
+  it('uses work_uri directly and skips the CELEX→work resolution', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_relations.errors });
+    // Only ONE query — the relation traversal. No resolve step when work_uri is supplied.
+    mockQuery.mockResolvedValueOnce([
+      makeRelationBinding({
+        relatedWork: 'http://publications.europa.eu/resource/cellar/amend-work',
+        relationType: AMENDED_BY_PREDICATE,
+        direction: 'incoming',
+        relatedCelex: '32022R0000',
+      }),
+    ]);
+
+    const input = eurlex_get_relations.input.parse({ work_uri: GDPR_WORK_URI });
+    const result = await eurlex_get_relations.handler(input, ctx);
+
+    expect(result.work_uri).toBe(GDPR_WORK_URI);
+    // No source CELEX is known when addressed directly by work_uri.
+    expect(result.celex_number).toBeUndefined();
+    expect(result.total).toBe(1);
+    expect(result.relations[0]?.relation_type).toBe('amended_by');
+
+    // Single query: the traversal binds <work_uri> directly — the CELEX resolve never fired.
+    expect(mockQuery).toHaveBeenCalledTimes(1);
+    const relSparql = mockQuery.mock.calls[0]?.[0] as string;
+    expect(relSparql).toContain(`<${GDPR_WORK_URI}>`);
+  });
+
+  // --- Input guard: exactly one identifier (issue #8) ---
+
+  it('throws ctx.fail("invalid_identifier_args") when neither celex_number nor work_uri is given', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_relations.errors });
+    const input = eurlex_get_relations.input.parse({});
+    await expect(eurlex_get_relations.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'invalid_identifier_args' },
+    });
+    expect(mockQuery).not.toHaveBeenCalled();
+  });
+
+  it('throws ctx.fail("invalid_identifier_args") when both celex_number and work_uri are given', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_relations.errors });
+    const input = eurlex_get_relations.input.parse({
+      celex_number: '32016R0679',
+      work_uri: GDPR_WORK_URI,
+    });
+    await expect(eurlex_get_relations.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'invalid_identifier_args' },
+    });
+    expect(mockQuery).not.toHaveBeenCalled();
+  });
+
+  it('treats work_uri:"" as absent and routes to celex_number path (form-client regression)', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_relations.errors });
+    // Two queries: resolve CELEX → work URI, then fetch relations.
+    mockQuery.mockResolvedValueOnce([makeResolveBinding(GDPR_WORK_URI)]).mockResolvedValueOnce([
+      makeRelationBinding({
+        relatedWork: 'http://publications.europa.eu/resource/cellar/amend-work',
+        relationType: AMENDED_BY_PREDICATE,
+        direction: 'incoming',
+        relatedCelex: '32022R0000',
+      }),
+    ]);
+
+    // Form clients send "" for an omitted optional field — schema must accept it without -32602.
+    const input = eurlex_get_relations.input.parse({ celex_number: '32016R0679', work_uri: '' });
+    const result = await eurlex_get_relations.handler(input, ctx);
+
+    expect(result.celex_number).toBe('32016R0679');
+    expect(result.work_uri).toBe(GDPR_WORK_URI);
+    expect(result.total).toBe(1);
+    // CELEX resolve fired — work_uri:"" was treated as absent, not as the work_uri path.
+    expect(mockQuery).toHaveBeenCalledTimes(2);
+  });
+
   // --- Error contract: not_found ---
 
   it('throws ctx.fail("not_found") when CELEX resolves to no work URI', async () => {

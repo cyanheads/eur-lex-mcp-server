@@ -188,6 +188,85 @@ describe('eurlex_get_document', () => {
     expect(sparql).not.toContain('cdm:work_title');
   });
 
+  // --- ELI URI alternative (issue #8) ---
+
+  it('resolves an eli_uri to the same document as the equivalent CELEX', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_document.errors });
+    // First query: ELI → work resolution (yields GDPR's work + CELEX).
+    // Second query: metadata keyed by the resolved CELEX.
+    mockSparqlQuery
+      .mockResolvedValueOnce([makeMetaBinding({ celex: '32016R0679' })])
+      .mockResolvedValueOnce([
+        makeMetaBinding({
+          celex: '32016R0679',
+          date: '2016-04-27',
+          title: 'General Data Protection Regulation',
+          type: 'http://publications.europa.eu/resource/authority/resource-type/REG',
+          inForce: 'true',
+        }),
+      ]);
+    mockFetchContent.mockResolvedValue({
+      content: '<html>GDPR full text</html>',
+      contentAvailable: true,
+      format: 'html',
+      language: 'EN',
+    });
+
+    const input = eurlex_get_document.input.parse({
+      eli_uri: 'http://data.europa.eu/eli/reg/2016/679/oj',
+    });
+    const result = await eurlex_get_document.handler(input, ctx);
+
+    // Same work as the celex_number: '32016R0679' path.
+    expect(result.celex_number).toBe('32016R0679');
+    expect(result.title).toBe('General Data Protection Regulation');
+    expect(result.content).toBe('<html>GDPR full text</html>');
+
+    // First call exact-matches the ELI literal; content is fetched by the resolved CELEX.
+    const eliSparql = mockSparqlQuery.mock.calls[0]?.[0] as string;
+    expect(eliSparql).toContain('cdm:resource_legal_eli');
+    expect(eliSparql).toContain('"http://data.europa.eu/eli/reg/2016/679/oj"^^xsd:anyURI');
+    expect(mockFetchContent).toHaveBeenCalledWith('32016R0679', 'EN', 'html', expect.anything());
+  });
+
+  it('throws ctx.fail("not_found") when an eli_uri resolves to no work', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_document.errors });
+    mockSparqlQuery.mockResolvedValue([]);
+
+    const input = eurlex_get_document.input.parse({
+      eli_uri: 'http://data.europa.eu/eli/reg/9999/99999/oj',
+    });
+    await expect(eurlex_get_document.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: { reason: 'not_found' },
+    });
+  });
+
+  // --- Input guard: exactly one identifier (issue #8) ---
+
+  it('throws ctx.fail("invalid_identifier_args") when neither celex_number nor eli_uri is given', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_document.errors });
+    const input = eurlex_get_document.input.parse({});
+    await expect(eurlex_get_document.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'invalid_identifier_args' },
+    });
+    expect(mockSparqlQuery).not.toHaveBeenCalled();
+  });
+
+  it('throws ctx.fail("invalid_identifier_args") when both celex_number and eli_uri are given', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_document.errors });
+    const input = eurlex_get_document.input.parse({
+      celex_number: '32016R0679',
+      eli_uri: 'http://data.europa.eu/eli/reg/2016/679/oj',
+    });
+    await expect(eurlex_get_document.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'invalid_identifier_args' },
+    });
+    expect(mockSparqlQuery).not.toHaveBeenCalled();
+  });
+
   // --- Error contract: not_found ---
 
   it('throws ctx.fail("not_found") when CELEX resolves to no bindings', async () => {

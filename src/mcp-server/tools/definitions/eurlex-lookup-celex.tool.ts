@@ -9,15 +9,16 @@ import {
   CellarSparqlService,
   getCellarSparqlService,
 } from '@/services/cellar-sparql/cellar-sparql-service.js';
+import {
+  escapeSparqlLiteral,
+  isEliUri,
+  resolveEliToWork,
+} from '@/services/cellar-sparql/eli-resolution.js';
+import type { SparqlBinding } from '@/services/cellar-sparql/types.js';
 
 /** Detect CELEX number format: starts with a sector digit. */
 function isCelex(identifier: string): boolean {
   return /^[1-9]\d{4}[A-Z]+\d+/.test(identifier.trim());
-}
-
-/** Detect ELI URI format: starts with http://data.europa.eu/eli/ */
-function isEliUri(identifier: string): boolean {
-  return identifier.trim().startsWith('http://data.europa.eu/eli/');
 }
 
 type IdentifierType = 'celex' | 'eli' | 'auto';
@@ -26,41 +27,6 @@ function detectIdentifierType(identifier: string): IdentifierType | null {
   if (isCelex(identifier)) return 'celex';
   if (isEliUri(identifier)) return 'eli';
   return null;
-}
-
-const ELI_NAMESPACE = 'http://data.europa.eu/eli/';
-
-/**
- * A bare work-level ELI — `…/eli/{type}/{year}/{number}` with no manifestation
- * suffix (no `/oj`, no `/YYYY-MM-DD` consolidation date). CELLAR stores the
- * canonical OJ-manifestation literal (`…/{number}/oj`) rather than the bare
- * work-level form, so these never match on exact lookup and must be normalized
- * to their `/oj` form to resolve.
- */
-function isBareWorkLevelEli(eli: string): boolean {
-  if (!eli.startsWith(ELI_NAMESPACE)) return false;
-  const path = eli.slice(ELI_NAMESPACE.length).replace(/\/+$/, '');
-  return /^[^/]+\/\d{4}\/[^/]+$/.test(path);
-}
-
-/** Escape backslashes then double-quotes for safe interpolation into a SPARQL string literal. */
-function escapeSparqlLiteral(value: string): string {
-  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-}
-
-/**
- * ELI exact-match query: resolve the single work whose canonical ELI literal
- * (`cdm:resource_legal_eli`, an `xsd:anyURI` literal) equals `safeEli`, reading
- * its CELEX, type, and date. `safeEli` must be pre-escaped.
- */
-function buildEliQuery(safeEli: string): string {
-  return `
-SELECT ?work ?celexNumber ?type ?date WHERE {
-  ?work cdm:resource_legal_eli "${safeEli}"^^xsd:anyURI .
-  ?work cdm:resource_legal_id_celex ?celexNumber .
-  OPTIONAL { ?work cdm:work_has_resource-type ?type . }
-  OPTIONAL { ?work cdm:work_date_document ?date . }
-} LIMIT 5`;
 }
 
 export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
@@ -141,54 +107,43 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
       effectiveType = input.identifier_type;
     }
 
-    let sparql: string;
+    // ELI resolution (exact-match on cdm:resource_legal_eli, with the bare
+    // work-level /oj retry) is shared with eurlex_get_document — see
+    // services/cellar-sparql/eli-resolution.ts. The CELEX branch stays here: a
+    // direct exact-string match on the CELEX literal.
+    let binding: SparqlBinding | null;
     if (effectiveType === 'celex') {
-      sparql = `
+      const celexQuery = `
 SELECT ?work ?celexNumber ?type ?date WHERE {
   ?work cdm:resource_legal_id_celex ?celexNumber .
   OPTIONAL { ?work cdm:work_has_resource-type ?type . }
   OPTIONAL { ?work cdm:work_date_document ?date . }
   FILTER(STR(?celexNumber) = "${escapeSparqlLiteral(identifier)}")
 } LIMIT 5`;
+      const bindings = await svc.query(celexQuery, ctx);
+      binding = bindings[0] ?? null;
     } else {
-      sparql = buildEliQuery(escapeSparqlLiteral(identifier));
-    }
-
-    let bindings = await svc.query(sparql, ctx);
-
-    // CELLAR stores only the OJ-manifestation ELI literal (…/{number}/oj), so a
-    // bare work-level ELI (…/{type}/{year}/{number}) — the most common citation
-    // form — misses on exact match. Retry once with /oj appended: a deterministic,
-    // one-to-one normalization to the same act's canonical manifestation. Gated to
-    // bare work-level ELIs, so a manifestation-suffixed ELI (e.g. a /YYYY-MM-DD
-    // consolidated version) never silently falls back to the original act.
-    let bareEliRetry = false;
-    if (bindings.length === 0 && effectiveType === 'eli' && isBareWorkLevelEli(identifier)) {
-      const ojEli = `${identifier.replace(/\/+$/, '')}/oj`;
-      bindings = await svc.query(buildEliQuery(escapeSparqlLiteral(ojEli)), ctx);
-      bareEliRetry = true;
+      binding = await resolveEliToWork(svc, identifier, ctx);
     }
 
     ctx.log.info('Citation lookup', {
       identifier,
       type: effectiveType,
-      bareEliRetry,
-      resultCount: bindings.length,
+      found: binding !== null,
     });
 
-    if (bindings.length === 0) {
+    if (!binding) {
       throw ctx.fail('not_found', `No CELLAR work found for identifier: ${identifier}`, {
         ...ctx.recoveryFor('not_found'),
       });
     }
 
-    const first = bindings[0];
     return {
       found: true,
-      work_uri: CellarSparqlService.bindingValue(first, 'work'),
-      celex_number: CellarSparqlService.bindingValue(first, 'celexNumber'),
-      resource_type: CellarSparqlService.bindingValue(first, 'type'),
-      date: CellarSparqlService.bindingValue(first, 'date'),
+      work_uri: CellarSparqlService.bindingValue(binding, 'work'),
+      celex_number: CellarSparqlService.bindingValue(binding, 'celexNumber'),
+      resource_type: CellarSparqlService.bindingValue(binding, 'type'),
+      date: CellarSparqlService.bindingValue(binding, 'date'),
     };
   },
 
