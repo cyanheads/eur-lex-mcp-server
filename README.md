@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.3.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/eur-lex-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/eur-lex-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/eur-lex-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.11-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.4.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/eur-lex-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/eur-lex-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/eur-lex-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.11-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -34,7 +34,7 @@ Seven tools covering EU legal research — document discovery, content retrieval
 | Tool | Description |
 |:-----|:------------|
 | `eurlex_search_documents` | Search EU legislation, treaties, and preparatory acts across the CELLAR corpus. Filters by document type, date range, EuroVoc concept, author institution, and in-force status. |
-| `eurlex_get_document` | Fetch structured metadata and full text (HTML or Formex4 XML) for a work by CELEX number or ELI URI. |
+| `eurlex_get_document` | Fetch structured metadata and full text (HTML, Markdown, or Formex4 XML) for a work by CELEX number or ELI URI. |
 | `eurlex_lookup_celex` | Resolve an EU legal citation — a CELEX number or an ELI URI — to the canonical CELLAR work. |
 | `eurlex_get_cases` | Search CJEU and General Court case law — judgments, orders, and Advocate General opinions — by case number, party name, subject, or date range. |
 | `eurlex_get_relations` | Traverse the CELLAR relationship graph: amendment chain, consolidated versions, legal basis, citation network, and national transposition measures. |
@@ -61,7 +61,7 @@ Fetch the notice and full text of an EU legal act.
 
 - Accepts CELEX numbers (e.g., `32016R0679`) or ELI URIs
 - Returns structured metadata: title, date, document type, author institution, legal basis, EuroVoc subjects, in-force flag
-- Full text in HTML (default) or Formex4 XML
+- Full text in HTML (default), Markdown, or Formex4 XML — `format: "markdown"` converts the act body to clean Markdown server-side (recitals and numbered points as readable text, genuine data tables as GFM)
 - Content shaping for large acts: `content_mode` `"paged"` (default) returns a bounded character window (`offset` + `limit`) with `content_chars_total` and `has_more` so you can page to the end; `"full"` returns the whole body in one call; `"metadata_only"` skips the body
 - Supports all 24 official EU languages; defaults to English with automatic fallback when a translation is unavailable
 - Older acts and some CJEU judgments may lack English translations
@@ -141,7 +141,7 @@ EUR-Lex-specific:
 
 - No API key required — both CELLAR SPARQL and EUR-Lex REST content endpoints are publicly accessible
 - `CellarSparqlService` POSTs `application/x-www-form-urlencoded` SPARQL with CDM prefix declarations built in; server-side LIMIT enforcement (max 100) prevents Virtuoso timeout abuse
-- `EurLexContentService` fetches full HTML or Formex4 XML via the canonical `legal-content/{LANG}/TXT/` URL pattern (CELLAR work URIs return 400 on direct GET — this avoids that)
+- `EurLexContentService` fetches act text from the CELLAR content-negotiation resolver (`/resource/celex/{CELEX}` with `Accept` / `Accept-Language` headers); HTML and Formex4 XML pass through, Markdown is converted server-side from the HTML body
 - Virtuoso error classification: HTTP 200 with `Virtuoso 37000 Error` body is parsed and re-raised as `ServiceUnavailable` (transient/timeout) or `InvalidParams` (syntax error)
 - Language fallback on document fetch: if the requested language is unavailable, retries with English; returns metadata-only with a note when English also fails
 - Typed error contracts on every tool — structured `reason` codes let agents branch on outcomes without parsing text

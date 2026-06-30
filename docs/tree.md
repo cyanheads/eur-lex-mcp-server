@@ -1,6 +1,6 @@
 # eur-lex-mcp-server - Directory Structure
 
-Generated on: 2026-06-30 17:02:46
+Generated on: 2026-06-30 19:53:18
 
 ```text
 eur-lex-mcp-server/
@@ -23,6 +23,7 @@ eur-lex-mcp-server/
 │   ├── 0.1.x/
 │   ├── 0.2.x/
 │   ├── 0.3.x/
+│   ├── 0.4.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md
@@ -158,18 +159,21 @@ eur-lex-mcp-server/
 │   │   │   ├── eli-resolution.ts
 │   │   │   └── types.ts
 │   │   └── eurlex-content/
-│   │       └── eurlex-content-service.ts
+│   │       ├── eurlex-content-service.ts
+│   │       └── html-to-markdown.ts
 │   └── index.ts
 ├── tests/
 │   ├── fixtures/
-│   │   └── aws-waf-challenge.ts
+│   │   ├── aws-waf-challenge.ts
+│   │   └── eurlex-act-html.ts
 │   ├── prompts/
 │   │   └── eurlex-comparative-analysis.prompt.test.ts
 │   ├── resources/
 │   │   ├── eurlex-document-relations.resource.test.ts
 │   │   └── eurlex-document.resource.test.ts
 │   ├── services/
-│   │   └── eurlex-content-service.test.ts
+│   │   ├── eurlex-content-service.test.ts
+│   │   └── html-to-markdown.test.ts
 │   └── tools/
 │       ├── eurlex-browse-subjects.tool.test.ts
 │       ├── eurlex-get-cases.tool.test.ts

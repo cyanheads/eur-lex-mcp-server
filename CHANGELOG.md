@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.0](changelog/0.4.x/0.4.0.md) — 2026-06-30 · 🛡️ Security
+
+eurlex_get_document adds an opt-in markdown format — server-side HTML→Markdown of the act body with GFM data tables — and bumps @cyanheads/mcp-ts-core to ^0.10.10, refreshing the lockfile to clear transitive advisories in hono, js-yaml, and esbuild
+
 ## [0.3.0](changelog/0.3.x/0.3.0.md) — 2026-06-30
 
 eurlex_get_document re-sources act text from the EU Publications Office CELLAR resolver and refuses AWS WAF bot-challenge stubs (previously surfaced as content); adds content_mode/offset/limit body pagination with content_* navigation fields and removes the 8,000-char text cut
