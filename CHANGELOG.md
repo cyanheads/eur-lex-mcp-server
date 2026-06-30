@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.1](changelog/0.2.x/0.2.1.md) — 2026-06-30
+
+eurlex_search_documents and eurlex_get_cases return one row per work, so multi-resource-type works (corrigenda) no longer duplicate or miscount LIMIT/total; constrained optional filters now accept empty string from form-based clients
+
 ## [0.2.0](changelog/0.2.x/0.2.0.md) — 2026-06-30
 
 eurlex_get_document accepts eli_uri and eurlex_get_relations accepts work_uri as functional identifier alternatives (exactly one of the pair required); eurlex_browse_subjects restricts results to EuroVoc concepts so every concept_uri is usable as an eurovoc_concept filter
