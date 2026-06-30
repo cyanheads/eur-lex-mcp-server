@@ -10,12 +10,24 @@ import {
   getCellarSparqlService,
 } from '@/services/cellar-sparql/cellar-sparql-service.js';
 
+/**
+ * Namespace of actual EuroVoc concepts. CELLAR's skos:Concept space also holds
+ * other Publications Office authority concepts (class-sum-leg, fd_*, …) whose
+ * URIs the eurlex_search_documents `eurovoc_concept` filter accepts but cannot
+ * match — only `http://eurovoc.europa.eu/` concepts are bound by
+ * `cdm:work_is_about_concept_eurovoc`. Results are restricted to this namespace
+ * so every URI returned is usable in that filter (#11).
+ */
+const EUROVOC_CONCEPT_NAMESPACE = 'http://eurovoc.europa.eu/';
+
 export const eurlex_browse_subjects = tool('eurlex_browse_subjects', {
   title: 'Browse EuroVoc Subjects',
   description:
     'Search the EuroVoc multilingual thesaurus to resolve a human-readable term or keyword into EuroVoc concept IDs. ' +
     'This tool is required before using the eurovoc_concept filter in eurlex_search_documents — ' +
     'agents cannot guess numeric EuroVoc concept IDs. ' +
+    'Every returned concept_uri is a EuroVoc concept (http://eurovoc.europa.eu/…) directly usable in that filter; ' +
+    'other Publications Office authority concepts are excluded because the filter cannot match them. ' +
     'Returns concept URI, preferred label in the requested language, concept code, and broader/narrower hierarchy hints. ' +
     'EuroVoc covers all EU policy domains: agriculture, environment, finance, health, trade, transport, and more. ' +
     'If no results are found in a non-English language, retry with language "en" and a broader English term.',
@@ -88,6 +100,7 @@ SELECT ?concept ?label ?code ?broaderLabel WHERE {
     ?broader skos:prefLabel ?broaderLabel .
     FILTER(LANG(?broaderLabel) = "${lang}")
   }
+  FILTER(STRSTARTS(STR(?concept), "${EUROVOC_CONCEPT_NAMESPACE}"))
   FILTER(LANG(?label) = "${lang}")
   FILTER(CONTAINS(LCASE(STR(?label)), "${keyword.replace(/"/g, '\\"')}"))
 } LIMIT ${limit}`;

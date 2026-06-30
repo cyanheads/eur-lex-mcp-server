@@ -92,6 +92,23 @@ describe('eurlex_browse_subjects', () => {
     expect(sparql).toContain('"fr"');
   });
 
+  it('restricts results to the EuroVoc namespace so every URI is filter-compatible (issue #11)', async () => {
+    const ctx = createMockContext({ errors: eurlex_browse_subjects.errors });
+    mockQuery.mockResolvedValue([
+      makeConceptBinding({ uri: 'http://eurovoc.europa.eu/2828', label: 'privacy', code: '2828' }),
+    ]);
+
+    const input = eurlex_browse_subjects.input.parse({ keyword: 'privacy' });
+    const result = await eurlex_browse_subjects.handler(input, ctx);
+
+    // The query constrains ?concept to the EuroVoc namespace, so non-EuroVoc
+    // authority concepts (class-sum-leg, fd_*) cannot be returned — every
+    // concept_uri is usable in eurlex_search_documents.eurovoc_concept.
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    expect(sparql).toContain('STRSTARTS(STR(?concept), "http://eurovoc.europa.eu/")');
+    expect(result.concepts[0]?.concept_uri).toBe('http://eurovoc.europa.eu/2828');
+  });
+
   it('respects limit parameter', async () => {
     const ctx = createMockContext({ errors: eurlex_browse_subjects.errors });
     mockQuery.mockResolvedValue([
