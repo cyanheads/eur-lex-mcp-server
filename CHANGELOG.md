@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.0](changelog/0.2.x/0.2.0.md) — 2026-06-30
+
+eurlex_get_document accepts eli_uri and eurlex_get_relations accepts work_uri as functional identifier alternatives (exactly one of the pair required); eurlex_browse_subjects restricts results to EuroVoc concepts so every concept_uri is usable as an eurovoc_concept filter
+
 ## [0.1.8](changelog/0.1.x/0.1.8.md) — 2026-06-30
 
 eurlex_lookup_celex now resolves ELI URIs via an exact cdm:resource_legal_eli match, with bare work-level ELIs retrying once with /oj; the never-functional oj identifier_type is removed
