@@ -6,6 +6,7 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import {
+  ENG_LANGUAGE_URI,
   resolveCorporateBodyLabel,
   resolveResourceTypeLabel,
 } from '@/services/cellar-sparql/cdm-labels.js';
@@ -145,7 +146,11 @@ SELECT ?work ?celexNumber ?type ?date ?title ?inForce ?author ?legalBasis ?eurov
   FILTER(STR(?celexNumber) = "${safeCelexNumber}")
   OPTIONAL { ?work cdm:work_has_resource-type ?type . }
   OPTIONAL { ?work cdm:work_date_document ?date . }
-  OPTIONAL { ?work cdm:work_title ?titleNode . ?titleNode cdm:expression_title ?title . FILTER(LANG(?title) = "en") }
+  OPTIONAL {
+    ?expr cdm:expression_belongs_to_work ?work .
+    ?expr cdm:expression_uses_language <${ENG_LANGUAGE_URI}> .
+    ?expr cdm:expression_title ?title .
+  }
   OPTIONAL { ?work cdm:resource_legal_in-force ?inForce . }
   OPTIONAL { ?work cdm:work_created_by_agent ?author . }
   OPTIONAL { ?work cdm:resource_legal_based_on_resource_legal ?legalBasis . }

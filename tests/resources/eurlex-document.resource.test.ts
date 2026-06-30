@@ -92,6 +92,24 @@ describe('eurlex_document_resource', () => {
     expect((result as Record<string, unknown>).in_force).toBe(false);
   });
 
+  // --- Title traversal (issue #7) ---
+
+  it('uses the expression-level title traversal, not the obsolete work_title pattern', async () => {
+    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    mockQuery.mockResolvedValue([
+      makeMetaBinding({ celex: '32016R0679', title: 'General Data Protection Regulation' }),
+    ]);
+
+    const params = eurlex_document_resource.params.parse({ celexNumber: '32016R0679' });
+    const result = await eurlex_document_resource.handler(params, ctx);
+
+    expect((result as Record<string, unknown>).title).toBe('General Data Protection Regulation');
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    expect(sparql).toContain('cdm:expression_belongs_to_work');
+    expect(sparql).toContain('cdm:expression_title');
+    expect(sparql).not.toContain('cdm:work_title');
+  });
+
   // --- Error path: not found ---
 
   it('throws notFound when CELEX resolves to no bindings', async () => {

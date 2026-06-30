@@ -162,6 +162,32 @@ describe('eurlex_get_document', () => {
     expect(result.content).toBeUndefined();
   });
 
+  // --- Title traversal (issue #7) ---
+
+  it('uses the expression-level title traversal, not the obsolete work_title pattern', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_document.errors });
+    mockSparqlQuery.mockResolvedValue([
+      makeMetaBinding({ celex: '32016R0679', title: 'General Data Protection Regulation' }),
+    ]);
+    mockFetchContent.mockResolvedValue({
+      content: '',
+      contentAvailable: false,
+      format: 'html',
+      language: 'EN',
+    });
+
+    const input = eurlex_get_document.input.parse({ celex_number: '32016R0679' });
+    const result = await eurlex_get_document.handler(input, ctx);
+
+    // Title from the English expression is surfaced.
+    expect(result.title).toBe('General Data Protection Regulation');
+    const sparql = mockSparqlQuery.mock.calls[0]?.[0] as string;
+    expect(sparql).toContain('cdm:expression_belongs_to_work');
+    expect(sparql).toContain('cdm:expression_title');
+    // Obsolete work-level pattern must be gone.
+    expect(sparql).not.toContain('cdm:work_title');
+  });
+
   // --- Error contract: not_found ---
 
   it('throws ctx.fail("not_found") when CELEX resolves to no bindings', async () => {
