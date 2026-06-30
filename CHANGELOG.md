@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.7](changelog/0.1.x/0.1.7.md) — 2026-06-30
+
+eurlex_search_documents author_institution now constrains results via a required skos:prefLabel/bif:contains filter, and eurlex_get_document plus the document resource return English titles through the expression-level CELLAR traversal
+
 ## [0.1.6](changelog/0.1.x/0.1.6.md) — 2026-06-30
 
 eurlex_query_sparql enforces its read-only contract (non-SELECT queries rejected locally) and honors the previously-ignored timeout_hint parameter
