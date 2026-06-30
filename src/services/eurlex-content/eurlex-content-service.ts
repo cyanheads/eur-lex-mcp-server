@@ -1,7 +1,26 @@
 /**
- * @fileoverview EurLexContentService — HTTP client for the EUR-Lex REST content API.
- * Fetches full HTML or XML text of EU legal acts via the legal-content URL pattern.
- * Document content is NOT available via CELLAR work URI content negotiation (returns 400).
+ * @fileoverview EurLexContentService — HTTP client for EU act full-text content.
+ *
+ * Sources content from the EU Publications Office CELLAR content-negotiation
+ * resolver (`publications.europa.eu/resource/celex/{CELEX}`) — the same host the
+ * metadata SPARQL pipeline already queries — rather than the legacy
+ * `eur-lex.europa.eu` legal-content endpoint, which is now fronted by an AWS WAF
+ * that returns a JavaScript bot-challenge stub instead of the act text (issue #16).
+ *
+ * Content negotiation:
+ *  - `Accept`: HTML acts vary by document family — OJ legislation exposes
+ *    `application/xhtml+xml`, CJEU judgments expose `text/html`, so the HTML path
+ *    tries both. The XML path requests Formex 4 (`application/xml;type=fmx4`),
+ *    which CELLAR serves directly for single-part acts and returns HTTP 300
+ *    (multiple manifestation streams) for multi-part OJ acts — treated as
+ *    unavailable rather than reconstructed.
+ *  - `Accept-Language`: CELLAR requires an ISO 639-2/T (three-letter) code and
+ *    400s on a missing one or on a bibliographic 639-2/B code (`ger`, `fre`);
+ *    EUR-Lex two-letter codes are mapped before the request.
+ *
+ * Defense in depth: any response carrying an AWS WAF challenge signature is
+ * refused (never surfaced as content) and raised as a ServiceUnavailable error,
+ * so a challenge stub can never again be reported as `contentAvailable: true`.
  * @module services/eurlex-content/eurlex-content-service
  */
 
@@ -41,6 +60,70 @@ export type EurLexLanguage =
   | 'HR'
   | 'GA';
 
+/**
+ * Map EUR-Lex two-letter language codes to the ISO 639-2/T (terminological,
+ * three-letter) codes CELLAR's content-negotiation resolver accepts in
+ * `Accept-Language`. CELLAR rejects bibliographic 639-2/B codes (`ger`, `fre`,
+ * `dut`, …), so the terminological forms (`deu`, `fra`, `nld`, …) are used.
+ */
+const LANGUAGE_TO_ISO_639_2: Record<EurLexLanguage, string> = {
+  EN: 'eng',
+  FR: 'fra',
+  DE: 'deu',
+  ES: 'spa',
+  IT: 'ita',
+  PL: 'pol',
+  PT: 'por',
+  NL: 'nld',
+  CS: 'ces',
+  DA: 'dan',
+  EL: 'ell',
+  ET: 'est',
+  FI: 'fin',
+  HU: 'hun',
+  LT: 'lit',
+  LV: 'lav',
+  MT: 'mlt',
+  RO: 'ron',
+  SK: 'slk',
+  SL: 'slv',
+  SV: 'swe',
+  BG: 'bul',
+  HR: 'hrv',
+  GA: 'gle',
+};
+
+/**
+ * `Accept` values tried per format, in order. HTML resolves to `application/xhtml+xml`
+ * for OJ legislation and `text/html` for CJEU judgments; the first to return a body
+ * wins. XML requests Formex 4 only.
+ */
+const ACCEPT_BY_FORMAT: Record<ContentFormat, readonly string[]> = {
+  html: ['application/xhtml+xml', 'text/html'],
+  xml: ['application/xml;type=fmx4'],
+};
+
+/**
+ * AWS WAF bot-challenge signatures. `awswaf` matches the challenge.js host
+ * (`token.awswaf.com`), the cookie-domain list, and the `AwsWafIntegration`
+ * calls; `gokuprops` matches the per-request challenge blob. Both are
+ * WAF-specific and never appear in legitimate EU legal text. Matched
+ * case-insensitively against the response head.
+ */
+const CHALLENGE_MARKERS = ['awswaf', 'gokuprops'];
+
+/** Bodies shorter than this (after trimming) are treated as empty/unavailable. */
+const MIN_CONTENT_LENGTH = 100;
+
+/** True when a response body carries an AWS WAF bot-challenge signature. */
+function isChallengeResponse(body: string): boolean {
+  const head = body.slice(0, 4096).toLowerCase();
+  return CHALLENGE_MARKERS.some((marker) => head.includes(marker));
+}
+
+/** Outcome of a single content-negotiation attempt. */
+type FetchOutcome = { kind: 'content'; text: string } | { kind: 'none' } | { kind: 'challenge' };
+
 export interface FetchContentResult {
   content: string;
   contentAvailable: boolean;
@@ -60,18 +143,20 @@ export class EurLexContentService {
   }
 
   /**
-   * Build the EUR-Lex legal-content URL for a CELEX number.
-   * Pattern: /legal-content/{LANG}/TXT/{FORMAT}/?uri=CELEX:{celex}
+   * Build the CELLAR content-negotiation URL for a CELEX number.
+   * Pattern: /resource/celex/{CELEX} (format + language come from request headers).
    */
-  buildContentUrl(celexNumber: string, language: EurLexLanguage, format: ContentFormat): string {
-    const fmt = format === 'xml' ? 'XML' : 'HTML';
-    return `${this.baseUrl}/legal-content/${language}/TXT/${fmt}/?uri=CELEX:${celexNumber}`;
+  buildContentUrl(celexNumber: string): string {
+    return `${this.baseUrl}/resource/celex/${encodeURIComponent(celexNumber)}`;
   }
 
   /**
    * Fetch the full text content of an EU act by CELEX number.
    * If the requested language is unavailable, falls back to English.
    * Returns `contentAvailable: false` with an empty string if both attempts fail.
+   *
+   * Throws ServiceUnavailable if the content host returns an AWS WAF bot-challenge
+   * stub — a challenge is never reported as available content.
    */
   async fetchContent(
     celexNumber: string,
@@ -79,14 +164,14 @@ export class EurLexContentService {
     format: ContentFormat,
     ctx: Context,
   ): Promise<FetchContentResult> {
-    const primary = await this.tryFetch(celexNumber, language, format, ctx);
+    const primary = await this.fetchForLanguage(celexNumber, language, format, ctx);
     if (primary !== null) {
       return { content: primary, language, format, contentAvailable: true };
     }
 
-    // Language fallback: try English if primary language failed
+    // Language fallback: try English if primary language failed.
     if (language !== 'EN') {
-      const fallback = await this.tryFetch(celexNumber, 'EN', format, ctx);
+      const fallback = await this.fetchForLanguage(celexNumber, 'EN', format, ctx);
       if (fallback !== null) {
         return {
           content: fallback,
@@ -102,50 +187,81 @@ export class EurLexContentService {
   }
 
   /**
-   * Attempt to fetch content for a specific language. Returns null on non-200 or
-   * empty/redirect response rather than throwing — callers handle fallback logic.
+   * Resolve content for one language by trying each `Accept` variant for the
+   * format. Returns the first non-empty body, or null when none of the variants
+   * yield content (so the caller can fall back to English). Throws when a variant
+   * returns a bot-challenge stub.
    */
-  private async tryFetch(
+  private async fetchForLanguage(
     celexNumber: string,
     language: EurLexLanguage,
     format: ContentFormat,
     ctx: Context,
   ): Promise<string | null> {
-    const url = this.buildContentUrl(celexNumber, language, format);
+    const isoLanguage = LANGUAGE_TO_ISO_639_2[language];
+    if (!isoLanguage) return null;
+
+    for (const accept of ACCEPT_BY_FORMAT[format]) {
+      const outcome = await this.fetchVariant(celexNumber, accept, isoLanguage, ctx);
+      if (outcome.kind === 'challenge') {
+        throw serviceUnavailable(
+          `The EU content endpoint returned a bot-challenge interstitial instead of the act text for CELEX ${celexNumber}.`,
+          {
+            celexNumber,
+            reason: 'content_challenge',
+            recovery: {
+              hint:
+                'The content host is behind a WAF/bot challenge. Retry shortly; metadata remains ' +
+                'reachable via content_mode "metadata_only". A persistent challenge means ' +
+                'EURLEX_CONTENT_BASE_URL points at a WAF-protected host rather than the EU ' +
+                'Publications Office CELLAR resolver.',
+            },
+          },
+        );
+      }
+      if (outcome.kind === 'content') return outcome.text;
+    }
+    return null;
+  }
+
+  /**
+   * Single content-negotiation request for one `Accept`/`Accept-Language` pair.
+   * Non-2xx responses (404 = no datastream of that type, 300 = multi-part Formex,
+   * 4xx/5xx) and network failures resolve to `none` so callers can try the next
+   * variant or language. A WAF challenge body resolves to `challenge`. The inner
+   * function only throws on a `fetch` rejection, so `withRetry` retries transient
+   * network errors but never a 404 or a challenge.
+   */
+  private fetchVariant(
+    celexNumber: string,
+    accept: string,
+    isoLanguage: string,
+    ctx: Context,
+  ): Promise<FetchOutcome> {
+    const url = this.buildContentUrl(celexNumber);
 
     return withRetry(
-      async () => {
+      async (): Promise<FetchOutcome> => {
         const response = await fetch(url, {
-          headers: { Accept: format === 'xml' ? 'application/xml' : 'text/html' },
+          headers: { Accept: accept, 'Accept-Language': isoLanguage },
           signal: AbortSignal.timeout(this.timeoutMs),
           redirect: 'follow',
         });
 
-        if (response.status === 404 || response.status === 302 || !response.ok) {
-          return null;
-        }
+        if (!response.ok) return { kind: 'none' };
 
         const text = await response.text();
-
-        // Detect HTML error pages masquerading as success (e.g. rate-limit pages)
-        if (format === 'xml' && /^\s*<(!DOCTYPE\s+html|html[\s>])/i.test(text)) {
-          throw serviceUnavailable('EUR-Lex returned HTML instead of XML content.');
-        }
-
-        // Empty content means unavailable
-        if (text.trim().length < 100) {
-          return null;
-        }
-
-        return text;
+        if (isChallengeResponse(text)) return { kind: 'challenge' };
+        if (text.trim().length < MIN_CONTENT_LENGTH) return { kind: 'none' };
+        return { kind: 'content', text };
       },
       {
-        operation: 'EurLexContentService.tryFetch',
+        operation: 'EurLexContentService.fetchVariant',
         baseDelayMs: 1000,
         maxRetries: 2,
         signal: ctx.signal,
       },
-    ).catch(() => null); // Treat fetch failures as unavailable for language fallback
+    ).catch((): FetchOutcome => ({ kind: 'none' }));
   }
 }
 

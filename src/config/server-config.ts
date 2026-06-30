@@ -16,8 +16,12 @@ const ServerConfigSchema = z.object({
   eurLexContentBaseUrl: z
     .string()
     .url()
-    .default('https://eur-lex.europa.eu')
-    .describe('EUR-Lex content API base URL'),
+    .default('http://publications.europa.eu')
+    .describe(
+      'Base URL of the EU Publications Office CELLAR content-negotiation resolver, which serves ' +
+        'act text via /resource/celex/{CELEX}. Replaces the WAF-protected eur-lex.europa.eu ' +
+        'legal-content endpoint, which now returns an AWS WAF bot-challenge stub (issue #16).',
+    ),
   sparqlQueryTimeoutMs: z.coerce
     .number()
     .int()
