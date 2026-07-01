@@ -14,6 +14,12 @@ vi.mock('@/services/cellar-sparql/cellar-sparql-service.js', () => ({
   CellarSparqlService: {
     bindingValue: (binding: Record<string, { value?: string }> | undefined, field: string) =>
       binding?.[field]?.value,
+    parseBoolean: (lexical: string | undefined) =>
+      lexical === 'true' || lexical === '1'
+        ? true
+        : lexical === 'false' || lexical === '0'
+          ? false
+          : undefined,
   },
 }));
 
@@ -90,6 +96,18 @@ describe('eurlex_document_resource', () => {
     const result = await eurlex_document_resource.handler(params, ctx);
 
     expect((result as Record<string, unknown>).in_force).toBe(false);
+  });
+
+  // --- #20: CELLAR serializes xsd:boolean as the lexical "1"/"0" ---
+
+  it('parses in_force from the xsd:boolean lexical "1"', async () => {
+    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    mockQuery.mockResolvedValue([makeMetaBinding({ celex: '32016R0679', inForce: '1' })]);
+
+    const params = eurlex_document_resource.params.parse({ celexNumber: '32016R0679' });
+    const result = await eurlex_document_resource.handler(params, ctx);
+
+    expect((result as Record<string, unknown>).in_force).toBe(true);
   });
 
   // --- Title traversal (issue #7) ---

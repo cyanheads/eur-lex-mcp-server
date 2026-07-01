@@ -53,13 +53,41 @@ export class CellarSparqlService {
   }
 
   /**
-   * Execute a raw SPARQL SELECT query. Prefixes are prepended automatically
-   * if not already present. LIMIT is injected/capped at `maxResults`.
+   * Execute a raw SPARQL SELECT query and return its binding rows. Prefixes are
+   * prepended automatically if not already present. LIMIT is injected/capped at
+   * `maxResults`.
    *
    * @param timeoutMs - Optional per-call client-side timeout in milliseconds.
    *   Falls back to the server-configured `sparqlQueryTimeoutMs` when omitted.
    */
   async query(rawQuery: string, ctx: Context, timeoutMs?: number): Promise<SparqlBinding[]> {
+    return (await this.execute(rawQuery, ctx, timeoutMs)).results.bindings;
+  }
+
+  /**
+   * Execute a raw SPARQL SELECT query and return the projected SELECT variables
+   * (`head.vars`) alongside the binding rows. Unlike deriving variable names
+   * from a binding's keys, the projection is reported even when the result set
+   * is empty — SPARQL 1.1 carries `head.vars` independent of binding count.
+   */
+  async queryWithVars(
+    rawQuery: string,
+    ctx: Context,
+    timeoutMs?: number,
+  ): Promise<{ variables: string[]; bindings: SparqlBinding[] }> {
+    const parsed = await this.execute(rawQuery, ctx, timeoutMs);
+    return { variables: parsed.head?.vars ?? [], bindings: parsed.results.bindings };
+  }
+
+  /**
+   * POST a SPARQL query to CELLAR and return the parsed SPARQL-results JSON
+   * envelope (`head` + `results`). Shared by `query` and `queryWithVars`.
+   */
+  private async execute(
+    rawQuery: string,
+    ctx: Context,
+    timeoutMs?: number,
+  ): Promise<SparqlResultsJson> {
     const effectiveTimeoutMs = timeoutMs ?? this.timeoutMs;
     const withPrefixes = rawQuery.includes('PREFIX cdm:') ? rawQuery : SPARQL_PREFIXES + rawQuery;
     const cappedQuery = enforceLimitInQuery(withPrefixes, this.maxResults);
@@ -109,9 +137,8 @@ export class CellarSparqlService {
           });
         }
 
-        let parsed: SparqlResultsJson;
         try {
-          parsed = JSON.parse(text) as SparqlResultsJson;
+          return JSON.parse(text) as SparqlResultsJson;
         } catch {
           if (/^\s*<(!DOCTYPE\s+html|html[\s>])/i.test(text)) {
             throw serviceUnavailable(
@@ -120,8 +147,6 @@ export class CellarSparqlService {
           }
           throw serviceUnavailable('Failed to parse CELLAR SPARQL response as JSON');
         }
-
-        return parsed.results.bindings;
       },
       {
         operation: 'CellarSparqlService.query',
@@ -134,6 +159,18 @@ export class CellarSparqlService {
   /** Extract a string value from a binding field, returning undefined if absent. */
   static bindingValue(binding: SparqlBinding | undefined, field: string): string | undefined {
     return binding?.[field]?.value;
+  }
+
+  /**
+   * Interpret a SPARQL `xsd:boolean` lexical value. Virtuoso serializes
+   * `xsd:boolean` as the lexicals `"1"` / `"0"` (not `"true"` / `"false"`) in
+   * SPARQL-JSON, so accept both forms. Returns `undefined` for an absent or
+   * unrecognized value rather than coercing it to a false negative.
+   */
+  static parseBoolean(lexical: string | undefined): boolean | undefined {
+    if (lexical === 'true' || lexical === '1') return true;
+    if (lexical === 'false' || lexical === '0') return false;
+    return;
   }
 }
 

@@ -9,28 +9,29 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_query_sparql } from '@/mcp-server/tools/definitions/eurlex-query-sparql.tool.js';
 
 // --- Service mock ---
-const mockQuery = vi.fn();
+// The tool reads the projected SELECT variables (head.vars) via queryWithVars,
+// which returns { variables, bindings } so the projection survives an empty set.
+const mockQueryWithVars = vi.fn();
 vi.mock('@/services/cellar-sparql/cellar-sparql-service.js', () => ({
-  getCellarSparqlService: () => ({ query: mockQuery }),
-  CellarSparqlService: {
-    bindingValue: (binding: Record<string, { value?: string }> | undefined, field: string) =>
-      binding?.[field]?.value,
-  },
+  getCellarSparqlService: () => ({ queryWithVars: mockQueryWithVars }),
 }));
 
 describe('eurlex_query_sparql', () => {
-  beforeEach(() => mockQuery.mockReset());
+  beforeEach(() => mockQueryWithVars.mockReset());
 
   // --- Happy paths ---
 
   it('returns bindings, variables, and total from a successful query', async () => {
     const ctx = createMockContext({ errors: eurlex_query_sparql.errors });
-    mockQuery.mockResolvedValue([
-      {
-        work: { type: 'uri', value: 'http://publications.europa.eu/resource/cellar/gdpr' },
-        celexNumber: { type: 'literal', value: '32016R0679' },
-      },
-    ]);
+    mockQueryWithVars.mockResolvedValue({
+      variables: ['work', 'celexNumber'],
+      bindings: [
+        {
+          work: { type: 'uri', value: 'http://publications.europa.eu/resource/cellar/gdpr' },
+          celexNumber: { type: 'literal', value: '32016R0679' },
+        },
+      ],
+    });
 
     const input = eurlex_query_sparql.input.parse({
       sparql_query:
@@ -39,50 +40,53 @@ describe('eurlex_query_sparql', () => {
     const result = await eurlex_query_sparql.handler(input, ctx);
 
     expect(result.total).toBe(1);
-    expect(result.variables).toContain('work');
-    expect(result.variables).toContain('celexNumber');
+    expect(result.variables).toEqual(['work', 'celexNumber']);
     expect(result.bindings).toHaveLength(1);
   });
 
-  it('returns empty bindings with empty variables when query returns no results', async () => {
+  // --- #23: projected variables survive an empty result set ---
+
+  it('reports the projected SELECT variables even when the result set is empty', async () => {
     const ctx = createMockContext({ errors: eurlex_query_sparql.errors });
-    mockQuery.mockResolvedValue([]);
+    // SPARQL 1.1 head.vars carries the projection regardless of binding count;
+    // the old Object.keys(bindings[0]) approach dropped it on zero rows.
+    mockQueryWithVars.mockResolvedValue({ variables: ['work', 'celex'], bindings: [] });
 
     const input = eurlex_query_sparql.input.parse({
       sparql_query:
-        'SELECT ?work WHERE { ?work cdm:resource_legal_id_celex "NONEXISTENT" . } LIMIT 1',
+        'SELECT ?work ?celex WHERE { ?work cdm:resource_legal_id_celex ?celex . FILTER(STR(?celex) = "NONEXISTENT") } LIMIT 5',
     });
     const result = await eurlex_query_sparql.handler(input, ctx);
 
     expect(result.total).toBe(0);
-    expect(result.variables).toHaveLength(0);
     expect(result.bindings).toHaveLength(0);
+    expect(result.variables).toEqual(['work', 'celex']);
   });
 
-  it('LIMIT is enforced at 100 — service layer applies cap', async () => {
-    // The service's enforceLimitInQuery is tested via the service mock;
-    // here we verify the handler passes the query through to the service unchanged
+  it('passes the query through to the service unchanged (service enforces LIMIT)', async () => {
     const ctx = createMockContext({ errors: eurlex_query_sparql.errors });
-    mockQuery.mockResolvedValue([]);
+    mockQueryWithVars.mockResolvedValue({ variables: [], bindings: [] });
 
     const rawQuery = 'SELECT ?work WHERE { ?work cdm:resource_legal_id_celex ?celex . } LIMIT 200';
     const input = eurlex_query_sparql.input.parse({ sparql_query: rawQuery });
     await eurlex_query_sparql.handler(input, ctx);
 
-    // Handler passes the query directly to service.query() — service enforces LIMIT.
     // Third arg is the per-call timeout: undefined here (no timeout_hint supplied).
-    expect(mockQuery).toHaveBeenCalledWith(rawQuery, expect.anything(), undefined);
+    expect(mockQueryWithVars).toHaveBeenCalledWith(rawQuery, expect.anything(), undefined);
   });
 
-  it('extracts variable names from first binding row', async () => {
+  it('surfaces the projected variables from the service in query order', async () => {
     const ctx = createMockContext({ errors: eurlex_query_sparql.errors });
-    mockQuery.mockResolvedValue([
-      {
-        work: { type: 'uri', value: 'http://publications.europa.eu/resource/cellar/gdpr' },
-        celex: { type: 'literal', value: '32016R0679' },
-        date: { type: 'literal', value: '2016-04-27' },
-      },
-    ]);
+    mockQueryWithVars.mockResolvedValue({
+      variables: ['work', 'celex', 'date'],
+      bindings: [
+        {
+          work: { type: 'uri', value: 'http://publications.europa.eu/resource/cellar/gdpr' },
+          celex: { type: 'literal', value: '32016R0679' },
+          date: { type: 'literal', value: '2016-04-27' },
+        },
+      ],
+    });
 
     const input = eurlex_query_sparql.input.parse({
       sparql_query:
@@ -107,7 +111,7 @@ describe('eurlex_query_sparql', () => {
         recovery: { hint: expect.stringContaining('SELECT') },
       },
     });
-    expect(mockQuery).not.toHaveBeenCalled();
+    expect(mockQueryWithVars).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -125,14 +129,17 @@ describe('eurlex_query_sparql', () => {
       code: JsonRpcErrorCode.ValidationError,
       data: { reason: 'not_read_only' },
     });
-    expect(mockQuery).not.toHaveBeenCalled();
+    expect(mockQueryWithVars).not.toHaveBeenCalled();
   });
 
   it('accepts a SELECT preceded by a leading comment and PREFIX declaration', async () => {
     const ctx = createMockContext({ errors: eurlex_query_sparql.errors });
-    mockQuery.mockResolvedValue([
-      { work: { type: 'uri', value: 'http://publications.europa.eu/resource/cellar/gdpr' } },
-    ]);
+    mockQueryWithVars.mockResolvedValue({
+      variables: ['work'],
+      bindings: [
+        { work: { type: 'uri', value: 'http://publications.europa.eu/resource/cellar/gdpr' } },
+      ],
+    });
 
     const query =
       '# resolve GDPR\nPREFIX cdm: <http://publications.europa.eu/ontology/cdm#>\nSELECT ?work WHERE { ?work cdm:resource_legal_id_celex ?celex . } LIMIT 1';
@@ -140,31 +147,31 @@ describe('eurlex_query_sparql', () => {
     const result = await eurlex_query_sparql.handler(input, ctx);
 
     expect(result.total).toBe(1);
-    expect(mockQuery).toHaveBeenCalledWith(query, expect.anything(), undefined);
+    expect(mockQueryWithVars).toHaveBeenCalledWith(query, expect.anything(), undefined);
   });
 
   // --- timeout_hint (#10): forwarded to the service as the per-call timeout ---
 
   it('forwards timeout_hint to the service as the per-call timeout', async () => {
     const ctx = createMockContext({ errors: eurlex_query_sparql.errors });
-    mockQuery.mockResolvedValue([]);
+    mockQueryWithVars.mockResolvedValue({ variables: [], bindings: [] });
 
     const query = 'SELECT ?work WHERE { ?work cdm:resource_legal_id_celex ?celex . } LIMIT 1';
     const input = eurlex_query_sparql.input.parse({ sparql_query: query, timeout_hint: 5000 });
     await eurlex_query_sparql.handler(input, ctx);
 
-    expect(mockQuery).toHaveBeenCalledWith(query, expect.anything(), 5000);
+    expect(mockQueryWithVars).toHaveBeenCalledWith(query, expect.anything(), 5000);
   });
 
   it('passes undefined as the per-call timeout when timeout_hint is absent', async () => {
     const ctx = createMockContext({ errors: eurlex_query_sparql.errors });
-    mockQuery.mockResolvedValue([]);
+    mockQueryWithVars.mockResolvedValue({ variables: [], bindings: [] });
 
     const query = 'SELECT ?work WHERE { ?work cdm:resource_legal_id_celex ?celex . } LIMIT 1';
     const input = eurlex_query_sparql.input.parse({ sparql_query: query });
     await eurlex_query_sparql.handler(input, ctx);
 
-    expect(mockQuery).toHaveBeenCalledWith(query, expect.anything(), undefined);
+    expect(mockQueryWithVars).toHaveBeenCalledWith(query, expect.anything(), undefined);
   });
 
   // --- Format ---

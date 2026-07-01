@@ -17,6 +17,12 @@ vi.mock('@/services/cellar-sparql/cellar-sparql-service.js', () => ({
   CellarSparqlService: {
     bindingValue: (binding: Record<string, { value?: string }> | undefined, field: string) =>
       binding?.[field]?.value,
+    parseBoolean: (lexical: string | undefined) =>
+      lexical === 'true' || lexical === '1'
+        ? true
+        : lexical === 'false' || lexical === '0'
+          ? false
+          : undefined,
   },
 }));
 
@@ -96,6 +102,38 @@ describe('eurlex_get_document', () => {
     expect(result.content_chars_returned).toBe('<html>GDPR full text</html>'.length);
     expect(result.content_offset).toBe(0);
     expect(result.has_more).toBe(false);
+  });
+
+  // --- #20: in_force parses CELLAR's xsd:boolean lexical "1"/"0" ---
+
+  it('parses in_force=true from the xsd:boolean lexical "1" and renders it', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_document.errors });
+    // CELLAR serializes cdm:resource_legal_in-force as the lexical "1", not "true".
+    mockSparqlQuery.mockResolvedValue([makeMetaBinding({ celex: '32016R0679', inForce: '1' })]);
+
+    const input = eurlex_get_document.input.parse({
+      celex_number: '32016R0679',
+      content_mode: 'metadata_only',
+    });
+    const result = await eurlex_get_document.handler(input, ctx);
+
+    expect(result.in_force).toBe(true);
+    // The markdown formatter renders the parsed boolean downstream.
+    const text = (eurlex_get_document.format!(result)[0] as { text: string }).text;
+    expect(text).toContain('**In Force:** true');
+  });
+
+  it('parses in_force=false from the xsd:boolean lexical "0"', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_document.errors });
+    mockSparqlQuery.mockResolvedValue([makeMetaBinding({ celex: '32014L0000', inForce: '0' })]);
+
+    const input = eurlex_get_document.input.parse({
+      celex_number: '32014L0000',
+      content_mode: 'metadata_only',
+    });
+    const result = await eurlex_get_document.handler(input, ctx);
+
+    expect(result.in_force).toBe(false);
   });
 
   it('aggregates legal_basis and eurovoc_subjects from multi-row result', async () => {

@@ -308,8 +308,9 @@ SELECT ?work ?celexNumber ?type ?date ?title ?inForce ?author ?legalBasis ?eurov
     const resourceType = CellarSparqlService.bindingValue(first, 'type');
     const date = CellarSparqlService.bindingValue(first, 'date');
     const title = CellarSparqlService.bindingValue(first, 'title');
-    const inForceStr = CellarSparqlService.bindingValue(first, 'inForce');
-    const inForce = inForceStr !== undefined ? inForceStr === 'true' : undefined;
+    const inForce = CellarSparqlService.parseBoolean(
+      CellarSparqlService.bindingValue(first, 'inForce'),
+    );
     const authorUri = CellarSparqlService.bindingValue(first, 'author');
 
     // Step 2: assemble metadata, then shape the body per content_mode. The body

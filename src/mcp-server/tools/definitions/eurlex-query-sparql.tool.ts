@@ -56,6 +56,7 @@ export const eurlex_query_sparql = tool('eurlex_query_sparql', {
     'Key predicates: cdm:resource_legal_id_celex (CELEX number), cdm:work_date_document (date), ' +
     'cdm:work_has_resource-type (document type), cdm:work_is_about_concept_eurovoc (EuroVoc subject), ' +
     'cdm:work_cites_work (citation). ' +
+    'CELEX is stored as an xsd:string-typed literal, so match it with FILTER(STR(?celex) = "…"); a plain FILTER(?celex = "…") matches nothing. ' +
     'For multi-word phrases, single-quote the term inside bif:contains (e.g. "\'data protection\'") to use the full-text index, or FILTER(CONTAINS(LCASE(?title), "keyword")) to scan.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
@@ -135,11 +136,15 @@ export const eurlex_query_sparql = tool('eurlex_query_sparql', {
 
     const svc = getCellarSparqlService();
 
-    const bindings = await svc.query(input.sparql_query, ctx, input.timeout_hint);
+    // queryWithVars exposes the projected SELECT variables (head.vars), so the
+    // result columns are reported even when no rows match — Object.keys on an
+    // empty bindings array would drop them.
+    const { variables, bindings } = await svc.queryWithVars(
+      input.sparql_query,
+      ctx,
+      input.timeout_hint,
+    );
     ctx.log.info('Raw SPARQL query executed', { resultCount: bindings.length });
-
-    // Extract variable names from first binding or return empty
-    const variables = bindings.length > 0 ? Object.keys(bindings[0]!) : [];
 
     return {
       bindings,

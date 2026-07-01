@@ -62,8 +62,10 @@ SELECT ?work ?celexNumber ?type ?date ?title ?inForce ?author WHERE {
     if (date) result.date = date;
     const title = CellarSparqlService.bindingValue(first, 'title');
     if (title) result.title = title;
-    const inForceStr = CellarSparqlService.bindingValue(first, 'inForce');
-    if (inForceStr !== undefined) result.in_force = inForceStr === 'true';
+    const inForce = CellarSparqlService.parseBoolean(
+      CellarSparqlService.bindingValue(first, 'inForce'),
+    );
+    if (inForce !== undefined) result.in_force = inForce;
     const author = CellarSparqlService.bindingValue(first, 'author');
     if (author) result.author_institution = author;
 
