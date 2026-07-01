@@ -57,7 +57,7 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
     found: z
       .boolean()
       .describe(
-        'Always true on success (the tool throws not_found when the identifier does not resolve). Present as a discriminator for downstream logic.',
+        'True when the identifier resolves to a CELLAR work; false when a well-formed CELEX/ELI matches no work in the corpus. A malformed or undetectable identifier raises ambiguous_identifier instead.',
       ),
     work_uri: z.string().optional().describe('CELLAR work URI (stable resource identifier).'),
     celex_number: z.string().optional().describe('Confirmed CELEX number for the resolved work.'),
@@ -71,13 +71,6 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
   }),
 
   errors: [
-    {
-      reason: 'not_found',
-      code: JsonRpcErrorCode.NotFound,
-      when: 'The identifier resolves to no CELLAR work — check the CELEX/ELI format and try again.',
-      recovery:
-        'Verify the CELEX or ELI format, or try eurlex_search_documents to find the work by keyword.',
-    },
     {
       reason: 'ambiguous_identifier',
       code: JsonRpcErrorCode.ValidationError,
@@ -133,9 +126,11 @@ SELECT ?work ?celexNumber ?type ?date WHERE {
     });
 
     if (!binding) {
-      throw ctx.fail('not_found', `No CELLAR work found for identifier: ${identifier}`, {
-        ...ctx.recoveryFor('not_found'),
-      });
+      // A well-formed identifier that resolves to no work is a clean negative,
+      // not an error — the documented "validate before fetch" role depends on a
+      // boolean here. Malformed/undetectable input already errored above with
+      // ambiguous_identifier.
+      return { found: false };
     }
 
     return {

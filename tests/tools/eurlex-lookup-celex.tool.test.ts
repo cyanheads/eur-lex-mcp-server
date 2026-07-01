@@ -175,20 +175,21 @@ describe('eurlex_lookup_celex', () => {
     ).toThrow();
   });
 
-  // --- Error contract: not_found ---
+  // --- #22: well-formed-but-nonexistent identifiers return found: false (no throw) ---
 
-  it('throws ctx.fail("not_found") when SPARQL returns no bindings', async () => {
+  it('returns found: false (no throw) when a well-formed CELEX resolves to no work', async () => {
     const ctx = createMockContext({ errors: eurlex_lookup_celex.errors });
     mockQuery.mockResolvedValue([]);
 
-    const input = eurlex_lookup_celex.input.parse({ identifier: '32099X0000' });
-    await expect(eurlex_lookup_celex.handler(input, ctx)).rejects.toMatchObject({
-      code: JsonRpcErrorCode.NotFound,
-      data: { reason: 'not_found' },
-    });
+    const input = eurlex_lookup_celex.input.parse({ identifier: '32016R9999' });
+    const result = await eurlex_lookup_celex.handler(input, ctx);
+
+    expect(result.found).toBe(false);
+    expect(result.work_uri).toBeUndefined();
+    expect(result.celex_number).toBeUndefined();
   });
 
-  it('throws ctx.fail("not_found") for an ELI that resolves to no work', async () => {
+  it('returns found: false for an ELI that resolves to no work', async () => {
     const ctx = createMockContext({ errors: eurlex_lookup_celex.errors });
     mockQuery.mockResolvedValue([]);
 
@@ -196,13 +197,11 @@ describe('eurlex_lookup_celex', () => {
       identifier: 'http://data.europa.eu/eli/reg/9999/99999/oj',
       identifier_type: 'eli',
     });
-    await expect(eurlex_lookup_celex.handler(input, ctx)).rejects.toMatchObject({
-      code: JsonRpcErrorCode.NotFound,
-      data: { reason: 'not_found' },
-    });
+    const result = await eurlex_lookup_celex.handler(input, ctx);
+    expect(result.found).toBe(false);
   });
 
-  it('does not retry a manifestation-suffixed ELI — never falls back to the original act', async () => {
+  it('does not retry a manifestation-suffixed ELI — found: false without a fallback query', async () => {
     const ctx = createMockContext({ errors: eurlex_lookup_celex.errors });
     mockQuery.mockResolvedValue([]);
 
@@ -212,15 +211,13 @@ describe('eurlex_lookup_celex', () => {
       identifier: 'http://data.europa.eu/eli/reg/2016/679/2018-05-25',
       identifier_type: 'eli',
     });
-    await expect(eurlex_lookup_celex.handler(input, ctx)).rejects.toMatchObject({
-      code: JsonRpcErrorCode.NotFound,
-      data: { reason: 'not_found' },
-    });
+    const result = await eurlex_lookup_celex.handler(input, ctx);
+    expect(result.found).toBe(false);
     // Single query — the /oj retry never fired for a manifestation-suffixed ELI.
     expect(mockQuery).toHaveBeenCalledTimes(1);
   });
 
-  it('still returns not_found when a bare work-level ELI has no matching act', async () => {
+  it('returns found: false when a bare work-level ELI has no matching act (after /oj retry)', async () => {
     const ctx = createMockContext({ errors: eurlex_lookup_celex.errors });
     mockQuery.mockResolvedValue([]);
 
@@ -228,10 +225,8 @@ describe('eurlex_lookup_celex', () => {
       identifier: 'http://data.europa.eu/eli/reg/9999/99999',
       identifier_type: 'eli',
     });
-    await expect(eurlex_lookup_celex.handler(input, ctx)).rejects.toMatchObject({
-      code: JsonRpcErrorCode.NotFound,
-      data: { reason: 'not_found' },
-    });
+    const result = await eurlex_lookup_celex.handler(input, ctx);
+    expect(result.found).toBe(false);
     // The /oj retry fired (bare work-level) but also missed — never fabricates a match.
     expect(mockQuery).toHaveBeenCalledTimes(2);
   });
@@ -259,5 +254,11 @@ describe('eurlex_lookup_celex', () => {
     const blocks = eurlex_lookup_celex.format!(output);
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('**Found:** true');
+  });
+
+  it('format renders found: false for a well-formed-but-nonexistent identifier', () => {
+    const blocks = eurlex_lookup_celex.format!({ found: false });
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).toContain('**Found:** false');
   });
 });
