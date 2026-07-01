@@ -203,11 +203,38 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
       }
     }
 
-    if (input.keyword && input.keyword.trim()) {
-      const kw = input.keyword.trim().toLowerCase().replace(/"/g, '\\"');
-      filters.push(
-        `FILTER(CONTAINS(LCASE(COALESCE(STR(?title), "")), "${kw}") || CONTAINS(LCASE(STR(?celexNumber)), "${kw}"))`,
-      );
+    /**
+     * Keyword match — title via the Virtuoso full-text index, CELEX by substring.
+     * The former `FILTER(CONTAINS(LCASE(?title), …))` scan forced the expression
+     * graph to be joined for every candidate work before the term was tested, so
+     * a broad keyword scanned every candidate title and risked the query timeout
+     * (issue #17). `bif:contains` drives the match straight off the full-text
+     * index — the same fix the author filter in eurlex_search_documents uses —
+     * resolving in well under a second. Exact-substring CELEX matching is
+     * preserved as a UNION arm; a UNION arm evaluates its FILTER over its own
+     * scope, so the CELEX triple is re-bound inside the arm (a bare FILTER on the
+     * outer ?celexNumber binds nothing there).
+     */
+    let keywordClause = '';
+    const keywordInput = input.keyword?.trim();
+    if (keywordInput) {
+      const celexTerm = keywordInput.toLowerCase().replace(/"/g, '\\"');
+      const ftPhrase = keywordInput
+        .replace(/[^\p{L}\p{N}\s]+/gu, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+      const celexArm = `?work cdm:resource_legal_id_celex ?kwCelex .
+    FILTER(CONTAINS(LCASE(STR(?kwCelex)), "${celexTerm}"))`;
+      keywordClause = ftPhrase
+        ? `{
+    ?kwExpr cdm:expression_title ?kwTitle .
+    ?kwTitle bif:contains "'${ftPhrase}'" .
+    ?kwExpr cdm:expression_uses_language <${ENG_LANGUAGE_URI}> .
+    ?kwExpr cdm:expression_belongs_to_work ?work .
+  } UNION {
+    ${celexArm}
+  }`
+        : celexArm;
     }
 
     if (input.court === 'CJEU') {
@@ -236,24 +263,38 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
       filters.push(`FILTER(?date <= "${input.date_to.trim()}"^^xsd:date)`);
     }
 
-    // Titles live on expressions, not works. Traverse the expression graph:
-    // ?expr cdm:expression_belongs_to_work ?work (inverse of cdm:work_has_expression)
-    // ?expr cdm:expression_uses_language <.../ENG>
-    // ?expr cdm:expression_title ?title
-    //
-    // GROUP BY ?work collapses each work to one row. A work can carry several
-    // cdm:work_has_resource-type values (corrigenda hold 2–3); without grouping these
-    // cross-product into duplicate rows that SELECT DISTINCT cannot merge (?type
-    // differs per row), and LIMIT/OFFSET would then page over raw rows rather than
-    // works. GROUP_CONCAT gathers every resource-type URI per work; SAMPLE picks the
-    // single-valued display fields. Aggregate aliases are renamed (?celex/?docDate/
-    // ?docTitle) because a projected AS-variable cannot reuse a name already in scope.
+    /**
+     * Titles live on expressions, not works — traverse the expression graph:
+     * ?expr cdm:expression_belongs_to_work ?work (inverse of cdm:work_has_expression),
+     * ?expr cdm:expression_uses_language <.../ENG>, ?expr cdm:expression_title ?title.
+     *
+     * GROUP BY ?celexNumber collapses each case to one row, handling two distinct
+     * CELLAR duplications at once:
+     *   1. A work carrying several cdm:work_has_resource-type values (corrigenda
+     *      hold 2–3) — GROUP_CONCAT gathers every type URI per case (issue #14).
+     *   2. Several distinct work URIs sharing one CELEX (e.g. a titled judgment
+     *      plus a do_not_index member work) — grouping by CELEX rather than ?work
+     *      merges them, so LIMIT N returns N distinct cases and `total` counts
+     *      cases rather than rows (issue #21).
+     * MAX(?title) keeps a bound title across the group, so a titled member's title
+     * survives over a bare duplicate's absent one; MAX(?titledWork) likewise prefers
+     * the work URI that carries a title — ?titledWork binds to ?work only inside the
+     * title OPTIONAL — and the handler falls back to SAMPLE(?work) when no work in the
+     * group is titled. ?docDate uses SAMPLE, NOT MAX: under ORDER BY DESC(?docDate) a
+     * MAX over the ordered column lets Virtuoso pick a date-index TOP-k plan that
+     * bypasses the date-range upper-bound FILTER whenever no selective graph pattern
+     * is present (a bare date/court/type search), returning the globally-latest cases
+     * instead of the in-range ones. Date is single-valued per CELEX, so SAMPLE shows
+     * the same value without triggering that plan.
+     */
     const sparql = `
-SELECT ?work
+SELECT
   (SAMPLE(?celexNumber) AS ?celex)
+  (MAX(?titledWork) AS ?titledWork)
+  (SAMPLE(?work) AS ?work)
   (GROUP_CONCAT(DISTINCT STR(?type); SEPARATOR=" ") AS ?types)
   (SAMPLE(?date) AS ?docDate)
-  (SAMPLE(?title) AS ?docTitle) WHERE {
+  (MAX(?title) AS ?docTitle) WHERE {
   ?work cdm:resource_legal_id_celex ?celexNumber .
   OPTIONAL { ?work cdm:work_has_resource-type ?type . }
   OPTIONAL { ?work cdm:work_date_document ?date . }
@@ -261,9 +302,11 @@ SELECT ?work
     ?expr cdm:expression_belongs_to_work ?work .
     ?expr cdm:expression_uses_language <${ENG_LANGUAGE_URI}> .
     ?expr cdm:expression_title ?title .
+    BIND(?work AS ?titledWork)
   }
+  ${keywordClause}
   ${filters.join('\n  ')}
-} GROUP BY ?work ORDER BY DESC(?docDate) LIMIT ${input.limit} OFFSET ${input.offset}`;
+} GROUP BY ?celexNumber ORDER BY DESC(?docDate) LIMIT ${input.limit} OFFSET ${input.offset}`;
 
     const queryEcho = {
       ...(input.case_number ? { case_number: input.case_number } : {}),
@@ -304,7 +347,10 @@ SELECT ?work
         date?: string;
         title?: string;
       } = {
-        work_uri: CellarSparqlService.bindingValue(b, 'work') ?? '',
+        work_uri:
+          CellarSparqlService.bindingValue(b, 'titledWork') ??
+          CellarSparqlService.bindingValue(b, 'work') ??
+          '',
         celex_number: CellarSparqlService.bindingValue(b, 'celex') ?? '',
       };
       const resourceType = resolveResourceTypeLabels(CellarSparqlService.bindingValue(b, 'types'));

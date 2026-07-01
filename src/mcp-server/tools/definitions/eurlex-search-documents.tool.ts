@@ -32,7 +32,7 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
     'Search EU legislation, treaties, and preparatory acts across the CELLAR corpus of 2.7M+ works. ' +
     'Filters by document type, date range, EuroVoc subject concept, author institution, and in-force status. ' +
     'Keyword search matches against English expression titles and CELEX strings — full-text body search is not available via this API. ' +
-    'For multi-word searches, supply a single dominant keyword; use other filters to narrow results. ' +
+    'Multi-word keywords are matched as a title phrase via the full-text index; use other filters to narrow results. ' +
     'Returns CELEX numbers, work URIs, human-readable document type labels, and dates — use these with eurlex_get_document to fetch full content. ' +
     'To filter by EuroVoc subject, first call eurlex_browse_subjects to obtain the concept URI. ' +
     'Case law (CJEU/GC judgments) is better searched via eurlex_get_cases which has court-specific parameters.',
@@ -42,7 +42,7 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
       .string()
       .optional()
       .describe(
-        'Keyword to match against document titles. Single dominant word recommended; multi-word phrase uses substring match.',
+        'Keyword matched against English document titles via the full-text index (multi-word input is treated as a phrase), or against CELEX substrings.',
       ),
     document_type: z
       .union([
@@ -194,12 +194,6 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
     const svc = getCellarSparqlService();
 
     const filters: string[] = [];
-    if (input.keyword && input.keyword.trim()) {
-      const kw = input.keyword.trim().toLowerCase().replace(/"/g, '\\"');
-      filters.push(
-        `FILTER(CONTAINS(LCASE(COALESCE(STR(?title), "")), "${kw}") || CONTAINS(LCASE(STR(?celexNumber)), "${kw}"))`,
-      );
-    }
     if (input.document_type) {
       const typeUri = DOCUMENT_TYPE_URIS[input.document_type];
       if (typeUri) {
@@ -256,27 +250,76 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
   FILTER(LANG(?agentLabel) = "en")`;
     }
 
+    /**
+     * Keyword match — title via the Virtuoso full-text index, CELEX by substring.
+     * The former `FILTER(CONTAINS(LCASE(?title), …))` scan forced the expression
+     * graph to be joined for every one of the 2.7M works before the term was
+     * tested, so a broad or lightly-filtered keyword scanned every candidate
+     * title and hit the query timeout (issue #17). `bif:contains` drives the
+     * match straight off the full-text index — the same fix the author filter
+     * uses — resolving in well under a second. Exact-substring CELEX matching is
+     * preserved as a UNION arm; a UNION arm evaluates its FILTER over its own
+     * scope, so the CELEX triple is re-bound inside the arm (a bare FILTER on the
+     * outer ?celexNumber binds nothing there). The term is sanitised for the
+     * full-text phrase the same way the author phrase is.
+     */
+    let keywordClause = '';
+    const keywordInput = input.keyword?.trim();
+    if (keywordInput) {
+      const celexTerm = keywordInput.toLowerCase().replace(/"/g, '\\"');
+      const ftPhrase = keywordInput
+        .replace(/[^\p{L}\p{N}\s]+/gu, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+      const celexArm = `?work cdm:resource_legal_id_celex ?kwCelex .
+    FILTER(CONTAINS(LCASE(STR(?kwCelex)), "${celexTerm}"))`;
+      keywordClause = ftPhrase
+        ? `{
+    ?kwExpr cdm:expression_title ?kwTitle .
+    ?kwTitle bif:contains "'${ftPhrase}'" .
+    ?kwExpr cdm:expression_uses_language <${ENG_LANGUAGE_URI}> .
+    ?kwExpr cdm:expression_belongs_to_work ?work .
+  } UNION {
+    ${celexArm}
+  }`
+        : celexArm;
+    }
+
     const inForceClause =
       input.in_force === true ? `OPTIONAL { ?work cdm:resource_legal_in-force ?inForce . }` : '';
 
-    // Titles live on expressions, not works. Traverse the expression graph:
-    // ?expr cdm:expression_belongs_to_work ?work  (inverse of cdm:work_has_expression)
-    // ?expr cdm:expression_uses_language <.../ENG>
-    // ?expr cdm:expression_title ?title
-    //
-    // GROUP BY ?work collapses each work to one row. A work can carry several
-    // cdm:work_has_resource-type values (corrigenda hold 2–3); without grouping these
-    // cross-product into duplicate rows that SELECT DISTINCT cannot merge (?type
-    // differs per row), and LIMIT/OFFSET would then page over raw rows rather than
-    // works. GROUP_CONCAT gathers every resource-type URI per work; SAMPLE picks the
-    // single-valued display fields. Aggregate aliases are renamed (?celex/?docDate/
-    // ?docTitle) because a projected AS-variable cannot reuse a name already in scope.
+    /**
+     * Titles live on expressions, not works — traverse the expression graph:
+     * ?expr cdm:expression_belongs_to_work ?work (inverse of cdm:work_has_expression),
+     * ?expr cdm:expression_uses_language <.../ENG>, ?expr cdm:expression_title ?title.
+     *
+     * GROUP BY ?celexNumber collapses each document to one row, handling two
+     * distinct CELLAR duplications at once:
+     *   1. A work carrying several cdm:work_has_resource-type values (corrigenda
+     *      hold 2–3) — GROUP_CONCAT gathers every type URI per document (issue #14).
+     *   2. Several distinct work URIs sharing one CELEX (e.g. a titled work plus a
+     *      do_not_index member work, or parallel manifestations) — grouping by
+     *      CELEX rather than ?work merges them, so LIMIT N returns N distinct
+     *      documents and each duplicate no longer wastes a result slot (issue #24).
+     * MAX(?title) keeps a bound title across the group, so a titled member's title
+     * survives over a bare duplicate's absent one; MAX(?titledWork) likewise prefers
+     * the work URI that carries a title — ?titledWork binds to ?work only inside the
+     * title OPTIONAL — and the handler falls back to SAMPLE(?work) when no work in the
+     * group is titled. ?docDate uses SAMPLE, NOT MAX: under ORDER BY DESC(?docDate) a
+     * MAX over the ordered column lets Virtuoso pick a date-index TOP-k plan that
+     * bypasses the date-range upper-bound FILTER whenever no selective graph pattern
+     * is present (a bare date/type search), returning the globally-latest documents
+     * instead of the in-range ones. Date is single-valued per CELEX, so SAMPLE shows
+     * the same value without triggering that plan.
+     */
     const sparql = `
-SELECT ?work
+SELECT
   (SAMPLE(?celexNumber) AS ?celex)
+  (MAX(?titledWork) AS ?titledWork)
+  (SAMPLE(?work) AS ?work)
   (GROUP_CONCAT(DISTINCT STR(?type); SEPARATOR=" ") AS ?types)
   (SAMPLE(?date) AS ?docDate)
-  (SAMPLE(?title) AS ?docTitle) WHERE {
+  (MAX(?title) AS ?docTitle) WHERE {
   ?work cdm:resource_legal_id_celex ?celexNumber .
   OPTIONAL { ?work cdm:work_has_resource-type ?type . }
   OPTIONAL { ?work cdm:work_date_document ?date . }
@@ -284,12 +327,14 @@ SELECT ?work
     ?expr cdm:expression_belongs_to_work ?work .
     ?expr cdm:expression_uses_language <${ENG_LANGUAGE_URI}> .
     ?expr cdm:expression_title ?title .
+    BIND(?work AS ?titledWork)
   }
   ${eurovocClause}
   ${authorClause}
+  ${keywordClause}
   ${inForceClause}
   ${filters.join('\n  ')}
-} GROUP BY ?work ORDER BY DESC(?docDate) LIMIT ${input.limit} OFFSET ${input.offset}`;
+} GROUP BY ?celexNumber ORDER BY DESC(?docDate) LIMIT ${input.limit} OFFSET ${input.offset}`;
 
     const queryEcho = {
       ...(input.keyword ? { keyword: input.keyword } : {}),
@@ -328,7 +373,10 @@ SELECT ?work
         date?: string;
         title?: string;
       } = {
-        work_uri: CellarSparqlService.bindingValue(b, 'work') ?? '',
+        work_uri:
+          CellarSparqlService.bindingValue(b, 'titledWork') ??
+          CellarSparqlService.bindingValue(b, 'work') ??
+          '',
         celex_number: CellarSparqlService.bindingValue(b, 'celex') ?? '',
       };
       const resourceType = resolveResourceTypeLabels(CellarSparqlService.bindingValue(b, 'types'));

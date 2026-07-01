@@ -26,7 +26,13 @@ vi.mock('@/services/cellar-sparql/cellar-sparql-service.js', () => ({
  */
 function makeCaseBinding(
   celex: string,
-  opts: { workUri?: string; types?: string; date?: string; title?: string } = {},
+  opts: {
+    workUri?: string;
+    titledWork?: string;
+    types?: string;
+    date?: string;
+    title?: string;
+  } = {},
 ): Record<string, { type: string; value: string }> {
   const b: Record<string, { type: string; value: string }> = {
     celex: { type: 'literal', value: celex },
@@ -35,6 +41,9 @@ function makeCaseBinding(
       value: opts.workUri ?? `http://publications.europa.eu/resource/cellar/${celex}`,
     },
   };
+  // Mirrors MAX(?titledWork): the work URI that carried an English title in the
+  // CELEX group. Present only when the case had a titled work (issue #21).
+  if (opts.titledWork) b.titledWork = { type: 'uri', value: opts.titledWork };
   if (opts.types) b.types = { type: 'literal', value: opts.types };
   if (opts.date) b.docDate = { type: 'literal', value: opts.date };
   if (opts.title) b.docTitle = { type: 'literal', value: opts.title };
@@ -190,9 +199,30 @@ describe('eurlex_get_cases', () => {
     });
   });
 
+  // --- Keyword full-text search (issue #17) ---
+
+  it('matches the keyword against the title via the full-text index, not a scan (issue #17)', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+    mockQuery.mockResolvedValue([
+      makeCaseBinding('62013CJ0131', { title: 'Google Spain SL v AEPD' }),
+    ]);
+
+    const input = eurlex_get_cases.input.parse({ keyword: 'google spain' });
+    await eurlex_get_cases.handler(input, ctx);
+
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    // Multi-word keyword single-quoted as a phrase for the Virtuoso FT index.
+    expect(sparql).toContain(`bif:contains "'google spain'"`);
+    expect(sparql).toContain('cdm:expression_title ?kwTitle');
+    // The old full-scan filter over every candidate title must be gone (#17).
+    expect(sparql).not.toContain('CONTAINS(LCASE(COALESCE(STR(?title)');
+    // CELEX substring matching is preserved as a UNION arm.
+    expect(sparql).toContain('cdm:resource_legal_id_celex ?kwCelex');
+  });
+
   // --- Dedup of multi-resource-type works (issue #14) ---
 
-  it('groups by work and concatenates resource-types instead of SELECT DISTINCT', async () => {
+  it('collapses resource-types via GROUP_CONCAT rather than SELECT DISTINCT (issue #14)', async () => {
     const ctx = createMockContext({ errors: eurlex_get_cases.errors });
     mockQuery.mockResolvedValue([makeCaseBinding('62013CJ0131')]);
 
@@ -200,7 +230,6 @@ describe('eurlex_get_cases', () => {
     await eurlex_get_cases.handler(input, ctx);
 
     const sparql = mockQuery.mock.calls[0]?.[0] as string;
-    expect(sparql).toContain('GROUP BY ?work');
     expect(sparql).toContain('GROUP_CONCAT(DISTINCT STR(?type)');
     expect(sparql).not.toContain('SELECT DISTINCT ?work ?celexNumber ?type');
   });
@@ -228,7 +257,7 @@ describe('eurlex_get_cases', () => {
     expect(result.cases[0]?.resource_type).toBe('CORRIGENDUM, Judgment');
   });
 
-  it('the limit bounds distinct works (cap applied after GROUP BY)', async () => {
+  it('the limit bounds distinct cases (cap applied after GROUP BY CELEX)', async () => {
     const ctx = createMockContext({ errors: eurlex_get_cases.errors });
     mockQuery.mockResolvedValue([
       makeCaseBinding('62013CJ0131R(01)', {
@@ -247,9 +276,79 @@ describe('eurlex_get_cases', () => {
     const result = await eurlex_get_cases.handler(input, ctx);
 
     const sparql = mockQuery.mock.calls[0]?.[0] as string;
-    expect(sparql).toMatch(/GROUP BY \?work[\s\S]*LIMIT 2/);
+    expect(sparql).toMatch(/GROUP BY \?celexNumber[\s\S]*LIMIT 2/);
     expect(result.total).toBe(2);
     expect(new Set(result.cases.map((c) => c.work_uri)).size).toBe(2);
+  });
+
+  // --- Dedup of same-CELEX duplicate works (issue #21) ---
+
+  it('groups by CELEX (not work) so N distinct cases fill a page of N (issue #21)', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+    mockQuery.mockResolvedValue([makeCaseBinding('62012CJ0131', { title: 'Google Spain' })]);
+
+    const input = eurlex_get_cases.input.parse({ case_number: 'C-131/12' });
+    await eurlex_get_cases.handler(input, ctx);
+
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    // Two distinct work URIs can share one CELEX (a titled judgment + a
+    // do_not_index member); grouping by ?work left both rows, so a page of N
+    // surfaced fewer than N cases. Grouping by CELEX collapses them.
+    expect(sparql).toContain('GROUP BY ?celexNumber');
+    expect(sparql).not.toContain('GROUP BY ?work');
+    // MAX keeps a bound title across the group; ?titledWork binds inside the title
+    // OPTIONAL so the titled work URI can be preferred.
+    expect(sparql).toContain('MAX(?title)');
+    expect(sparql).toContain('MAX(?titledWork)');
+    expect(sparql).toContain('BIND(?work AS ?titledWork)');
+    // ?docDate uses SAMPLE, not MAX: a MAX over the ORDER BY DESC(?docDate) column
+    // lets Virtuoso pick a date-index TOP-k plan that bypasses the date-range
+    // upper-bound FILTER on bare date/court/type searches (no selective graph
+    // pattern), surfacing globally-latest cases instead of in-range ones.
+    expect(sparql).toContain('SAMPLE(?date)');
+    expect(sparql).not.toContain('MAX(?date)');
+  });
+
+  it('keeps the titled work_uri over a bare same-CELEX duplicate (issue #21)', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+    // One CELEX, collapsed by GROUP BY: MAX(?titledWork) carries the titled work's
+    // URI while SAMPLE(?work) may be the bare do_not_index member. The handler must
+    // surface the titled URI and the recovered title.
+    mockQuery.mockResolvedValue([
+      makeCaseBinding('62012CJ0131', {
+        workUri: 'http://publications.europa.eu/resource/cellar/57f6959c-bare-member',
+        titledWork: 'http://publications.europa.eu/resource/cellar/09eb0861-titled-judgment',
+        title: 'Google Spain SL v AEPD',
+        types: 'http://publications.europa.eu/resource/authority/resource-type/JUDG',
+      }),
+    ]);
+
+    const input = eurlex_get_cases.input.parse({ case_number: 'C-131/12' });
+    const result = await eurlex_get_cases.handler(input, ctx);
+
+    expect(result.total).toBe(1);
+    expect(result.cases[0]?.work_uri).toBe(
+      'http://publications.europa.eu/resource/cellar/09eb0861-titled-judgment',
+    );
+    expect(result.cases[0]?.title).toBe('Google Spain SL v AEPD');
+  });
+
+  it('falls back to the sampled work_uri when no titled duplicate exists (issue #21)', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+    // An older case with no English title: MAX(?titledWork) is unbound (absent from
+    // the binding), so the handler uses SAMPLE(?work).
+    mockQuery.mockResolvedValue([
+      makeCaseBinding('61962CJ0025', {
+        workUri: 'http://publications.europa.eu/resource/cellar/old-untitled-case',
+      }),
+    ]);
+
+    const input = eurlex_get_cases.input.parse({ case_number: 'C-25/62' });
+    const result = await eurlex_get_cases.handler(input, ctx);
+
+    expect(result.cases[0]?.work_uri).toBe(
+      'http://publications.europa.eu/resource/cellar/old-untitled-case',
+    );
   });
 
   // --- Empty-string optional filters from form clients (issue #15) ---
