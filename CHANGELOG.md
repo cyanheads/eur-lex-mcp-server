@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.2](changelog/0.4.x/0.4.2.md) — 2026-06-30
+
+eurlex_search_documents and eurlex_get_cases now match keywords via the CELLAR full-text index instead of a corpus-wide title scan (broad queries no longer risk the query timeout), and collapse distinct works that share one CELEX so a page of N returns N distinct results
+
 ## [0.4.1](changelog/0.4.x/0.4.1.md) — 2026-06-30
 
 Four result-interpretation bug fixes: eurlex_get_relations amended_by/consolidated_version resolve (were zero-triple CDM predicates), eurlex_get_document in_force parses xsd:boolean 1/0, eurlex_lookup_celex returns found:false instead of throwing, eurlex_query_sparql reports SELECT variables on empty result sets
