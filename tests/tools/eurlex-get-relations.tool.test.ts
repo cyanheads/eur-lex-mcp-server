@@ -20,32 +20,60 @@ vi.mock('@/services/cellar-sparql/cellar-sparql-service.js', () => ({
 
 const GDPR_WORK_URI =
   'http://publications.europa.eu/resource/cellar/3e485e15-d3d0-11e5-8cd4-01aa75ed71a1';
-const AMENDED_BY_PREDICATE =
-  'http://publications.europa.eu/ontology/cdm#resource_legal_amended_by_resource_legal';
-const AMENDS_PREDICATE =
-  'http://publications.europa.eu/ontology/cdm#resource_legal_amends_resource_legal';
-const LEGAL_BASIS_PREDICATE =
-  'http://publications.europa.eu/ontology/cdm#resource_legal_based_on_resource_legal';
 
-function makeResolveBinding(workUri: string): Record<string, { type: string; value: string }> {
+type Row = Record<string, { type: string; value: string }>;
+
+function makeResolveBinding(workUri: string): Row {
   return { work: { type: 'uri', value: workUri } };
 }
 
+/**
+ * A relation row as the per-type query projects it: `?relatedWork ?relatedCelex
+ * ?direction` — no `?relationType` (the type is known from which query ran).
+ */
 function makeRelationBinding(opts: {
   relatedWork: string;
-  relationType: string;
-  direction: string;
+  direction: 'outgoing' | 'incoming';
   relatedCelex?: string;
-}): Record<string, { type: string; value: string }> {
-  const b: Record<string, { type: string; value: string }> = {
+}): Row {
+  const b: Row = {
     relatedWork: { type: 'uri', value: opts.relatedWork },
-    relationType: { type: 'uri', value: opts.relationType },
     direction: { type: 'literal', value: opts.direction },
   };
-  if (opts.relatedCelex) {
-    b.relatedCelex = { type: 'literal', value: opts.relatedCelex };
-  }
+  if (opts.relatedCelex) b.relatedCelex = { type: 'literal', value: opts.relatedCelex };
   return b;
+}
+
+/**
+ * Route a mocked `svc.query` call to the resolve step or a per-relation-type
+ * query by inspecting the query text. `amends` and `amended_by` share a
+ * predicate and differ only by direction, so distinguish them by which side of
+ * the triple binds the source work.
+ */
+function routeQuery(handlers: {
+  resolve?: Row[];
+  cites?: Row[];
+  amends?: Row[];
+  amendedBy?: Row[];
+  legalBasis?: Row[];
+  consolidated?: Row[];
+}) {
+  return async (q: string): Promise<Row[]> => {
+    // Tolerate any unrecognized call shape (e.g. a stray no-arg call from the
+    // test harness's async cleanup) — an unmatched query yields no rows.
+    if (typeof q !== 'string') return [];
+    if (q.includes('SELECT ?work WHERE')) return handlers.resolve ?? [];
+    if (q.includes('cdm:work_cites_work')) return handlers.cites ?? [];
+    if (q.includes('cdm:act_consolidated_consolidates_resource_legal'))
+      return handlers.consolidated ?? [];
+    if (q.includes('cdm:resource_legal_based_on_resource_legal')) return handlers.legalBasis ?? [];
+    if (q.includes('cdm:resource_legal_amends_resource_legal')) {
+      return q.includes('?relatedWork cdm:resource_legal_amends_resource_legal <')
+        ? (handlers.amendedBy ?? [])
+        : (handlers.amends ?? []);
+    }
+    return [];
+  };
 }
 
 describe('eurlex_get_relations', () => {
@@ -53,56 +81,251 @@ describe('eurlex_get_relations', () => {
 
   // --- Happy path ---
 
-  it('returns relations for a valid CELEX number', async () => {
+  it('returns relations across requested types with correct type and direction', async () => {
     const ctx = createMockContext({ errors: eurlex_get_relations.errors });
+    mockQuery.mockImplementation(
+      routeQuery({
+        resolve: [makeResolveBinding(GDPR_WORK_URI)],
+        amendedBy: [
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/amend-work',
+            direction: 'incoming',
+            relatedCelex: '32022R0000',
+          }),
+        ],
+        legalBasis: [
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/basis-work',
+            direction: 'outgoing',
+          }),
+        ],
+      }),
+    );
 
-    // First call: resolve CELEX → work URI
-    mockQuery
-      .mockResolvedValueOnce([makeResolveBinding(GDPR_WORK_URI)])
-      // Second call: fetch relations
-      .mockResolvedValueOnce([
-        makeRelationBinding({
-          relatedWork: 'http://publications.europa.eu/resource/cellar/amend-work',
-          relationType: AMENDED_BY_PREDICATE,
-          direction: 'incoming',
-          relatedCelex: '32022R0000',
-        }),
-        makeRelationBinding({
-          relatedWork: 'http://publications.europa.eu/resource/cellar/basis-work',
-          relationType: LEGAL_BASIS_PREDICATE,
-          direction: 'outgoing',
-        }),
-      ]);
-
-    const input = eurlex_get_relations.input.parse({ celex_number: '32016R0679' });
+    const input = eurlex_get_relations.input.parse({
+      celex_number: '32016R0679',
+      relation_types: ['amended_by', 'legal_basis'],
+    });
     const result = await eurlex_get_relations.handler(input, ctx);
 
     expect(result.celex_number).toBe('32016R0679');
     expect(result.work_uri).toBe(GDPR_WORK_URI);
     expect(result.total).toBe(2);
-    const amendedByRel = result.relations.find((r) => r.relation_type === 'amended_by');
-    expect(amendedByRel).toBeDefined();
-    expect(amendedByRel?.related_celex_number).toBe('32022R0000');
-    expect(amendedByRel?.direction).toBe('incoming');
+
+    const amendedBy = result.relations.find((r) => r.relation_type === 'amended_by');
+    expect(amendedBy?.direction).toBe('incoming');
+    expect(amendedBy?.related_celex_number).toBe('32022R0000');
+
+    const legalBasis = result.relations.find((r) => r.relation_type === 'legal_basis');
+    expect(legalBasis?.direction).toBe('outgoing');
   });
 
-  it('deduplicates identical relation bindings', async () => {
-    const ctx = createMockContext({ errors: eurlex_get_relations.errors });
-    mockQuery.mockResolvedValueOnce([makeResolveBinding(GDPR_WORK_URI)]).mockResolvedValueOnce([
-      makeRelationBinding({
-        relatedWork: 'http://publications.europa.eu/resource/cellar/some-work',
-        relationType: AMENDS_PREDICATE,
-        direction: 'outgoing',
-      }),
-      // Duplicate — same key
-      makeRelationBinding({
-        relatedWork: 'http://publications.europa.eu/resource/cellar/some-work',
-        relationType: AMENDS_PREDICATE,
-        direction: 'outgoing',
-      }),
-    ]);
+  // --- #19: amended_by is the INCOMING side of the amends predicate ---
 
-    const input = eurlex_get_relations.input.parse({ celex_number: '32016R0679' });
+  it('amended_by queries incoming cdm:resource_legal_amends_resource_legal, not the zero-triple predicate', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_relations.errors });
+    mockQuery.mockImplementation(
+      routeQuery({
+        resolve: [makeResolveBinding(GDPR_WORK_URI)],
+        amendedBy: [
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/amender',
+            direction: 'incoming',
+            relatedCelex: '32026R1165',
+          }),
+        ],
+      }),
+    );
+
+    const input = eurlex_get_relations.input.parse({
+      celex_number: '32012R0528',
+      relation_types: ['amended_by'],
+    });
+    const result = await eurlex_get_relations.handler(input, ctx);
+
+    expect(result.total).toBe(1);
+    expect(result.relations[0]?.relation_type).toBe('amended_by');
+    expect(result.relations[0]?.direction).toBe('incoming');
+    expect(result.relations[0]?.related_celex_number).toBe('32026R1165');
+
+    // The relation query binds the amender on the incoming side of the *amends*
+    // predicate — the dedicated amended_by predicate (zero triples) is gone.
+    const relSparql = mockQuery.mock.calls
+      .map((c) => c[0] as string)
+      .find((q) => !q.includes('SELECT ?work WHERE'))!;
+    expect(relSparql).toContain(
+      `?relatedWork cdm:resource_legal_amends_resource_legal <${GDPR_WORK_URI}>`,
+    );
+    expect(relSparql).not.toContain('cdm:resource_legal_amended_by_resource_legal');
+  });
+
+  it('amends is outgoing-only — incoming amenders no longer leak under the amends label', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_relations.errors });
+    mockQuery.mockImplementation(
+      routeQuery({
+        resolve: [makeResolveBinding(GDPR_WORK_URI)],
+        amends: [
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/amended-work',
+            direction: 'outgoing',
+            relatedCelex: '32007L0047',
+          }),
+        ],
+      }),
+    );
+
+    const input = eurlex_get_relations.input.parse({
+      celex_number: '32012R0528',
+      relation_types: ['amends'],
+    });
+    const result = await eurlex_get_relations.handler(input, ctx);
+
+    expect(result.total).toBe(1);
+    expect(result.relations.every((r) => r.direction === 'outgoing')).toBe(true);
+
+    const relSparql = mockQuery.mock.calls
+      .map((c) => c[0] as string)
+      .find((q) => !q.includes('SELECT ?work WHERE'))!;
+    expect(relSparql).toContain(
+      `<${GDPR_WORK_URI}> cdm:resource_legal_amends_resource_legal ?relatedWork`,
+    );
+    // Outgoing-only: no incoming UNION arm for amends.
+    expect(relSparql).not.toContain(
+      `?relatedWork cdm:resource_legal_amends_resource_legal <${GDPR_WORK_URI}>`,
+    );
+  });
+
+  // --- #19: consolidated_version is the INCOMING side of the consolidates predicate ---
+
+  it('consolidated_version queries incoming cdm:act_consolidated_consolidates_resource_legal', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_relations.errors });
+    mockQuery.mockImplementation(
+      routeQuery({
+        resolve: [makeResolveBinding(GDPR_WORK_URI)],
+        consolidated: [
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/consolidated',
+            direction: 'incoming',
+            relatedCelex: '02012R0528-20240611',
+          }),
+        ],
+      }),
+    );
+
+    const input = eurlex_get_relations.input.parse({
+      celex_number: '32012R0528',
+      relation_types: ['consolidated_version'],
+    });
+    const result = await eurlex_get_relations.handler(input, ctx);
+
+    expect(result.total).toBe(1);
+    expect(result.relations[0]?.relation_type).toBe('consolidated_version');
+    expect(result.relations[0]?.related_celex_number).toBe('02012R0528-20240611');
+
+    const relSparql = mockQuery.mock.calls
+      .map((c) => c[0] as string)
+      .find((q) => !q.includes('SELECT ?work WHERE'))!;
+    expect(relSparql).toContain(
+      `?relatedWork cdm:act_consolidated_consolidates_resource_legal <${GDPR_WORK_URI}>`,
+    );
+    expect(relSparql).not.toContain('cdm:resource_legal_has_consolidated_version');
+  });
+
+  it('cites traverses both directions (citation graph is symmetric)', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_relations.errors });
+    mockQuery.mockImplementation(
+      routeQuery({
+        resolve: [makeResolveBinding(GDPR_WORK_URI)],
+        cites: [
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/cited',
+            direction: 'outgoing',
+          }),
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/citer',
+            direction: 'incoming',
+          }),
+        ],
+      }),
+    );
+
+    const input = eurlex_get_relations.input.parse({
+      celex_number: '32016R0679',
+      relation_types: ['cites'],
+    });
+    const result = await eurlex_get_relations.handler(input, ctx);
+
+    expect(result.total).toBe(2);
+    const directions = new Set(result.relations.map((r) => r.direction));
+    expect(directions).toEqual(new Set(['outgoing', 'incoming']));
+
+    const relSparql = mockQuery.mock.calls
+      .map((c) => c[0] as string)
+      .find((q) => !q.includes('SELECT ?work WHERE'))!;
+    expect(relSparql).toContain(`<${GDPR_WORK_URI}> cdm:work_cites_work ?relatedWork`);
+    expect(relSparql).toContain(`?relatedWork cdm:work_cites_work <${GDPR_WORK_URI}>`);
+  });
+
+  // --- #19: per-type queries so high-volume types don't starve rarer ones ---
+
+  it('queries each requested type independently so a dense type cannot starve a sparse one', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_relations.errors });
+    const manyCites = Array.from({ length: 100 }, (_, i) =>
+      makeRelationBinding({
+        relatedWork: `http://publications.europa.eu/resource/cellar/cited-${i}`,
+        direction: 'incoming',
+      }),
+    );
+    mockQuery.mockImplementation(
+      routeQuery({
+        resolve: [makeResolveBinding(GDPR_WORK_URI)],
+        cites: manyCites,
+        legalBasis: [
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/tfeu-16',
+            direction: 'outgoing',
+            relatedCelex: '12016E016',
+          }),
+        ],
+      }),
+    );
+
+    const input = eurlex_get_relations.input.parse({
+      celex_number: '32016R0679',
+      relation_types: ['cites', 'legal_basis'],
+    });
+    const result = await eurlex_get_relations.handler(input, ctx);
+
+    // The single legal_basis row survives alongside 100 cites — separate caps.
+    expect(result.relations.some((r) => r.relation_type === 'legal_basis')).toBe(true);
+    expect(result.relations.filter((r) => r.relation_type === 'cites')).toHaveLength(100);
+
+    // Resolve + one query per requested type (no shared UNION).
+    expect(mockQuery).toHaveBeenCalledTimes(3);
+  });
+
+  it('deduplicates identical relation rows within a type', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_relations.errors });
+    mockQuery.mockImplementation(
+      routeQuery({
+        resolve: [makeResolveBinding(GDPR_WORK_URI)],
+        amends: [
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/some-work',
+            direction: 'outgoing',
+          }),
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/some-work',
+            direction: 'outgoing',
+          }),
+        ],
+      }),
+    );
+
+    const input = eurlex_get_relations.input.parse({
+      celex_number: '32016R0679',
+      relation_types: ['amends'],
+    });
     const result = await eurlex_get_relations.handler(input, ctx);
 
     expect(result.total).toBe(1);
@@ -110,13 +333,17 @@ describe('eurlex_get_relations', () => {
 
   it('filters to requested relation_types only', async () => {
     const ctx = createMockContext({ errors: eurlex_get_relations.errors });
-    mockQuery.mockResolvedValueOnce([makeResolveBinding(GDPR_WORK_URI)]).mockResolvedValueOnce([
-      makeRelationBinding({
-        relatedWork: 'http://publications.europa.eu/resource/cellar/lb-work',
-        relationType: LEGAL_BASIS_PREDICATE,
-        direction: 'outgoing',
+    mockQuery.mockImplementation(
+      routeQuery({
+        resolve: [makeResolveBinding(GDPR_WORK_URI)],
+        legalBasis: [
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/lb-work',
+            direction: 'outgoing',
+          }),
+        ],
       }),
-    ]);
+    );
 
     const input = eurlex_get_relations.input.parse({
       celex_number: '32016R0679',
@@ -124,39 +351,47 @@ describe('eurlex_get_relations', () => {
     });
     await eurlex_get_relations.handler(input, ctx);
 
-    // The second SPARQL call should only include the legal_basis predicate
-    const relSparql = mockQuery.mock.calls[1]?.[0] as string;
-    expect(relSparql).toContain('cdm:resource_legal_based_on_resource_legal');
-    expect(relSparql).not.toContain('cdm:work_cites_work');
+    // Only the legal_basis predicate is queried — no cites, no amends.
+    const relCalls = mockQuery.mock.calls
+      .map((c) => c[0] as string)
+      .filter((q) => !q.includes('SELECT ?work WHERE'));
+    expect(relCalls).toHaveLength(1);
+    expect(relCalls[0]).toContain('cdm:resource_legal_based_on_resource_legal');
+    expect(relCalls[0]).not.toContain('cdm:work_cites_work');
   });
 
   // --- work_uri alternative (issue #8) ---
 
   it('uses work_uri directly and skips the CELEX→work resolution', async () => {
     const ctx = createMockContext({ errors: eurlex_get_relations.errors });
-    // Only ONE query — the relation traversal. No resolve step when work_uri is supplied.
-    mockQuery.mockResolvedValueOnce([
-      makeRelationBinding({
-        relatedWork: 'http://publications.europa.eu/resource/cellar/amend-work',
-        relationType: AMENDED_BY_PREDICATE,
-        direction: 'incoming',
-        relatedCelex: '32022R0000',
+    mockQuery.mockImplementation(
+      routeQuery({
+        amendedBy: [
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/amend-work',
+            direction: 'incoming',
+            relatedCelex: '32022R0000',
+          }),
+        ],
       }),
-    ]);
+    );
 
-    const input = eurlex_get_relations.input.parse({ work_uri: GDPR_WORK_URI });
+    const input = eurlex_get_relations.input.parse({
+      work_uri: GDPR_WORK_URI,
+      relation_types: ['amended_by'],
+    });
     const result = await eurlex_get_relations.handler(input, ctx);
 
     expect(result.work_uri).toBe(GDPR_WORK_URI);
-    // No source CELEX is known when addressed directly by work_uri.
     expect(result.celex_number).toBeUndefined();
     expect(result.total).toBe(1);
     expect(result.relations[0]?.relation_type).toBe('amended_by');
 
-    // Single query: the traversal binds <work_uri> directly — the CELEX resolve never fired.
+    // Single query: the per-type traversal binds <work_uri> directly — no resolve.
     expect(mockQuery).toHaveBeenCalledTimes(1);
     const relSparql = mockQuery.mock.calls[0]?.[0] as string;
     expect(relSparql).toContain(`<${GDPR_WORK_URI}>`);
+    expect(relSparql).not.toContain('SELECT ?work WHERE');
   });
 
   // --- Input guard: exactly one identifier (issue #8) ---
@@ -186,24 +421,30 @@ describe('eurlex_get_relations', () => {
 
   it('treats work_uri:"" as absent and routes to celex_number path (form-client regression)', async () => {
     const ctx = createMockContext({ errors: eurlex_get_relations.errors });
-    // Two queries: resolve CELEX → work URI, then fetch relations.
-    mockQuery.mockResolvedValueOnce([makeResolveBinding(GDPR_WORK_URI)]).mockResolvedValueOnce([
-      makeRelationBinding({
-        relatedWork: 'http://publications.europa.eu/resource/cellar/amend-work',
-        relationType: AMENDED_BY_PREDICATE,
-        direction: 'incoming',
-        relatedCelex: '32022R0000',
+    mockQuery.mockImplementation(
+      routeQuery({
+        resolve: [makeResolveBinding(GDPR_WORK_URI)],
+        amendedBy: [
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/amend-work',
+            direction: 'incoming',
+            relatedCelex: '32022R0000',
+          }),
+        ],
       }),
-    ]);
+    );
 
-    // Form clients send "" for an omitted optional field — schema must accept it without -32602.
-    const input = eurlex_get_relations.input.parse({ celex_number: '32016R0679', work_uri: '' });
+    const input = eurlex_get_relations.input.parse({
+      celex_number: '32016R0679',
+      work_uri: '',
+      relation_types: ['amended_by'],
+    });
     const result = await eurlex_get_relations.handler(input, ctx);
 
     expect(result.celex_number).toBe('32016R0679');
     expect(result.work_uri).toBe(GDPR_WORK_URI);
     expect(result.total).toBe(1);
-    // CELEX resolve fired — work_uri:"" was treated as absent, not as the work_uri path.
+    // CELEX resolve fired (call 0) + one relation query — work_uri:"" treated as absent.
     expect(mockQuery).toHaveBeenCalledTimes(2);
   });
 
@@ -211,8 +452,7 @@ describe('eurlex_get_relations', () => {
 
   it('throws ctx.fail("not_found") when CELEX resolves to no work URI', async () => {
     const ctx = createMockContext({ errors: eurlex_get_relations.errors });
-    // Resolve step returns empty
-    mockQuery.mockResolvedValueOnce([]);
+    mockQuery.mockImplementation(routeQuery({ resolve: [] }));
 
     const input = eurlex_get_relations.input.parse({ celex_number: '99999X0000' });
     await expect(eurlex_get_relations.handler(input, ctx)).rejects.toMatchObject({
@@ -223,9 +463,10 @@ describe('eurlex_get_relations', () => {
 
   // --- Error contract: no_relations ---
 
-  it('throws ctx.fail("no_relations") when relation query returns empty bindings', async () => {
+  it('throws ctx.fail("no_relations") when every relation query returns empty', async () => {
     const ctx = createMockContext({ errors: eurlex_get_relations.errors });
-    mockQuery.mockResolvedValueOnce([makeResolveBinding(GDPR_WORK_URI)]).mockResolvedValueOnce([]); // No relations
+    // resolve succeeds; all per-type queries return [].
+    mockQuery.mockImplementation(routeQuery({ resolve: [makeResolveBinding(GDPR_WORK_URI)] }));
 
     const input = eurlex_get_relations.input.parse({ celex_number: '32016R0679' });
     await expect(eurlex_get_relations.handler(input, ctx)).rejects.toMatchObject({

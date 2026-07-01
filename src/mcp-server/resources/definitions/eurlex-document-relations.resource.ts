@@ -9,26 +9,14 @@ import {
   CellarSparqlService,
   getCellarSparqlService,
 } from '@/services/cellar-sparql/cellar-sparql-service.js';
+import { RELATION_TYPES, traverseRelations } from '@/services/cellar-sparql/relation-traversal.js';
 
-/** CDM relation predicates for the summary resource. */
-const RELATION_PREDICATES = [
-  'cdm:work_cites_work',
-  'cdm:resource_legal_amends_resource_legal',
-  'cdm:resource_legal_amended_by_resource_legal',
-  'cdm:resource_legal_based_on_resource_legal',
-  'cdm:resource_legal_has_consolidated_version',
-];
-
-const PREDICATE_TO_TYPE: Record<string, string> = {
-  'http://publications.europa.eu/ontology/cdm#work_cites_work': 'cites',
-  'http://publications.europa.eu/ontology/cdm#resource_legal_amends_resource_legal': 'amends',
-  'http://publications.europa.eu/ontology/cdm#resource_legal_amended_by_resource_legal':
-    'amended_by',
-  'http://publications.europa.eu/ontology/cdm#resource_legal_based_on_resource_legal':
-    'legal_basis',
-  'http://publications.europa.eu/ontology/cdm#resource_legal_has_consolidated_version':
-    'consolidated_version',
-};
+/**
+ * Per-type relation cap for the summary resource — lighter than the
+ * eurlex_get_relations tool's default. This resource is injectable context, not
+ * an exhaustive traversal.
+ */
+const SUMMARY_PER_TYPE_LIMIT = 25;
 
 export const eurlex_document_relations_resource = resource(
   'eurlex://document/{celexNumber}/relations',
@@ -63,49 +51,22 @@ SELECT ?work WHERE {
 
       const workUri = CellarSparqlService.bindingValue(resolveBindings[0], 'work') ?? '';
 
-      // Fetch relations
-      const relSparql = `
-SELECT ?relatedWork ?relatedCelex ?relationType ?direction WHERE {
-  {
-    <${workUri}> ?relationType ?relatedWork .
-    OPTIONAL { ?relatedWork cdm:resource_legal_id_celex ?relatedCelex . }
-    BIND("outgoing" AS ?direction)
-    FILTER(?relationType IN (${RELATION_PREDICATES.join(', ')}))
-  } UNION {
-    ?relatedWork ?relationType <${workUri}> .
-    OPTIONAL { ?relatedWork cdm:resource_legal_id_celex ?relatedCelex . }
-    BIND("incoming" AS ?direction)
-    FILTER(?relationType IN (${RELATION_PREDICATES.join(', ')}))
-  }
-} LIMIT 50`;
-
-      const relBindings = await svc.query(relSparql, ctx);
-
-      const relations: Array<{
-        relation_type: string;
-        direction: string;
-        related_work_uri: string;
-        related_celex_number?: string;
-      }> = [];
-      const seen = new Set<string>();
-
-      for (const b of relBindings) {
-        const relatedWorkUri = CellarSparqlService.bindingValue(b, 'relatedWork') ?? '';
-        const predicateUri = CellarSparqlService.bindingValue(b, 'relationType') ?? '';
-        const direction = CellarSparqlService.bindingValue(b, 'direction') ?? 'outgoing';
-        const key = `${predicateUri}|${relatedWorkUri}|${direction}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-
-        const entry: (typeof relations)[number] = {
-          relation_type: PREDICATE_TO_TYPE[predicateUri] ?? predicateUri,
-          direction,
-          related_work_uri: relatedWorkUri,
-        };
-        const relatedCelex = CellarSparqlService.bindingValue(b, 'relatedCelex');
-        if (relatedCelex) entry.related_celex_number = relatedCelex;
-        relations.push(entry);
-      }
+      // Summarize all relation types via the shared traversal — one query per
+      // type so amendment and consolidation relations (modeled one-directionally
+      // in CELLAR) actually surface. See relation-traversal.ts.
+      const workRelations = await traverseRelations(
+        svc,
+        workUri,
+        RELATION_TYPES,
+        ctx,
+        SUMMARY_PER_TYPE_LIMIT,
+      );
+      const relations = workRelations.map((r) => ({
+        relation_type: r.relationType,
+        direction: r.direction,
+        related_work_uri: r.relatedWorkUri,
+        ...(r.relatedCelexNumber ? { related_celex_number: r.relatedCelexNumber } : {}),
+      }));
 
       return {
         celex_number: celexNumber,

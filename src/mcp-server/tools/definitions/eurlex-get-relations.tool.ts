@@ -10,37 +10,21 @@ import {
   getCellarSparqlService,
 } from '@/services/cellar-sparql/cellar-sparql-service.js';
 import { escapeSparqlLiteral } from '@/services/cellar-sparql/eli-resolution.js';
-
-/** CDM relation predicates traversed by this tool. */
-const CDM_RELATIONS: Record<string, string> = {
-  cites: 'cdm:work_cites_work',
-  amends: 'cdm:resource_legal_amends_resource_legal',
-  amended_by: 'cdm:resource_legal_amended_by_resource_legal',
-  legal_basis: 'cdm:resource_legal_based_on_resource_legal',
-  consolidated_version: 'cdm:resource_legal_has_consolidated_version',
-};
-
-/** Map predicate URI to human-readable relation type name. */
-const PREDICATE_TO_TYPE: Record<string, string> = {
-  'http://publications.europa.eu/ontology/cdm#work_cites_work': 'cites',
-  'http://publications.europa.eu/ontology/cdm#resource_legal_amends_resource_legal': 'amends',
-  'http://publications.europa.eu/ontology/cdm#resource_legal_amended_by_resource_legal':
-    'amended_by',
-  'http://publications.europa.eu/ontology/cdm#resource_legal_based_on_resource_legal':
-    'legal_basis',
-  'http://publications.europa.eu/ontology/cdm#resource_legal_has_consolidated_version':
-    'consolidated_version',
-};
+import {
+  RELATION_TYPES,
+  type RelationType,
+  traverseRelations,
+} from '@/services/cellar-sparql/relation-traversal.js';
 
 export const eurlex_get_relations = tool('eurlex_get_relations', {
   title: 'Get CELLAR Relationship Graph',
   description:
     'Traverse the CELLAR CDM relationship graph for an EU work: ' +
-    'what it amends, what amends it, its current consolidated version, its legal basis, and works that cite it. ' +
+    'what it amends, what amends it, its consolidated versions, its legal basis, and works that cite it. ' +
     "This is CELLAR's primary value over HTML scraping — the graph traversal that exposes the lifecycle and dependencies of an EU act. " +
     'Returns one-hop direct relations only. For deeper traversal, use eurlex_query_sparql. ' +
-    'The "consolidated_version" relation links to the current consolidated text (a separate CELEX-numbered work); ' +
-    'fetch that work with eurlex_get_document. ' +
+    'The "consolidated_version" relation links to the consolidated texts of the act (each a separate CELEX-numbered work); ' +
+    'fetch one with eurlex_get_document. ' +
     'Requires a valid CELEX number or CELLAR work URI — use eurlex_lookup_celex to resolve identifiers first.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
@@ -75,7 +59,7 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
       .describe(
         'Subset of relation types to return. Omit to return all types: ' +
           'cites (citation graph), amends (what this work amends), amended_by (what amends this work), ' +
-          'legal_basis (treaty/treaty article this act is based on), consolidated_version (current consolidated text).',
+          'legal_basis (treaty/treaty article this act is based on), consolidated_version (consolidated versions of this act).',
       ),
   }),
   output: z.object({
@@ -176,48 +160,19 @@ SELECT ?work WHERE {
       );
     }
 
-    // Step 2: Build relation type filter
-    const requestedTypes = input.relation_types ?? [
-      'cites',
-      'amends',
-      'amended_by',
-      'legal_basis',
-      'consolidated_version',
-    ];
-    const predicates = requestedTypes.map((t) => CDM_RELATIONS[t]).filter(Boolean);
-
-    if (predicates.length === 0) {
-      throw ctx.fail('no_relations', `No valid relation types requested.`, {
-        ...ctx.recoveryFor('no_relations'),
-      });
-    }
-
-    // Step 3: Traverse relation graph (outgoing and incoming)
-    const relationSparql = `
-SELECT ?relatedWork ?relatedCelex ?relationType ?direction WHERE {
-  {
-    # Outgoing: this work → related work
-    <${workUri}> ?relationType ?relatedWork .
-    OPTIONAL { ?relatedWork cdm:resource_legal_id_celex ?relatedCelex . }
-    BIND("outgoing" AS ?direction)
-    FILTER(?relationType IN (${predicates.join(', ')}))
-  } UNION {
-    # Incoming: related work → this work
-    ?relatedWork ?relationType <${workUri}> .
-    OPTIONAL { ?relatedWork cdm:resource_legal_id_celex ?relatedCelex . }
-    BIND("incoming" AS ?direction)
-    FILTER(?relationType IN (${predicates.join(', ')}))
-  }
-} LIMIT 100`;
-
-    const relationBindings = await svc.query(relationSparql, ctx);
+    // Step 2: Traverse the requested relation types. Each type is resolved
+    // through its own query (with its own LIMIT), run concurrently, so a
+    // high-volume type (e.g. cites) can't starve the rarer ones under a shared
+    // cap. The predicate + direction model lives in relation-traversal.ts.
+    const requestedTypes: readonly RelationType[] = input.relation_types ?? RELATION_TYPES;
+    const workRelations = await traverseRelations(svc, workUri, requestedTypes, ctx);
     ctx.log.info('Relation traversal', {
       celexNumber,
       workUri,
-      resultCount: relationBindings.length,
+      resultCount: workRelations.length,
     });
 
-    if (relationBindings.length === 0) {
+    if (workRelations.length === 0) {
       throw ctx.fail(
         'no_relations',
         `Work ${celexNumber ?? workUri} has no CDM relations of the requested types.`,
@@ -227,35 +182,12 @@ SELECT ?relatedWork ?relatedCelex ?relationType ?direction WHERE {
       );
     }
 
-    // Deduplicate relations
-    const seen = new Set<string>();
-    const relations: Array<{
-      relation_type: string;
-      direction: string;
-      related_work_uri: string;
-      related_celex_number?: string;
-    }> = [];
-
-    for (const b of relationBindings) {
-      const relatedWorkUri = CellarSparqlService.bindingValue(b, 'relatedWork') ?? '';
-      const predicateUri = CellarSparqlService.bindingValue(b, 'relationType') ?? '';
-      const direction = CellarSparqlService.bindingValue(b, 'direction') ?? 'outgoing';
-      const key = `${predicateUri}|${relatedWorkUri}|${direction}`;
-
-      if (seen.has(key)) continue;
-      seen.add(key);
-
-      const relationType = PREDICATE_TO_TYPE[predicateUri] ?? predicateUri;
-      const relatedCelex = CellarSparqlService.bindingValue(b, 'relatedCelex');
-
-      const entry: (typeof relations)[number] = {
-        relation_type: relationType,
-        direction,
-        related_work_uri: relatedWorkUri,
-      };
-      if (relatedCelex) entry.related_celex_number = relatedCelex;
-      relations.push(entry);
-    }
+    const relations = workRelations.map((r) => ({
+      relation_type: r.relationType,
+      direction: r.direction,
+      related_work_uri: r.relatedWorkUri,
+      ...(r.relatedCelexNumber ? { related_celex_number: r.relatedCelexNumber } : {}),
+    }));
 
     return {
       ...(celexNumber ? { celex_number: celexNumber } : {}),
