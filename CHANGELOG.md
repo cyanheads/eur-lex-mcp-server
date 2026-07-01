@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.1](changelog/0.4.x/0.4.1.md) — 2026-06-30
+
+Four result-interpretation bug fixes: eurlex_get_relations amended_by/consolidated_version resolve (were zero-triple CDM predicates), eurlex_get_document in_force parses xsd:boolean 1/0, eurlex_lookup_celex returns found:false instead of throwing, eurlex_query_sparql reports SELECT variables on empty result sets
+
 ## [0.4.0](changelog/0.4.x/0.4.0.md) — 2026-06-30 · 🛡️ Security
 
 eurlex_get_document adds an opt-in markdown format — server-side HTML→Markdown of the act body with GFM data tables — and bumps @cyanheads/mcp-ts-core to ^0.10.10, refreshing the lockfile to clear transitive advisories in hono, js-yaml, and esbuild
