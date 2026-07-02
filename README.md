@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.4.2-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/eur-lex-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/eur-lex-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/eur-lex-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.11-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.5.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/eur-lex-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/eur-lex-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/eur-lex-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.11-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -63,6 +63,7 @@ Fetch the notice and full text of an EU legal act.
 - Returns structured metadata: title, date, document type, author institution, legal basis, EuroVoc subjects, in-force flag
 - Full text in HTML (default), Markdown, or Formex4 XML — `format: "markdown"` converts the act body to clean Markdown server-side (recitals and numbered points as readable text, genuine data tables as GFM)
 - Content shaping for large acts: `content_mode` `"paged"` (default) returns a bounded character window (`offset` + `limit`) with `content_chars_total` and `has_more` so you can page to the end; `"full"` returns the whole body in one call; `"metadata_only"` skips the body
+- Navigate structure instead of raw offsets: `outline: true` returns the act's chapters, articles, annexes, and recitals as a heading list (each with its character offset), and `select` (e.g. `{ articles: "1,5,17" }`) returns just those sections' text — degrading cleanly to the paging floor for acts with no detectable structure (e.g. case law)
 - Supports all 24 official EU languages; defaults to English with automatic fallback when a translation is unavailable
 - Older acts and some CJEU judgments may lack English translations
 

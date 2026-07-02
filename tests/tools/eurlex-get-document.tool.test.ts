@@ -591,4 +591,242 @@ describe('eurlex_get_document', () => {
     expect(text).toContain(body); // full body present, uncut
     expect(text).toContain('full body');
   });
+
+  // --- Outline mode and structural selectors (issue #12) ---
+
+  describe('outline mode and structural selectors', () => {
+    // A structured body: one chapter with two articles. Each heading on its own
+    // line, mirroring the CELLAR layout confirmed live against GDPR.
+    const STRUCTURED_BODY = [
+      '<p class="oj-ti-grseq">CHAPTER I</p>',
+      '<p class="oj-ti-grseq">General provisions</p>',
+      '<p class="oj-ti-art">Article 1</p>',
+      '<p class="oj-sti-art">Subject-matter</p>',
+      '<p class="oj-normal">This Regulation lays down rules.</p>',
+      '<p class="oj-ti-art">Article 2</p>',
+      '<p class="oj-sti-art">Scope</p>',
+      '<p class="oj-normal">This Regulation applies broadly.</p>',
+    ].join('\n');
+    const UNSTRUCTURED_BODY = '<p>JUDGMENT OF THE COURT</p>\n<p>The action is dismissed.</p>';
+
+    const mockStructured = () => {
+      mockSparqlQuery.mockResolvedValue([makeMetaBinding({ celex: '32016R0679' })]);
+      mockFetchContent.mockResolvedValue({
+        content: STRUCTURED_BODY,
+        contentAvailable: true,
+        format: 'html',
+        language: 'EN',
+      });
+    };
+
+    it('outline: true returns the heading list with offsets and no body', async () => {
+      const ctx = createMockContext({ errors: eurlex_get_document.errors });
+      mockStructured();
+
+      const input = eurlex_get_document.input.parse({
+        celex_number: '32016R0679',
+        outline: true,
+      });
+      const result = await eurlex_get_document.handler(input, ctx);
+
+      expect(result.structure_detected).toBe(true);
+      expect(result.outline?.map((h) => h.label)).toEqual(['CHAPTER I', 'Article 1', 'Article 2']);
+      expect(result.outline?.every((h) => typeof h.offset === 'number')).toBe(true);
+      // Structure-only: no body text, but the full size is still reported.
+      expect(result.content).toBeUndefined();
+      expect(result.content_chars_total).toBe(STRUCTURED_BODY.length);
+      expect(result.content_available).toBe(true);
+      expect(result.has_more).toBe(false);
+    });
+
+    it('outline: true on an unstructured act returns an empty outline, not an error', async () => {
+      const ctx = createMockContext({ errors: eurlex_get_document.errors });
+      mockSparqlQuery.mockResolvedValue([makeMetaBinding({ celex: '62024CJ0629' })]);
+      mockFetchContent.mockResolvedValue({
+        content: UNSTRUCTURED_BODY,
+        contentAvailable: true,
+        format: 'html',
+        language: 'EN',
+      });
+
+      const input = eurlex_get_document.input.parse({
+        celex_number: '62024CJ0629',
+        outline: true,
+      });
+      const result = await eurlex_get_document.handler(input, ctx);
+
+      expect(result.outline).toEqual([]);
+      expect(result.structure_detected).toBe(false);
+      expect(result.content).toBeUndefined();
+    });
+
+    it('select returns only the requested section as content with selection metadata', async () => {
+      const ctx = createMockContext({ errors: eurlex_get_document.errors });
+      mockStructured();
+
+      const input = eurlex_get_document.input.parse({
+        celex_number: '32016R0679',
+        select: { articles: '1' },
+      });
+      const result = await eurlex_get_document.handler(input, ctx);
+
+      expect(result.structure_detected).toBe(true);
+      expect(result.selection).toEqual({
+        requested: ['Article 1'],
+        matched: ['Article 1'],
+        missed: [],
+      });
+      expect(result.content).toContain('Article 1');
+      expect(result.content).toContain('Subject-matter');
+      // The neighbor article is not bled into the slice.
+      expect(result.content).not.toContain('Article 2');
+      expect(result.content_chars_returned).toBe(result.content!.length);
+      expect(result.has_more).toBe(false);
+    });
+
+    it('select reports a miss with no body and never the wrong section', async () => {
+      const ctx = createMockContext({ errors: eurlex_get_document.errors });
+      mockStructured();
+
+      const input = eurlex_get_document.input.parse({
+        celex_number: '32016R0679',
+        select: { articles: '99' },
+      });
+      const result = await eurlex_get_document.handler(input, ctx);
+
+      expect(result.selection).toEqual({
+        requested: ['Article 99'],
+        matched: [],
+        missed: ['Article 99'],
+      });
+      expect(result.content).toBeUndefined();
+      expect(result.content_chars_returned).toBe(0);
+      expect(result.structure_detected).toBe(true);
+    });
+
+    it('select on an unstructured act reports all missed and structure_detected false', async () => {
+      const ctx = createMockContext({ errors: eurlex_get_document.errors });
+      mockSparqlQuery.mockResolvedValue([makeMetaBinding({ celex: '62024CJ0629' })]);
+      mockFetchContent.mockResolvedValue({
+        content: UNSTRUCTURED_BODY,
+        contentAvailable: true,
+        format: 'html',
+        language: 'EN',
+      });
+
+      const input = eurlex_get_document.input.parse({
+        celex_number: '62024CJ0629',
+        select: { articles: '1', chapters: 'I' },
+      });
+      const result = await eurlex_get_document.handler(input, ctx);
+
+      expect(result.structure_detected).toBe(false);
+      expect(result.selection?.missed).toEqual(['Article 1', 'CHAPTER I']);
+      expect(result.content).toBeUndefined();
+    });
+
+    it('outline takes precedence over select when both are set', async () => {
+      const ctx = createMockContext({ errors: eurlex_get_document.errors });
+      mockStructured();
+
+      const input = eurlex_get_document.input.parse({
+        celex_number: '32016R0679',
+        outline: true,
+        select: { articles: '1' },
+      });
+      const result = await eurlex_get_document.handler(input, ctx);
+
+      expect(result.outline).toBeDefined();
+      expect(result.selection).toBeUndefined();
+    });
+
+    it('outline is ignored in metadata_only mode — no fetch, no outline', async () => {
+      const ctx = createMockContext({ errors: eurlex_get_document.errors });
+      mockSparqlQuery.mockResolvedValue([makeMetaBinding({ celex: '32016R0679' })]);
+
+      const input = eurlex_get_document.input.parse({
+        celex_number: '32016R0679',
+        content_mode: 'metadata_only',
+        outline: true,
+      });
+      const result = await eurlex_get_document.handler(input, ctx);
+
+      expect(result.outline).toBeUndefined();
+      expect(result.structure_detected).toBeUndefined();
+      expect(mockFetchContent).not.toHaveBeenCalled();
+    });
+
+    it('outline composes with the requested format (select passes markdown through)', async () => {
+      const ctx = createMockContext({ errors: eurlex_get_document.errors });
+      mockSparqlQuery.mockResolvedValue([makeMetaBinding({ celex: '32016R0679' })]);
+      mockFetchContent.mockResolvedValue({
+        content: STRUCTURED_BODY,
+        contentAvailable: true,
+        format: 'markdown',
+        language: 'EN',
+      });
+
+      const input = eurlex_get_document.input.parse({
+        celex_number: '32016R0679',
+        format: 'markdown',
+        outline: true,
+      });
+      const result = await eurlex_get_document.handler(input, ctx);
+
+      expect(result.content_format).toBe('markdown');
+      expect(result.outline?.length).toBeGreaterThan(0);
+      expect(mockFetchContent).toHaveBeenCalledWith(
+        '32016R0679',
+        'EN',
+        'markdown',
+        expect.anything(),
+      );
+    });
+
+    it('format renders the outline as a heading list with offsets', () => {
+      const output = {
+        celex_number: '32016R0679',
+        content_mode: 'paged',
+        content_available: true,
+        has_more: false,
+        language: 'EN',
+        content_format: 'html',
+        content_chars_total: 500,
+        structure_detected: true,
+        outline: [
+          {
+            kind: 'chapter',
+            number: 'I',
+            label: 'CHAPTER I',
+            title: 'General provisions',
+            offset: 0,
+          },
+          { kind: 'article', number: '1', label: 'Article 1', offset: 42 },
+        ],
+      };
+      const text = (eurlex_get_document.format!(output)[0] as { text: string }).text;
+      expect(text).toContain('Outline');
+      expect(text).toContain('CHAPTER I');
+      expect(text).toContain('offset 0');
+      expect(text).toContain('Article 1');
+    });
+
+    it('format renders a selection miss notice pointing at the paging floor', () => {
+      const output = {
+        celex_number: '32016R0679',
+        content_mode: 'paged',
+        content_available: true,
+        has_more: false,
+        language: 'EN',
+        content_format: 'html',
+        content_chars_total: 500,
+        structure_detected: true,
+        selection: { requested: ['Article 99'], matched: [], missed: ['Article 99'] },
+      };
+      const text = (eurlex_get_document.format!(output)[0] as { text: string }).text;
+      expect(text).toContain('Selection');
+      expect(text).toContain('Not found: Article 99');
+      expect(text).toContain('content_mode "full"');
+    });
+  });
 });

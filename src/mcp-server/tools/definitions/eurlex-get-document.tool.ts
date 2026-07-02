@@ -16,6 +16,12 @@ import {
 } from '@/services/cellar-sparql/cellar-sparql-service.js';
 import { escapeSparqlLiteral, resolveEliToWork } from '@/services/cellar-sparql/eli-resolution.js';
 import {
+  type ActHeading,
+  extractSections,
+  parseActStructure,
+  type SectionSelectors,
+} from '@/services/eurlex-content/act-structure.js';
+import {
   type ContentFormat,
   type EurLexLanguage,
   getEurLexContentService,
@@ -46,7 +52,9 @@ export const eurlex_get_document = tool('eurlex_get_document', {
     '(recitals and numbered points as readable text, genuine data tables as GFM tables); XML returns Formex4 for structured processing. ' +
     'Large bodies are bounded per call but never lost: content_mode "paged" (default) returns a character window ' +
     '(offset + limit) alongside content_chars_total and has_more, so you can page to the end and reconstruct the whole act; ' +
-    'content_mode "full" returns the entire body in one call; content_mode "metadata_only" returns metadata with no body and skips the content fetch.',
+    'content_mode "full" returns the entire body in one call; content_mode "metadata_only" returns metadata with no body and skips the content fetch. ' +
+    'To navigate structure instead of raw offsets: outline: true returns a heading list of the chapters, articles, annexes, and recitals (no body), and select (e.g. { articles: "1,5,17" }) returns only those sections as text. ' +
+    'Acts with no detectable structure (e.g. case law) fall back to the paging floor, never an error.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     celex_number: z
@@ -107,6 +115,36 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .describe(
         `Maximum characters of body content to return in this window ("paged" mode only). Default ${DEFAULT_CONTENT_LIMIT}, max ${MAX_CONTENT_LIMIT}. ` +
           'For the entire body in one response, use content_mode "full" instead of a large limit.',
+      ),
+    outline: z
+      .boolean()
+      .default(false)
+      .describe(
+        'Return a structural outline of the act — the detected chapters, sections, articles, annexes, and recitals as ' +
+          'a heading list, each with its character offset into the body of the requested format — instead of body text. ' +
+          'Use it to see what sections exist, then read one by paging (content_mode "paged") with its offset. ' +
+          'Ignores offset/limit and select. An act with no detectable structure (e.g. case law) returns an empty outline, never an error. ' +
+          'Not applied in content_mode "metadata_only".',
+      ),
+    select: z
+      .object({
+        articles: z.string().optional().describe('Comma-separated article numbers, e.g. "1,5,17".'),
+        chapters: z
+          .string()
+          .optional()
+          .describe('Comma-separated chapter numbers, Roman or Arabic, e.g. "I,IV" or "1,4".'),
+        recitals: z.string().optional().describe('Comma-separated recital numbers, e.g. "1,10".'),
+        annexes: z
+          .string()
+          .optional()
+          .describe('Comma-separated annex numbers or letters, e.g. "I,II".'),
+      })
+      .optional()
+      .describe(
+        'Return only the text of specific sections by type and number, instead of a raw character window. ' +
+          'Roman and Arabic chapter/annex numbers are treated as equivalent. Applies on top of the requested format (html, markdown, xml). ' +
+          'A section that cannot be located, or an act with no detectable structure, is reported in selection.missed with no wrong text returned — ' +
+          'use offset/limit or content_mode "full" to read it. Ignored when outline is true or in content_mode "metadata_only".',
       ),
   }),
   output: z.object({
@@ -195,6 +233,58 @@ export const eurlex_get_document = tool('eurlex_get_document', {
     content_format: z
       .string()
       .describe('Format of the returned content: "html", "markdown", or "xml".'),
+    outline: z
+      .array(
+        z
+          .object({
+            kind: z
+              .string()
+              .describe(
+                'Structural unit kind: "chapter", "section", "article", "annex", or "recital".',
+              ),
+            number: z
+              .string()
+              .describe(
+                'Numbering token as rendered (e.g. "17", "IV"); empty for a lone unnumbered annex.',
+              ),
+            label: z.string().describe('Human label, e.g. "Article 17", "CHAPTER IV".'),
+            title: z.string().optional().describe('Descriptive title where the act supplies one.'),
+            offset: z
+              .number()
+              .int()
+              .describe(
+                'Character offset of the heading in the full body of the requested format — pass as offset in a paged call to read from here.',
+              ),
+          })
+          .describe('One detected heading, addressable by its character offset into the body.'),
+      )
+      .optional()
+      .describe(
+        'Structural outline of the act. Present only when outline is true; an empty array means no structure was detected.',
+      ),
+    selection: z
+      .object({
+        requested: z
+          .array(z.string())
+          .describe('Section descriptors requested, e.g. ["Article 17", "CHAPTER IV"].'),
+        matched: z
+          .array(z.string())
+          .describe('Section descriptors found and returned in content, in document order.'),
+        missed: z
+          .array(z.string())
+          .describe('Requested section descriptors that could not be located.'),
+      })
+      .optional()
+      .describe(
+        'Outcome of a structural selection. Present only when select was used; content holds the matched sections joined in document order.',
+      ),
+    structure_detected: z
+      .boolean()
+      .optional()
+      .describe(
+        'Whether any act structure was parsed from the body. Present when outline or select was used; false means the act has no ' +
+          'detectable chapter/article/annex structure — read it via the paging floor (offset/limit or content_mode "full").',
+      ),
   }),
 
   errors: [
@@ -339,6 +429,9 @@ SELECT ?work ?celexNumber ?type ?date ?title ?inForce ?author ?legalBasis ?eurov
       language: string;
       language_fallback?: string;
       content_format: string;
+      outline?: ActHeading[];
+      selection?: { requested: string[]; matched: string[]; missed: string[] };
+      structure_detected?: boolean;
     } = {
       celex_number: confirmedCelex,
       content_mode: input.content_mode,
@@ -370,7 +463,32 @@ SELECT ?work ?celexNumber ?type ?date ?title ?inForce ?author ?legalBasis ?eurov
         const total = full.length;
         result.content_chars_total = total;
 
-        if (input.content_mode === 'full') {
+        if (input.outline) {
+          // Structure-only view: the detected headings and their offsets into the
+          // same body the floor pages, no body text. Ignores offset/limit/select.
+          // No parseable structure yields an empty outline, never an error.
+          const headings = parseActStructure(full, format);
+          result.outline = headings;
+          result.structure_detected = headings.length > 0;
+          result.content_chars_returned = 0;
+          result.has_more = false;
+        } else if (input.select) {
+          // Structural selection: return only the requested sections' text. A miss
+          // (bad number, or no structure at all) is reported in selection.missed
+          // with no body returned — never the wrong section — and the paging floor
+          // stays available. Applies on top of the requested format.
+          const headings = parseActStructure(full, format);
+          result.structure_detected = headings.length > 0;
+          const selection = extractSections(full, headings, input.select as SectionSelectors);
+          result.selection = {
+            requested: selection.requested,
+            matched: selection.matched,
+            missed: selection.missed,
+          };
+          result.has_more = false;
+          result.content_chars_returned = selection.text.length;
+          if (selection.text.length > 0) result.content = selection.text;
+        } else if (input.content_mode === 'full') {
           result.content = full;
           result.content_offset = 0;
           result.content_chars_returned = total;
@@ -421,28 +539,71 @@ SELECT ?work ?celexNumber ?type ?date ?title ?inForce ?author ?legalBasis ?eurov
       );
     } else if (result.content_available) {
       const total = result.content_chars_total ?? result.content?.length ?? 0;
-      if (result.content) {
-        const start = result.content_offset ?? 0;
-        const returned = result.content_chars_returned ?? result.content.length;
-        const end = start + returned;
-        if (result.content_mode === 'full') {
-          lines.push(`**Content** (full): full body — ${returned} of ${total} characters.`);
-        } else {
+      const start = result.content_offset ?? 0;
+      const returned = result.content_chars_returned ?? result.content?.length ?? 0;
+      const end = start + returned;
+
+      // Navigation status — always rendered so every navigation field (content_mode,
+      // content_offset, content_chars_returned/total, has_more) reaches the text
+      // channel too, whichever view (window / outline / selection) shaped the body.
+      if (result.content_mode === 'full') {
+        lines.push(
+          `**Body** (full): full body — ${returned} of ${total} characters from offset ${start}.`,
+        );
+      } else {
+        lines.push(
+          `**Body** (${result.content_mode}): characters ${start}–${end} of ${total} (${returned} returned).` +
+            (result.has_more
+              ? ` More available — page forward with offset=${end}, or content_mode="full" for the entire act.`
+              : ''),
+        );
+      }
+
+      if (result.outline) {
+        if (result.outline.length > 0) {
+          lines.push('');
           lines.push(
-            `**Content** (${result.content_mode}): characters ${start}–${end} of ${total} (${returned} returned).` +
-              (result.has_more
-                ? ` More available — page forward with offset=${end}, or content_mode="full" for the entire act.`
-                : ' End of document.'),
+            `**Outline** — ${result.outline.length} section${result.outline.length === 1 ? '' : 's'} detected. Read one by paging with its offset (content_mode "paged", offset=…):`,
+          );
+          lines.push('');
+          for (const h of result.outline) {
+            lines.push(
+              `- \`offset ${h.offset}\` — [${h.kind} ${h.number}] ${h.label}${h.title ? `: ${h.title}` : ''}`,
+            );
+          }
+        } else {
+          lines.push('');
+          lines.push(
+            `*No act structure detected in the ${total}-character ${result.content_format} body (e.g. case law or a non-standard layout). Use content_mode "paged"/"full" to read it.*`,
           );
         }
+      }
+
+      if (result.selection) {
+        lines.push('');
+        lines.push(
+          `**Selection** — requested: ${result.selection.requested.join(', ') || '(none)'}.`,
+        );
+        if (result.selection.matched.length > 0) {
+          lines.push(`Returned: ${result.selection.matched.join(', ')}.`);
+        }
+        if (result.selection.missed.length > 0) {
+          lines.push(
+            `Not found: ${result.selection.missed.join(', ')} — ${result.structure_detected ? 'no such section in this act' : 'no act structure detected'}. ` +
+              'Use offset/limit or content_mode "full" to read the act.',
+          );
+        }
+      }
+
+      if (result.content) {
         lines.push('');
         lines.push('---');
         lines.push('');
         lines.push(result.content);
-      } else {
+      } else if (!result.outline && !result.selection) {
         lines.push('');
         lines.push(
-          `*No content at offset ${result.content_offset ?? 0} — past the end of the ${total}-character body. Lower offset to read.*`,
+          `*No content at offset ${start} — past the end of the ${total}-character body. Lower offset to read.*`,
         );
       }
     } else {
