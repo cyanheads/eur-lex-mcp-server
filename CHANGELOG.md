@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.5.0](changelog/0.5.x/0.5.0.md) — 2026-07-01
+
+eurlex_get_document gains outline mode and structural section selectors (reach Article 17 by number, not character offset), and assembles multi-part Formex 4 so the xml format returns the full act for multi-part OJ acts such as the GDPR
+
 ## [0.4.2](changelog/0.4.x/0.4.2.md) — 2026-06-30
 
 eurlex_search_documents and eurlex_get_cases now match keywords via the CELLAR full-text index instead of a corpus-wide title scan (broad queries no longer risk the query timeout), and collapse distinct works that share one CELEX so a page of N returns N distinct results

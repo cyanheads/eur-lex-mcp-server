@@ -1,6 +1,6 @@
 # eur-lex-mcp-server - Directory Structure
 
-Generated on: 2026-07-01 00:39:13
+Generated on: 2026-07-02 03:12:23
 
 ```text
 eur-lex-mcp-server/
@@ -24,6 +24,7 @@ eur-lex-mcp-server/
 │   ├── 0.2.x/
 │   ├── 0.3.x/
 │   ├── 0.4.x/
+│   ├── 0.5.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md
@@ -160,19 +161,22 @@ eur-lex-mcp-server/
 │   │   │   ├── relation-traversal.ts
 │   │   │   └── types.ts
 │   │   └── eurlex-content/
+│   │       ├── act-structure.ts
 │   │       ├── eurlex-content-service.ts
 │   │       └── html-to-markdown.ts
 │   └── index.ts
 ├── tests/
 │   ├── fixtures/
 │   │   ├── aws-waf-challenge.ts
-│   │   └── eurlex-act-html.ts
+│   │   ├── eurlex-act-html.ts
+│   │   └── eurlex-formex-multipart.ts
 │   ├── prompts/
 │   │   └── eurlex-comparative-analysis.prompt.test.ts
 │   ├── resources/
 │   │   ├── eurlex-document-relations.resource.test.ts
 │   │   └── eurlex-document.resource.test.ts
 │   ├── services/
+│   │   ├── act-structure.test.ts
 │   │   ├── cellar-sparql-service.test.ts
 │   │   ├── eurlex-content-service.test.ts
 │   │   └── html-to-markdown.test.ts
