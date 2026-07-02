@@ -12,8 +12,11 @@
  *    `application/xhtml+xml`, CJEU judgments expose `text/html`, so the HTML path
  *    tries both. The XML path requests Formex 4 (`application/xml;type=fmx4`),
  *    which CELLAR serves directly for single-part acts and returns HTTP 300
- *    (multiple manifestation streams) for multi-part OJ acts — treated as
- *    unavailable rather than reconstructed.
+ *    (Multiple Choices) for multi-part OJ acts — a small `<BIB.DOC>`/`<DOC>`
+ *    notice header plus the `<ACT>` body split across sibling streams. The XML
+ *    path follows those sibling references and concatenates the parts into one
+ *    document (see {@link EurLexContentService.assembleFormexParts}); assembly is
+ *    best-effort and falls back to unavailable if any part cannot be fetched.
  *  - `Accept-Language`: CELLAR requires an ISO 639-2/T (three-letter) code and
  *    400s on a missing one or on a bibliographic 639-2/B code (`ger`, `fre`);
  *    EUR-Lex two-letter codes are mapped before the request.
@@ -140,8 +143,66 @@ function isChallengeResponse(body: string): boolean {
   return CHALLENGE_MARKERS.some((marker) => head.includes(marker));
 }
 
-/** Outcome of a single content-negotiation attempt. */
-type FetchOutcome = { kind: 'content'; text: string } | { kind: 'none' } | { kind: 'challenge' };
+/**
+ * Trailing `DOC_<n>` sequence number of a CELLAR part URL — the multi-part
+ * stream order. Returns `+∞` for a URL without one so unnumbered links sort last
+ * while keeping their relative order.
+ */
+function docSequence(url: string): number {
+  const match = url.match(/\/DOC[_-]?(\d+)/i);
+  return match ? Number(match[1]) : Number.MAX_SAFE_INTEGER;
+}
+
+/**
+ * Parse the sibling part URLs from a CELLAR "300 Multiple Choices" index body.
+ * The index is an XHTML list where each part is an `<a href="…/DOC_N">` link, so
+ * the `href` attributes pointing at `/resource/` streams are the part URLs. They
+ * are de-duplicated and ordered by their `DOC_<n>` sequence.
+ */
+function extractFormexPartUrls(indexBody: string): string[] {
+  const seen = new Set<string>();
+  const urls: string[] = [];
+  for (const match of indexBody.matchAll(/href="([^"]+)"/gi)) {
+    const raw = match[1];
+    if (!raw) continue;
+    const url = raw.replace(/&amp;/g, '&');
+    if (url.includes('/resource/') && !seen.has(url)) {
+      seen.add(url);
+      urls.push(url);
+    }
+  }
+  return urls.sort((a, b) => docSequence(a) - docSequence(b));
+}
+
+/**
+ * Combine fetched Formex part bodies into one well-formed XML document. A
+ * multi-part act has no canonical single-file form — CELLAR serves the parts as
+ * independent streams (a `<BIB.DOC>`/`<DOC>` notice header plus the `<ACT>`
+ * body), each its own document with its own prolog. Concatenating them verbatim
+ * would yield multiple prologs and roots (not parseable), so each part's prolog
+ * is stripped and the roots are wrapped in one synthetic container — preserving
+ * every part verbatim and in order while keeping the result a single document the
+ * caller can parse for structured processing.
+ */
+function combineFormexParts(parts: readonly string[]): string {
+  const children = parts.map((part) => part.replace(/^\s*<\?xml[^>]*\?>\s*/i, '').trim());
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!-- Assembled by eur-lex-mcp-server from multi-part Formex 4 streams (CELLAR returned HTTP 300 Multiple Choices). Each child is one part root, in stream order. -->
+<formex-multipart parts="${parts.length}">
+${children.join('\n')}
+</formex-multipart>`;
+}
+
+/**
+ * Outcome of a single content-negotiation attempt. `multipart` carries the CELLAR
+ * "300 Multiple Choices" index body listing the sibling Formex part URLs — only
+ * the `application/xml;type=fmx4` variant ever produces it.
+ */
+type FetchOutcome =
+  | { kind: 'content'; text: string }
+  | { kind: 'none' }
+  | { kind: 'challenge' }
+  | { kind: 'multipart'; body: string };
 
 export interface FetchContentResult {
   content: string;
@@ -224,8 +285,9 @@ export class EurLexContentService {
     const isoLanguage = LANGUAGE_TO_ISO_639_2[language];
     if (!isoLanguage) return null;
 
+    const url = this.buildContentUrl(celexNumber);
     for (const accept of ACCEPT_BY_FORMAT[format]) {
-      const outcome = await this.fetchVariant(celexNumber, accept, isoLanguage, ctx);
+      const outcome = await this.fetchUrl(url, accept, isoLanguage, ctx);
       if (outcome.kind === 'challenge') {
         throw serviceUnavailable(
           `The EU content endpoint returned a bot-challenge interstitial instead of the act text for CELEX ${celexNumber}.`,
@@ -242,27 +304,36 @@ export class EurLexContentService {
           },
         );
       }
+      // A 300 (multi-part Formex, xml path only): follow the sibling part
+      // references and assemble the full act. Assembly is best-effort — on
+      // failure fall through so the variant loop ends in `null` (unavailable),
+      // never a throw.
+      if (outcome.kind === 'multipart') {
+        const assembled = await this.assembleFormexParts(outcome.body, accept, isoLanguage, ctx);
+        if (assembled !== null) return assembled;
+        continue;
+      }
       if (outcome.kind === 'content') return outcome.text;
     }
     return null;
   }
 
   /**
-   * Single content-negotiation request for one `Accept`/`Accept-Language` pair.
-   * Non-2xx responses (404 = no datastream of that type, 300 = multi-part Formex,
-   * 4xx/5xx) and network failures resolve to `none` so callers can try the next
-   * variant or language. A WAF challenge body resolves to `challenge`. The inner
-   * function only throws on a `fetch` rejection, so `withRetry` retries transient
-   * network errors but never a 404 or a challenge.
+   * Single content-negotiation GET for one URL / `Accept` / `Accept-Language`.
+   * A 300 (Multiple Choices — multi-part Formex, xml path only) resolves to
+   * `multipart` carrying the index body; other non-2xx (404 = no datastream of
+   * that type, 4xx/5xx) and network failures resolve to `none` so callers can
+   * try the next variant or language; a WAF challenge body resolves to
+   * `challenge`. The inner function only throws on a `fetch` rejection, so
+   * `withRetry` retries transient network errors but never a 300, 404, or a
+   * challenge.
    */
-  private fetchVariant(
-    celexNumber: string,
+  private fetchUrl(
+    url: string,
     accept: string,
     isoLanguage: string,
     ctx: Context,
   ): Promise<FetchOutcome> {
-    const url = this.buildContentUrl(celexNumber);
-
     return withRetry(
       async (): Promise<FetchOutcome> => {
         const response = await fetch(url, {
@@ -271,6 +342,7 @@ export class EurLexContentService {
           redirect: 'follow',
         });
 
+        if (response.status === 300) return { kind: 'multipart', body: await response.text() };
         if (!response.ok) return { kind: 'none' };
 
         const text = await response.text();
@@ -279,12 +351,41 @@ export class EurLexContentService {
         return { kind: 'content', text };
       },
       {
-        operation: 'EurLexContentService.fetchVariant',
+        operation: 'EurLexContentService.fetchUrl',
         baseDelayMs: 1000,
         maxRetries: 2,
         signal: ctx.signal,
       },
     ).catch((): FetchOutcome => ({ kind: 'none' }));
+  }
+
+  /**
+   * Reconstruct a multi-part Formex act from a CELLAR "300 Multiple Choices"
+   * index. Discovers the sibling part URLs, fetches each with the same Formex
+   * `Accept`/`Accept-Language` used for the act, and concatenates them in stream
+   * order. Best-effort: no discoverable parts, or any part that does not return a
+   * body, yields `null` so the caller falls back to `contentAvailable: false`.
+   * Never throws — a challenge or error mid-assembly is treated as failure, not
+   * surfaced (unlike the primary fetch, which throws on a challenge).
+   */
+  private async assembleFormexParts(
+    indexBody: string,
+    accept: string,
+    isoLanguage: string,
+    ctx: Context,
+  ): Promise<string | null> {
+    const partUrls = extractFormexPartUrls(indexBody);
+    if (partUrls.length === 0) return null;
+
+    const outcomes = await Promise.all(
+      partUrls.map((partUrl) => this.fetchUrl(partUrl, accept, isoLanguage, ctx)),
+    );
+    const parts: string[] = [];
+    for (const outcome of outcomes) {
+      if (outcome.kind !== 'content') return null;
+      parts.push(outcome.text);
+    }
+    return combineFormexParts(parts);
   }
 }
 
