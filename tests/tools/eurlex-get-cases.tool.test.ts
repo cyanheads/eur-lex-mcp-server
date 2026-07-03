@@ -110,15 +110,83 @@ describe('eurlex_get_cases', () => {
     expect(sparql).toContain('"TJ"');
   });
 
-  it('applies case_type=judgment filter (CJ substring)', async () => {
+  // --- case_type filters by resource-type, not CELEX substring (issue #38) ---
+
+  it('applies case_type=judgment as a required JUDG resource-type, not a CELEX substring (issue #38)', async () => {
     const ctx = createMockContext({ errors: eurlex_get_cases.errors });
-    mockQuery.mockResolvedValue([makeCaseBinding('62013CJ0131')]);
+    mockQuery.mockResolvedValue([
+      makeCaseBinding('62013CJ0131', {
+        types: 'http://publications.europa.eu/resource/authority/resource-type/JUDG',
+      }),
+    ]);
 
     const input = eurlex_get_cases.input.parse({ case_type: 'judgment' });
     await eurlex_get_cases.handler(input, ctx);
 
     const sparql = mockQuery.mock.calls[0]?.[0] as string;
-    expect(sparql).toContain('"CJ"');
+    // The type filter is a required resource-type triple. Abstract (_RES → ABSTRACT_JUR)
+    // and summary (_SUM → SUM_JUR) siblings carry the parent's "CJ" CELEX letters under a
+    // distinct CELEX and slipped through the old CONTAINS(?celexNumber, "CJ") test.
+    expect(sparql).toContain(
+      '?work cdm:work_has_resource-type <http://publications.europa.eu/resource/authority/resource-type/JUDG> .',
+    );
+    // No court is set, so the CELEX-substring "CJ" test must be absent entirely.
+    expect(sparql).not.toContain('CONTAINS(STR(?celexNumber), "CJ")');
+  });
+
+  it('applies case_type=order as a required ORDER resource-type (issue #38)', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+    mockQuery.mockResolvedValue([
+      makeCaseBinding('62025CO0850', {
+        types: 'http://publications.europa.eu/resource/authority/resource-type/ORDER',
+      }),
+    ]);
+
+    const input = eurlex_get_cases.input.parse({ case_type: 'order' });
+    await eurlex_get_cases.handler(input, ctx);
+
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    expect(sparql).toContain(
+      '?work cdm:work_has_resource-type <http://publications.europa.eu/resource/authority/resource-type/ORDER> .',
+    );
+    expect(sparql).not.toContain('CONTAINS(STR(?celexNumber), "CO")');
+  });
+
+  it('applies case_type=ag_opinion as a required OPIN_AG resource-type (issue #38)', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+    mockQuery.mockResolvedValue([
+      makeCaseBinding('62025CC0300', {
+        types: 'http://publications.europa.eu/resource/authority/resource-type/OPIN_AG',
+      }),
+    ]);
+
+    const input = eurlex_get_cases.input.parse({ case_type: 'ag_opinion' });
+    await eurlex_get_cases.handler(input, ctx);
+
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    expect(sparql).toContain(
+      '?work cdm:work_has_resource-type <http://publications.europa.eu/resource/authority/resource-type/OPIN_AG> .',
+    );
+    expect(sparql).not.toContain('CONTAINS(STR(?celexNumber), "CC")');
+  });
+
+  it('combines a court CELEX filter with a case_type resource-type triple as orthogonal axes', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+    mockQuery.mockResolvedValue([
+      makeCaseBinding('62013CJ0131', {
+        types: 'http://publications.europa.eu/resource/authority/resource-type/JUDG',
+      }),
+    ]);
+
+    const input = eurlex_get_cases.input.parse({ court: 'CJEU', case_type: 'judgment' });
+    await eurlex_get_cases.handler(input, ctx);
+
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    // Court stays a CELEX-letter test (CJEU = CJ/CC/CO); case_type is the resource-type triple.
+    expect(sparql).toContain('CONTAINS(STR(?celexNumber), "CJ")');
+    expect(sparql).toContain(
+      '?work cdm:work_has_resource-type <http://publications.europa.eu/resource/authority/resource-type/JUDG> .',
+    );
   });
 
   it('applies offset and limit', async () => {
@@ -477,5 +545,105 @@ describe('eurlex_get_cases', () => {
     const blocks = eurlex_get_cases.format!(output);
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('62020TJ0001');
+  });
+
+  // --- #40: case title parsed into structured fields ---
+
+  it('parses a #-delimited case title into structured fields, preserving the raw title', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+    const rawTitle =
+      'Judgment of the Court (Grand Chamber) of 10 February 2026.#WhatsApp Ireland Ltd v European Data Protection Board.#Appeal – Protection of natural persons – Regulation (EU) 2016/679.#Case C-97/23 P.';
+    mockQuery.mockResolvedValue([
+      makeCaseBinding('62023CJ0097', {
+        date: '2026-02-10',
+        title: rawTitle,
+        types: 'http://publications.europa.eu/resource/authority/resource-type/JUDG',
+      }),
+    ]);
+
+    const input = eurlex_get_cases.input.parse({ keyword: 'data protection' });
+    const result = await eurlex_get_cases.handler(input, ctx);
+
+    const c = result.cases[0];
+    // Raw title preserved verbatim — nothing dropped (issue #40 is additive).
+    expect(c?.title).toBe(rawTitle);
+    // Parsed segments surfaced alongside it.
+    expect(c?.display_title).toBe('WhatsApp Ireland Ltd v European Data Protection Board.');
+    expect(c?.parties).toBe('WhatsApp Ireland Ltd v European Data Protection Board.');
+    expect(c?.case_reference).toBe('Case C-97/23 P.');
+    expect(c?.subject_matter).toContain('Protection of natural persons');
+  });
+
+  it('leaves structured title fields unset for a sparse AG-opinion title', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+    const rawTitle = 'Opinion of Advocate General Kokott delivered on 2 July 2026.###';
+    mockQuery.mockResolvedValue([
+      makeCaseBinding('62025CC0383', {
+        date: '2026-07-02',
+        title: rawTitle,
+        types: 'http://publications.europa.eu/resource/authority/resource-type/OPIN_AG',
+      }),
+    ]);
+
+    const input = eurlex_get_cases.input.parse({ case_type: 'ag_opinion' });
+    const result = await eurlex_get_cases.handler(input, ctx);
+
+    const c = result.cases[0];
+    expect(c?.title).toBe(rawTitle);
+    // The parties/subject/reference segments are empty — none is fabricated.
+    expect(c?.parties).toBeUndefined();
+    expect(c?.subject_matter).toBeUndefined();
+    expect(c?.case_reference).toBeUndefined();
+    // The display title still resolves to the clean AG descriptor.
+    expect(c?.display_title).toBe('Opinion of Advocate General Kokott delivered on 2 July 2026.');
+  });
+
+  it('keeps a plain (non-"#") title as-is with no structured fields', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+    mockQuery.mockResolvedValue([
+      makeCaseBinding('62013CJ0131', { title: 'Google Spain SL v AEPD' }),
+    ]);
+
+    const input = eurlex_get_cases.input.parse({ keyword: 'google' });
+    const result = await eurlex_get_cases.handler(input, ctx);
+
+    const c = result.cases[0];
+    expect(c?.title).toBe('Google Spain SL v AEPD');
+    expect(c?.display_title).toBeUndefined();
+    expect(c?.parties).toBeUndefined();
+    expect(c?.case_reference).toBeUndefined();
+  });
+
+  it('format renders the clean display title, subject matter, and case reference (issue #40)', () => {
+    const output = {
+      cases: [
+        {
+          work_uri: 'http://publications.europa.eu/resource/cellar/whatsapp',
+          celex_number: '62023CJ0097',
+          date: '2026-02-10',
+          resource_type: 'Judgment',
+          title:
+            'Judgment of the Court of 10 February 2026.#WhatsApp Ireland Ltd v European Data Protection Board.#Appeal – Protection of natural persons.#Case C-97/23 P.',
+          display_title: 'WhatsApp Ireland Ltd v European Data Protection Board.',
+          parties: 'WhatsApp Ireland Ltd v European Data Protection Board.',
+          subject_matter: 'Appeal – Protection of natural persons.',
+          case_reference: 'Case C-97/23 P.',
+        },
+      ],
+      total: 1,
+      offset: 0,
+      query_echo: { case_type: 'judgment' },
+    };
+    const blocks = eurlex_get_cases.format!(output);
+    const text = (blocks[0] as { text: string }).text;
+    // Heading uses the clean display title, not the raw "#"-delimited string.
+    expect(text).toContain('62023CJ0097 — WhatsApp Ireland Ltd v European Data Protection Board.');
+    const headingLine = text.split('\n').find((l) => l.startsWith('### '));
+    expect(headingLine).not.toContain('#Appeal');
+    expect(text).toContain('**Parties:** WhatsApp Ireland Ltd v European Data Protection Board.');
+    expect(text).toContain('**Subject matter:** Appeal – Protection of natural persons.');
+    expect(text).toContain('**Case reference:** Case C-97/23 P.');
+    // The full raw title stays available as a labelled line (format parity).
+    expect(text).toContain('**Full title:** Judgment of the Court of 10 February 2026.#WhatsApp');
   });
 });

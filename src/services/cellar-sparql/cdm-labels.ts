@@ -1,7 +1,8 @@
 /**
- * @fileoverview CDM authority-register URI → human-readable label maps and resolvers.
+ * @fileoverview CDM authority-register URI → human-readable label maps and resolvers,
+ * plus a parser for CELLAR's `#`-delimited case-law expression titles.
  * Covers resource types (legislation, case law) and corporate bodies (EU institutions).
- * Used by tool handlers that normalise raw CDM URIs into labels before returning results.
+ * Used by tool handlers that normalise raw CDM URIs and titles before returning results.
  * @module services/cellar-sparql/cdm-labels
  */
 
@@ -53,6 +54,76 @@ export function resolveResourceTypeLabels(concatenated: string | undefined): str
     ...new Set(concatenated.split(/\s+/).filter(Boolean).map(resolveResourceTypeLabel)),
   ].sort();
   return labels.length > 0 ? labels.join(', ') : undefined;
+}
+
+/**
+ * Structured decomposition of a CELLAR case-law expression title. Every field is
+ * optional — a real title may carry fewer segments, empty segments, or no `#`
+ * delimiter at all, and no segment is ever fabricated from missing data.
+ */
+export interface ParsedCaseTitle {
+  /** Case reference, e.g. "Case C-97/23 P.". */
+  caseReference?: string;
+  /** Clean human-readable title for display: the parties, or the court/AG descriptor when there are none. */
+  displayTitle?: string;
+  /** The parties segment, e.g. "Google Spain SL v AEPD". */
+  parties?: string;
+  /** Subject-matter keyword summary — the en-dash-delimited keyword list. */
+  subjectMatter?: string;
+}
+
+/**
+ * Parse a CELLAR case-law expression title into structured fields.
+ *
+ * Case-law titles pack several segments into one `#`-delimited string, roughly
+ *   `{court + date}#{parties}#[request for a ruling]#{subject-matter keywords}#{case reference}`
+ * e.g. `Judgment of the Court (Grand Chamber) of 10 February 2026.#WhatsApp
+ * Ireland Ltd v European Data Protection Board.#Appeal – … .#Case C-97/23 P.`
+ *
+ * The segment count is not fixed: preliminary-ruling judgments insert a "Request
+ * for a preliminary ruling from …" provenance segment before the subject matter,
+ * and AG opinions leave the parties/subject/reference segments empty (`Opinion of
+ * Advocate General … .###`). Rather than assume a fixed layout, this anchors on
+ * the reliable positions — the parties are the second segment, the case reference
+ * is the trailing `Case …` segment, and the subject matter is the segment
+ * immediately before it. Absent or empty segments are left unset, never invented.
+ * A title with no `#` (already a plain title, or an older sparse record) yields an
+ * empty object so the caller keeps the raw title untouched.
+ */
+export function parseCaseLawTitle(raw: string | undefined): ParsedCaseTitle {
+  if (!raw?.includes('#')) return {};
+  const segments = raw.split('#').map((s) => s.trim());
+  const result: ParsedCaseTitle = {};
+
+  // Parties: the second segment — the reliable display-name position.
+  const parties = segments[1];
+  if (parties) result.parties = parties;
+
+  // Locate the trailing non-empty segment; it anchors the case reference.
+  const lastIdx = segments.findLastIndex((s) => s !== '');
+
+  // Case reference: the trailing segment, only when it has the "Case …"/"Cases …"
+  // shape and sits past the parties (index ≥ 2). The optional trailing "s" matches
+  // CELLAR's plural joined-case form ("Cases T-318/24 and T-362/24.") — `\b` never
+  // asserts between "Case" and "s", so a singular-only anchor missed it (issue #42).
+  // AG-opinion titles whose trailing segments are all empty leave this unset.
+  const last = lastIdx >= 2 ? segments[lastIdx] : undefined;
+  const hasCaseReference = last !== undefined && /^Cases?\b/i.test(last);
+  if (hasCaseReference && last) result.caseReference = last;
+
+  // Subject matter: the keyword list — the segment right before the case reference,
+  // or, absent a case reference, the trailing segment when it sits past the parties.
+  const subjectIdx = hasCaseReference ? lastIdx - 1 : lastIdx;
+  if (subjectIdx >= 2) {
+    const subject = segments[subjectIdx];
+    if (subject) result.subjectMatter = subject;
+  }
+
+  // Display title: the parties for contested cases, else the leading court/AG descriptor.
+  const displayTitle = result.parties ?? segments[0];
+  if (displayTitle) result.displayTitle = displayTitle;
+
+  return result;
 }
 
 /**

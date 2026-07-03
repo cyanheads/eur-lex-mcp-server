@@ -7,6 +7,7 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import {
   ENG_LANGUAGE_URI,
+  parseCaseLawTitle,
   resolveResourceTypeLabels,
 } from '@/services/cellar-sparql/cdm-labels.js';
 import {
@@ -14,11 +15,20 @@ import {
   getCellarSparqlService,
 } from '@/services/cellar-sparql/cellar-sparql-service.js';
 
-/** Case type to CELEX type substring mapping. */
-const CASE_TYPE_PATTERN: Record<string, string> = {
-  judgment: 'CJ',
-  order: 'CO',
-  ag_opinion: 'CC',
+/**
+ * Case type → CDM resource-type authority URI. A case_type filter tests the
+ * work's resource-type, NOT a CELEX substring: abstract (`_RES` → ABSTRACT_JUR)
+ * and summary (`_SUM` → SUM_JUR) sibling works carry the same CELEX type letters
+ * as their parent judgment/order (they still CONTAIN "CJ"/"CO"), only under a
+ * distinct CELEX, so a substring test admitted them as separate rows. Requiring
+ * the resource-type excludes those derivative works (issue #38). CELLAR types
+ * CJEU/GC judgments as JUDG, orders as ORDER, and AG opinions (CELEX "CC") as
+ * OPIN_AG.
+ */
+const CASE_TYPE_RESOURCE_TYPE: Record<string, string> = {
+  judgment: 'http://publications.europa.eu/resource/authority/resource-type/JUDG',
+  order: 'http://publications.europa.eu/resource/authority/resource-type/ORDER',
+  ag_opinion: 'http://publications.europa.eu/resource/authority/resource-type/OPIN_AG',
 };
 
 /**
@@ -49,7 +59,8 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
     'by case number, court, party name, or AG opinion type. ' +
     'Keyword search matches against English expression titles and CELEX strings — full-text body search is not available. ' +
     'Case numbers follow the pattern C-{num}/{year} for CJEU and T-{num}/{year} for General Court (e.g. C-131/12). ' +
-    'Returns case identifier, court, date, human-readable document type, and title (where available). ' +
+    'Returns case identifier, court, date, human-readable document type, and — parsed from the case title — ' +
+    'the parties, subject matter, and case reference (where available). ' +
     'Use eurlex_get_document with the CELEX number to fetch the full judgment text.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
@@ -145,7 +156,38 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
               .string()
               .optional()
               .describe(
-                'English expression title where available (e.g. "Google Spain SL v AEPD"). Absent for many older cases.',
+                'Raw English expression title as stored in CELLAR. For case law this is a "#"-delimited string ' +
+                  '(court+date, parties, subject-matter, case reference); the parsed segments are surfaced in ' +
+                  'display_title, parties, subject_matter, and case_reference. Absent for many older cases.',
+              ),
+            display_title: z
+              .string()
+              .optional()
+              .describe(
+                'Clean human-readable title for display — the parties for a contested case ' +
+                  '(e.g. "Google Spain SL v AEPD"), or the court/AG descriptor when a case has no named parties ' +
+                  '(e.g. an Advocate General opinion). Parsed from title; absent when title is.',
+              ),
+            parties: z
+              .string()
+              .optional()
+              .describe(
+                'Parties to the case, parsed from the title (e.g. "WhatsApp Ireland Ltd v European Data Protection Board."). ' +
+                  'Absent when the title carries no parties segment (e.g. AG opinions, some older cases).',
+              ),
+            subject_matter: z
+              .string()
+              .optional()
+              .describe(
+                'Subject-matter keyword summary parsed from the title — the legal topics and provisions at issue. ' +
+                  'Absent when the title carries no subject-matter segment.',
+              ),
+            case_reference: z
+              .string()
+              .optional()
+              .describe(
+                'Case reference parsed from the title (e.g. "Case C-97/23 P."). ' +
+                  'Absent when the title carries no case-reference segment.',
               ),
           })
           .describe('A single CJEU or General Court case law record.'),
@@ -258,10 +300,20 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
       );
     }
 
+    /**
+     * Case-type filter — a required resource-type triple, not a CELEX substring.
+     * The old `FILTER(CONTAINS(STR(?celexNumber), "CJ"))` also matched the abstract
+     * (`_RES`) and summary (`_SUM`) sibling works, which share the parent's CELEX
+     * type letters under a distinct CELEX and so survived `GROUP BY ?celexNumber`
+     * as extra rows. Requiring the resource-type keeps only true judgments/orders/
+     * opinions (issue #38). The `OPTIONAL { … ?type }` below still gathers every
+     * type for the display label, so a corrigendum-judgment keeps all its labels.
+     */
+    let typeConstraint = '';
     if (input.case_type) {
-      const pattern = CASE_TYPE_PATTERN[input.case_type];
-      if (pattern) {
-        filters.push(`FILTER(CONTAINS(STR(?celexNumber), "${pattern}"))`);
+      const typeUri = CASE_TYPE_RESOURCE_TYPE[input.case_type];
+      if (typeUri) {
+        typeConstraint = `?work cdm:work_has_resource-type <${typeUri}> .`;
       }
     }
 
@@ -305,6 +357,7 @@ SELECT
   (SAMPLE(?date) AS ?docDate)
   (MAX(?title) AS ?docTitle) WHERE {
   ?work cdm:resource_legal_id_celex ?celexNumber .
+  ${typeConstraint}
   OPTIONAL { ?work cdm:work_has_resource-type ?type . }
   OPTIONAL { ?work cdm:work_date_document ?date . }
   OPTIONAL {
@@ -355,6 +408,10 @@ SELECT
         resource_type?: string;
         date?: string;
         title?: string;
+        display_title?: string;
+        parties?: string;
+        subject_matter?: string;
+        case_reference?: string;
       } = {
         work_uri:
           CellarSparqlService.bindingValue(b, 'titledWork') ??
@@ -366,8 +423,19 @@ SELECT
       if (resourceType) c.resource_type = resourceType;
       const date = CellarSparqlService.bindingValue(b, 'docDate');
       if (date) c.date = date;
+      // Preserve the raw title verbatim, then surface the parsed case-law segments
+      // (parties/subject-matter/case-reference and a clean display title) alongside
+      // it — nothing is dropped, and a sparse or malformed title just leaves the
+      // structured fields unset (issue #40).
       const title = CellarSparqlService.bindingValue(b, 'docTitle');
-      if (title) c.title = title;
+      if (title) {
+        c.title = title;
+        const parsed = parseCaseLawTitle(title);
+        if (parsed.displayTitle) c.display_title = parsed.displayTitle;
+        if (parsed.parties) c.parties = parsed.parties;
+        if (parsed.subjectMatter) c.subject_matter = parsed.subjectMatter;
+        if (parsed.caseReference) c.case_reference = parsed.caseReference;
+      }
       return c;
     });
 
@@ -390,9 +458,18 @@ SELECT
       );
     }
     for (const c of result.cases) {
-      lines.push(`### ${c.celex_number}${c.title ? ` — ${c.title}` : ''}`);
+      // Prefer the clean parsed display title; fall back to the raw title (already
+      // clean for the plain, non-"#"-delimited titles that don't parse).
+      const heading = c.display_title ?? c.title;
+      lines.push(`### ${c.celex_number}${heading ? ` — ${heading}` : ''}`);
       if (c.date) lines.push(`**Date:** ${c.date}`);
       if (c.resource_type) lines.push(`**Type:** ${c.resource_type}`);
+      if (c.parties) lines.push(`**Parties:** ${c.parties}`);
+      if (c.subject_matter) lines.push(`**Subject matter:** ${c.subject_matter}`);
+      if (c.case_reference) lines.push(`**Case reference:** ${c.case_reference}`);
+      // Full raw CELLAR title — carries the court/chamber/date descriptor the parsed
+      // fields omit, and keeps the original string available to the reader.
+      if (c.title) lines.push(`**Full title:** ${c.title}`);
       lines.push(`**Work URI:** ${c.work_uri}`);
       lines.push('');
     }
