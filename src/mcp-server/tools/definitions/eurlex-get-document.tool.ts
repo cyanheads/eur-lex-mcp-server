@@ -16,6 +16,11 @@ import {
 } from '@/services/cellar-sparql/cellar-sparql-service.js';
 import { escapeSparqlLiteral, resolveEliToWork } from '@/services/cellar-sparql/eli-resolution.js';
 import {
+  type CurrentConsolidated,
+  findCurrentConsolidated,
+} from '@/services/cellar-sparql/relation-traversal.js';
+import type { SparqlBinding } from '@/services/cellar-sparql/types.js';
+import {
   type ActHeading,
   extractSections,
   parseActStructure,
@@ -36,6 +41,15 @@ const DEFAULT_CONTENT_LIMIT = 25_000;
 
 /** Hard ceiling on one paged window. Use `content_mode: "full"` for the whole body in a single call. */
 const MAX_CONTENT_LIMIT = 100_000;
+
+/**
+ * Per-dimension row cap for the multi-valued metadata queries (authors, legal
+ * bases, EuroVoc subjects). Each dimension is fetched in its own query — never a
+ * cross-product — so this bounds a single dimension in isolation, comfortably
+ * above any real act (a handful of authors, a dozen legal bases, ~20 subjects).
+ * The service caps further if MAX_SPARQL_RESULTS is lower.
+ */
+const META_DIMENSION_LIMIT = 100;
 
 export const eurlex_get_document = tool('eurlex_get_document', {
   title: 'Get EU Document',
@@ -62,7 +76,7 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .optional()
       .describe(
         'CELEX number of the act to fetch (e.g. 32016R0679 for GDPR). ' +
-          'Provide exactly one of celex_number or eli_uri.',
+          'Provide exactly one of celex_number, eli_uri, or work_uri.',
       ),
     eli_uri: z
       .string()
@@ -70,7 +84,37 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .describe(
         'Work-level ELI URI of the act to fetch, resolved to its CELLAR work (e.g. ' +
           'http://data.europa.eu/eli/reg/2016/679, with or without the /oj suffix). ' +
-          'Provide exactly one of celex_number or eli_uri.',
+          'Provide exactly one of celex_number, eli_uri, or work_uri.',
+      ),
+    work_uri: z
+      .string()
+      .refine(
+        (v) =>
+          !v ||
+          (v.startsWith('http') &&
+            !v.includes('>') &&
+            !v.includes('<') &&
+            !v.includes('"') &&
+            !v.includes(' ')),
+        { message: 'work_uri must be a valid http URI with no angle brackets, quotes, or spaces.' },
+      )
+      .optional()
+      .describe(
+        'CELLAR work resource URI to fetch (e.g. ' +
+          'http://publications.europa.eu/resource/cellar/3e485e15-11bd-11e6-ba9a-01aa75ed71a1) — ' +
+          'the form returned by eurlex_lookup_celex, eurlex_get_relations, and eurlex_search_documents. ' +
+          'Dereferenced to its CELEX, then fetched by the same flow. Provide exactly one of celex_number, eli_uri, or work_uri.',
+      ),
+    resolve: z
+      .enum(['as_requested', 'current_consolidated'])
+      .default('as_requested')
+      .describe(
+        'Which version to serve for a base act that has newer consolidated versions. ' +
+          '"as_requested" (default) returns the exact CELEX requested — for a base act, the as-enacted text. ' +
+          '"current_consolidated" transparently serves the newest consolidated version instead when one exists, ' +
+          'reporting the served CELEX in celex_number and the originally requested CELEX in requested_celex; ' +
+          'a no-op when no newer consolidated version exists. Regardless of this setting, is_superseded / ' +
+          'current_consolidated_celex / consolidated_as_of flag a stale base act.',
       ),
     language: z
       .string()
@@ -167,7 +211,15 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .string()
       .optional()
       .describe(
-        'Human-readable name of the originating EU institution (e.g. "European Parliament", "Council of the EU"). Absent when not recorded.',
+        'Human-readable name of the primary (first) originating EU institution (e.g. "European Parliament", "Council of the EU"). ' +
+          'For co-legislated acts adopted by more than one body, prefer author_institutions for the complete set. Absent when not recorded.',
+      ),
+    author_institutions: z
+      .array(z.string().describe('Human-readable EU institution name.'))
+      .optional()
+      .describe(
+        'All originating EU institutions, for co-legislated acts adopted by more than one body ' +
+          '(e.g. ["European Parliament", "Council of the EU"] for an ordinary-legislative-procedure act). Absent when none recorded.',
       ),
     legal_basis: z
       .array(z.string().describe('CELEX number or URI of a legal basis act.'))
@@ -178,6 +230,33 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .optional()
       .describe('EuroVoc subject classifications.'),
     in_force: z.boolean().optional().describe('Whether the act is currently in force.'),
+    is_superseded: z
+      .boolean()
+      .optional()
+      .describe(
+        'True when the requested work is a base act with a newer consolidated version available — the returned text ' +
+          'may be outdated. Absent when the act has no consolidated version, or is itself a consolidated version.',
+      ),
+    current_consolidated_celex: z
+      .string()
+      .optional()
+      .describe(
+        'CELEX of the newest consolidated version of the requested base act (e.g. 02014R0833-20260424) — ' +
+          'fetch it with eurlex_get_document, or pass resolve "current_consolidated". Present only when is_superseded is true.',
+      ),
+    consolidated_as_of: z
+      .string()
+      .optional()
+      .describe(
+        'Consolidation date of current_consolidated_celex in ISO 8601 (YYYY-MM-DD). Present only when is_superseded is true.',
+      ),
+    requested_celex: z
+      .string()
+      .optional()
+      .describe(
+        'The originally requested CELEX, echoed when resolve "current_consolidated" served a different (consolidated) work. ' +
+          'celex_number holds the CELEX actually served. Absent when the served work is the one requested.',
+      ),
     content: z
       .string()
       .optional()
@@ -291,14 +370,15 @@ export const eurlex_get_document = tool('eurlex_get_document', {
     {
       reason: 'invalid_identifier_args',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'Neither celex_number nor eli_uri was provided, or both were.',
-      recovery: 'Provide exactly one of celex_number or eli_uri.',
+      when: 'None of celex_number, eli_uri, or work_uri was provided, or more than one was.',
+      recovery: 'Provide exactly one of celex_number, eli_uri, or work_uri.',
     },
     {
       reason: 'not_found',
       code: JsonRpcErrorCode.NotFound,
-      when: 'CELEX number or ELI URI not found in CELLAR — the work does not exist in the corpus.',
-      recovery: 'Verify the identifier or use eurlex_lookup_celex to confirm it exists.',
+      when: 'The CELEX, ELI, or work URI resolves to no fetchable work — the work is absent from the corpus, or the CELLAR work carries no CELEX number.',
+      recovery:
+        'Verify the identifier with eurlex_lookup_celex; a CELLAR work with no CELEX cannot be fetched as a document.',
     },
     {
       reason: 'language_unavailable',
@@ -320,17 +400,31 @@ export const eurlex_get_document = tool('eurlex_get_document', {
     const sparqlSvc = getCellarSparqlService();
     const contentSvc = getEurLexContentService();
 
-    // Accept exactly one identifier: a CELEX number, or an ELI URI resolved to
-    // its CELLAR work. Treat empty/whitespace as absent so form-based clients
-    // that send "" for an omitted field route to the friendly guard, not -32602.
-    // An ELI is resolved to its CELLAR work via the shared #5 resolution
-    // (cdm:resource_legal_eli exact-match + bare-work /oj retry), then the rest
-    // of the flow (metadata + content) is keyed on the confirmed CELEX.
+    // Accept exactly one identifier: a CELEX number, an ELI URI resolved to its
+    // CELLAR work, or a CELLAR work URI dereferenced to its CELEX. Treat
+    // empty/whitespace as absent so form-based clients sending "" for an omitted
+    // field route to the friendly guard, not a raw -32602. An ELI is resolved via
+    // the shared #5 resolution (cdm:resource_legal_eli exact-match + bare-work /oj
+    // retry); a work_uri (the form eurlex_lookup_celex / get_relations / search
+    // emit) is dereferenced by cdm:resource_legal_id_celex. Every path lands on a
+    // CELEX, which keys the rest of the flow.
     const celexInput = input.celex_number?.trim();
     const eliInput = input.eli_uri?.trim();
+    const workUriInput = input.work_uri?.trim();
+    const providedCount = [celexInput, eliInput, workUriInput].filter(Boolean).length;
 
-    let celexNumber: string;
-    if (eliInput && !celexInput) {
+    let requestedCelex: string;
+    if (providedCount !== 1) {
+      throw ctx.fail(
+        'invalid_identifier_args',
+        providedCount === 0
+          ? 'Provide one of celex_number, eli_uri, or work_uri.'
+          : 'Provide only one of celex_number, eli_uri, or work_uri, not multiple.',
+        { ...ctx.recoveryFor('invalid_identifier_args') },
+      );
+    } else if (celexInput) {
+      requestedCelex = celexInput;
+    } else if (eliInput) {
       const binding = await resolveEliToWork(sparqlSvc, eliInput, ctx);
       const resolvedCelex = binding && CellarSparqlService.bindingValue(binding, 'celexNumber');
       if (!resolvedCelex) {
@@ -338,28 +432,45 @@ export const eurlex_get_document = tool('eurlex_get_document', {
           ...ctx.recoveryFor('not_found'),
         });
       }
-      celexNumber = resolvedCelex;
-    } else if (celexInput && !eliInput) {
-      celexNumber = celexInput;
+      requestedCelex = resolvedCelex;
     } else {
-      throw ctx.fail(
-        'invalid_identifier_args',
-        celexInput
-          ? 'Provide only one of celex_number or eli_uri, not both.'
-          : 'Provide either celex_number or eli_uri.',
-        { ...ctx.recoveryFor('invalid_identifier_args') },
+      // work_uri (#34): dereference the CELLAR work to its CELEX. A work with no
+      // CELEX (some CONS_TEXT member/manifestation works) can't be fetched by the
+      // CELEX-keyed flow — report that honestly, never as a mislabeled ELI. The
+      // refine already guaranteed the URI is safe to interpolate inside <...>.
+      const safeWorkUri = workUriInput as string;
+      const derefBindings = await sparqlSvc.query(
+        `SELECT ?celex WHERE {\n  <${safeWorkUri}> cdm:resource_legal_id_celex ?celex .\n} LIMIT 1`,
+        ctx,
       );
+      const resolvedCelex =
+        derefBindings[0] && CellarSparqlService.bindingValue(derefBindings[0], 'celex');
+      if (!resolvedCelex) {
+        throw ctx.fail(
+          'not_found',
+          `This CELLAR work carries no CELEX number and cannot be fetched as a document: ${safeWorkUri}`,
+          { ...ctx.recoveryFor('not_found') },
+        );
+      }
+      requestedCelex = resolvedCelex;
     }
 
     const language = (input.language.trim().toUpperCase() || 'EN') as EurLexLanguage;
     const format = input.format as ContentFormat;
-    const safeCelexNumber = escapeSparqlLiteral(celexNumber);
 
-    // Step 1: Fetch metadata via SPARQL
-    const metaSparql = `
-SELECT ?work ?celexNumber ?type ?date ?title ?inForce ?author ?legalBasis ?eurovoc WHERE {
+    // Metadata fetch (#33): one query per multi-valued dimension, never a
+    // cross-product. The old single query was a LIMIT-20 cross-product of author ×
+    // legalBasis × eurovoc, so a heavily-classified act could drop source rows
+    // before aggregation — and authors were read from the first row only, losing
+    // co-legislators. Each dimension now gets its own query (as
+    // relation-traversal.ts runs one per relation type); the core query carries the
+    // single-valued fields. No dimension can truncate another.
+    const fetchMetadata = async (celex: string) => {
+      const safe = escapeSparqlLiteral(celex);
+      const coreQuery = `
+SELECT ?work ?celexNumber ?type ?date ?title ?inForce WHERE {
   ?work cdm:resource_legal_id_celex ?celexNumber .
-  FILTER(STR(?celexNumber) = "${safeCelexNumber}")
+  FILTER(STR(?celexNumber) = "${safe}")
   OPTIONAL { ?work cdm:work_has_resource-type ?type . }
   OPTIONAL { ?work cdm:work_date_document ?date . }
   OPTIONAL {
@@ -368,40 +479,92 @@ SELECT ?work ?celexNumber ?type ?date ?title ?inForce ?author ?legalBasis ?eurov
     ?expr cdm:expression_title ?title .
   }
   OPTIONAL { ?work cdm:resource_legal_in-force ?inForce . }
-  OPTIONAL { ?work cdm:work_created_by_agent ?author . }
-  OPTIONAL { ?work cdm:resource_legal_based_on_resource_legal ?legalBasis . }
-  OPTIONAL { ?work cdm:work_is_about_concept_eurovoc ?eurovoc . }
-} LIMIT 20`;
+} LIMIT 5`;
+      const dimensionQuery = (predicate: string, variable: string) => `
+SELECT ?${variable} WHERE {
+  ?work cdm:resource_legal_id_celex ?c .
+  FILTER(STR(?c) = "${safe}")
+  ?work ${predicate} ?${variable} .
+} LIMIT ${META_DIMENSION_LIMIT}`;
 
-    const metaBindings = await sparqlSvc.query(metaSparql, ctx);
-    ctx.log.info('Document metadata fetch', { celexNumber, resultCount: metaBindings.length });
+      const [coreBindings, authorBindings, legalBasisBindings, eurovocBindings] = await Promise.all(
+        [
+          sparqlSvc.query(coreQuery, ctx),
+          sparqlSvc.query(dimensionQuery('cdm:work_created_by_agent', 'author'), ctx),
+          sparqlSvc.query(
+            dimensionQuery('cdm:resource_legal_based_on_resource_legal', 'legalBasis'),
+            ctx,
+          ),
+          sparqlSvc.query(dimensionQuery('cdm:work_is_about_concept_eurovoc', 'eurovoc'), ctx),
+        ],
+      );
 
-    if (metaBindings.length === 0) {
-      throw ctx.fail('not_found', `No CELLAR work found for CELEX: ${celexNumber}`, {
+      const collect = (bindings: SparqlBinding[], variable: string): string[] => {
+        const set = new Set<string>();
+        for (const b of bindings) {
+          const v = CellarSparqlService.bindingValue(b, variable);
+          if (v) set.add(v);
+        }
+        return [...set];
+      };
+
+      const first = coreBindings[0];
+      return {
+        found: Boolean(first),
+        workUri: CellarSparqlService.bindingValue(first, 'work'),
+        confirmedCelex: CellarSparqlService.bindingValue(first, 'celexNumber') ?? celex,
+        resourceType: CellarSparqlService.bindingValue(first, 'type'),
+        date: CellarSparqlService.bindingValue(first, 'date'),
+        title: CellarSparqlService.bindingValue(first, 'title'),
+        inForce: CellarSparqlService.parseBoolean(
+          CellarSparqlService.bindingValue(first, 'inForce'),
+        ),
+        authorUris: collect(authorBindings, 'author'),
+        legalBases: collect(legalBasisBindings, 'legalBasis'),
+        eurovoc: collect(eurovocBindings, 'eurovoc'),
+      };
+    };
+
+    const fetchBody = (celex: string) =>
+      input.content_mode === 'metadata_only'
+        ? Promise.resolve(null)
+        : contentSvc.fetchContent(celex, language, format, ctx);
+
+    // Staleness detection + opt-in resolution (#29). findCurrentConsolidated is
+    // self-contained (resolves the base work by CELEX), so on the default path it
+    // runs concurrently with the metadata + content fetch and adds no serial
+    // latency. resolve "current_consolidated" must know which work to serve before
+    // fetching, so it awaits detection first — an inherent serial step on the
+    // opt-in path only. The staleness fields always describe the REQUESTED base
+    // act, whichever work is served.
+    let staleness: CurrentConsolidated | undefined;
+    let servedCelex = requestedCelex;
+    let metaResult: Awaited<ReturnType<typeof fetchMetadata>>;
+    let body: Awaited<ReturnType<typeof fetchBody>>;
+
+    if (input.resolve === 'current_consolidated') {
+      staleness = await findCurrentConsolidated(sparqlSvc, requestedCelex, ctx);
+      servedCelex = staleness?.celex ?? requestedCelex;
+      [metaResult, body] = await Promise.all([fetchMetadata(servedCelex), fetchBody(servedCelex)]);
+    } else {
+      [metaResult, body, staleness] = await Promise.all([
+        fetchMetadata(requestedCelex),
+        fetchBody(requestedCelex),
+        findCurrentConsolidated(sparqlSvc, requestedCelex, ctx),
+      ]);
+    }
+
+    ctx.log.info('Document metadata fetch', {
+      requestedCelex,
+      servedCelex,
+      superseded: Boolean(staleness),
+    });
+
+    if (!metaResult.found) {
+      throw ctx.fail('not_found', `No CELLAR work found for CELEX: ${servedCelex}`, {
         ...ctx.recoveryFor('not_found'),
       });
     }
-
-    // Aggregate repeated fields from multi-row result
-    const first = metaBindings[0];
-    const legalBases = new Set<string>();
-    const eurovocConcepts = new Set<string>();
-    for (const b of metaBindings) {
-      const lb = CellarSparqlService.bindingValue(b, 'legalBasis');
-      if (lb) legalBases.add(lb);
-      const ev = CellarSparqlService.bindingValue(b, 'eurovoc');
-      if (ev) eurovocConcepts.add(ev);
-    }
-
-    const workUri = CellarSparqlService.bindingValue(first, 'work');
-    const confirmedCelex = CellarSparqlService.bindingValue(first, 'celexNumber') ?? celexNumber;
-    const resourceType = CellarSparqlService.bindingValue(first, 'type');
-    const date = CellarSparqlService.bindingValue(first, 'date');
-    const title = CellarSparqlService.bindingValue(first, 'title');
-    const inForce = CellarSparqlService.parseBoolean(
-      CellarSparqlService.bindingValue(first, 'inForce'),
-    );
-    const authorUri = CellarSparqlService.bindingValue(first, 'author');
 
     // Step 2: assemble metadata, then shape the body per content_mode. The body
     // is one navigable mechanism — "metadata_only" skips the fetch entirely,
@@ -411,14 +574,19 @@ SELECT ?work ?celexNumber ?type ?date ?title ?inForce ?author ?legalBasis ?eurov
     // structuredContent and format(); there is no separate truncation downstream.
     const result: {
       celex_number: string;
+      requested_celex?: string;
       work_uri?: string;
       title?: string;
       date?: string;
       resource_type?: string;
       author_institution?: string;
+      author_institutions?: string[];
       legal_basis?: string[];
       eurovoc_subjects?: string[];
       in_force?: boolean;
+      is_superseded?: boolean;
+      current_consolidated_celex?: string;
+      consolidated_as_of?: string;
       content?: string;
       content_mode: string;
       content_available: boolean;
@@ -433,7 +601,7 @@ SELECT ?work ?celexNumber ?type ?date ?title ?inForce ?author ?legalBasis ?eurov
       selection?: { requested: string[]; matched: string[]; missed: string[] };
       structure_detected?: boolean;
     } = {
-      celex_number: confirmedCelex,
+      celex_number: metaResult.confirmedCelex,
       content_mode: input.content_mode,
       content_available: false,
       has_more: false,
@@ -441,25 +609,48 @@ SELECT ?work ?celexNumber ?type ?date ?title ?inForce ?author ?legalBasis ?eurov
       content_format: format,
     };
 
-    if (workUri) result.work_uri = workUri;
-    if (title) result.title = title;
-    if (date) result.date = date;
-    if (resourceType) result.resource_type = resolveResourceTypeLabel(resourceType);
-    if (authorUri) result.author_institution = resolveCorporateBodyLabel(authorUri);
-    if (legalBases.size > 0) result.legal_basis = [...legalBases];
-    if (eurovocConcepts.size > 0) result.eurovoc_subjects = [...eurovocConcepts];
-    if (typeof inForce === 'boolean') result.in_force = inForce;
+    if (metaResult.workUri) result.work_uri = metaResult.workUri;
+    if (metaResult.title) result.title = metaResult.title;
+    if (metaResult.date) result.date = metaResult.date;
+    if (metaResult.resourceType) {
+      result.resource_type = resolveResourceTypeLabel(metaResult.resourceType);
+    }
+    // #33: surface every author. author_institution stays the primary (first) for
+    // back-compat; author_institutions carries the full set (labels deduped, since
+    // distinct URIs like EMA/EMEA share a label).
+    if (metaResult.authorUris.length > 0) {
+      const institutions = [...new Set(metaResult.authorUris.map(resolveCorporateBodyLabel))];
+      const [primary] = institutions;
+      if (primary) {
+        result.author_institution = primary;
+        result.author_institutions = institutions;
+      }
+    }
+    if (metaResult.legalBases.length > 0) result.legal_basis = metaResult.legalBases;
+    if (metaResult.eurovoc.length > 0) result.eurovoc_subjects = metaResult.eurovoc;
+    if (typeof metaResult.inForce === 'boolean') result.in_force = metaResult.inForce;
 
-    if (input.content_mode !== 'metadata_only') {
-      const contentResult = await contentSvc.fetchContent(celexNumber, language, format, ctx);
-      result.content_available = contentResult.contentAvailable;
-      result.language = contentResult.language;
-      if (contentResult.languageFallback) {
-        result.language_fallback = contentResult.languageFallback;
+    // #29: staleness describes the requested base act. When resolve served a
+    // different (consolidated) work, echo the original request so the redirect is
+    // visible — celex_number already holds the served CELEX.
+    if (staleness) {
+      result.is_superseded = true;
+      result.current_consolidated_celex = staleness.celex;
+      result.consolidated_as_of = staleness.asOf;
+    }
+    if (servedCelex !== requestedCelex) {
+      result.requested_celex = requestedCelex;
+    }
+
+    if (body) {
+      result.content_available = body.contentAvailable;
+      result.language = body.language;
+      if (body.languageFallback) {
+        result.language_fallback = body.languageFallback;
       }
 
-      if (contentResult.contentAvailable && contentResult.content) {
-        const full = contentResult.content;
+      if (body.contentAvailable && body.content) {
+        const full = body.content;
         const total = full.length;
         result.content_chars_total = total;
 
@@ -517,7 +708,26 @@ SELECT ?work ?celexNumber ?type ?date ?title ?inForce ?author ?legalBasis ?eurov
     if (result.date) lines.push(`**Date:** ${result.date}`);
     if (result.resource_type) lines.push(`**Type:** ${result.resource_type}`);
     if (result.author_institution) lines.push(`**Author:** ${result.author_institution}`);
+    if (result.author_institutions && result.author_institutions.length > 0) {
+      lines.push(`**Authors:** ${result.author_institutions.join(', ')}`);
+    }
     if (typeof result.in_force === 'boolean') lines.push(`**In Force:** ${result.in_force}`);
+    // #29 staleness — each field renders in its own block so the format-parity
+    // sentinel walk sees every one; is_superseded is present only when true.
+    if (result.is_superseded) {
+      lines.push('**Superseded:** true — a newer consolidated version exists.');
+    }
+    if (result.current_consolidated_celex) {
+      lines.push(`**Current consolidated:** ${result.current_consolidated_celex}`);
+    }
+    if (result.consolidated_as_of) {
+      lines.push(`**Consolidated as of:** ${result.consolidated_as_of}`);
+    }
+    if (result.requested_celex) {
+      lines.push(
+        `**Requested CELEX:** ${result.requested_celex} (served ${result.celex_number} instead)`,
+      );
+    }
     if (result.work_uri) lines.push(`**Work URI:** ${result.work_uri}`);
     if (result.legal_basis && result.legal_basis.length > 0) {
       lines.push(`**Legal Basis:** ${result.legal_basis.join(', ')}`);

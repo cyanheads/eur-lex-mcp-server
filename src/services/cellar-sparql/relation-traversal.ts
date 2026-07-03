@@ -8,6 +8,7 @@
 
 import type { Context } from '@cyanheads/mcp-ts-core';
 import { CellarSparqlService } from './cellar-sparql-service.js';
+import { escapeSparqlLiteral } from './eli-resolution.js';
 import type { WorkRelation } from './types.js';
 
 /** The relation types this server exposes over the CDM graph. */
@@ -119,6 +120,74 @@ ${body}
 const CELEX_ACT_CORE_RE = /^[0-9A-Z](\d{4}[A-Z]{1,2}\d+)/;
 function celexActCore(celex: string): string | undefined {
   return CELEX_ACT_CORE_RE.exec(celex)?.[1];
+}
+
+/**
+ * A consolidated-version CELEX: sector `0`, the `{year}{type}{number}` act core
+ * (group 1), and a `-YYYYMMDD` consolidation-date suffix (groups 2–4). Genuine
+ * consolidations of an act carry this shape, e.g. `02014R0833-20260424`.
+ */
+const CONSOLIDATED_CELEX_RE = /^0(\d{4}[A-Z]{1,2}\d+)-(\d{4})(\d{2})(\d{2})$/;
+
+/** True when a CELEX is itself a consolidated version (…-YYYYMMDD), not a base act. */
+export function isConsolidatedCelex(celex: string): boolean {
+  return CONSOLIDATED_CELEX_RE.test(celex);
+}
+
+/** The newest consolidated version of a base act. */
+export interface CurrentConsolidated {
+  /** Consolidation date parsed from the CELEX suffix, ISO 8601 (`2026-04-24`). */
+  asOf: string;
+  /** CELEX of the consolidated work, e.g. `02014R0833-20260424`. */
+  celex: string;
+}
+
+/**
+ * Find the newest consolidated version of a base act, or `undefined` when the
+ * act has no consolidation (or is itself a consolidated version). Mirrors the
+ * `consolidated_version` relation — the incoming side of
+ * `cdm:act_consolidated_consolidates_resource_legal`, CELEX-bearing, same act
+ * core — so a base act (sector `3`) resolves to its sector-`0` consolidations.
+ *
+ * Self-contained: resolves the base work by CELEX inline (rather than taking a
+ * work URI like `traverseRelations`), so the caller can run it concurrently with
+ * the metadata/content fetch. `ORDER BY DESC(?consolidatedCelex)` puts the newest
+ * same-act consolidation first — the date suffix sorts chronologically within an
+ * act core — so the first row whose core matches is the current version, robust
+ * to a truncating LIMIT. CELLAR also asserts the `consolidates` edge for
+ * consolidations of *other* acts (a graph artifact), so the act-core match is
+ * required, not incidental.
+ */
+export async function findCurrentConsolidated(
+  svc: Pick<CellarSparqlService, 'query'>,
+  celex: string,
+  ctx: Context,
+): Promise<CurrentConsolidated | undefined> {
+  // A consolidated version has no newer consolidation to resolve to.
+  if (isConsolidatedCelex(celex)) return;
+  const baseCore = celexActCore(celex);
+  if (!baseCore) return;
+
+  const query = `
+SELECT ?consolidatedCelex WHERE {
+  ?work cdm:resource_legal_id_celex ?c .
+  FILTER(STR(?c) = "${escapeSparqlLiteral(celex)}")
+  ?consolidated cdm:act_consolidated_consolidates_resource_legal ?work .
+  ?consolidated cdm:resource_legal_id_celex ?consolidatedCelex .
+}
+ORDER BY DESC(?consolidatedCelex)
+LIMIT 100`;
+
+  const bindings = await svc.query(query, ctx);
+  for (const b of bindings) {
+    const c = CellarSparqlService.bindingValue(b, 'consolidatedCelex');
+    if (!c) continue;
+    const m = CONSOLIDATED_CELEX_RE.exec(c);
+    if (m && m[1] === baseCore) {
+      return { celex: c, asOf: `${m[2]}-${m[3]}-${m[4]}` };
+    }
+  }
+  return;
 }
 
 /**

@@ -237,10 +237,12 @@ describe('eurlex_get_document', () => {
   it('resolves an eli_uri to the same document as the equivalent CELEX', async () => {
     const ctx = createMockContext({ errors: eurlex_get_document.errors });
     // First query: ELI → work resolution (yields GDPR's work + CELEX).
-    // Second query: metadata keyed by the resolved CELEX.
+    // Remaining queries (core metadata + per-dimension + staleness) all key off
+    // the resolved CELEX; the shared default binding carries no consolidatedCelex,
+    // so the staleness probe cleanly yields nothing.
     mockSparqlQuery
       .mockResolvedValueOnce([makeMetaBinding({ celex: '32016R0679' })])
-      .mockResolvedValueOnce([
+      .mockResolvedValue([
         makeMetaBinding({
           celex: '32016R0679',
           date: '2016-04-27',
@@ -827,6 +829,303 @@ describe('eurlex_get_document', () => {
       expect(text).toContain('Selection');
       expect(text).toContain('Not found: Article 99');
       expect(text).toContain('content_mode "full"');
+    });
+  });
+
+  // --- #33 authors, #34 work_uri, #29 staleness/resolve ---
+
+  describe('authors (#33), work_uri (#34), staleness + resolve (#29)', () => {
+    type SparqlRows = Array<Record<string, { type: string; value: string }>>;
+    const CB = 'http://publications.europa.eu/resource/authority/corporate-body';
+    /** A single-column binding row (dimension / consolidation / deref queries). */
+    const row = (field: string, value: string): SparqlRows[number] => ({
+      [field]: { type: 'uri', value },
+    });
+
+    /**
+     * Route the shared SPARQL mock by query content. The handler now issues a core
+     * metadata query plus one query per multi-valued dimension (#33), a work_uri
+     * deref (#34), and a consolidation probe (#29), so a single blanket return can't
+     * exercise them independently.
+     */
+    const routeSparql = (routes: {
+      eli?: SparqlRows;
+      workUriDeref?: SparqlRows;
+      core?: SparqlRows;
+      author?: SparqlRows;
+      legalBasis?: SparqlRows;
+      eurovoc?: SparqlRows;
+      consolidation?: SparqlRows;
+    }) => {
+      mockSparqlQuery.mockImplementation((query: string) => {
+        if (query.includes('cdm:resource_legal_eli')) return Promise.resolve(routes.eli ?? []);
+        if (query.includes('cdm:act_consolidated_consolidates_resource_legal'))
+          return Promise.resolve(routes.consolidation ?? []);
+        if (query.includes('cdm:work_created_by_agent'))
+          return Promise.resolve(routes.author ?? []);
+        if (query.includes('cdm:resource_legal_based_on_resource_legal'))
+          return Promise.resolve(routes.legalBasis ?? []);
+        if (query.includes('cdm:work_is_about_concept_eurovoc'))
+          return Promise.resolve(routes.eurovoc ?? []);
+        if (query.includes('cdm:expression_belongs_to_work'))
+          return Promise.resolve(routes.core ?? []);
+        return Promise.resolve(routes.workUriDeref ?? []); // work_uri → CELEX deref
+      });
+    };
+
+    // --- #33: co-legislator authors and no cross-product truncation ---
+
+    it('#33: surfaces all co-legislator authors, not just the first', async () => {
+      const ctx = createMockContext({ errors: eurlex_get_document.errors });
+      routeSparql({
+        core: [makeMetaBinding({ celex: '32016R0679', title: 'GDPR' })],
+        author: [row('author', `${CB}/EP`), row('author', `${CB}/CONSIL`)],
+      });
+
+      const input = eurlex_get_document.input.parse({
+        celex_number: '32016R0679',
+        content_mode: 'metadata_only',
+      });
+      const result = await eurlex_get_document.handler(input, ctx);
+
+      // Full set present regardless of order; primary is one of them.
+      expect(result.author_institutions).toEqual(
+        expect.arrayContaining(['European Parliament', 'Council of the EU']),
+      );
+      expect(result.author_institutions).toHaveLength(2);
+      expect(['European Parliament', 'Council of the EU']).toContain(result.author_institution);
+
+      // format() surfaces the full set (parity).
+      const text = (eurlex_get_document.format!(result)[0] as { text: string }).text;
+      expect(text).toContain('European Parliament');
+      expect(text).toContain('Council of the EU');
+    });
+
+    it('#33: captures the full set for every dimension — no cross-product truncation (REACH-shape)', async () => {
+      const ctx = createMockContext({ errors: eurlex_get_document.errors });
+      // 2 authors × 2 legal bases × 8 EuroVoc = 32 cross-product rows — over the old
+      // LIMIT-20 cap. Per-dimension queries capture each in full.
+      const eurovoc = Array.from({ length: 8 }, (_, i) => row('eurovoc', `http://eurovoc/${i}`));
+      routeSparql({
+        core: [makeMetaBinding({ celex: '32006R1907', title: 'REACH' })],
+        author: [row('author', `${CB}/EP`), row('author', `${CB}/CONSIL`)],
+        legalBasis: [row('legalBasis', 'http://lb/1'), row('legalBasis', 'http://lb/2')],
+        eurovoc,
+      });
+
+      const input = eurlex_get_document.input.parse({
+        celex_number: '32006R1907',
+        content_mode: 'metadata_only',
+      });
+      const result = await eurlex_get_document.handler(input, ctx);
+
+      expect(result.eurovoc_subjects).toHaveLength(8);
+      expect(result.legal_basis).toHaveLength(2);
+      expect(result.author_institutions).toHaveLength(2);
+    });
+
+    // --- #34: fetch by CELLAR work_uri ---
+
+    it('#34: fetches a document by CELLAR work_uri (dereferences to CELEX)', async () => {
+      const ctx = createMockContext({ errors: eurlex_get_document.errors });
+      routeSparql({
+        workUriDeref: [{ celex: { type: 'literal', value: '32024R2822' } }],
+        core: [makeMetaBinding({ celex: '32024R2822', title: 'Regulation (EU) 2024/2822' })],
+      });
+      mockFetchContent.mockResolvedValue({
+        content: '<html>2822</html>',
+        contentAvailable: true,
+        format: 'html',
+        language: 'EN',
+      });
+
+      const input = eurlex_get_document.input.parse({
+        work_uri:
+          'http://publications.europa.eu/resource/cellar/bd40f370-a54d-11ef-85f0-01aa75ed71a1',
+      });
+      const result = await eurlex_get_document.handler(input, ctx);
+
+      expect(result.celex_number).toBe('32024R2822');
+      expect(result.title).toBe('Regulation (EU) 2024/2822');
+      expect(result.content).toBe('<html>2822</html>');
+      // The deref query interpolated the work URI inside <...> and read the CELEX.
+      const derefQuery = mockSparqlQuery.mock.calls
+        .map((c) => c[0] as string)
+        .find((q) => q.includes('/resource/cellar/bd40f370'));
+      expect(derefQuery).toContain('cdm:resource_legal_id_celex');
+      // Content was fetched by the resolved CELEX, not the work URI.
+      expect(mockFetchContent).toHaveBeenCalledWith('32024R2822', 'EN', 'html', expect.anything());
+    });
+
+    it('#34: a CELLAR work with no CELEX throws not_found with an honest message, not a mislabeled ELI', async () => {
+      const ctx = createMockContext({ errors: eurlex_get_document.errors });
+      routeSparql({ workUriDeref: [] }); // deref resolves no CELEX
+
+      const input = eurlex_get_document.input.parse({
+        work_uri: 'http://publications.europa.eu/resource/cellar/no-celex-uuid',
+      });
+      const err = await eurlex_get_document.handler(input, ctx).catch((e: unknown) => e);
+      expect(err).toMatchObject({
+        code: JsonRpcErrorCode.NotFound,
+        data: { reason: 'not_found' },
+      });
+      expect((err as Error).message).toMatch(/no CELEX number/i);
+      // Must NOT label a cellar URI an "ELI".
+      expect((err as Error).message).not.toMatch(/\bELI\b/i);
+    });
+
+    it('#34: providing more than one identifier throws invalid_identifier_args before any query', async () => {
+      const ctx = createMockContext({ errors: eurlex_get_document.errors });
+      const input = eurlex_get_document.input.parse({
+        celex_number: '32016R0679',
+        work_uri: 'http://publications.europa.eu/resource/cellar/uuid',
+      });
+      await expect(eurlex_get_document.handler(input, ctx)).rejects.toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        data: { reason: 'invalid_identifier_args' },
+      });
+      expect(mockSparqlQuery).not.toHaveBeenCalled();
+    });
+
+    // --- #29: staleness signal + opt-in resolve ---
+
+    it('#29: flags a superseded base act — newest same-act consolidation wins, other acts filtered out', async () => {
+      const ctx = createMockContext({ errors: eurlex_get_document.errors });
+      routeSparql({
+        core: [makeMetaBinding({ celex: '32014R0833' })],
+        // Query orders DESC(?consolidatedCelex); newest same-act first, then older,
+        // then a different act's consolidation (a graph artifact to be filtered).
+        consolidation: [
+          row('consolidatedCelex', '02014R0833-20260424'),
+          row('consolidatedCelex', '02014R0833-20220101'),
+          row('consolidatedCelex', '01995L0046-20180525'),
+        ],
+      });
+
+      const input = eurlex_get_document.input.parse({
+        celex_number: '32014R0833',
+        content_mode: 'metadata_only',
+      });
+      const result = await eurlex_get_document.handler(input, ctx);
+
+      expect(result.is_superseded).toBe(true);
+      expect(result.current_consolidated_celex).toBe('02014R0833-20260424');
+      expect(result.consolidated_as_of).toBe('2026-04-24');
+      // format() surfaces the staleness fields (parity).
+      const text = (eurlex_get_document.format!(result)[0] as { text: string }).text;
+      expect(text).toContain('Superseded');
+      expect(text).toContain('02014R0833-20260424');
+      expect(text).toContain('2026-04-24');
+    });
+
+    it('#29: omits staleness when the requested CELEX is itself a consolidated version (no probe issued)', async () => {
+      const ctx = createMockContext({ errors: eurlex_get_document.errors });
+      routeSparql({
+        core: [makeMetaBinding({ celex: '02014R0833-20260424' })],
+        consolidation: [row('consolidatedCelex', '02014R0833-20260424')],
+      });
+
+      const input = eurlex_get_document.input.parse({
+        celex_number: '02014R0833-20260424',
+        content_mode: 'metadata_only',
+      });
+      const result = await eurlex_get_document.handler(input, ctx);
+
+      expect(result.is_superseded).toBeUndefined();
+      expect(result.current_consolidated_celex).toBeUndefined();
+      // Short-circuits before issuing the consolidation query.
+      const probed = mockSparqlQuery.mock.calls
+        .map((c) => c[0] as string)
+        .some((q) => q.includes('act_consolidated_consolidates'));
+      expect(probed).toBe(false);
+    });
+
+    it('#29: omits staleness for a base act with no consolidated versions', async () => {
+      const ctx = createMockContext({ errors: eurlex_get_document.errors });
+      routeSparql({
+        core: [makeMetaBinding({ celex: '32024R2822' })],
+        consolidation: [],
+      });
+
+      const input = eurlex_get_document.input.parse({
+        celex_number: '32024R2822',
+        content_mode: 'metadata_only',
+      });
+      const result = await eurlex_get_document.handler(input, ctx);
+
+      expect(result.is_superseded).toBeUndefined();
+      expect(result.current_consolidated_celex).toBeUndefined();
+      expect(result.consolidated_as_of).toBeUndefined();
+    });
+
+    it('#29: resolve "current_consolidated" serves the consolidated work and reports served + requested CELEX', async () => {
+      const ctx = createMockContext({ errors: eurlex_get_document.errors });
+      mockSparqlQuery.mockImplementation((query: string) => {
+        if (query.includes('cdm:act_consolidated_consolidates_resource_legal')) {
+          return Promise.resolve([
+            { consolidatedCelex: { type: 'literal', value: '02014R0833-20260424' } },
+          ]);
+        }
+        if (query.includes('cdm:expression_belongs_to_work')) {
+          // Core metadata keys off the served CELEX (the FILTER literal).
+          const celex = /"([^"]+)"/.exec(query)?.[1] ?? '';
+          return Promise.resolve([makeMetaBinding({ celex })]);
+        }
+        return Promise.resolve([]);
+      });
+      mockFetchContent.mockResolvedValue({
+        content: '<html>consolidated</html>',
+        contentAvailable: true,
+        format: 'html',
+        language: 'EN',
+      });
+
+      const input = eurlex_get_document.input.parse({
+        celex_number: '32014R0833',
+        resolve: 'current_consolidated',
+      });
+      const result = await eurlex_get_document.handler(input, ctx);
+
+      expect(result.celex_number).toBe('02014R0833-20260424'); // served consolidated
+      expect(result.requested_celex).toBe('32014R0833'); // original echoed
+      expect(result.is_superseded).toBe(true);
+      expect(result.current_consolidated_celex).toBe('02014R0833-20260424');
+      expect(result.content).toBe('<html>consolidated</html>');
+      // Content fetched for the CONSOLIDATED celex, not the requested base.
+      expect(mockFetchContent).toHaveBeenCalledWith(
+        '02014R0833-20260424',
+        'EN',
+        'html',
+        expect.anything(),
+      );
+      const text = (eurlex_get_document.format!(result)[0] as { text: string }).text;
+      expect(text).toContain('Requested CELEX');
+      expect(text).toContain('32014R0833');
+    });
+
+    it('#29: resolve "current_consolidated" is a no-op when no newer consolidated version exists', async () => {
+      const ctx = createMockContext({ errors: eurlex_get_document.errors });
+      routeSparql({
+        core: [makeMetaBinding({ celex: '32024R2822' })],
+        consolidation: [],
+      });
+      mockFetchContent.mockResolvedValue({
+        content: '<html>as enacted</html>',
+        contentAvailable: true,
+        format: 'html',
+        language: 'EN',
+      });
+
+      const input = eurlex_get_document.input.parse({
+        celex_number: '32024R2822',
+        resolve: 'current_consolidated',
+      });
+      const result = await eurlex_get_document.handler(input, ctx);
+
+      expect(result.celex_number).toBe('32024R2822'); // served as requested
+      expect(result.requested_celex).toBeUndefined(); // no redirect
+      expect(result.is_superseded).toBeUndefined();
+      expect(mockFetchContent).toHaveBeenCalledWith('32024R2822', 'EN', 'html', expect.anything());
     });
   });
 });
