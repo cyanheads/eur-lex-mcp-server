@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.8.2](changelog/0.8.x/0.8.2.md) — 2026-07-03
+
+eurlex_get_cases case_type filtering now tests CDM resource-type instead of a CELEX substring, case titles are parsed into structured parties/subject_matter/case_reference fields, and the parser handles CELLAR's plural joined-case reference form
+
 ## [0.8.1](changelog/0.8.x/0.8.1.md) — 2026-07-03
 
 sparql_error responses now carry their declared recovery hint, eurlex_search_documents/eurlex_get_cases/eurlex_browse_subjects disclose capped-list truncation, and reader-/config-specific phrasing is trimmed from two tool descriptions

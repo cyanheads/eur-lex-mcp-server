@@ -1,6 +1,6 @@
 # eur-lex-mcp-server - Directory Structure
 
-Generated on: 2026-07-03 16:44:20
+Generated on: 2026-07-03 20:02:11
 
 ```text
 eur-lex-mcp-server/
@@ -180,6 +180,7 @@ eur-lex-mcp-server/
 │   │   └── eurlex-document.resource.test.ts
 │   ├── services/
 │   │   ├── act-structure.test.ts
+│   │   ├── cdm-labels.test.ts
 │   │   ├── cellar-sparql-service.test.ts
 │   │   ├── eurlex-content-service.test.ts
 │   │   └── html-to-markdown.test.ts
