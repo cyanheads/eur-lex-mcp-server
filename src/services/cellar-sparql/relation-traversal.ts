@@ -75,38 +75,68 @@ const RELATION_SPECS: Record<RelationType, { predicate: string; direction: Direc
 };
 
 /**
- * Default per-type result cap. Each relation type is queried independently with
- * its own LIMIT so a high-volume type (e.g. `cites`) can't starve rarer types
- * under a single shared cap. The service caps further if MAX_SPARQL_RESULTS is
- * lower than this.
+ * Default per-direction result cap. Each relation type is queried independently
+ * with its own LIMIT so a high-volume type (e.g. `cites`) can't starve rarer
+ * types under a single shared cap; a symmetric type splits its cap per direction
+ * too (see `buildRelationQuery`). The service caps further if MAX_SPARQL_RESULTS
+ * is lower — callers clamp to it to keep both sides of a symmetric query capped
+ * consistently.
  */
 export const DEFAULT_PER_TYPE_LIMIT = 100;
 
-/** Build a single-relation-type SPARQL query for the given predicate + direction. */
+/** One direction's graph pattern for a relation predicate, tagged with its direction. */
+function relationArm(
+  workUri: string,
+  predicate: string,
+  direction: 'outgoing' | 'incoming',
+): string {
+  const edge =
+    direction === 'outgoing'
+      ? `<${workUri}> ${predicate} ?relatedWork .`
+      : `?relatedWork ${predicate} <${workUri}> .`;
+  // `?relatedDate` drives the per-direction ordering below; it stays OPTIONAL so
+  // related works without a document date still return (they sort last under DESC).
+  return `${edge}
+    OPTIONAL { ?relatedWork cdm:resource_legal_id_celex ?relatedCelex . }
+    OPTIONAL { ?relatedWork cdm:work_date_document ?relatedDate . }
+    BIND("${direction}" AS ?direction)`;
+}
+
+/**
+ * Build a single-relation-type SPARQL query, ordered by the related work's
+ * document date DESC and paged (LIMIT + OFFSET).
+ *
+ * Ordering is the fix for the unordered-cap bug: an incoming edge on a
+ * heavily-related act (e.g. works citing the GDPR) returns thousands of rows, so
+ * an unordered LIMIT dropped the newest. `ORDER BY DESC(?relatedDate)` keeps the
+ * most recent within the cap; `OFFSET` reaches the rest.
+ *
+ * A symmetric type (`cites`, direction `both`) is a UNION of two subqueries, each
+ * ordered and capped independently, so a dense outgoing set can't consume the
+ * incoming budget and vice versa. The per-direction LIMITs must each be ≤
+ * MAX_SPARQL_RESULTS: the service's `enforceLimitInQuery` only rewrites the first
+ * LIMIT it finds, so an over-cap here would silently leave the second subquery
+ * uncapped — callers pass a limit already clamped to the service ceiling.
+ */
 function buildRelationQuery(
   workUri: string,
   spec: { predicate: string; direction: Direction },
   limit: number,
+  offset: number,
 ): string {
-  const outgoing = `{
-    <${workUri}> ${spec.predicate} ?relatedWork .
-    OPTIONAL { ?relatedWork cdm:resource_legal_id_celex ?relatedCelex . }
-    BIND("outgoing" AS ?direction)
-  }`;
-  const incoming = `{
-    ?relatedWork ${spec.predicate} <${workUri}> .
-    OPTIONAL { ?relatedWork cdm:resource_legal_id_celex ?relatedCelex . }
-    BIND("incoming" AS ?direction)
-  }`;
-  const body =
-    spec.direction === 'outgoing'
-      ? outgoing
-      : spec.direction === 'incoming'
-        ? incoming
-        : `${outgoing} UNION ${incoming}`;
+  const paging = `ORDER BY DESC(?relatedDate) LIMIT ${limit} OFFSET ${offset}`;
+  if (spec.direction !== 'both') {
+    return `SELECT ?relatedWork ?relatedCelex ?direction WHERE {
+    ${relationArm(workUri, spec.predicate, spec.direction)}
+} ${paging}`;
+  }
+  const subquery = (direction: 'outgoing' | 'incoming') =>
+    `{ SELECT ?relatedWork ?relatedCelex ?direction WHERE {
+    ${relationArm(workUri, spec.predicate, direction)}
+  } ${paging} }`;
   return `SELECT ?relatedWork ?relatedCelex ?direction WHERE {
-${body}
-} LIMIT ${limit}`;
+  ${subquery('outgoing')} UNION ${subquery('incoming')}
+}`;
 }
 
 /**
@@ -205,6 +235,10 @@ LIMIT 100`;
  * are always dropped (they can't be fetched via get_document anyway); when
  * `sourceCelex` is known, rows whose CELEX belongs to a different act are dropped
  * too. Every other relation type is returned unfiltered.
+ *
+ * `perTypeLimit` bounds each direction of each type; `offset` pages within a
+ * direction. Returns the relations plus `truncated` — true when any type's
+ * direction filled its cap, so more related works may exist at a higher offset.
  */
 export async function traverseRelations(
   svc: Pick<CellarSparqlService, 'query'>,
@@ -213,13 +247,14 @@ export async function traverseRelations(
   ctx: Context,
   sourceCelex?: string,
   perTypeLimit: number = DEFAULT_PER_TYPE_LIMIT,
-): Promise<WorkRelation[]> {
+  offset = 0,
+): Promise<{ relations: WorkRelation[]; truncated: boolean }> {
   const sourceActCore = sourceCelex ? celexActCore(sourceCelex) : undefined;
   const perType = await Promise.all(
     types.map(async (type) => ({
       type,
       bindings: await svc.query(
-        buildRelationQuery(workUri, RELATION_SPECS[type], perTypeLimit),
+        buildRelationQuery(workUri, RELATION_SPECS[type], perTypeLimit, offset),
         ctx,
       ),
     })),
@@ -227,11 +262,18 @@ export async function traverseRelations(
 
   const seen = new Set<string>();
   const relations: WorkRelation[] = [];
+  let truncated = false;
   for (const { type, bindings } of perType) {
+    // Raw rows per direction: a direction whose rows fill the cap may have more
+    // upstream. A symmetric type interleaves two independently-capped directions
+    // in one result set, so count each side separately (against the raw bindings,
+    // before the consolidated_version filter — the cap is what CELLAR returned).
+    const rowsByDirection = new Map<'outgoing' | 'incoming', number>();
     for (const b of bindings) {
       const relatedWorkUri = CellarSparqlService.bindingValue(b, 'relatedWork') ?? '';
       const direction =
         CellarSparqlService.bindingValue(b, 'direction') === 'incoming' ? 'incoming' : 'outgoing';
+      rowsByDirection.set(direction, (rowsByDirection.get(direction) ?? 0) + 1);
       const relatedCelex = CellarSparqlService.bindingValue(b, 'relatedCelex');
 
       // #32: keep the consolidated_version list trustworthy at a glance. A
@@ -252,6 +294,9 @@ export async function traverseRelations(
       if (relatedCelex) relation.relatedCelexNumber = relatedCelex;
       relations.push(relation);
     }
+    for (const count of rowsByDirection.values()) {
+      if (count >= perTypeLimit) truncated = true;
+    }
   }
-  return relations;
+  return { relations, truncated };
 }

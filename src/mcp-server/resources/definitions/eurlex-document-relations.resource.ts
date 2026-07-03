@@ -54,14 +54,18 @@ SELECT ?work WHERE {
       // Summarize all relation types via the shared traversal — one query per
       // type so amendment and consolidation relations (modeled one-directionally
       // in CELLAR) actually surface. Passing the CELEX lets the traversal apply
-      // the consolidated_version act-number filter (#32). See relation-traversal.ts.
-      const workRelations = await traverseRelations(
+      // the consolidated_version act-number filter (#32). Incoming edges come
+      // ordered newest-first, so this lightweight summary keeps the most recent
+      // within its per-direction cap. See relation-traversal.ts. The cap is
+      // clamped to the service ceiling so both sides of a symmetric query stay
+      // capped consistently.
+      const { relations: workRelations, truncated } = await traverseRelations(
         svc,
         workUri,
         RELATION_TYPES,
         ctx,
         celexNumber,
-        SUMMARY_PER_TYPE_LIMIT,
+        Math.min(SUMMARY_PER_TYPE_LIMIT, svc.maxResults),
       );
       const relations = workRelations.map((r) => ({
         relation_type: r.relationType,
@@ -75,6 +79,9 @@ SELECT ?work WHERE {
         work_uri: workUri,
         relations,
         total: relations.length,
+        // True when a relation direction filled the summary cap — the fuller,
+        // pageable list is available via the eurlex_get_relations tool.
+        truncated,
       };
     },
   },

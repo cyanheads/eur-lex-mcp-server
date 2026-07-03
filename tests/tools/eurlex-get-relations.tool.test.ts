@@ -4,14 +4,16 @@
  */
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_get_relations } from '@/mcp-server/tools/definitions/eurlex-get-relations.tool.js';
 
 // --- Service mock ---
 const mockQuery = vi.fn();
+// maxResults mirrors the real service ceiling (MAX_SPARQL_RESULTS); the handler
+// clamps the per-direction cap to it.
 vi.mock('@/services/cellar-sparql/cellar-sparql-service.js', () => ({
-  getCellarSparqlService: () => ({ query: mockQuery }),
+  getCellarSparqlService: () => ({ query: mockQuery, maxResults: 100 }),
   CellarSparqlService: {
     bindingValue: (binding: Record<string, { value?: string }> | undefined, field: string) =>
       binding?.[field]?.value,
@@ -564,6 +566,160 @@ describe('eurlex_get_relations', () => {
     expect(relSparql).toContain(`?relatedWork cdm:work_cites_work <${GDPR_WORK_URI}>`);
   });
 
+  // --- #39: incoming edges ordered newest-first, per-direction caps, paging, truncation ---
+
+  it('orders each relation query by document date DESC and pages with LIMIT + OFFSET', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_relations.errors });
+    mockQuery.mockImplementation(
+      routeQuery({
+        resolve: [makeResolveBinding(GDPR_WORK_URI)],
+        amendedBy: [
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/amender',
+            direction: 'incoming',
+            relatedCelex: '32026R1165',
+          }),
+        ],
+      }),
+    );
+
+    const input = eurlex_get_relations.input.parse({
+      celex_number: '32016R0679',
+      relation_types: ['amended_by'],
+    });
+    await eurlex_get_relations.handler(input, ctx);
+
+    const relSparql = mockQuery.mock.calls
+      .map((c) => c[0] as string)
+      .find((q) => !q.includes('SELECT ?work WHERE'))!;
+    // Ordering fix: the newest related works land within the cap, not an arbitrary subset.
+    expect(relSparql).toContain('ORDER BY DESC(?relatedDate)');
+    expect(relSparql).toContain('cdm:work_date_document ?relatedDate');
+    expect(relSparql).toContain('LIMIT 100');
+    expect(relSparql).toContain('OFFSET 0');
+  });
+
+  it('splits the per-direction cap for the symmetric cites relation (one LIMIT per direction)', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_relations.errors });
+    mockQuery.mockImplementation(
+      routeQuery({
+        resolve: [makeResolveBinding(GDPR_WORK_URI)],
+        cites: [
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/cited',
+            direction: 'outgoing',
+          }),
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/citer',
+            direction: 'incoming',
+          }),
+        ],
+      }),
+    );
+
+    const input = eurlex_get_relations.input.parse({
+      celex_number: '32016R0679',
+      relation_types: ['cites'],
+    });
+    await eurlex_get_relations.handler(input, ctx);
+
+    const citesSparql = mockQuery.mock.calls
+      .map((c) => c[0] as string)
+      .find((q) => q.includes('cdm:work_cites_work'))!;
+    // Two independently-capped subqueries UNIONed — outgoing can't consume incoming's budget.
+    expect(citesSparql).toContain('UNION');
+    expect((citesSparql.match(/LIMIT /g) ?? []).length).toBe(2);
+    expect((citesSparql.match(/OFFSET /g) ?? []).length).toBe(2);
+  });
+
+  it('passes offset through to the per-type queries and echoes it in the response', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_relations.errors });
+    mockQuery.mockImplementation(
+      routeQuery({
+        resolve: [makeResolveBinding(GDPR_WORK_URI)],
+        amendedBy: [
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/amender',
+            direction: 'incoming',
+            relatedCelex: '32026R1165',
+          }),
+        ],
+      }),
+    );
+
+    const input = eurlex_get_relations.input.parse({
+      celex_number: '32016R0679',
+      relation_types: ['amended_by'],
+      offset: 25,
+    });
+    const result = await eurlex_get_relations.handler(input, ctx);
+
+    expect(result.offset).toBe(25);
+    const relSparql = mockQuery.mock.calls
+      .map((c) => c[0] as string)
+      .find((q) => !q.includes('SELECT ?work WHERE'))!;
+    expect(relSparql).toContain('OFFSET 25');
+  });
+
+  it('discloses truncation when a direction fills its per-direction cap', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_relations.errors });
+    // Two incoming amenders at a cap of 2 — the direction is full, so more may exist.
+    mockQuery.mockImplementation(
+      routeQuery({
+        resolve: [makeResolveBinding(GDPR_WORK_URI)],
+        amendedBy: [
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/amender-1',
+            direction: 'incoming',
+            relatedCelex: '32026R1165',
+          }),
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/amender-2',
+            direction: 'incoming',
+            relatedCelex: '32026R1166',
+          }),
+        ],
+      }),
+    );
+
+    const input = eurlex_get_relations.input.parse({
+      celex_number: '32016R0679',
+      relation_types: ['amended_by'],
+      limit: 2,
+    });
+    await eurlex_get_relations.handler(input, ctx);
+
+    const enriched = getEnrichment(ctx);
+    expect(enriched.truncated).toBe(true);
+    expect(enriched.shown).toBe(2);
+    expect(enriched.cap).toBe(2);
+  });
+
+  it('does not disclose truncation when every direction is short of the cap', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_relations.errors });
+    mockQuery.mockImplementation(
+      routeQuery({
+        resolve: [makeResolveBinding(GDPR_WORK_URI)],
+        amendedBy: [
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/amender',
+            direction: 'incoming',
+            relatedCelex: '32026R1165',
+          }),
+        ],
+      }),
+    );
+
+    const input = eurlex_get_relations.input.parse({
+      celex_number: '32016R0679',
+      relation_types: ['amended_by'],
+      limit: 2,
+    });
+    await eurlex_get_relations.handler(input, ctx);
+
+    expect(getEnrichment(ctx).truncated).toBeUndefined();
+  });
+
   // --- #19: per-type queries so high-volume types don't starve rarer ones ---
 
   it('queries each requested type independently so a dense type cannot starve a sparse one', async () => {
@@ -775,7 +931,7 @@ describe('eurlex_get_relations', () => {
 
   // --- Format ---
 
-  it('format groups relations by type and direction, renders CELEX and work URI', () => {
+  it('format groups relations by type and direction, renders CELEX, work URI, and offset', () => {
     const output = {
       celex_number: '32016R0679',
       work_uri: GDPR_WORK_URI,
@@ -793,6 +949,7 @@ describe('eurlex_get_relations', () => {
         },
       ],
       total: 2,
+      offset: 0,
     };
     const blocks = eurlex_get_relations.format!(output);
     expect(blocks[0]?.type).toBe('text');
@@ -801,5 +958,7 @@ describe('eurlex_get_relations', () => {
     expect(text).toContain('32022R0000');
     expect(text).toContain('amended_by');
     expect(text).toContain('legal_basis');
+    // The pagination offset reaches the text channel (format parity).
+    expect(text).toContain('offset 0');
   });
 });

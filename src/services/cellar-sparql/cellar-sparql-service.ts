@@ -55,7 +55,13 @@ function enforceLimitInQuery(query: string, max: number): string {
 export class CellarSparqlService {
   private readonly endpoint: string;
   private readonly timeoutMs: number;
-  private readonly maxResults: number;
+  /**
+   * Enforced ceiling on generated LIMIT clauses (`MAX_SPARQL_RESULTS`). Public so
+   * callers that split a query into multiple independently-capped sub-selects
+   * (e.g. the per-direction relation traversal) can clamp each cap to it up front,
+   * rather than have `enforceLimitInQuery` rewrite only the first LIMIT it finds.
+   */
+  readonly maxResults: number;
 
   constructor(_config: AppConfig, _storage: StorageService, serverConfig: ServerConfig) {
     this.endpoint = serverConfig.cellarSparqlEndpoint;

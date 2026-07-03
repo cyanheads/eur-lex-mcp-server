@@ -9,8 +9,9 @@ import { eurlex_document_relations_resource } from '@/mcp-server/resources/defin
 
 // --- Service mock ---
 const mockQuery = vi.fn();
+// maxResults mirrors the real service ceiling; the handler clamps the summary cap to it.
 vi.mock('@/services/cellar-sparql/cellar-sparql-service.js', () => ({
-  getCellarSparqlService: () => ({ query: mockQuery }),
+  getCellarSparqlService: () => ({ query: mockQuery, maxResults: 100 }),
   CellarSparqlService: {
     bindingValue: (binding: Record<string, { value?: string }> | undefined, field: string) =>
       binding?.[field]?.value,
@@ -114,6 +115,39 @@ describe('eurlex_document_relations_resource', () => {
     expect(relations[0]?.relation_type).toBe('amended_by');
     expect(relations[0]?.direction).toBe('incoming');
     expect(relations[0]?.related_celex_number).toBe('32022R0000');
+    // #39: a lightly-related act does not fill the summary cap.
+    expect((result as Record<string, unknown>).truncated).toBe(false);
+  });
+
+  // --- #39: the summary orders + caps per direction and discloses truncation ---
+
+  it('orders each relation query newest-first and discloses truncation when the summary cap fills', async () => {
+    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    // 25 incoming amenders = the SUMMARY_PER_TYPE_LIMIT, so the direction is full.
+    const manyAmenders = Array.from({ length: 25 }, (_, i) =>
+      makeRelationBinding({
+        relatedWork: `http://publications.europa.eu/resource/cellar/amender-${i}`,
+        direction: 'incoming',
+        relatedCelex: `3202${i % 10}R${1000 + i}`,
+      }),
+    );
+    mockQuery.mockImplementation(
+      routeQuery({ resolve: [makeResolveBinding(GDPR_WORK_URI)], amendedBy: manyAmenders }),
+    );
+
+    const params = eurlex_document_relations_resource.params.parse({ celexNumber: '32016R0679' });
+    const result = (await eurlex_document_relations_resource.handler(params, ctx)) as Record<
+      string,
+      unknown
+    >;
+
+    expect(result.truncated).toBe(true);
+    // Incoming edges are ordered newest-first so the summary keeps the most recent.
+    const relSparql = mockQuery.mock.calls
+      .map((c) => c[0] as string)
+      .find((q) => !q.includes('SELECT ?work WHERE'))!;
+    expect(relSparql).toContain('ORDER BY DESC(?relatedDate)');
+    expect(relSparql).toContain('LIMIT 25');
   });
 
   // --- #19: amendment + consolidation relations now surface on the resource ---

@@ -64,6 +64,27 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
           'implicitly_repeals (what this work implicitly repeals), implicitly_repealed_by (what implicitly repealed this work), ' +
           'legal_basis (treaty/treaty article this act is based on), consolidated_version (consolidated versions of this act).',
       ),
+    offset: z
+      .number()
+      .int()
+      .min(0)
+      .default(0)
+      .describe(
+        'Pagination offset applied per relation type and per direction — number of related works to skip. Defaults to 0. ' +
+          'Page forward by adding limit each call; incoming edges are ordered newest-first, so higher offsets reach older works.',
+      ),
+    limit: z
+      .number()
+      .int()
+      .min(1)
+      .max(100)
+      .default(100)
+      .describe(
+        'Maximum related works to return per relation type and per direction (1–100). Defaults to 100. ' +
+          'Incoming edges (e.g. works that cite this act) are ordered by document date descending, so the cap keeps the newest — ' +
+          'page with offset for older ones. For the symmetric cites relation, outgoing and incoming each get this budget independently. ' +
+          'When truncated is true, at least one direction filled its cap and more may exist.',
+      ),
   }),
   output: z.object({
     celex_number: z
@@ -100,8 +121,27 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
           .describe('A single CDM relation between the source work and a related work.'),
       )
       .describe('Direct CDM relations for the requested work.'),
-    total: z.number().describe('Total number of direct CDM relations returned.'),
+    total: z
+      .number()
+      .describe(
+        'Number of relations returned in this page (not a corpus-wide count). ' +
+          'A direction that filled its per-direction cap sets truncated — page with offset for the rest.',
+      ),
+    offset: z
+      .number()
+      .describe('Pagination offset applied to this response (per relation type and direction).'),
   }),
+
+  enrichment: {
+    truncated: z
+      .boolean()
+      .optional()
+      .describe(
+        'True when at least one relation type/direction filled its per-direction cap and more related works may exist — page with offset.',
+      ),
+    shown: z.number().optional().describe('Number of relations returned in this page.'),
+    cap: z.number().optional().describe('The per-direction cap applied to this page.'),
+  },
 
   errors: [
     {
@@ -165,17 +205,32 @@ SELECT ?work WHERE {
     }
 
     // Step 2: Traverse the requested relation types. Each type is resolved
-    // through its own query (with its own LIMIT), run concurrently, so a
-    // high-volume type (e.g. cites) can't starve the rarer ones under a shared
-    // cap. The predicate + direction model lives in relation-traversal.ts.
+    // through its own query (with its own per-direction LIMIT + OFFSET), run
+    // concurrently, so a high-volume type (e.g. cites) can't starve the rarer
+    // ones under a shared cap. The predicate + direction model lives in
+    // relation-traversal.ts. Clamp the per-direction cap to the service ceiling
+    // (MAX_SPARQL_RESULTS) up front so both sides of a symmetric query stay
+    // capped consistently — the service's LIMIT enforcement rewrites only the
+    // first LIMIT it finds, which would leave a UNION's second subquery uncapped.
     const requestedTypes: readonly RelationType[] = input.relation_types ?? RELATION_TYPES;
+    const perDirectionLimit = Math.min(input.limit, svc.maxResults);
     // Pass the source CELEX (undefined on the work_uri path) so the shared
     // traversal can apply the consolidated_version act-number filter (#32).
-    const workRelations = await traverseRelations(svc, workUri, requestedTypes, ctx, celexNumber);
+    const { relations: workRelations, truncated } = await traverseRelations(
+      svc,
+      workUri,
+      requestedTypes,
+      ctx,
+      celexNumber,
+      perDirectionLimit,
+      input.offset,
+    );
     ctx.log.info('Relation traversal', {
       celexNumber,
       workUri,
       resultCount: workRelations.length,
+      offset: input.offset,
+      truncated,
     });
 
     if (workRelations.length === 0) {
@@ -195,17 +250,24 @@ SELECT ?work WHERE {
       ...(r.relatedCelexNumber ? { related_celex_number: r.relatedCelexNumber } : {}),
     }));
 
+    // Disclose truncation so a capped list isn't mistaken for the complete set —
+    // the same signal eurlex_get_cases and eurlex_search_documents expose.
+    if (truncated) {
+      ctx.enrich.truncated({ shown: relations.length, cap: perDirectionLimit });
+    }
+
     return {
       ...(celexNumber ? { celex_number: celexNumber } : {}),
       work_uri: workUri,
       relations,
       total: relations.length,
+      offset: input.offset,
     };
   },
 
   format: (result) => {
     const lines: string[] = [
-      `## Relations for ${result.celex_number ?? result.work_uri} (${result.total} found)\n`,
+      `## Relations for ${result.celex_number ?? result.work_uri} (${result.total} in this page, offset ${result.offset})\n`,
     ];
     if (result.work_uri) lines.push(`**Work URI:** ${result.work_uri}\n`);
 
