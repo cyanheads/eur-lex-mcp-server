@@ -5,11 +5,16 @@
  */
 
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ServerConfig } from '@/config/server-config.js';
-import { CellarSparqlService } from '@/services/cellar-sparql/cellar-sparql-service.js';
+import { eurlex_query_sparql } from '@/mcp-server/tools/definitions/eurlex-query-sparql.tool.js';
+import {
+  CellarSparqlService,
+  SPARQL_ERROR_RECOVERY_HINT,
+} from '@/services/cellar-sparql/cellar-sparql-service.js';
 
 function makeService(): CellarSparqlService {
   const serverConfig = {
@@ -112,5 +117,64 @@ describe('CellarSparqlService.queryWithVars', () => {
 
     const bindings = await makeService().query('SELECT ?work WHERE { ?s ?p ?o }', ctx);
     expect(bindings).toHaveLength(1);
+  });
+});
+
+// --- #26: sparql_error throws carry the declared recovery hint on the wire ---
+
+describe('CellarSparqlService sparql_error recovery (#26)', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  function stubFetchRaw(opts: { ok: boolean; status: number; body: string }): void {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({
+        ok: opts.ok,
+        status: opts.status,
+        text: async () => opts.body,
+      })),
+    );
+  }
+
+  it('attaches the recovery hint to an HTTP 400 malformed-query error', async () => {
+    stubFetchRaw({
+      ok: false,
+      status: 400,
+      body: "Virtuoso 37000 Error SP030: SPARQL compiler, line 5: syntax error at 'WHERE'",
+    });
+    const ctx = createMockContext();
+
+    await expect(makeService().query('SELECT WHERE { ?s ?p ?o }', ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: {
+        reason: 'sparql_error',
+        recovery: { hint: SPARQL_ERROR_RECOVERY_HINT },
+      },
+    });
+  });
+
+  it('attaches the recovery hint to a Virtuoso HTTP-200 error body', async () => {
+    // Virtuoso returns HTTP 200 even for syntax errors — the body carries the error.
+    stubFetchRaw({
+      ok: true,
+      status: 200,
+      body: "Virtuoso 37000 Error SP030: SPARQL compiler, line 5: syntax error at 'WHERE' before '{'",
+    });
+    const ctx = createMockContext();
+
+    await expect(makeService().query('SELECT WHERE { ?s ?p ?o }', ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: {
+        reason: 'sparql_error',
+        recovery: { hint: SPARQL_ERROR_RECOVERY_HINT },
+      },
+    });
+  });
+
+  it('keeps the service hint identical to the eurlex_query_sparql contract recovery (no drift)', () => {
+    const contractRecovery = eurlex_query_sparql.errors?.find(
+      (e) => e.reason === 'sparql_error',
+    )?.recovery;
+    expect(SPARQL_ERROR_RECOVERY_HINT).toBe(contractRecovery);
   });
 });

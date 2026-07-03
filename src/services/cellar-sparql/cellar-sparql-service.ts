@@ -25,6 +25,17 @@ const VIRTUOSO_ERROR_RE = /Virtuoso\s+\d+\s+Error/i;
 const VIRTUOSO_TIMEOUT_RE = /SP031|query execution timed out/i;
 
 /**
+ * Recovery hint attached to every `sparql_error` throw so the wire
+ * `data.recovery.hint` (and its mirrored `Recovery:` content line) is populated
+ * even though the error is raised here in the shared service rather than through
+ * a handler's `ctx.fail`. Kept identical to the `sparql_error` contract recovery
+ * declared on eurlex_query_sparql — that tool's inline literal is the
+ * human-readable source of truth, and a service test asserts the two never drift.
+ */
+export const SPARQL_ERROR_RECOVERY_HINT =
+  'Fix the SPARQL query syntax, ensure predicates use the cdm: prefix, and verify variable names.';
+
+/**
  * Inject or cap the LIMIT clause in a SPARQL query to `max`.
  * If the query has no LIMIT, appends one. If it has a LIMIT above `max`, rewrites it.
  */
@@ -116,6 +127,7 @@ export class CellarSparqlService {
             throw validationError(`CELLAR SPARQL error: ${text.slice(0, 300)}`, {
               reason: 'sparql_error',
               retryable: false,
+              recovery: { hint: SPARQL_ERROR_RECOVERY_HINT },
             });
           }
           throw serviceUnavailable(`CELLAR SPARQL HTTP ${response.status}`, {
@@ -134,6 +146,7 @@ export class CellarSparqlService {
           throw validationError(`CELLAR SPARQL error: ${text.slice(0, 300)}`, {
             reason: 'sparql_error',
             retryable: false,
+            recovery: { hint: SPARQL_ERROR_RECOVERY_HINT },
           });
         }
 
