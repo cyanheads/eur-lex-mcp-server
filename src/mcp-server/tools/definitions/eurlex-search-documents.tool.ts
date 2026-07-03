@@ -201,6 +201,17 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
       .describe('Echo of filters applied to this search. Useful for diagnosing empty results.'),
   }),
 
+  enrichment: {
+    truncated: z
+      .boolean()
+      .optional()
+      .describe(
+        'True when the returned page was capped at the limit and more documents may exist.',
+      ),
+    shown: z.number().optional().describe('Number of documents returned in this page.'),
+    cap: z.number().optional().describe('The limit that was applied to this page.'),
+  },
+
   errors: [
     {
       reason: 'no_filters',
@@ -456,6 +467,11 @@ SELECT
       if (title) doc.title = title;
       return doc;
     });
+
+    // A full page means the limit capped the list — page forward with offset for more.
+    if (documents.length >= input.limit) {
+      ctx.enrich.truncated({ shown: documents.length, cap: input.limit });
+    }
 
     return { documents, total: documents.length, offset: input.offset, query_echo: queryEcho };
   },

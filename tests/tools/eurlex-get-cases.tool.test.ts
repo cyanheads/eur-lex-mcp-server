@@ -4,7 +4,7 @@
  */
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_get_cases } from '@/mcp-server/tools/definitions/eurlex-get-cases.tool.js';
 
@@ -408,6 +408,31 @@ describe('eurlex_get_cases', () => {
     const result = await eurlex_get_cases.handler(input, ctx);
 
     expect(result.query_echo.keyword).toBe('google');
+  });
+
+  // --- #28: truncation disclosure ---
+
+  it('discloses truncation when the returned page fills the limit', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+    mockQuery.mockResolvedValue([makeCaseBinding('62013CJ0131'), makeCaseBinding('62020TJ0022')]);
+
+    const input = eurlex_get_cases.input.parse({ keyword: 'x', limit: 2 });
+    await eurlex_get_cases.handler(input, ctx);
+
+    const enriched = getEnrichment(ctx);
+    expect(enriched.truncated).toBe(true);
+    expect(enriched.shown).toBe(2);
+    expect(enriched.cap).toBe(2);
+  });
+
+  it('does not disclose truncation when the page is short of the limit', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+    mockQuery.mockResolvedValue([makeCaseBinding('62013CJ0131')]);
+
+    const input = eurlex_get_cases.input.parse({ keyword: 'x', limit: 2 });
+    await eurlex_get_cases.handler(input, ctx);
+
+    expect(getEnrichment(ctx).truncated).toBeUndefined();
   });
 
   // --- Format ---

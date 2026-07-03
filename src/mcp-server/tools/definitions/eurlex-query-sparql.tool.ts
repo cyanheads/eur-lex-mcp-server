@@ -76,7 +76,7 @@ export const eurlex_query_sparql = tool('eurlex_query_sparql', {
       .optional()
       .describe(
         'Optional client-side timeout for this request, in milliseconds (1000–55000). ' +
-          'When omitted, the server-configured default (SPARQL_QUERY_TIMEOUT_MS, 55000) applies. Virtuoso hard limit is 60 seconds.',
+          'When omitted, the default timeout applies; the endpoint hard limit is 60 seconds.',
       ),
   }),
   output: z.object({

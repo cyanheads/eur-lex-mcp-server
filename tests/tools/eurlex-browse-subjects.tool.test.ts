@@ -4,7 +4,7 @@
  */
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_browse_subjects } from '@/mcp-server/tools/definitions/eurlex-browse-subjects.tool.js';
 
@@ -133,6 +133,36 @@ describe('eurlex_browse_subjects', () => {
       code: JsonRpcErrorCode.NotFound,
       data: { reason: 'no_concepts' },
     });
+  });
+
+  // --- #28: truncation disclosure ---
+
+  it('discloses truncation when the returned page fills the limit', async () => {
+    const ctx = createMockContext({ errors: eurlex_browse_subjects.errors });
+    mockQuery.mockResolvedValue([
+      makeConceptBinding({ uri: 'http://eurovoc.europa.eu/1', label: 'a' }),
+      makeConceptBinding({ uri: 'http://eurovoc.europa.eu/2', label: 'b' }),
+    ]);
+
+    const input = eurlex_browse_subjects.input.parse({ keyword: 'data', limit: 2 });
+    await eurlex_browse_subjects.handler(input, ctx);
+
+    const enriched = getEnrichment(ctx);
+    expect(enriched.truncated).toBe(true);
+    expect(enriched.shown).toBe(2);
+    expect(enriched.cap).toBe(2);
+  });
+
+  it('does not disclose truncation when the page is short of the limit', async () => {
+    const ctx = createMockContext({ errors: eurlex_browse_subjects.errors });
+    mockQuery.mockResolvedValue([
+      makeConceptBinding({ uri: 'http://eurovoc.europa.eu/1', label: 'a' }),
+    ]);
+
+    const input = eurlex_browse_subjects.input.parse({ keyword: 'data', limit: 2 });
+    await eurlex_browse_subjects.handler(input, ctx);
+
+    expect(getEnrichment(ctx).truncated).toBeUndefined();
   });
 
   // --- Format ---

@@ -165,6 +165,10 @@ async function main(): Promise<void> {
     prompts,
     serverJson,
     packageJson,
+    // eurlex_get_document's `limit` caps body content CHARACTERS (a paging window),
+    // not an array — body truncation is already disclosed via content_chars_total /
+    // content_chars_returned / has_more, so the capped-list rule does not apply.
+    truncationAllowlist: ['eurlex_get_document'],
   });
 
   for (const w of report.warnings) {

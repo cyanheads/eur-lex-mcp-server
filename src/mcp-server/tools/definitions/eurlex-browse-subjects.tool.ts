@@ -24,8 +24,8 @@ export const eurlex_browse_subjects = tool('eurlex_browse_subjects', {
   title: 'Browse EuroVoc Subjects',
   description:
     'Search the EuroVoc multilingual thesaurus to resolve a human-readable term or keyword into EuroVoc concept IDs. ' +
-    'This tool is required before using the eurovoc_concept filter in eurlex_search_documents — ' +
-    'agents cannot guess numeric EuroVoc concept IDs. ' +
+    'This tool is required before using the eurovoc_concept filter in eurlex_search_documents: ' +
+    'EuroVoc concept IDs are numeric, so resolve them here before filtering. ' +
     'Every returned concept_uri is a EuroVoc concept (http://eurovoc.europa.eu/…) directly usable in that filter; ' +
     'other Publications Office authority concepts are excluded because the filter cannot match them. ' +
     'Returns concept URI, preferred label in the requested language, concept code, and broader/narrower hierarchy hints. ' +
@@ -74,6 +74,15 @@ export const eurlex_browse_subjects = tool('eurlex_browse_subjects', {
       .describe('Matching EuroVoc concepts ordered by relevance of the label match.'),
     total: z.number().describe('Number of concepts returned in this response.'),
   }),
+
+  enrichment: {
+    truncated: z
+      .boolean()
+      .optional()
+      .describe('True when the returned list was capped at the limit and more concepts may exist.'),
+    shown: z.number().optional().describe('Number of concepts returned in this response.'),
+    cap: z.number().optional().describe('The limit that was applied to this response.'),
+  },
 
   errors: [
     {
@@ -138,6 +147,11 @@ SELECT ?concept ?label ?code ?broaderLabel WHERE {
       if (broaderLabel) entry.broader_label = broaderLabel;
       return entry;
     });
+
+    // A full page means the limit capped the list — more concepts may exist.
+    if (concepts.length >= input.limit) {
+      ctx.enrich.truncated({ shown: concepts.length, cap: input.limit });
+    }
 
     return { concepts, total: concepts.length };
   },

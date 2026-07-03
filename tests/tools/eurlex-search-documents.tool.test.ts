@@ -4,7 +4,7 @@
  */
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_search_documents } from '@/mcp-server/tools/definitions/eurlex-search-documents.tool.js';
 
@@ -623,6 +623,31 @@ describe('eurlex_search_documents', () => {
     expect(result.documents[0]?.is_consolidated).toBe(true);
     expect(result.documents[1]?.celex_number).toBe('32014R0833');
     expect(result.documents[1]?.is_consolidated).toBe(false);
+  });
+
+  // --- #28: truncation disclosure ---
+
+  it('discloses truncation when the returned page fills the limit', async () => {
+    const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+    mockQuery.mockResolvedValue([makeDocBinding('32016R0679'), makeDocBinding('32022R0868')]);
+
+    const input = eurlex_search_documents.input.parse({ keyword: 'data', limit: 2 });
+    await eurlex_search_documents.handler(input, ctx);
+
+    const enriched = getEnrichment(ctx);
+    expect(enriched.truncated).toBe(true);
+    expect(enriched.shown).toBe(2);
+    expect(enriched.cap).toBe(2);
+  });
+
+  it('does not disclose truncation when the page is short of the limit', async () => {
+    const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+    mockQuery.mockResolvedValue([makeDocBinding('32016R0679')]);
+
+    const input = eurlex_search_documents.input.parse({ keyword: 'data', limit: 2 });
+    await eurlex_search_documents.handler(input, ctx);
+
+    expect(getEnrichment(ctx).truncated).toBeUndefined();
   });
 
   // --- Format ---

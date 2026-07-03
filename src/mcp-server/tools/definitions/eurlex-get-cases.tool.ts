@@ -166,6 +166,15 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
       .describe('Echo of filters applied to this search. Useful for diagnosing empty results.'),
   }),
 
+  enrichment: {
+    truncated: z
+      .boolean()
+      .optional()
+      .describe('True when the returned page was capped at the limit and more cases may exist.'),
+    shown: z.number().optional().describe('Number of cases returned in this page.'),
+    cap: z.number().optional().describe('The limit that was applied to this page.'),
+  },
+
   errors: [
     {
       reason: 'no_results',
@@ -361,6 +370,11 @@ SELECT
       if (title) c.title = title;
       return c;
     });
+
+    // A full page means the limit capped the list — page forward with offset for more.
+    if (cases.length >= input.limit) {
+      ctx.enrich.truncated({ shown: cases.length, cap: input.limit });
+    }
 
     return { cases, total: cases.length, offset: input.offset, query_echo: queryEcho };
   },
