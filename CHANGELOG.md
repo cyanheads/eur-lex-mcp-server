@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.9.1](changelog/0.9.x/0.9.1.md) — 2026-07-03
+
+Tool/resource descriptions lead with capability, with cross-tool workflow guidance moved to server instructions; eurlex_comparative_analysis merges an overlapping focus into its existing axis instead of duplicating it
+
 ## [0.9.0](changelog/0.9.x/0.9.0.md) — 2026-07-03 · ⚠️ Breaking
 
 eurlex_get_relations gains offset/limit paging, truncation disclosure, and newest-first citation ordering; eurlex_document_resource resolves authority labels and adds author_institutions; eurlex_get_document renders the full EuroVoc list; cdm-labels fixes transposed regulation-type keys
