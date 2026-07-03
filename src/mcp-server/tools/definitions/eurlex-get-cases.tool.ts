@@ -54,14 +54,12 @@ function caseNumberToCelexFragment(caseNumber: string): string | null {
 export const eurlex_get_cases = tool('eurlex_get_cases', {
   title: 'Search CJEU/GC Case Law',
   description:
-    'Search CJEU (Court of Justice of the EU) and General Court case law — judgments, orders, and Advocate General opinions. ' +
-    'Distinct from eurlex_search_documents because case law uses CELEX sector 6 and practitioners search it differently: ' +
-    'by case number, court, party name, or AG opinion type. ' +
-    'Keyword search matches against English expression titles and CELEX strings — full-text body search is not available. ' +
+    'Search CJEU (Court of Justice of the EU) and General Court case law — judgments, orders, and Advocate General opinions — ' +
+    'by case number, court, case type, keyword, and date range. ' +
+    'Case law occupies CELEX sector 6 and is searched by these court-specific axes. ' +
+    'Keyword search matches against English expression titles (which carry party names) and CELEX strings — full-text body search is not available. ' +
     'Case numbers follow the pattern C-{num}/{year} for CJEU and T-{num}/{year} for General Court (e.g. C-131/12). ' +
-    'Returns case identifier, court, date, human-readable document type, and — parsed from the case title — ' +
-    'the parties, subject matter, and case reference (where available). ' +
-    'Use eurlex_get_document with the CELEX number to fetch the full judgment text.',
+    'Returns case identifier, court, date, human-readable document type, and — parsed from the case title where available — the parties, subject matter, and case reference.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
     case_number: z

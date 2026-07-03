@@ -34,7 +34,6 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
   description:
     'Resolve an EU legal citation — a CELEX number or an ELI URI — to the canonical CELLAR work. ' +
     'Returns the work URI, confirmed CELEX number, document type, document date, and whether the work exists in the CELLAR corpus. ' +
-    'Use this to validate identifiers before passing them to eurlex_get_document or eurlex_get_relations. ' +
     'CELEX format: {sector}{year}{type}{number} e.g. 32016R0679 (GDPR). ' +
     'ELI format: http://data.europa.eu/eli/{type}/{year}/{number} — the /oj suffix is optional.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },

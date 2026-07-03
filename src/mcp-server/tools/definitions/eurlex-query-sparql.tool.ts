@@ -47,7 +47,7 @@ export const eurlex_query_sparql = tool('eurlex_query_sparql', {
   description:
     'Execute a raw, read-only SPARQL SELECT query against the CELLAR Virtuoso endpoint. ' +
     'Only SELECT is accepted: update forms (DELETE, INSERT, LOAD, CLEAR, CREATE, DROP, COPY, MOVE, ADD) and other query forms (ASK, CONSTRUCT, DESCRIBE) are rejected locally before any request is sent. ' +
-    'Use only when the curated tools (eurlex_search_documents, eurlex_get_relations, etc.) do not cover the needed traversal. ' +
+    'An escape hatch for CDM ontology traversals that the curated tools do not express. ' +
     'The server caps all queries at 100 results — include an explicit LIMIT in your query to control the count; ' +
     'if omitted or above 100 it will be injected or capped automatically. ' +
     'The CDM ontology prefix is prepended automatically: cdm: = http://publications.europa.eu/ontology/cdm#. ' +

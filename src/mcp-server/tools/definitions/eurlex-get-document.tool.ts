@@ -61,7 +61,6 @@ export const eurlex_get_document = tool('eurlex_get_document', {
     'especially older acts pre-2004 EU enlargement. ' +
     'If the requested language is unavailable, the server automatically falls back to English and notes the fallback. ' +
     'CELEX format: {sector}{year}{type}{number} e.g. 32016R0679 for GDPR. ' +
-    'Use eurlex_lookup_celex to validate an identifier before calling this tool. ' +
     'HTML returns the full act text as served by EUR-Lex; markdown converts that HTML to clean Markdown server-side ' +
     '(recitals and numbered points as readable text, genuine data tables as GFM tables); XML returns Formex4 for structured processing. ' +
     'Large bodies are bounded per call but never lost: content_mode "paged" (default) returns a character window ' +

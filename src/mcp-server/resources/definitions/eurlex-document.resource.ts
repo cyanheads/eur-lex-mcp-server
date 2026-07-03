@@ -19,10 +19,8 @@ export const eurlex_document_resource = resource('eurlex://document/{celexNumber
   name: 'EUR-Lex document metadata',
   description:
     'Metadata snapshot for a CELLAR work identified by CELEX number. ' +
-    'Returns human-readable document type and author institution labels (matching the eurlex_get_document tool), ' +
-    'date, title (where available), and in-force flag. ' +
-    'Read-only, stable-URI injectable context for EU acts. ' +
-    'Full content and relations are available via the eurlex_get_document and eurlex_get_relations tools.',
+    'Returns human-readable document type and author institution labels, date, title (where available), and in-force flag. ' +
+    'Read-only, stable-URI injectable context for EU acts.',
   mimeType: 'application/json',
   params: z.object({
     celexNumber: z.string().describe('CELEX number of the EU act (e.g. 32016R0679 for GDPR).'),

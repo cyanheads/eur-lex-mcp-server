@@ -22,11 +22,9 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
     'Traverse the CELLAR CDM relationship graph for an EU work: ' +
     'what it amends, what amends it, what it repeals (explicitly or implicitly), what repealed it, ' +
     'its consolidated versions, its legal basis, and works that cite it. ' +
-    "This is CELLAR's primary value over HTML scraping — the graph traversal that exposes the lifecycle and dependencies of an EU act. " +
-    'Returns one-hop direct relations only. For deeper traversal, use eurlex_query_sparql. ' +
-    'The "consolidated_version" relation links to the consolidated texts of the act (each a separate CELEX-numbered work); ' +
-    'fetch one with eurlex_get_document. ' +
-    'Requires a valid CELEX number or CELLAR work URI — use eurlex_lookup_celex to resolve identifiers first.',
+    'Returns one-hop direct relations only, paginated per relation type and direction (offset/limit) with a truncated flag when a cap is hit. ' +
+    'The consolidated_version relation links to the consolidated texts of the act, each a separate CELEX-numbered work. ' +
+    'Requires a valid CELEX number or CELLAR work URI.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     celex_number: z

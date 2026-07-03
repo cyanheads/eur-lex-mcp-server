@@ -41,11 +41,9 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
   description:
     'Search EU legislation, treaties, and preparatory acts across the CELLAR corpus of 2.7M+ works. ' +
     'Filters by document type, date range, EuroVoc subject concept, author institution, and in-force status. ' +
-    'Keyword search matches against English expression titles and CELEX strings — full-text body search is not available via this API. ' +
-    'Multi-word keywords are matched as a title phrase via the full-text index; use other filters to narrow results. ' +
-    'Returns CELEX numbers, work URIs, human-readable document type labels, and dates — use these with eurlex_get_document to fetch full content. ' +
-    'To filter by EuroVoc subject, first call eurlex_browse_subjects to obtain the concept URI. ' +
-    'Case law (CJEU/GC judgments) is better searched via eurlex_get_cases which has court-specific parameters.',
+    'Keyword search matches against English expression titles and CELEX strings — full-text body search is not available via this API; ' +
+    'multi-word keywords are matched as a title phrase via the full-text index. ' +
+    'Returns a page of CELEX numbers, work URIs, human-readable document type labels, dates, and English titles where available, ordered by date descending, each flagged with is_consolidated, plus a query_echo of the applied filters.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
     keyword: z

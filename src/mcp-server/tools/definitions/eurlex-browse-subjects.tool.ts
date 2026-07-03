@@ -23,14 +23,10 @@ const EUROVOC_CONCEPT_NAMESPACE = 'http://eurovoc.europa.eu/';
 export const eurlex_browse_subjects = tool('eurlex_browse_subjects', {
   title: 'Browse EuroVoc Subjects',
   description:
-    'Search the EuroVoc multilingual thesaurus to resolve a human-readable term or keyword into EuroVoc concept IDs. ' +
-    'This tool is required before using the eurovoc_concept filter in eurlex_search_documents: ' +
-    'EuroVoc concept IDs are numeric, so resolve them here before filtering. ' +
-    'Every returned concept_uri is a EuroVoc concept (http://eurovoc.europa.eu/…) directly usable in that filter; ' +
-    'other Publications Office authority concepts are excluded because the filter cannot match them. ' +
-    'Returns concept URI, preferred label in the requested language, concept code, and broader/narrower hierarchy hints. ' +
-    'EuroVoc covers all EU policy domains: agriculture, environment, finance, health, trade, transport, and more. ' +
-    'If no results are found in a non-English language, retry with language "en" and a broader English term.',
+    'Search the EuroVoc multilingual thesaurus and resolve a human-readable term or keyword into EuroVoc concepts. ' +
+    'Returns each concept URI, its preferred label in the requested language, concept code, and broader (parent) label where available, ordered by relevance of the label match. ' +
+    'Returned URIs are EuroVoc concepts (http://eurovoc.europa.eu/…) — the form accepted by the eurovoc_concept subject filter; other Publications Office authority concepts are excluded because that filter cannot match them. ' +
+    'EuroVoc covers all EU policy domains: agriculture, environment, finance, health, trade, transport, and more.',
   annotations: { readOnlyHint: true, openWorldHint: true, idempotentHint: true },
   input: z.object({
     keyword: z
