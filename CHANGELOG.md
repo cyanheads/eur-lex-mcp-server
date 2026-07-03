@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.8.1](changelog/0.8.x/0.8.1.md) — 2026-07-03
+
+sparql_error responses now carry their declared recovery hint, eurlex_search_documents/eurlex_get_cases/eurlex_browse_subjects disclose capped-list truncation, and reader-/config-specific phrasing is trimmed from two tool descriptions
+
 ## [0.8.0](changelog/0.8.x/0.8.0.md) — 2026-07-03
 
 eurlex_search_documents gains include_consolidated/is_consolidated to surface consolidated texts, and both search tools reject or ignore whitespace-only keywords instead of running an unbounded corpus scan
