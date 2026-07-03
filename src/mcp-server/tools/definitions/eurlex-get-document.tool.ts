@@ -733,9 +733,10 @@ SELECT ?${variable} WHERE {
       lines.push(`**Legal Basis:** ${result.legal_basis.join(', ')}`);
     }
     if (result.eurovoc_subjects && result.eurovoc_subjects.length > 0) {
-      lines.push(
-        `**EuroVoc Subjects:** ${result.eurovoc_subjects.slice(0, 5).join(', ')}${result.eurovoc_subjects.length > 5 ? ` (+${result.eurovoc_subjects.length - 5} more)` : ''}`,
-      );
+      // Render the full list for format parity with structuredContent — the set is
+      // bounded at META_DIMENSION_LIMIT (100) and real acts carry ~a dozen, so
+      // there is no length reason to cut it (previously truncated to 5).
+      lines.push(`**EuroVoc Subjects:** ${result.eurovoc_subjects.join(', ')}`);
     }
     lines.push(`**Language:** ${result.language} | **Format:** ${result.content_format}`);
     if (result.language_fallback) lines.push(`*Note: ${result.language_fallback}*`);

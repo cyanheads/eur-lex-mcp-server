@@ -502,6 +502,30 @@ describe('eurlex_get_document', () => {
     expect(text).toContain('not available');
   });
 
+  // --- #41: EuroVoc subjects render in full (no first-5 cut) for format parity ---
+
+  it('format renders every EuroVoc subject, not a truncated first 5 (#41)', () => {
+    // A real act (GDPR) carries 9 subjects; structuredContent has all of them, so
+    // the text channel must too — the old .slice(0, 5) + "(+N more)" cut lost the
+    // rest for content[]-only clients.
+    const subjects = Array.from({ length: 9 }, (_, i) => `http://eurovoc.europa.eu/${1000 + i}`);
+    const output = {
+      celex_number: '32016R0679',
+      eurovoc_subjects: subjects,
+      content_mode: 'metadata_only',
+      content_available: false,
+      has_more: false,
+      language: 'EN',
+      content_format: 'html',
+    };
+    const text = (eurlex_get_document.format!(output)[0] as { text: string }).text;
+    for (const s of subjects) expect(text).toContain(s);
+    // No "(+N more)" truncation notice, and the 6th subject (first one the old cut
+    // dropped) is present.
+    expect(text).not.toContain('more)');
+    expect(text).toContain('http://eurovoc.europa.eu/1005');
+  });
+
   it('format() and structuredContent.content honor the same window (no separate 8000-char cut)', async () => {
     const ctx = createMockContext({ errors: eurlex_get_document.errors });
     const body = 'Q'.repeat(12_000); // larger than the removed 8000-char format() cut
