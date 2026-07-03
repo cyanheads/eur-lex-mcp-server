@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.6.0](changelog/0.6.x/0.6.0.md) — 2026-07-03
+
+eurlex_get_relations gains repeals/repealed_by/implicitly_repeals/implicitly_repealed_by relation types, and consolidated_version now filters out CELEX-less and cross-act rows so the list holds only genuine consolidations of the requested act
+
 ## [0.5.0](changelog/0.5.x/0.5.0.md) — 2026-07-01
 
 eurlex_get_document gains outline mode and structural section selectors (reach Article 17 by number, not character offset), and assembles multi-part Formex 4 so the xml format returns the full act for multi-part OJ acts such as the GDPR
