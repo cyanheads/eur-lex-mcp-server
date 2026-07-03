@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.8.0](changelog/0.8.x/0.8.0.md) — 2026-07-03
+
+eurlex_search_documents gains include_consolidated/is_consolidated to surface consolidated texts, and both search tools reject or ignore whitespace-only keywords instead of running an unbounded corpus scan
+
 ## [0.7.0](changelog/0.7.x/0.7.0.md) — 2026-07-03
 
 eurlex_get_document accepts CELLAR work URIs, surfaces every co-legislating author institution instead of just the first, and flags base acts with a newer consolidated version via is_superseded/current_consolidated_celex, with an opt-in resolve=current_consolidated to serve it directly

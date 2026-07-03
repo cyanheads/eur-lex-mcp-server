@@ -1,6 +1,6 @@
 {
   "name": "eur-lex-mcp-server",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Search EU legislation, CJEU case law, and treaties; traverse the CELLAR relationship graph; resolve EuroVoc concepts via MCP. STDIO or Streamable HTTP.",
   "author": {
     "name": "cyanheads",
