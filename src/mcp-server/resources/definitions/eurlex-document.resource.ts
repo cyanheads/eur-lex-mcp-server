@@ -5,7 +5,11 @@
 
 import { resource, z } from '@cyanheads/mcp-ts-core';
 import { notFound } from '@cyanheads/mcp-ts-core/errors';
-import { ENG_LANGUAGE_URI } from '@/services/cellar-sparql/cdm-labels.js';
+import {
+  ENG_LANGUAGE_URI,
+  resolveCorporateBodyLabel,
+  resolveResourceTypeLabel,
+} from '@/services/cellar-sparql/cdm-labels.js';
 import {
   CellarSparqlService,
   getCellarSparqlService,
@@ -15,7 +19,8 @@ export const eurlex_document_resource = resource('eurlex://document/{celexNumber
   name: 'EUR-Lex document metadata',
   description:
     'Metadata snapshot for a CELLAR work identified by CELEX number. ' +
-    'Returns document type, date, title (where available), author institution, and in-force flag. ' +
+    'Returns human-readable document type and author institution labels (matching the eurlex_get_document tool), ' +
+    'date, title (where available), and in-force flag. ' +
     'Read-only, stable-URI injectable context for EU acts. ' +
     'Full content and relations are available via the eurlex_get_document and eurlex_get_relations tools.',
   mimeType: 'application/json',
@@ -56,8 +61,10 @@ SELECT ?work ?celexNumber ?type ?date ?title ?inForce ?author WHERE {
 
     const workUri = CellarSparqlService.bindingValue(first, 'work');
     if (workUri) result.work_uri = workUri;
+    // Resolve the raw CDM authority URI to a human-readable label, matching the
+    // eurlex_get_document tool (previously the resource leaked the raw URI).
     const resourceType = CellarSparqlService.bindingValue(first, 'type');
-    if (resourceType) result.resource_type = resourceType;
+    if (resourceType) result.resource_type = resolveResourceTypeLabel(resourceType);
     const date = CellarSparqlService.bindingValue(first, 'date');
     if (date) result.date = date;
     const title = CellarSparqlService.bindingValue(first, 'title');
@@ -66,8 +73,27 @@ SELECT ?work ?celexNumber ?type ?date ?title ?inForce ?author WHERE {
       CellarSparqlService.bindingValue(first, 'inForce'),
     );
     if (inForce !== undefined) result.in_force = inForce;
-    const author = CellarSparqlService.bindingValue(first, 'author');
-    if (author) result.author_institution = author;
+
+    // Authors resolve to human-readable institution labels, matching
+    // eurlex_get_document. The metadata query returns one row per author
+    // (cross-joined with the single-valued fields), so gather every author across
+    // the rows — a co-legislated act (e.g. GDPR: Parliament + Council) carries
+    // several. Labels are de-duplicated (distinct URIs like EMA/EMEA share a
+    // label); the first is the primary author_institution, the full set is
+    // author_institutions.
+    const authorUris = new Set<string>();
+    for (const b of bindings) {
+      const author = CellarSparqlService.bindingValue(b, 'author');
+      if (author) authorUris.add(author);
+    }
+    if (authorUris.size > 0) {
+      const institutions = [...new Set([...authorUris].map(resolveCorporateBodyLabel))];
+      const [primary] = institutions;
+      if (primary) {
+        result.author_institution = primary;
+        result.author_institutions = institutions;
+      }
+    }
 
     return result;
   },

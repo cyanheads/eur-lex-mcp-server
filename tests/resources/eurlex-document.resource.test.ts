@@ -72,7 +72,59 @@ describe('eurlex_document_resource', () => {
       date: '2016-04-27',
       title: 'General Data Protection Regulation',
       in_force: true,
+      // #35: the raw resource-type URI resolves to a human-readable label.
+      resource_type: 'Regulation',
     });
+  });
+
+  // --- #35: metadata authorities resolve to human-readable labels ---
+
+  it('resolves resource_type and author URIs to labels, matching eurlex_get_document', async () => {
+    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    const CB = 'http://publications.europa.eu/resource/authority/corporate-body';
+    // A co-legislated act: the metadata query returns one row per author. CONSIL
+    // is first, so it is the primary — matching the tool's output for GDPR.
+    mockQuery.mockResolvedValue([
+      makeMetaBinding({
+        celex: '32016R0679',
+        type: 'http://publications.europa.eu/resource/authority/resource-type/REG',
+        author: `${CB}/CONSIL`,
+      }),
+      makeMetaBinding({
+        celex: '32016R0679',
+        type: 'http://publications.europa.eu/resource/authority/resource-type/REG',
+        author: `${CB}/EP`,
+      }),
+    ]);
+
+    const params = eurlex_document_resource.params.parse({ celexNumber: '32016R0679' });
+    const result = (await eurlex_document_resource.handler(params, ctx)) as Record<string, unknown>;
+
+    // No raw authority URIs leak: type and author are human-readable labels.
+    expect(result.resource_type).toBe('Regulation');
+    expect(result.author_institution).toBe('Council of the EU');
+    expect(result.author_institutions).toEqual(['Council of the EU', 'European Parliament']);
+    // The label fields are not overloaded with the raw URIs.
+    expect(result.resource_type).not.toContain('http');
+    expect(result.author_institution).not.toContain('http');
+  });
+
+  it('surfaces a single author as both the primary and the one-element institutions list', async () => {
+    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    const CB = 'http://publications.europa.eu/resource/authority/corporate-body';
+    mockQuery.mockResolvedValue([
+      makeMetaBinding({
+        celex: '32024R2822',
+        type: 'http://publications.europa.eu/resource/authority/resource-type/REG',
+        author: `${CB}/COM`,
+      }),
+    ]);
+
+    const params = eurlex_document_resource.params.parse({ celexNumber: '32024R2822' });
+    const result = (await eurlex_document_resource.handler(params, ctx)) as Record<string, unknown>;
+
+    expect(result.author_institution).toBe('European Commission');
+    expect(result.author_institutions).toEqual(['European Commission']);
   });
 
   it('returns sparse result when only required fields are present', async () => {
