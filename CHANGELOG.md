@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.9.0](changelog/0.9.x/0.9.0.md) — 2026-07-03 · ⚠️ Breaking
+
+eurlex_get_relations gains offset/limit paging, truncation disclosure, and newest-first citation ordering; eurlex_document_resource resolves authority labels and adds author_institutions; eurlex_get_document renders the full EuroVoc list; cdm-labels fixes transposed regulation-type keys
+
 ## [0.8.2](changelog/0.8.x/0.8.2.md) — 2026-07-03
 
 eurlex_get_cases case_type filtering now tests CDM resource-type instead of a CELEX substring, case titles are parsed into structured parties/subject_matter/case_reference fields, and the parser handles CELLAR's plural joined-case reference form

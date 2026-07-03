@@ -1,6 +1,6 @@
 # eur-lex-mcp-server - Directory Structure
 
-Generated on: 2026-07-03 20:02:11
+Generated on: 2026-07-03 21:16:55
 
 ```text
 eur-lex-mcp-server/
@@ -28,6 +28,7 @@ eur-lex-mcp-server/
 │   ├── 0.6.x/
 │   ├── 0.7.x/
 │   ├── 0.8.x/
+│   ├── 0.9.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md
