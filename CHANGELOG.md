@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.7.0](changelog/0.7.x/0.7.0.md) — 2026-07-03
+
+eurlex_get_document accepts CELLAR work URIs, surfaces every co-legislating author institution instead of just the first, and flags base acts with a newer consolidated version via is_superseded/current_consolidated_celex, with an opt-in resolve=current_consolidated to serve it directly
+
 ## [0.6.0](changelog/0.6.x/0.6.0.md) — 2026-07-03
 
 eurlex_get_relations gains repeals/repealed_by/implicitly_repeals/implicitly_repealed_by relation types, and consolidated_version now filters out CELEX-less and cross-act rows so the list holds only genuine consolidations of the requested act
