@@ -55,6 +55,10 @@ function routeQuery(handlers: {
   cites?: Row[];
   amends?: Row[];
   amendedBy?: Row[];
+  repeals?: Row[];
+  repealedBy?: Row[];
+  implicitlyRepeals?: Row[];
+  implicitlyRepealedBy?: Row[];
   legalBasis?: Row[];
   consolidated?: Row[];
 }) {
@@ -67,6 +71,18 @@ function routeQuery(handlers: {
     if (q.includes('cdm:act_consolidated_consolidates_resource_legal'))
       return handlers.consolidated ?? [];
     if (q.includes('cdm:resource_legal_based_on_resource_legal')) return handlers.legalBasis ?? [];
+    // Implicit repeal must be checked before explicit — same shared-predicate,
+    // direction-by-triple-side pattern as amends/amended_by.
+    if (q.includes('cdm:resource_legal_implicitly_repeals_resource_legal')) {
+      return q.includes('?relatedWork cdm:resource_legal_implicitly_repeals_resource_legal <')
+        ? (handlers.implicitlyRepealedBy ?? [])
+        : (handlers.implicitlyRepeals ?? []);
+    }
+    if (q.includes('cdm:resource_legal_repeals_resource_legal')) {
+      return q.includes('?relatedWork cdm:resource_legal_repeals_resource_legal <')
+        ? (handlers.repealedBy ?? [])
+        : (handlers.repeals ?? []);
+    }
     if (q.includes('cdm:resource_legal_amends_resource_legal')) {
       return q.includes('?relatedWork cdm:resource_legal_amends_resource_legal <')
         ? (handlers.amendedBy ?? [])
@@ -229,6 +245,288 @@ describe('eurlex_get_relations', () => {
       `?relatedWork cdm:act_consolidated_consolidates_resource_legal <${GDPR_WORK_URI}>`,
     );
     expect(relSparql).not.toContain('cdm:resource_legal_has_consolidated_version');
+  });
+
+  // --- #31: repeal relations (explicit + implicit, both directions) ---
+
+  it('repeals is outgoing on cdm:resource_legal_repeals_resource_legal (GDPR → 31995L0046)', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_relations.errors });
+    mockQuery.mockImplementation(
+      routeQuery({
+        resolve: [makeResolveBinding(GDPR_WORK_URI)],
+        repeals: [
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/dp-directive',
+            direction: 'outgoing',
+            relatedCelex: '31995L0046',
+          }),
+        ],
+      }),
+    );
+
+    const input = eurlex_get_relations.input.parse({
+      celex_number: '32016R0679',
+      relation_types: ['repeals'],
+    });
+    const result = await eurlex_get_relations.handler(input, ctx);
+
+    expect(result.total).toBe(1);
+    expect(result.relations[0]?.relation_type).toBe('repeals');
+    expect(result.relations[0]?.direction).toBe('outgoing');
+    expect(result.relations[0]?.related_celex_number).toBe('31995L0046');
+
+    const relSparql = mockQuery.mock.calls
+      .map((c) => c[0] as string)
+      .find((q) => !q.includes('SELECT ?work WHERE'))!;
+    expect(relSparql).toContain(
+      `<${GDPR_WORK_URI}> cdm:resource_legal_repeals_resource_legal ?relatedWork`,
+    );
+    expect(relSparql).not.toContain('cdm:resource_legal_implicitly_repeals_resource_legal');
+  });
+
+  it('repealed_by is the incoming side of cdm:resource_legal_repeals_resource_legal', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_relations.errors });
+    mockQuery.mockImplementation(
+      routeQuery({
+        resolve: [makeResolveBinding(GDPR_WORK_URI)],
+        repealedBy: [
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/repealer',
+            direction: 'incoming',
+            relatedCelex: '32030R9999',
+          }),
+        ],
+      }),
+    );
+
+    const input = eurlex_get_relations.input.parse({
+      celex_number: '31995L0046',
+      relation_types: ['repealed_by'],
+    });
+    const result = await eurlex_get_relations.handler(input, ctx);
+
+    expect(result.total).toBe(1);
+    expect(result.relations[0]?.relation_type).toBe('repealed_by');
+    expect(result.relations[0]?.direction).toBe('incoming');
+
+    const relSparql = mockQuery.mock.calls
+      .map((c) => c[0] as string)
+      .find((q) => !q.includes('SELECT ?work WHERE'))!;
+    expect(relSparql).toContain(
+      `?relatedWork cdm:resource_legal_repeals_resource_legal <${GDPR_WORK_URI}>`,
+    );
+  });
+
+  it('implicitly_repeals is outgoing on the implicit predicate (GDPR → 32003R1882)', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_relations.errors });
+    mockQuery.mockImplementation(
+      routeQuery({
+        resolve: [makeResolveBinding(GDPR_WORK_URI)],
+        implicitlyRepeals: [
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/implicit-target',
+            direction: 'outgoing',
+            relatedCelex: '32003R1882',
+          }),
+        ],
+      }),
+    );
+
+    const input = eurlex_get_relations.input.parse({
+      celex_number: '32016R0679',
+      relation_types: ['implicitly_repeals'],
+    });
+    const result = await eurlex_get_relations.handler(input, ctx);
+
+    expect(result.total).toBe(1);
+    expect(result.relations[0]?.relation_type).toBe('implicitly_repeals');
+    expect(result.relations[0]?.direction).toBe('outgoing');
+    expect(result.relations[0]?.related_celex_number).toBe('32003R1882');
+
+    const relSparql = mockQuery.mock.calls
+      .map((c) => c[0] as string)
+      .find((q) => !q.includes('SELECT ?work WHERE'))!;
+    expect(relSparql).toContain(
+      `<${GDPR_WORK_URI}> cdm:resource_legal_implicitly_repeals_resource_legal ?relatedWork`,
+    );
+  });
+
+  it('implicitly_repealed_by is the incoming side of the implicit predicate', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_relations.errors });
+    mockQuery.mockImplementation(
+      routeQuery({
+        resolve: [makeResolveBinding(GDPR_WORK_URI)],
+        implicitlyRepealedBy: [
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/implicit-repealer',
+            direction: 'incoming',
+          }),
+        ],
+      }),
+    );
+
+    const input = eurlex_get_relations.input.parse({
+      celex_number: '32016R0679',
+      relation_types: ['implicitly_repealed_by'],
+    });
+    const result = await eurlex_get_relations.handler(input, ctx);
+
+    expect(result.total).toBe(1);
+    expect(result.relations[0]?.relation_type).toBe('implicitly_repealed_by');
+    expect(result.relations[0]?.direction).toBe('incoming');
+
+    const relSparql = mockQuery.mock.calls
+      .map((c) => c[0] as string)
+      .find((q) => !q.includes('SELECT ?work WHERE'))!;
+    expect(relSparql).toContain(
+      `?relatedWork cdm:resource_legal_implicitly_repeals_resource_legal <${GDPR_WORK_URI}>`,
+    );
+  });
+
+  // --- #32: consolidated_version is filtered to genuine consolidations of the source act ---
+
+  it('consolidated_version drops CELEX-less and cross-act rows when the source CELEX is known', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_relations.errors });
+    mockQuery.mockImplementation(
+      routeQuery({
+        resolve: [makeResolveBinding(GDPR_WORK_URI)],
+        // Mirrors the live CELLAR shape for GDPR: one genuine consolidation, one
+        // cross-act consolidation of the repealed 1995 directive, one CELEX-less
+        // CONS_TEXT member work.
+        consolidated: [
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/genuine',
+            direction: 'incoming',
+            relatedCelex: '02016R0679-20160504',
+          }),
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/cross-act',
+            direction: 'incoming',
+            relatedCelex: '01995L0046-20180525',
+          }),
+          makeRelationBinding({
+            relatedWork:
+              'http://publications.europa.eu/resource/cellar/69c567aa-0ce3-4ba7-b13d-7142a9225a3c',
+            direction: 'incoming',
+          }),
+        ],
+      }),
+    );
+
+    const input = eurlex_get_relations.input.parse({
+      celex_number: '32016R0679',
+      relation_types: ['consolidated_version'],
+    });
+    const result = await eurlex_get_relations.handler(input, ctx);
+
+    expect(result.total).toBe(1);
+    expect(result.relations[0]?.related_celex_number).toBe('02016R0679-20160504');
+    expect(result.relations.map((r) => r.related_celex_number)).not.toContain(
+      '01995L0046-20180525',
+    );
+  });
+
+  it('consolidated_version keeps every genuine same-act consolidation', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_relations.errors });
+    mockQuery.mockImplementation(
+      routeQuery({
+        resolve: [makeResolveBinding(GDPR_WORK_URI)],
+        consolidated: [
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/cons-1',
+            direction: 'incoming',
+            relatedCelex: '02016R0679-20160504',
+          }),
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/cons-2',
+            direction: 'incoming',
+            relatedCelex: '02016R0679-20250101',
+          }),
+        ],
+      }),
+    );
+
+    const input = eurlex_get_relations.input.parse({
+      celex_number: '32016R0679',
+      relation_types: ['consolidated_version'],
+    });
+    const result = await eurlex_get_relations.handler(input, ctx);
+
+    expect(result.total).toBe(2);
+    expect(result.relations.map((r) => r.related_celex_number).sort()).toEqual([
+      '02016R0679-20160504',
+      '02016R0679-20250101',
+    ]);
+  });
+
+  it('consolidated_version on the work_uri path keeps CELEX-bearing rows (cross-act included) and drops only CELEX-less', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_relations.errors });
+    // work_uri-only: no source CELEX to match against, so the act-number filter
+    // is skipped — only the CELEX-less drop applies.
+    mockQuery.mockImplementation(
+      routeQuery({
+        consolidated: [
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/genuine',
+            direction: 'incoming',
+            relatedCelex: '02016R0679-20160504',
+          }),
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/cross-act',
+            direction: 'incoming',
+            relatedCelex: '01995L0046-20180525',
+          }),
+          makeRelationBinding({
+            relatedWork:
+              'http://publications.europa.eu/resource/cellar/69c567aa-0ce3-4ba7-b13d-7142a9225a3c',
+            direction: 'incoming',
+          }),
+        ],
+      }),
+    );
+
+    const input = eurlex_get_relations.input.parse({
+      work_uri: GDPR_WORK_URI,
+      relation_types: ['consolidated_version'],
+    });
+    const result = await eurlex_get_relations.handler(input, ctx);
+
+    expect(result.total).toBe(2);
+    expect(result.relations.map((r) => r.related_celex_number).sort()).toEqual([
+      '01995L0046-20180525',
+      '02016R0679-20160504',
+    ]);
+  });
+
+  it('the consolidated_version filter leaves other relation types untouched (CELEX-less amended_by survives)', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_relations.errors });
+    mockQuery.mockImplementation(
+      routeQuery({
+        resolve: [makeResolveBinding(GDPR_WORK_URI)],
+        amendedBy: [
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/celex-less-amender',
+            direction: 'incoming',
+          }),
+        ],
+        consolidated: [
+          makeRelationBinding({
+            relatedWork:
+              'http://publications.europa.eu/resource/cellar/69c567aa-0ce3-4ba7-b13d-7142a9225a3c',
+            direction: 'incoming',
+          }),
+        ],
+      }),
+    );
+
+    const input = eurlex_get_relations.input.parse({
+      celex_number: '32016R0679',
+      relation_types: ['amended_by', 'consolidated_version'],
+    });
+    const result = await eurlex_get_relations.handler(input, ctx);
+
+    // The CELEX-less consolidated row is dropped; the CELEX-less amended_by row is not.
+    expect(result.relations.map((r) => r.relation_type)).toEqual(['amended_by']);
   });
 
   it('cites traverses both directions (citation graph is symmetric)', async () => {

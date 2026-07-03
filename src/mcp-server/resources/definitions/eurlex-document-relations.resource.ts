@@ -53,12 +53,14 @@ SELECT ?work WHERE {
 
       // Summarize all relation types via the shared traversal — one query per
       // type so amendment and consolidation relations (modeled one-directionally
-      // in CELLAR) actually surface. See relation-traversal.ts.
+      // in CELLAR) actually surface. Passing the CELEX lets the traversal apply
+      // the consolidated_version act-number filter (#32). See relation-traversal.ts.
       const workRelations = await traverseRelations(
         svc,
         workUri,
         RELATION_TYPES,
         ctx,
+        celexNumber,
         SUMMARY_PER_TYPE_LIMIT,
       );
       const relations = workRelations.map((r) => ({

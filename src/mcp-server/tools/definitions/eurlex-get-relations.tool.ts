@@ -20,7 +20,8 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
   title: 'Get CELLAR Relationship Graph',
   description:
     'Traverse the CELLAR CDM relationship graph for an EU work: ' +
-    'what it amends, what amends it, its consolidated versions, its legal basis, and works that cite it. ' +
+    'what it amends, what amends it, what it repeals (explicitly or implicitly), what repealed it, ' +
+    'its consolidated versions, its legal basis, and works that cite it. ' +
     "This is CELLAR's primary value over HTML scraping — the graph traversal that exposes the lifecycle and dependencies of an EU act. " +
     'Returns one-hop direct relations only. For deeper traversal, use eurlex_query_sparql. ' +
     'The "consolidated_version" relation links to the consolidated texts of the act (each a separate CELEX-numbered work); ' +
@@ -54,11 +55,13 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
           'Used directly without CELEX resolution. Provide exactly one of celex_number or work_uri.',
       ),
     relation_types: z
-      .array(z.enum(['cites', 'amends', 'amended_by', 'legal_basis', 'consolidated_version']))
+      .array(z.enum([...RELATION_TYPES]))
       .optional()
       .describe(
         'Subset of relation types to return. Omit to return all types: ' +
           'cites (citation graph), amends (what this work amends), amended_by (what amends this work), ' +
+          'repeals (what this work explicitly repeals), repealed_by (what explicitly repealed this work), ' +
+          'implicitly_repeals (what this work implicitly repeals), implicitly_repealed_by (what implicitly repealed this work), ' +
           'legal_basis (treaty/treaty article this act is based on), consolidated_version (consolidated versions of this act).',
       ),
   }),
@@ -80,7 +83,8 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
             relation_type: z
               .string()
               .describe(
-                'Type of relation: cites, amends, amended_by, legal_basis, consolidated_version.',
+                'Type of relation: cites, amends, amended_by, repeals, repealed_by, ' +
+                  'implicitly_repeals, implicitly_repealed_by, legal_basis, consolidated_version.',
               ),
             direction: z
               .string()
@@ -165,7 +169,9 @@ SELECT ?work WHERE {
     // high-volume type (e.g. cites) can't starve the rarer ones under a shared
     // cap. The predicate + direction model lives in relation-traversal.ts.
     const requestedTypes: readonly RelationType[] = input.relation_types ?? RELATION_TYPES;
-    const workRelations = await traverseRelations(svc, workUri, requestedTypes, ctx);
+    // Pass the source CELEX (undefined on the work_uri path) so the shared
+    // traversal can apply the consolidated_version act-number filter (#32).
+    const workRelations = await traverseRelations(svc, workUri, requestedTypes, ctx, celexNumber);
     ctx.log.info('Relation traversal', {
       celexNumber,
       workUri,
