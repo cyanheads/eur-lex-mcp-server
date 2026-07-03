@@ -84,7 +84,11 @@ describe('eurlex_search_documents', () => {
     const ctx = createMockContext({ errors: eurlex_search_documents.errors });
     mockQuery.mockResolvedValue([makeDocBinding('32016R0679')]);
 
-    const input = eurlex_search_documents.input.parse({ offset: 20, limit: 10 });
+    const input = eurlex_search_documents.input.parse({
+      keyword: 'regulation',
+      offset: 20,
+      limit: 10,
+    });
     const result = await eurlex_search_documents.handler(input, ctx);
 
     expect(result.offset).toBe(20);
@@ -487,14 +491,149 @@ describe('eurlex_search_documents', () => {
     expect(() => eurlex_search_documents.input.parse({ document_type: 'NOPE' })).toThrow();
   });
 
+  // --- No-filter guard + whitespace-only keyword normalization (issue #25) ---
+
+  it('rejects a whitespace-only keyword with no other filter (issue #25)', async () => {
+    const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+
+    const input = eurlex_search_documents.input.parse({ keyword: '   ', limit: 3 });
+    await expect(eurlex_search_documents.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'no_filters' },
+    });
+    // Fails fast — never issues the broad, unbounded query that timed out in the field report.
+    expect(mockQuery).not.toHaveBeenCalled();
+  });
+
+  it('rejects a fully-empty request with no_filters (issue #25)', async () => {
+    const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+
+    const input = eurlex_search_documents.input.parse({});
+    await expect(eurlex_search_documents.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'no_filters' },
+    });
+    expect(mockQuery).not.toHaveBeenCalled();
+  });
+
+  it('does not count include_consolidated as an effective filter (issue #25)', async () => {
+    const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+
+    // include_consolidated broadens rather than narrows — on its own it must not
+    // unlock an unbounded scan.
+    const input = eurlex_search_documents.input.parse({ include_consolidated: true });
+    await expect(eurlex_search_documents.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'no_filters' },
+    });
+    expect(mockQuery).not.toHaveBeenCalled();
+  });
+
+  it('a whitespace-only keyword with another filter runs but is omitted from the echo (issue #25)', async () => {
+    const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+    mockQuery.mockResolvedValue([makeDocBinding('32016R0679')]);
+
+    const input = eurlex_search_documents.input.parse({ keyword: '   ', document_type: 'REG' });
+    const result = await eurlex_search_documents.handler(input, ctx);
+
+    // document_type is a real filter, so the query runs; the blank keyword adds no
+    // clause and is absent from the echo (previously it echoed the raw whitespace).
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    expect(sparql).not.toContain('bif:contains');
+    expect(result.query_echo.keyword).toBeUndefined();
+    expect(result.query_echo.document_type).toBe('REG');
+  });
+
+  it('echoes the trimmed keyword, not the raw padded value (issue #25)', async () => {
+    const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+    mockQuery.mockResolvedValue([makeDocBinding('32016R0679')]);
+
+    const input = eurlex_search_documents.input.parse({ keyword: '  data protection  ' });
+    const result = await eurlex_search_documents.handler(input, ctx);
+
+    expect(result.query_echo.keyword).toBe('data protection');
+  });
+
+  // --- Consolidated texts: include_consolidated filter + is_consolidated tag (issue #30) ---
+
+  it('the default type filter stays narrow and excludes CONS_TEXT (issue #30)', async () => {
+    const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+    mockQuery.mockResolvedValue([makeDocBinding('32014R0833')]);
+
+    const input = eurlex_search_documents.input.parse({
+      keyword: 'restrictive measures',
+      document_type: 'REG',
+    });
+    await eurlex_search_documents.handler(input, ctx);
+
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    expect(sparql).toContain(
+      'FILTER(?type = <http://publications.europa.eu/resource/authority/resource-type/REG>)',
+    );
+    expect(sparql).not.toContain('resource-type/CONS_TEXT');
+  });
+
+  it('include_consolidated broadens the type filter to admit CONS_TEXT (issue #30)', async () => {
+    const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+    mockQuery.mockResolvedValue([makeDocBinding('02014R0833-20260424')]);
+
+    const input = eurlex_search_documents.input.parse({
+      keyword: 'restrictive measures',
+      document_type: 'REG',
+      include_consolidated: true,
+    });
+    await eurlex_search_documents.handler(input, ctx);
+
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    // The filter now matches the base type OR the consolidated resource-type.
+    expect(sparql).toContain(
+      'FILTER(?type = <http://publications.europa.eu/resource/authority/resource-type/REG> || ' +
+        '?type = <http://publications.europa.eu/resource/authority/resource-type/CONS_TEXT>)',
+    );
+  });
+
+  it('include_consolidated adds no CONS_TEXT clause when document_type is omitted (issue #30)', async () => {
+    const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+    mockQuery.mockResolvedValue([makeDocBinding('02014R0833-20260424')]);
+
+    const input = eurlex_search_documents.input.parse({
+      keyword: 'restrictive measures',
+      include_consolidated: true,
+    });
+    await eurlex_search_documents.handler(input, ctx);
+
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    // No type filter at all — all types already return, so include_consolidated only
+    // affects the row tag, not the query.
+    expect(sparql).not.toContain('FILTER(?type =');
+    expect(sparql).not.toContain('resource-type/CONS_TEXT');
+  });
+
+  it('tags a consolidated CELEX is_consolidated:true and a base act false (issue #30)', async () => {
+    const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+    mockQuery.mockResolvedValue([
+      makeDocBinding('02014R0833-20260424', { date: '2026-04-24' }),
+      makeDocBinding('32014R0833', { date: '2014-07-31' }),
+    ]);
+
+    const input = eurlex_search_documents.input.parse({ keyword: '833/2014' });
+    const result = await eurlex_search_documents.handler(input, ctx);
+
+    expect(result.documents[0]?.celex_number).toBe('02014R0833-20260424');
+    expect(result.documents[0]?.is_consolidated).toBe(true);
+    expect(result.documents[1]?.celex_number).toBe('32014R0833');
+    expect(result.documents[1]?.is_consolidated).toBe(false);
+  });
+
   // --- Format ---
 
-  it('format renders celex, date, type label, and work_uri', () => {
+  it('format renders celex, date, type label, consolidated flag, and work_uri', () => {
     const output = {
       documents: [
         {
           work_uri: 'http://publications.europa.eu/resource/cellar/gdpr',
           celex_number: '32016R0679',
+          is_consolidated: false,
           resource_type: 'Regulation',
           date: '2016-04-27',
           title: 'GDPR',
@@ -510,8 +649,30 @@ describe('eurlex_search_documents', () => {
     expect(text).toContain('32016R0679');
     expect(text).toContain('2016-04-27');
     expect(text).toContain('Regulation');
+    // The boolean VALUE reaches the text channel (format-parity), not just a guarded marker.
+    expect(text).toContain('**Consolidated:** false');
     expect(text).toContain('http://publications.europa.eu/resource/cellar/gdpr');
     expect(text).toContain('keyword="gdpr"');
+  });
+
+  it('format renders is_consolidated:true for a consolidated row', () => {
+    const output = {
+      documents: [
+        {
+          work_uri: 'http://publications.europa.eu/resource/cellar/cons',
+          celex_number: '02014R0833-20260424',
+          is_consolidated: true,
+          resource_type: 'CONS_TEXT',
+          date: '2026-04-24',
+        },
+      ],
+      total: 1,
+      offset: 0,
+      query_echo: {},
+    };
+    const blocks = eurlex_search_documents.format!(output);
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).toContain('**Consolidated:** true');
   });
 
   it('format handles sparse documents (no type, date, or title)', () => {
@@ -520,6 +681,7 @@ describe('eurlex_search_documents', () => {
         {
           work_uri: 'http://publications.europa.eu/resource/cellar/sparse',
           celex_number: '12345ABC',
+          is_consolidated: false,
         },
       ],
       total: 1,

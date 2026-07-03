@@ -13,6 +13,7 @@ import {
   CellarSparqlService,
   getCellarSparqlService,
 } from '@/services/cellar-sparql/cellar-sparql-service.js';
+import { isConsolidatedCelex } from '@/services/cellar-sparql/relation-traversal.js';
 
 /** CDM resource type URIs for common document categories. */
 const DOCUMENT_TYPE_URIS: Record<string, string> = {
@@ -25,6 +26,15 @@ const DOCUMENT_TYPE_URIS: Record<string, string> = {
   PROP: 'http://publications.europa.eu/resource/authority/resource-type/PROP_DIR',
   REC: 'http://publications.europa.eu/resource/authority/resource-type/REC_SOFT',
 };
+
+/**
+ * CDM resource-type URI for consolidated texts. A point-in-time consolidation of
+ * an act (e.g. 02014R0833-20260424) carries this type — NOT its base type (REG,
+ * DIR, …) — so a `?type = <base>` filter excludes consolidations unless it is
+ * widened to also admit this URI. Confirmed live against CELLAR for a known
+ * consolidation.
+ */
+const CONS_TEXT_URI = 'http://publications.europa.eu/resource/authority/resource-type/CONS_TEXT';
 
 export const eurlex_search_documents = tool('eurlex_search_documents', {
   title: 'Search EU Documents',
@@ -58,7 +68,18 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
       .describe(
         'Document type filter: REG=Regulation, DIR=Directive, DEC=Decision, TREATY=Treaty, ' +
           'JUDG=Judgment, OPIN_AG=AG Opinion, PROP=Proposal, REC=Recommendation. ' +
-          'Leave blank or omit to search all document types.',
+          'Leave blank or omit to search all document types. ' +
+          'A type filter excludes consolidated texts (CONS_TEXT), which carry their own resource-type — ' +
+          'set include_consolidated to fold them back in.',
+      ),
+    include_consolidated: z
+      .boolean()
+      .default(false)
+      .describe(
+        'When true and document_type is set, also match consolidated texts (CONS_TEXT) of that type — ' +
+          'point-in-time versions that incorporate later amendments and carry their own resource-type, so a ' +
+          'plain type filter omits them. No effect when document_type is omitted (all types already return). ' +
+          'Either way, consolidated rows are tagged is_consolidated: true.',
       ),
     date_from: z
       .union([
@@ -138,6 +159,12 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
           .object({
             work_uri: z.string().describe('CELLAR work URI (stable resource identifier).'),
             celex_number: z.string().describe('CELEX identifier for the work.'),
+            is_consolidated: z
+              .boolean()
+              .describe(
+                'True when this CELEX is a consolidated version — a point-in-time text (…-YYYYMMDD) ' +
+                  'that incorporates amendments — rather than a base or amending act.',
+              ),
             resource_type: z
               .string()
               .optional()
@@ -176,6 +203,13 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
 
   errors: [
     {
+      reason: 'no_filters',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'No effective narrowing filter was supplied — an unfiltered search would scan the entire corpus.',
+      recovery:
+        'Supply at least one filter: keyword, document_type, date_from/date_to, eurovoc_concept, author_institution, or in_force.',
+    },
+    {
       reason: 'no_results',
       code: JsonRpcErrorCode.NotFound,
       when: 'The query returned zero bindings — no matching documents in CELLAR.',
@@ -197,7 +231,14 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
     if (input.document_type) {
       const typeUri = DOCUMENT_TYPE_URIS[input.document_type];
       if (typeUri) {
-        filters.push(`FILTER(?type = <${typeUri}>)`);
+        // A consolidated text carries resource-type CONS_TEXT, not its base type,
+        // so a bare `?type = <base>` filter drops it. When the caller opts in,
+        // widen the filter to also admit CONS_TEXT rows (issue #30).
+        filters.push(
+          input.include_consolidated
+            ? `FILTER(?type = <${typeUri}> || ?type = <${CONS_TEXT_URI}>)`
+            : `FILTER(?type = <${typeUri}>)`,
+        );
       }
     }
     if (input.date_from && input.date_from.trim()) {
@@ -289,6 +330,31 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
       input.in_force === true ? `OPTIONAL { ?work cdm:resource_legal_in-force ?inForce . }` : '';
 
     /**
+     * Reject a search with no effective narrowing filter. Unlike eurlex_get_cases
+     * (always bounded to CELEX sector 6), this tool has no inherent bound — with no
+     * keyword, type, date, subject, author, or in-force constraint it would scan the
+     * full 2.7M-work corpus and time out, and a bare {} call has no meaningful result
+     * anyway. A whitespace-only keyword trims to empty above, so it correctly counts
+     * as no filter here rather than issuing a broad query (issue #25).
+     * include_consolidated broadens rather than narrows, so it is not a filter here.
+     */
+    const hasEffectiveFilter =
+      !!keywordInput ||
+      !!input.document_type ||
+      !!input.date_from?.trim() ||
+      !!input.date_to?.trim() ||
+      !!input.eurovoc_concept?.trim() ||
+      !!authorInput ||
+      input.in_force === true;
+    if (!hasEffectiveFilter) {
+      throw ctx.fail(
+        'no_filters',
+        'A document search needs at least one narrowing filter; an unfiltered query would scan the entire 2.7M-work corpus.',
+        { ...ctx.recoveryFor('no_filters') },
+      );
+    }
+
+    /**
      * Titles live on expressions, not works — traverse the expression graph:
      * ?expr cdm:expression_belongs_to_work ?work (inverse of cdm:work_has_expression),
      * ?expr cdm:expression_uses_language <.../ENG>, ?expr cdm:expression_title ?title.
@@ -337,7 +403,7 @@ SELECT
 } GROUP BY ?celexNumber ORDER BY DESC(?docDate) LIMIT ${input.limit} OFFSET ${input.offset}`;
 
     const queryEcho = {
-      ...(input.keyword ? { keyword: input.keyword } : {}),
+      ...(keywordInput ? { keyword: keywordInput } : {}),
       ...(input.document_type ? { document_type: input.document_type } : {}),
       ...(input.date_from ? { date_from: input.date_from } : {}),
       ...(input.date_to ? { date_to: input.date_to } : {}),
@@ -366,9 +432,11 @@ SELECT
     }
 
     const documents = bindings.map((b) => {
+      const celexNumber = CellarSparqlService.bindingValue(b, 'celex') ?? '';
       const doc: {
         work_uri: string;
         celex_number: string;
+        is_consolidated: boolean;
         resource_type?: string;
         date?: string;
         title?: string;
@@ -377,7 +445,8 @@ SELECT
           CellarSparqlService.bindingValue(b, 'titledWork') ??
           CellarSparqlService.bindingValue(b, 'work') ??
           '',
-        celex_number: CellarSparqlService.bindingValue(b, 'celex') ?? '',
+        celex_number: celexNumber,
+        is_consolidated: isConsolidatedCelex(celexNumber),
       };
       const resourceType = resolveResourceTypeLabels(CellarSparqlService.bindingValue(b, 'types'));
       if (resourceType) doc.resource_type = resourceType;
@@ -405,6 +474,7 @@ SELECT
       lines.push(`### ${doc.celex_number}${doc.title ? ` — ${doc.title}` : ''}`);
       if (doc.date) lines.push(`**Date:** ${doc.date}`);
       if (doc.resource_type) lines.push(`**Type:** ${doc.resource_type}`);
+      lines.push(`**Consolidated:** ${doc.is_consolidated}`);
       lines.push(`**Work URI:** ${doc.work_uri}`);
       lines.push('');
     }

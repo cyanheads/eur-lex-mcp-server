@@ -382,6 +382,34 @@ describe('eurlex_get_cases', () => {
     expect(() => eurlex_get_cases.input.parse({ date_from: '2016' })).toThrow();
   });
 
+  // --- Whitespace-only keyword normalization (issue #25) ---
+
+  it('omits a whitespace-only keyword from the echo and browses on the sector-6 bound (issue #25)', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+    mockQuery.mockResolvedValue([makeCaseBinding('62024TJ0591', { date: '2026-07-01' })]);
+
+    const input = eurlex_get_cases.input.parse({ keyword: '   ', limit: 3 });
+    const result = await eurlex_get_cases.handler(input, ctx);
+
+    // get_cases always carries the sector-6 filter, so a bare browse of recent case
+    // law is valid — no no-filter guard. The blank keyword adds no clause or echo key.
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    expect(sparql).toContain('STRSTARTS(STR(?celexNumber), "6")');
+    expect(sparql).not.toContain('bif:contains');
+    expect(result.query_echo.keyword).toBeUndefined();
+    expect(result.total).toBe(1);
+  });
+
+  it('echoes the trimmed keyword, not the raw padded value (issue #25)', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+    mockQuery.mockResolvedValue([makeCaseBinding('62013CJ0131')]);
+
+    const input = eurlex_get_cases.input.parse({ keyword: '  google  ' });
+    const result = await eurlex_get_cases.handler(input, ctx);
+
+    expect(result.query_echo.keyword).toBe('google');
+  });
+
   // --- Format ---
 
   it('format renders celex, date, type label, and title', () => {

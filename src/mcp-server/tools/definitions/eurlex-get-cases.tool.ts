@@ -311,7 +311,7 @@ SELECT
     const queryEcho = {
       ...(input.case_number ? { case_number: input.case_number } : {}),
       ...(celexFragment ? { celex_fragment: celexFragment } : {}),
-      ...(input.keyword ? { keyword: input.keyword } : {}),
+      ...(keywordInput ? { keyword: keywordInput } : {}),
       ...(input.court ? { court: input.court } : {}),
       ...(input.case_type ? { case_type: input.case_type } : {}),
       ...(input.date_from ? { date_from: input.date_from } : {}),
