@@ -30,9 +30,9 @@ export const RESOURCE_TYPE_LABELS: Record<string, string> = {
   'http://publications.europa.eu/resource/authority/resource-type/RES': 'Resolution',
   'http://publications.europa.eu/resource/authority/resource-type/AGREE_INTERNATION':
     'International Agreement',
-  'http://publications.europa.eu/resource/authority/resource-type/IMPL_REG':
+  'http://publications.europa.eu/resource/authority/resource-type/REG_IMPL':
     'Implementing Regulation',
-  'http://publications.europa.eu/resource/authority/resource-type/DEL_REG': 'Delegated Regulation',
+  'http://publications.europa.eu/resource/authority/resource-type/REG_DEL': 'Delegated Regulation',
 };
 
 /** Resolve a CDM resource-type URI to a human-readable label. Falls back to last path segment. */

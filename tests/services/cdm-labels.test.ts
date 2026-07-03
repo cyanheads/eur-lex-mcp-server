@@ -4,7 +4,11 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { parseCaseLawTitle } from '@/services/cellar-sparql/cdm-labels.js';
+import {
+  parseCaseLawTitle,
+  resolveResourceTypeLabel,
+  resolveResourceTypeLabels,
+} from '@/services/cellar-sparql/cdm-labels.js';
 
 /**
  * Fixtures are verbatim CELLAR `expression_title` strings captured from the live
@@ -124,5 +128,51 @@ describe('parseCaseLawTitle', () => {
     expect(parsed.parties).toBe('A v B.');
     expect(parsed.caseReference).toBeUndefined();
     expect(parsed.subjectMatter).toBe('Some subject – keywords.');
+  });
+});
+
+/**
+ * Resource-type fixtures are verbatim CELLAR `cdm:work_has_resource-type` URIs,
+ * confirmed against the live Publications Office authority register: a Commission
+ * Implementing Regulation (e.g. CELEX 32019R0947) carries `…/resource-type/REG_IMPL`
+ * and a Commission Delegated Regulation (e.g. 32019R0945) carries `…/REG_DEL`. The
+ * register codes are `REG_IMPL` / `REG_DEL`, not the transposed `IMPL_REG` / `DEL_REG`
+ * the map keyed before issue #43 — the transposition made both fall through to the
+ * raw last path segment across get_document, search_documents, and the resource.
+ */
+const RESOURCE_TYPE_BASE = 'http://publications.europa.eu/resource/authority/resource-type/';
+const REG_URI = `${RESOURCE_TYPE_BASE}REG`;
+const REG_IMPL_URI = `${RESOURCE_TYPE_BASE}REG_IMPL`;
+const REG_DEL_URI = `${RESOURCE_TYPE_BASE}REG_DEL`;
+
+describe('resolveResourceTypeLabel', () => {
+  it('resolves a Commission Implementing Regulation to its label, not the raw REG_IMPL code (issue #43)', () => {
+    expect(resolveResourceTypeLabel(REG_IMPL_URI)).toBe('Implementing Regulation');
+    // Regression guard: the real CELLAR code must not fall through to the raw path segment.
+    expect(resolveResourceTypeLabel(REG_IMPL_URI)).not.toBe('REG_IMPL');
+  });
+
+  it('resolves a Commission Delegated Regulation to its label, not the raw REG_DEL code (issue #43)', () => {
+    expect(resolveResourceTypeLabel(REG_DEL_URI)).toBe('Delegated Regulation');
+    expect(resolveResourceTypeLabel(REG_DEL_URI)).not.toBe('REG_DEL');
+  });
+
+  it('falls back to the last path segment for an unmapped resource-type URI', () => {
+    expect(resolveResourceTypeLabel(`${RESOURCE_TYPE_BASE}UNKNOWN_TYPE`)).toBe('UNKNOWN_TYPE');
+  });
+});
+
+describe('resolveResourceTypeLabels', () => {
+  it('resolves REG_IMPL through the search path (space-concatenated multi-type)', () => {
+    // eurlex_search_documents collapses a work's resource-types via GROUP_CONCAT,
+    // so a work typed as both REG and REG_IMPL arrives space-separated. Both resolve,
+    // dedupe, and sort — the implementing-regulation label must appear, not the code.
+    expect(resolveResourceTypeLabels(`${REG_URI} ${REG_IMPL_URI}`)).toBe(
+      'Implementing Regulation, Regulation',
+    );
+  });
+
+  it('resolves a lone REG_DEL to the delegated-regulation label', () => {
+    expect(resolveResourceTypeLabels(REG_DEL_URI)).toBe('Delegated Regulation');
   });
 });
