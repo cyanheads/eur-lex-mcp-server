@@ -7,6 +7,15 @@ import { describe, expect, it } from 'vitest';
 import { eurlex_comparative_analysis } from '@/mcp-server/prompts/definitions/eurlex-comparative-analysis.prompt.js';
 
 describe('eurlex_comparative_analysis', () => {
+  type GenArgs = Parameters<typeof eurlex_comparative_analysis.generate>[0];
+  const renderText = (args: GenArgs) => {
+    const messages = eurlex_comparative_analysis.generate(args);
+    return (messages[0]!.content as { type: string; text: string }).text;
+  };
+  // Numbered analysis-framework headers whose bold title mentions enforcement.
+  const enforcementSections = (text: string) =>
+    text.match(/^\d+\.\s+\*\*[^*]*[Ee]nforcement[^*]*\*\*/gm) ?? [];
+
   // --- Happy path: required args only ---
 
   it('generates a valid user message for a domain with no focus', () => {
@@ -41,6 +50,57 @@ describe('eurlex_comparative_analysis', () => {
 
     expect(text).toContain('antitrust');
     expect(text).toContain('enforcement mechanisms');
+  });
+
+  // --- #37: focus normalization — an overlapping focus never spawns a second section ---
+
+  it('merges an overlapping focus into its axis without a duplicate section', () => {
+    const text = renderText(
+      eurlex_comparative_analysis.args!.parse({
+        domain: 'data privacy',
+        focus: 'enforcement mechanisms',
+      }),
+    );
+
+    // The Enforcement axis now carries the focus in its title...
+    expect(text).toContain('**Enforcement mechanisms** — Who enforces the rules');
+    // ...the swing slot reverts to the generic differences section...
+    expect(text).toContain('**Key differences**');
+    // ...and no separate "deep dive" focus section is appended.
+    expect(text).not.toContain('Deep dive into this specific aspect');
+    // Exactly one numbered section is enforcement-flavored (the merged axis).
+    expect(enforcementSections(text)).toHaveLength(1);
+  });
+
+  it('adds a dedicated section for a focus that overlaps no axis', () => {
+    const text = renderText(
+      eurlex_comparative_analysis.args!.parse({
+        domain: 'data privacy',
+        focus: 'cross-border data transfers',
+      }),
+    );
+
+    // The focus takes the swing slot as its own dedicated section...
+    expect(text).toContain(
+      '**Cross-border data transfers** — Deep dive into this specific aspect.',
+    );
+    // ...and the fixed axes stay generic (no focus bleed into Enforcement).
+    expect(text).toContain('**Enforcement** — Who enforces the rules');
+    expect(enforcementSections(text)).toHaveLength(1);
+  });
+
+  it.each([
+    'enforcement',
+    'penalties',
+    'remedies',
+    'recent developments',
+  ])('folds overlapping focus "%s" into an existing axis rather than duplicating', (focus) => {
+    const text = renderText(
+      eurlex_comparative_analysis.args!.parse({ domain: 'data privacy', focus }),
+    );
+    // Overlapping focus keeps the generic swing-slot section and adds no deep dive.
+    expect(text).toContain('**Key differences**');
+    expect(text).not.toContain('Deep dive into this specific aspect');
   });
 
   it('uses generic "Key differences" section when focus is omitted', () => {

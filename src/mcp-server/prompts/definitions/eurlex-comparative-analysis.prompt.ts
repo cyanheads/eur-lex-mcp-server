@@ -5,6 +5,76 @@
 
 import { prompt, z } from '@cyanheads/mcp-ts-core';
 
+/** Identifier for each fixed axis of the analysis framework. */
+type AxisKey =
+  | 'regulatory_scope'
+  | 'core_obligations'
+  | 'key_differences'
+  | 'enforcement'
+  | 'recent_developments'
+  | 'practical_implications';
+
+/**
+ * The fixed analysis axes, rendered in order. `key_differences` doubles as the
+ * swing slot that carries a non-overlapping focus as its own section.
+ */
+const ANALYSIS_AXES: ReadonlyArray<{ key: AxisKey; title: string; question: string }> = [
+  {
+    key: 'regulatory_scope',
+    title: 'Regulatory scope',
+    question: 'What conduct or activity is covered? Who are the regulated entities?',
+  },
+  {
+    key: 'core_obligations',
+    title: 'Core obligations',
+    question: 'What must regulated parties do or refrain from?',
+  },
+  {
+    key: 'key_differences',
+    title: 'Key differences',
+    question: 'Where do the EU and US approaches diverge most significantly?',
+  },
+  {
+    key: 'enforcement',
+    title: 'Enforcement',
+    question: 'Who enforces the rules and what are the penalties?',
+  },
+  {
+    key: 'recent_developments',
+    title: 'Recent developments',
+    question: 'Recent legislation, court decisions, or regulatory guidance.',
+  },
+  {
+    key: 'practical_implications',
+    title: 'Practical implications',
+    question: 'For a multinational entity operating in both jurisdictions.',
+  },
+];
+
+/**
+ * Map an optional focus to the fixed axis it overlaps, or null when it raises a
+ * genuinely new angle. Overlapping focuses (enforcement, penalties, remedies,
+ * recent developments, …) fold into their axis so the framework never renders
+ * two near-duplicate sections — one for the focus and one for the axis it
+ * restates (issue #37). A focus matching nothing takes the swing slot as its
+ * own dedicated section.
+ */
+function matchFocusToAxis(focus: string): AxisKey | null {
+  const f = focus.toLowerCase();
+  const rules: ReadonlyArray<readonly [AxisKey, RegExp]> = [
+    ['enforcement', /enforce|penalt|sanction|remed|liabilit|prosecut/],
+    ['recent_developments', /recent|latest|newest|\bdevelopment/],
+    ['key_differences', /difference|diverg|contrast|\bcompar|distinct/],
+    ['regulatory_scope', /\bscope|coverage|applicab|regulated entit|who is (?:covered|regulated)/],
+    ['core_obligations', /obligation|\bduty|\bduties|requirement|complian/],
+    ['practical_implications', /practical|implication|operational/],
+  ];
+  for (const [key, pattern] of rules) {
+    if (pattern.test(f)) return key;
+  }
+  return null;
+}
+
 export const eurlex_comparative_analysis = prompt('eurlex_comparative_analysis', {
   description:
     'Frames a comparative legal analysis across EU and US law for a given policy domain. ' +
@@ -27,8 +97,28 @@ export const eurlex_comparative_analysis = prompt('eurlex_comparative_analysis',
   }),
 
   generate: (args) => {
-    const focusLine = args.focus ? ` with emphasis on **${args.focus}**` : '';
     const domain = args.domain;
+    const focus = args.focus?.trim();
+    const focusLine = focus ? ` with emphasis on **${focus}**` : '';
+
+    // Route an overlapping focus into its existing axis rather than appending a
+    // duplicate section; a non-overlapping focus takes the "Key differences"
+    // swing slot as its own dedicated section (issue #37).
+    const matchedAxis = focus ? matchFocusToAxis(focus) : null;
+    const emphasizedFocus = focus ? focus.charAt(0).toUpperCase() + focus.slice(1) : '';
+
+    const framework = ANALYSIS_AXES.map((axis, i) => {
+      const n = i + 1;
+      if (focus && matchedAxis === axis.key) {
+        // Overlapping focus — this axis carries it, titled by the focus itself.
+        return `${n}. **${emphasizedFocus}** — ${axis.question}`;
+      }
+      if (axis.key === 'key_differences' && focus && !matchedAxis) {
+        // Non-overlapping focus — its own dedicated section in the swing slot.
+        return `${n}. **${emphasizedFocus}** — Deep dive into this specific aspect.`;
+      }
+      return `${n}. **${axis.title}** — ${axis.question}`;
+    }).join('\n');
 
     return [
       {
@@ -53,12 +143,7 @@ export const eurlex_comparative_analysis = prompt('eurlex_comparative_analysis',
 
 After gathering sources, structure your analysis around:
 
-1. **Regulatory scope** — What conduct or activity is covered? Who are the regulated entities?
-2. **Core obligations** — What must regulated parties do or refrain from?
-3. ${args.focus ? `**${args.focus}** — Deep dive into this specific aspect` : '**Key differences** — Where do the EU and US approaches diverge most significantly?'}
-4. **Enforcement** — Who enforces the rules and what are the penalties?
-5. **Recent developments** — Recent legislation, court decisions, or regulatory guidance.
-6. **Practical implications** — For a multinational entity operating in both jurisdictions.
+${framework}
 
 Please cite specific EU acts (with CELEX numbers) and US cases/statutes as you go.`,
         },
