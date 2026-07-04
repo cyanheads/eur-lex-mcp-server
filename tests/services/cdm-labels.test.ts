@@ -145,6 +145,18 @@ const REG_URI = `${RESOURCE_TYPE_BASE}REG`;
 const REG_IMPL_URI = `${RESOURCE_TYPE_BASE}REG_IMPL`;
 const REG_DEL_URI = `${RESOURCE_TYPE_BASE}REG_DEL`;
 
+/**
+ * Derivative sector-6 case-law resource-types, verified against the live authority
+ * register (English prefLabels "Judicial information" / "Information" / "Abstract" / "Summary").
+ * eurlex_get_cases excludes these from the default search but can re-admit them via
+ * include_derivative, so they must resolve to labels rather than raw codes (issue
+ * #44 — the same raw-code gap #43 fixed for REG_IMPL / REG_DEL).
+ */
+const INFO_JUDICIAL_URI = `${RESOURCE_TYPE_BASE}INFO_JUDICIAL`;
+const INFO_JUR_URI = `${RESOURCE_TYPE_BASE}INFO_JUR`;
+const ABSTRACT_JUR_URI = `${RESOURCE_TYPE_BASE}ABSTRACT_JUR`;
+const SUM_JUR_URI = `${RESOURCE_TYPE_BASE}SUM_JUR`;
+
 describe('resolveResourceTypeLabel', () => {
   it('resolves a Commission Implementing Regulation to its label, not the raw REG_IMPL code (issue #43)', () => {
     expect(resolveResourceTypeLabel(REG_IMPL_URI)).toBe('Implementing Regulation');
@@ -155,6 +167,16 @@ describe('resolveResourceTypeLabel', () => {
   it('resolves a Commission Delegated Regulation to its label, not the raw REG_DEL code (issue #43)', () => {
     expect(resolveResourceTypeLabel(REG_DEL_URI)).toBe('Delegated Regulation');
     expect(resolveResourceTypeLabel(REG_DEL_URI)).not.toBe('REG_DEL');
+  });
+
+  it('resolves derivative case-law resource-types to labels, not raw codes (issue #44)', () => {
+    expect(resolveResourceTypeLabel(INFO_JUDICIAL_URI)).toBe('Judicial Information Notice');
+    expect(resolveResourceTypeLabel(INFO_JUR_URI)).toBe('Information Notice');
+    expect(resolveResourceTypeLabel(ABSTRACT_JUR_URI)).toBe('Case Abstract');
+    expect(resolveResourceTypeLabel(SUM_JUR_URI)).toBe('Case Summary');
+    // Regression guard: the real CELLAR codes must not fall through to the raw segment.
+    expect(resolveResourceTypeLabel(INFO_JUDICIAL_URI)).not.toBe('INFO_JUDICIAL');
+    expect(resolveResourceTypeLabel(SUM_JUR_URI)).not.toBe('SUM_JUR');
   });
 
   it('falls back to the last path segment for an unmapped resource-type URI', () => {
@@ -174,5 +196,12 @@ describe('resolveResourceTypeLabels', () => {
 
   it('resolves a lone REG_DEL to the delegated-regulation label', () => {
     expect(resolveResourceTypeLabels(REG_DEL_URI)).toBe('Delegated Regulation');
+  });
+
+  it('resolves the derivative case-law types through the multi-type path (issue #44)', () => {
+    expect(resolveResourceTypeLabels(ABSTRACT_JUR_URI)).toBe('Case Abstract');
+    expect(resolveResourceTypeLabels(SUM_JUR_URI)).toBe('Case Summary');
+    expect(resolveResourceTypeLabels(INFO_JUDICIAL_URI)).toBe('Judicial Information Notice');
+    expect(resolveResourceTypeLabels(INFO_JUR_URI)).toBe('Information Notice');
   });
 });

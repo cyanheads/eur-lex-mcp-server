@@ -32,6 +32,24 @@ const CASE_TYPE_RESOURCE_TYPE: Record<string, string> = {
 };
 
 /**
+ * Derivative sector-6 resource-types excluded from the untyped/default search:
+ * information notices (INFO_JUDICIAL, INFO_JUR), case-law abstracts (ABSTRACT_JUR),
+ * and case summaries (SUM_JUR). Each is a separate CELLAR work with its own CELEX,
+ * so at a page limit they crowd distinct primary cases off the page — a keyword
+ * search for a landmark ruling could drop the ruling itself entirely (issue #44).
+ * A case_type filter already excludes them structurally (it requires a primary
+ * resource-type); the untyped path excludes them unless include_derivative opts in.
+ * JUDG_EXTRACT/ORDER_EXTRACT are deliberately NOT here: an OJ extract can be the
+ * sole published record of an older case, so excluding it would cost recall.
+ */
+const DERIVATIVE_RESOURCE_TYPES = [
+  'http://publications.europa.eu/resource/authority/resource-type/INFO_JUDICIAL',
+  'http://publications.europa.eu/resource/authority/resource-type/INFO_JUR',
+  'http://publications.europa.eu/resource/authority/resource-type/ABSTRACT_JUR',
+  'http://publications.europa.eu/resource/authority/resource-type/SUM_JUR',
+] as const;
+
+/**
  * Convert a standard EU case number (C-131/12 or T-131/12) into a CELEX substring
  * suitable for a CONTAINS filter.
  *
@@ -44,17 +62,20 @@ const CASE_TYPE_RESOURCE_TYPE: Record<string, string> = {
 function caseNumberToCelexFragment(caseNumber: string): string | null {
   const m = /^([CT])-(\d+)\/(\d{2,4})$/.exec(caseNumber.trim().toUpperCase());
   if (!m) return null;
+  // Groups 1–3 are all present once the pattern matches; the `?? ''` fallbacks
+  // satisfy the type-checker without a non-null assertion and never fire at runtime.
   const court = m[1] === 'C' ? 'CJ' : 'TJ';
-  const caseNum = m[2]!.padStart(4, '0');
-  const rawYear = parseInt(m[3]!, 10);
-  const year4 = m[3]!.length === 2 ? (rawYear <= 60 ? 2000 + rawYear : 1900 + rawYear) : rawYear;
+  const caseNum = (m[2] ?? '').padStart(4, '0');
+  const yearStr = m[3] ?? '';
+  const rawYear = parseInt(yearStr, 10);
+  const year4 = yearStr.length === 2 ? (rawYear <= 60 ? 2000 + rawYear : 1900 + rawYear) : rawYear;
   return `${year4}${court}${caseNum}`;
 }
 
 export const eurlex_get_cases = tool('eurlex_get_cases', {
   title: 'Search CJEU/GC Case Law',
   description:
-    'Search CJEU and General Court case law — judgments, orders, and Advocate General opinions — by case number, court, case type, keyword, and date range. Keyword matches English case titles (which carry party names) and CELEX strings; there is no full-text body search. Returns each case with its court, date, and type, plus — parsed from the title where present — the parties, subject matter, and case reference.',
+    'Search CJEU and General Court case law — judgments, orders, and Advocate General opinions — by case number, court, case type, keyword, and date range. By default only these primary records are returned; derivative judicial information notices, case abstracts, and summaries are excluded so distinct cases fill the page (set include_derivative to include them). Keyword matches English case titles (which carry party names) and CELEX strings; there is no full-text body search. Returns each case with its court, date, and type, plus — parsed from the title where present — the parties, subject matter, and case reference.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
     case_number: z
@@ -88,6 +109,12 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
       .optional()
       .describe(
         'Case type: judgment, order (procedural decision), or ag_opinion (Advocate General opinion). Omit to search all.',
+      ),
+    include_derivative: z
+      .boolean()
+      .default(false)
+      .describe(
+        'Include derivative sector-6 records — judicial information notices, case abstracts, and case summaries — alongside primary judgments, orders, and AG opinions. Default false: these are excluded so distinct primary cases fill the page. Ignored when case_type is set (that path already returns a single primary type).',
       ),
     date_from: z
       .union([
@@ -222,7 +249,7 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
     const filters: string[] = [`FILTER(STRSTARTS(STR(?celexNumber), "6"))`];
 
     let celexFragment: string | undefined;
-    if (input.case_number && input.case_number.trim()) {
+    if (input.case_number?.trim()) {
       // Convert standard case number (C-131/12) to CELEX substring (2012CJ0131).
       // The old approach — searching for the raw "131/12" string in the CELEX — is
       // inverted: CELEX stores year before case number, so "131/12" never matches.
@@ -299,10 +326,26 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
       }
     }
 
-    if (input.date_from && input.date_from.trim()) {
+    /**
+     * Exclude derivative sector-6 records (notices, abstracts, summaries) on the
+     * untyped/default path so distinct primary cases fill the page (issue #44). A
+     * single FILTER NOT EXISTS drops any work carrying one of the derivative types;
+     * type-less older cases carry none of them and are kept, so recall of pre-typed
+     * records is unaffected. Skipped when case_type is set — its required
+     * resource-type triple already excludes derivatives — or when include_derivative
+     * opts them back in.
+     */
+    if (!input.case_type && !input.include_derivative) {
+      const derivativeValues = DERIVATIVE_RESOURCE_TYPES.map((uri) => `<${uri}>`).join(' ');
+      filters.push(
+        `FILTER NOT EXISTS { ?work cdm:work_has_resource-type ?derivativeType . VALUES ?derivativeType { ${derivativeValues} } }`,
+      );
+    }
+
+    if (input.date_from?.trim()) {
       filters.push(`FILTER(?date >= "${input.date_from.trim()}"^^xsd:date)`);
     }
-    if (input.date_to && input.date_to.trim()) {
+    if (input.date_to?.trim()) {
       filters.push(`FILTER(?date <= "${input.date_to.trim()}"^^xsd:date)`);
     }
 

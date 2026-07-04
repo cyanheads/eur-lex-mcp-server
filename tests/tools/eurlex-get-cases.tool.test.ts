@@ -503,6 +503,83 @@ describe('eurlex_get_cases', () => {
     expect(getEnrichment(ctx).truncated).toBeUndefined();
   });
 
+  // --- #44: derivative sector-6 records excluded on the untyped/default path ---
+
+  it('excludes derivative resource-types on the untyped/default path (issue #44)', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+    mockQuery.mockResolvedValue([
+      makeCaseBinding('62014CJ0362', {
+        types: 'http://publications.europa.eu/resource/authority/resource-type/JUDG',
+      }),
+    ]);
+
+    const input = eurlex_get_cases.input.parse({ keyword: 'schrems' });
+    await eurlex_get_cases.handler(input, ctx);
+
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    // A single FILTER NOT EXISTS drops any work carrying a derivative case-law type,
+    // so derivative notices/abstracts/summaries can't crowd primary cases off the page.
+    expect(sparql).toContain('FILTER NOT EXISTS');
+    expect(sparql).toContain('cdm:work_has_resource-type ?derivativeType');
+    expect(sparql).toContain('resource-type/INFO_JUDICIAL');
+    expect(sparql).toContain('resource-type/INFO_JUR>');
+    expect(sparql).toContain('resource-type/ABSTRACT_JUR');
+    expect(sparql).toContain('resource-type/SUM_JUR');
+  });
+
+  it('include_derivative:true re-admits derivative records with human-readable labels (issue #44)', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+    mockQuery.mockResolvedValue([
+      makeCaseBinding('62021CA0446', {
+        types: 'http://publications.europa.eu/resource/authority/resource-type/INFO_JUDICIAL',
+      }),
+    ]);
+
+    const input = eurlex_get_cases.input.parse({ keyword: 'schrems', include_derivative: true });
+    const result = await eurlex_get_cases.handler(input, ctx);
+
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    // Opting in skips the exclusion entirely.
+    expect(sparql).not.toContain('FILTER NOT EXISTS');
+    // The re-admitted derivative row resolves its type to a label, not a raw code.
+    expect(result.cases[0]?.celex_number).toBe('62021CA0446');
+    expect(result.cases[0]?.resource_type).toBe('Judicial Information Notice');
+  });
+
+  it('a case_type filter needs no derivative exclusion — its resource-type triple already excludes them (issue #44)', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+    mockQuery.mockResolvedValue([
+      makeCaseBinding('62014CJ0362', {
+        types: 'http://publications.europa.eu/resource/authority/resource-type/JUDG',
+      }),
+    ]);
+
+    const input = eurlex_get_cases.input.parse({ keyword: 'schrems', case_type: 'judgment' });
+    await eurlex_get_cases.handler(input, ctx);
+
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    expect(sparql).not.toContain('FILTER NOT EXISTS');
+    expect(sparql).toContain(
+      '?work cdm:work_has_resource-type <http://publications.europa.eu/resource/authority/resource-type/JUDG> .',
+    );
+  });
+
+  it('keeps type-less older cases on the default path — the exclusion never drops them (issue #44)', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+    // An older case with no resource-type binding at all (GROUP_CONCAT yields no types).
+    mockQuery.mockResolvedValue([makeCaseBinding('61962CJ0026', { date: '1963-02-05' })]);
+
+    const input = eurlex_get_cases.input.parse({ keyword: 'van gend' });
+    const result = await eurlex_get_cases.handler(input, ctx);
+
+    // The exclusion is a server-side FILTER NOT EXISTS (a type-less work carries none
+    // of the derivative types, so recall is preserved), and the handler never
+    // client-side-drops a type-less row: the case still surfaces.
+    expect(result.total).toBe(1);
+    expect(result.cases[0]?.celex_number).toBe('61962CJ0026');
+    expect(result.cases[0]?.resource_type).toBeUndefined();
+  });
+
   // --- Format ---
 
   it('format renders celex, date, type label, and title', () => {

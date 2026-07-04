@@ -33,6 +33,14 @@ export const RESOURCE_TYPE_LABELS: Record<string, string> = {
   'http://publications.europa.eu/resource/authority/resource-type/REG_IMPL':
     'Implementing Regulation',
   'http://publications.europa.eu/resource/authority/resource-type/REG_DEL': 'Delegated Regulation',
+  // Derivative sector-6 case-law records. Excluded from the default eurlex_get_cases
+  // search but reachable via include_derivative, so map them to labels rather than
+  // raw codes (the same raw-code gap #43 fixed for REG_IMPL / REG_DEL).
+  'http://publications.europa.eu/resource/authority/resource-type/INFO_JUDICIAL':
+    'Judicial Information Notice',
+  'http://publications.europa.eu/resource/authority/resource-type/INFO_JUR': 'Information Notice',
+  'http://publications.europa.eu/resource/authority/resource-type/ABSTRACT_JUR': 'Case Abstract',
+  'http://publications.europa.eu/resource/authority/resource-type/SUM_JUR': 'Case Summary',
 };
 
 /** Resolve a CDM resource-type URI to a human-readable label. Falls back to last path segment. */
