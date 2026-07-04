@@ -23,8 +23,7 @@ export const eurlex_document_relations_resource = resource(
   {
     name: 'EUR-Lex document relations',
     description:
-      'Relationship summary for a CELLAR work: amendment chain, consolidations, legal basis, and cited-by information. ' +
-      'Returns direct one-hop CDM relations for the work identified by CELEX number.',
+      'One-hop CDM relationship summary for a CELLAR work by CELEX number: amendment chain, consolidations, legal basis, and cited-by.',
     mimeType: 'application/json',
     params: z.object({
       celexNumber: z.string().describe('CELEX number of the EU act (e.g. 32016R0679 for GDPR).'),

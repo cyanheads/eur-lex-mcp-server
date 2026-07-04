@@ -54,12 +54,7 @@ function caseNumberToCelexFragment(caseNumber: string): string | null {
 export const eurlex_get_cases = tool('eurlex_get_cases', {
   title: 'Search CJEU/GC Case Law',
   description:
-    'Search CJEU (Court of Justice of the EU) and General Court case law — judgments, orders, and Advocate General opinions — ' +
-    'by case number, court, case type, keyword, and date range. ' +
-    'Case law occupies CELEX sector 6 and is searched by these court-specific axes. ' +
-    'Keyword search matches against English expression titles (which carry party names) and CELEX strings — full-text body search is not available. ' +
-    'Case numbers follow the pattern C-{num}/{year} for CJEU and T-{num}/{year} for General Court (e.g. C-131/12). ' +
-    'Returns case identifier, court, date, human-readable document type, and — parsed from the case title where available — the parties, subject matter, and case reference.',
+    'Search CJEU and General Court case law — judgments, orders, and Advocate General opinions — by case number, court, case type, keyword, and date range. Keyword matches English case titles (which carry party names) and CELEX strings; there is no full-text body search. Returns each case with its court, date, and type, plus — parsed from the title where present — the parties, subject matter, and case reference.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
     case_number: z
@@ -79,8 +74,7 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
       ])
       .optional()
       .describe(
-        'Court filter: CJEU = Court of Justice of the EU, GC = General Court. ' +
-          'Leave blank or omit to search both courts.',
+        'Court filter: CJEU = Court of Justice of the EU, GC = General Court. Omit to search both.',
       ),
     case_type: z
       .union([
@@ -93,8 +87,7 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
       ])
       .optional()
       .describe(
-        'Case type filter: judgment, order (procedural decision), or ag_opinion (Advocate General opinion). ' +
-          'Leave blank or omit to search all case types.',
+        'Case type: judgment, order (procedural decision), or ag_opinion (Advocate General opinion). Omit to search all.',
       ),
     date_from: z
       .union([
@@ -145,47 +138,38 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
               .string()
               .optional()
               .describe(
-                'Human-readable case type label (e.g. "Judgment", "Order", "AG Opinion"). ' +
-                  'Cases classified under several resource-types (e.g. corrigenda) list all labels, comma-separated. ' +
-                  'Absent for some older cases.',
+                'Human-readable case type label (e.g. "Judgment", "Order", "AG Opinion"). Cases with several resource-types (e.g. corrigenda) list all, comma-separated. Absent for some older cases.',
               ),
             date: z.string().optional().describe('Judgment/opinion date in ISO 8601 format.'),
             title: z
               .string()
               .optional()
               .describe(
-                'Raw English expression title as stored in CELLAR. For case law this is a "#"-delimited string ' +
-                  '(court+date, parties, subject-matter, case reference); the parsed segments are surfaced in ' +
-                  'display_title, parties, subject_matter, and case_reference. Absent for many older cases.',
+                'Raw English expression title as stored in CELLAR — a "#"-delimited string (court+date, parties, subject-matter, case reference) whose segments are surfaced in display_title, parties, subject_matter, and case_reference. Absent for many older cases.',
               ),
             display_title: z
               .string()
               .optional()
               .describe(
-                'Clean human-readable title for display — the parties for a contested case ' +
-                  '(e.g. "Google Spain SL v AEPD"), or the court/AG descriptor when a case has no named parties ' +
-                  '(e.g. an Advocate General opinion). Parsed from title; absent when title is.',
+                'Clean human-readable title for display — the parties for a contested case (e.g. "Google Spain SL v AEPD"), or the court/AG descriptor when a case has no named parties. Parsed from title; absent when title is.',
               ),
             parties: z
               .string()
               .optional()
               .describe(
-                'Parties to the case, parsed from the title (e.g. "WhatsApp Ireland Ltd v European Data Protection Board."). ' +
-                  'Absent when the title carries no parties segment (e.g. AG opinions, some older cases).',
+                'Parties to the case, parsed from the title (e.g. "WhatsApp Ireland Ltd v European Data Protection Board."). Absent when the title carries no parties segment (e.g. AG opinions).',
               ),
             subject_matter: z
               .string()
               .optional()
               .describe(
-                'Subject-matter keyword summary parsed from the title — the legal topics and provisions at issue. ' +
-                  'Absent when the title carries no subject-matter segment.',
+                'Subject-matter keyword summary parsed from the title — the legal topics and provisions at issue. Absent when the title carries no subject-matter segment.',
               ),
             case_reference: z
               .string()
               .optional()
               .describe(
-                'Case reference parsed from the title (e.g. "Case C-97/23 P."). ' +
-                  'Absent when the title carries no case-reference segment.',
+                'Case reference parsed from the title (e.g. "Case C-97/23 P."). Absent when the title carries no case-reference segment.',
               ),
           })
           .describe('A single CJEU or General Court case law record.'),

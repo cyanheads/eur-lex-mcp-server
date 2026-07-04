@@ -32,10 +32,7 @@ function detectIdentifierType(identifier: string): IdentifierType | null {
 export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
   title: 'Resolve EU Legal Citation',
   description:
-    'Resolve an EU legal citation — a CELEX number or an ELI URI — to the canonical CELLAR work. ' +
-    'Returns the work URI, confirmed CELEX number, document type, document date, and whether the work exists in the CELLAR corpus. ' +
-    'CELEX format: {sector}{year}{type}{number} e.g. 32016R0679 (GDPR). ' +
-    'ELI format: http://data.europa.eu/eli/{type}/{year}/{number} — the /oj suffix is optional.',
+    'Resolve an EU legal citation — a CELEX number or ELI URI — to its canonical CELLAR work, confirming it exists before you fetch or traverse it. Returns the work URI, confirmed CELEX number, document type, and date.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     identifier: z
@@ -48,8 +45,7 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
       .enum(['celex', 'eli', 'auto'])
       .default('auto')
       .describe(
-        'Format of the identifier. Use "auto" to let the server detect the format automatically. ' +
-          'Supply explicitly if auto-detection fails or if the identifier is ambiguous.',
+        'Format of the identifier. "auto" detects it automatically; supply "celex" or "eli" explicitly if detection fails.',
       ),
   }),
   output: z.object({

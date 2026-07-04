@@ -39,11 +39,7 @@ const CONS_TEXT_URI = 'http://publications.europa.eu/resource/authority/resource
 export const eurlex_search_documents = tool('eurlex_search_documents', {
   title: 'Search EU Documents',
   description:
-    'Search EU legislation, treaties, and preparatory acts across the CELLAR corpus of 2.7M+ works. ' +
-    'Filters by document type, date range, EuroVoc subject concept, author institution, and in-force status. ' +
-    'Keyword search matches against English expression titles and CELEX strings — full-text body search is not available via this API; ' +
-    'multi-word keywords are matched as a title phrase via the full-text index. ' +
-    'Returns a page of CELEX numbers, work URIs, human-readable document type labels, dates, and English titles where available, ordered by date descending, each flagged with is_consolidated, plus a query_echo of the applied filters.',
+    'Search EU legislation, treaties, and preparatory acts across the CELLAR corpus by document type, date range, EuroVoc subject, author institution, and in-force status. Keyword matches English titles and CELEX strings only — there is no full-text body search. Returns a page of CELEX numbers, work URIs, type labels, dates, and titles, newest first, each flagged with is_consolidated. At least one filter is required.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
     keyword: z
@@ -58,26 +54,18 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
         z
           .enum(['REG', 'DIR', 'DEC', 'TREATY', 'JUDG', 'OPIN_AG', 'PROP', 'REC'])
           .describe(
-            'Document type: REG=Regulation, DIR=Directive, DEC=Decision, TREATY=Treaty, ' +
-              'JUDG=Judgment, OPIN_AG=AG Opinion, PROP=Proposal, REC=Recommendation.',
+            'Document type: REG=Regulation, DIR=Directive, DEC=Decision, TREATY=Treaty, JUDG=Judgment, OPIN_AG=AG Opinion, PROP=Proposal, REC=Recommendation.',
           ),
       ])
       .optional()
       .describe(
-        'Document type filter: REG=Regulation, DIR=Directive, DEC=Decision, TREATY=Treaty, ' +
-          'JUDG=Judgment, OPIN_AG=AG Opinion, PROP=Proposal, REC=Recommendation. ' +
-          'Leave blank or omit to search all document types. ' +
-          'A type filter excludes consolidated texts (CONS_TEXT), which carry their own resource-type — ' +
-          'set include_consolidated to fold them back in.',
+        'Document type: REG=Regulation, DIR=Directive, DEC=Decision, TREATY=Treaty, JUDG=Judgment, OPIN_AG=AG Opinion, PROP=Proposal, REC=Recommendation. Omit to search all types. A type filter excludes consolidated texts (CONS_TEXT) — set include_consolidated to fold them back in.',
       ),
     include_consolidated: z
       .boolean()
       .default(false)
       .describe(
-        'When true and document_type is set, also match consolidated texts (CONS_TEXT) of that type — ' +
-          'point-in-time versions that incorporate later amendments and carry their own resource-type, so a ' +
-          'plain type filter omits them. No effect when document_type is omitted (all types already return). ' +
-          'Either way, consolidated rows are tagged is_consolidated: true.',
+        'When true and document_type is set, also match consolidated texts (CONS_TEXT) of that type — point-in-time versions that a plain type filter omits. No effect when document_type is omitted. Consolidated rows are always tagged is_consolidated: true.',
       ),
     date_from: z
       .union([
@@ -89,8 +77,7 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
       ])
       .optional()
       .describe(
-        'Start of date range in ISO 8601 format (YYYY-MM-DD). Matches document date. ' +
-          'Leave blank or omit for no lower bound.',
+        'Start of date range (YYYY-MM-DD), matched against document date. Omit for no lower bound.',
       ),
     date_to: z
       .union([
@@ -102,8 +89,7 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
       ])
       .optional()
       .describe(
-        'End of date range in ISO 8601 format (YYYY-MM-DD). Matches document date. ' +
-          'Leave blank or omit for no upper bound.',
+        'End of date range (YYYY-MM-DD), matched against document date. Omit for no upper bound.',
       ),
     eurovoc_concept: z
       .union([
@@ -119,16 +105,13 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
       ])
       .optional()
       .describe(
-        'EuroVoc concept URI to filter by subject (e.g. http://eurovoc.europa.eu/2828). ' +
-          'Obtain concept URIs from eurlex_browse_subjects first. ' +
-          'Leave blank or omit for no subject filter.',
+        'EuroVoc concept URI to filter by subject (e.g. http://eurovoc.europa.eu/2828), obtained from eurlex_browse_subjects. Omit for no subject filter.',
       ),
     author_institution: z
       .string()
       .optional()
       .describe(
-        'Author institution name (e.g. "European Parliament", "Council", "European Commission"). ' +
-          'Matched against the English names of EU corporate bodies; only works created by a matching institution are returned.',
+        'Author institution name (e.g. "European Parliament", "Council", "European Commission"), matched against the English names of EU corporate bodies.',
       ),
     in_force: z
       .boolean()
@@ -160,16 +143,13 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
             is_consolidated: z
               .boolean()
               .describe(
-                'True when this CELEX is a consolidated version — a point-in-time text (…-YYYYMMDD) ' +
-                  'that incorporates amendments — rather than a base or amending act.',
+                'True when this CELEX is a consolidated version — a point-in-time text (…-YYYYMMDD) that incorporates amendments — rather than a base or amending act.',
               ),
             resource_type: z
               .string()
               .optional()
               .describe(
-                'Human-readable document type label (e.g. "Regulation", "Directive"). ' +
-                  'Works classified under several resource-types (e.g. corrigenda) list all labels, comma-separated. ' +
-                  'Absent for some older works.',
+                'Human-readable document type label (e.g. "Regulation", "Directive"). Works with several resource-types (e.g. corrigenda) list all, comma-separated. Absent for some older works.',
               ),
             date: z.string().optional().describe('Document date in ISO 8601 format (YYYY-MM-DD).'),
             title: z

@@ -77,10 +77,7 @@ function matchFocusToAxis(focus: string): AxisKey | null {
 
 export const eurlex_comparative_analysis = prompt('eurlex_comparative_analysis', {
   description:
-    'Frames a comparative legal analysis across EU and US law for a given policy domain. ' +
-    'Structures the inquiry to use eurlex_search_documents and eurlex_get_document for the EU side, ' +
-    'and courtlistener_search_opinions for the US counterpart. ' +
-    'Useful for policy analysts, legal researchers, and practitioners needing a cross-jurisdictional overview.',
+    'Frame a comparative legal analysis of a policy domain across EU and US law, driving eurlex_search_documents and eurlex_get_document for the EU side and courtlistener_search_opinions for the US counterpart.',
   args: z.object({
     domain: z
       .string()

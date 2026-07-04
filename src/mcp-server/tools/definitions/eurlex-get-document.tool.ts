@@ -54,36 +54,20 @@ const META_DIMENSION_LIMIT = 100;
 export const eurlex_get_document = tool('eurlex_get_document', {
   title: 'Get EU Document',
   description:
-    'Fetch the notice (metadata) and full text of an EU act by CELEX number or ELI URI. ' +
-    'Returns structured metadata — title, date, document type, author institution, legal basis, EuroVoc subjects — ' +
-    'plus the act content as HTML, Markdown, or Formex4 XML in the requested language. ' +
-    'Defaults to English (EN); not all works have content in all 24 official EU languages, ' +
-    'especially older acts pre-2004 EU enlargement. ' +
-    'If the requested language is unavailable, the server automatically falls back to English and notes the fallback. ' +
-    'CELEX format: {sector}{year}{type}{number} e.g. 32016R0679 for GDPR. ' +
-    'HTML returns the full act text as served by EUR-Lex; markdown converts that HTML to clean Markdown server-side ' +
-    '(recitals and numbered points as readable text, genuine data tables as GFM tables); XML returns Formex4 for structured processing. ' +
-    'Large bodies are bounded per call but never lost: content_mode "paged" (default) returns a character window ' +
-    '(offset + limit) alongside content_chars_total and has_more, so you can page to the end and reconstruct the whole act; ' +
-    'content_mode "full" returns the entire body in one call; content_mode "metadata_only" returns metadata with no body and skips the content fetch. ' +
-    'To navigate structure instead of raw offsets: outline: true returns a heading list of the chapters, articles, annexes, and recitals (no body), and select (e.g. { articles: "1,5,17" }) returns only those sections as text. ' +
-    'Acts with no detectable structure (e.g. case law) fall back to the paging floor, never an error.',
+    'Fetch the metadata and full text of an EU act by CELEX number, ELI URI, or work URI. Returns structured metadata (title, date, type, author institution, legal basis, EuroVoc subjects, in-force status) plus the act body as HTML, Markdown, or Formex4 XML, defaulting to English with automatic fallback. Large bodies are paged by default (offset/limit with has_more) or returned whole with content_mode "full"; use outline: true for a heading map and select to pull specific articles, chapters, recitals, or annexes.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     celex_number: z
       .string()
       .optional()
       .describe(
-        'CELEX number of the act to fetch (e.g. 32016R0679 for GDPR). ' +
-          'Provide exactly one of celex_number, eli_uri, or work_uri.',
+        'CELEX number of the act to fetch (e.g. 32016R0679 for GDPR). Provide exactly one of celex_number, eli_uri, or work_uri.',
       ),
     eli_uri: z
       .string()
       .optional()
       .describe(
-        'Work-level ELI URI of the act to fetch, resolved to its CELLAR work (e.g. ' +
-          'http://data.europa.eu/eli/reg/2016/679, with or without the /oj suffix). ' +
-          'Provide exactly one of celex_number, eli_uri, or work_uri.',
+        'Work-level ELI URI of the act to fetch (e.g. http://data.europa.eu/eli/reg/2016/679, with or without the /oj suffix). Provide exactly one of celex_number, eli_uri, or work_uri.',
       ),
     work_uri: z
       .string()
@@ -99,46 +83,32 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       )
       .optional()
       .describe(
-        'CELLAR work resource URI to fetch (e.g. ' +
-          'http://publications.europa.eu/resource/cellar/3e485e15-11bd-11e6-ba9a-01aa75ed71a1) — ' +
-          'the form returned by eurlex_lookup_celex, eurlex_get_relations, and eurlex_search_documents. ' +
-          'Dereferenced to its CELEX, then fetched by the same flow. Provide exactly one of celex_number, eli_uri, or work_uri.',
+        'CELLAR work resource URI to fetch (e.g. http://publications.europa.eu/resource/cellar/3e485e15-11bd-11e6-ba9a-01aa75ed71a1) — the form returned by eurlex_lookup_celex, eurlex_get_relations, and eurlex_search_documents. Provide exactly one of celex_number, eli_uri, or work_uri.',
       ),
     resolve: z
       .enum(['as_requested', 'current_consolidated'])
       .default('as_requested')
       .describe(
-        'Which version to serve for a base act that has newer consolidated versions. ' +
-          '"as_requested" (default) returns the exact CELEX requested — for a base act, the as-enacted text. ' +
-          '"current_consolidated" transparently serves the newest consolidated version instead when one exists, ' +
-          'reporting the served CELEX in celex_number and the originally requested CELEX in requested_celex; ' +
-          'a no-op when no newer consolidated version exists. Regardless of this setting, is_superseded / ' +
-          'current_consolidated_celex / consolidated_as_of flag a stale base act.',
+        'Which version to serve for a base act with newer consolidated versions. "as_requested" (default) returns the exact CELEX requested; "current_consolidated" serves the newest consolidated version instead (echoing the request in requested_celex), a no-op when none exists. Either way, is_superseded / current_consolidated_celex / consolidated_as_of flag a stale base act.',
       ),
     language: z
       .string()
       .regex(/^[A-Za-z]{2,3}$/)
       .default('EN')
       .describe(
-        'Language code for document content (ISO 639-1 uppercase, e.g. EN, FR, DE). ' +
-          'Defaults to EN. Falls back to EN if the requested language is unavailable.',
+        'Language code for document content (ISO 639-1 uppercase, e.g. EN, FR, DE). Defaults to EN, and falls back to EN if the requested language is unavailable.',
       ),
     format: z
       .enum(['html', 'xml', 'markdown'])
       .default('html')
       .describe(
-        'Content format: "html" for the act text as served by EUR-Lex (default); ' +
-          '"markdown" for that HTML converted to clean Markdown server-side ' +
-          '(recitals and numbered points as readable text, genuine data tables as GFM); ' +
-          '"xml" for Formex4 XML structured format.',
+        'Content format: "html" for the act text as served by EUR-Lex (default), "markdown" for that HTML converted to clean Markdown server-side, or "xml" for Formex4 structured XML.',
       ),
     content_mode: z
       .enum(['metadata_only', 'paged', 'full'])
       .default('paged')
       .describe(
-        'How much of the document body to return. "paged" (default) returns a bounded character window — see offset/limit; ' +
-          '"full" returns the entire body in one call (large acts can be hundreds of KB); ' +
-          '"metadata_only" returns metadata with no body and skips the content fetch. offset and limit apply only to "paged".',
+        'How much of the body to return. "paged" (default) returns a bounded character window (see offset/limit); "full" returns the entire body in one call (large acts can be hundreds of KB); "metadata_only" skips the content fetch. offset and limit apply only to "paged".',
       ),
     offset: z
       .number()
@@ -146,8 +116,7 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .min(0)
       .default(0)
       .describe(
-        'Character offset into the full document body where the returned window starts ("paged" mode only). ' +
-          'Page forward by setting offset = content_offset + content_chars_returned from the previous call.',
+        'Character offset into the body where the returned window starts ("paged" mode only). Page forward by setting offset = content_offset + content_chars_returned from the previous call.',
       ),
     limit: z
       .number()
@@ -156,18 +125,13 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .max(MAX_CONTENT_LIMIT)
       .default(DEFAULT_CONTENT_LIMIT)
       .describe(
-        `Maximum characters of body content to return in this window ("paged" mode only). Default ${DEFAULT_CONTENT_LIMIT}, max ${MAX_CONTENT_LIMIT}. ` +
-          'For the entire body in one response, use content_mode "full" instead of a large limit.',
+        `Maximum characters to return in this window ("paged" mode only). Default ${DEFAULT_CONTENT_LIMIT}, max ${MAX_CONTENT_LIMIT}. For the entire body in one response, use content_mode "full".`,
       ),
     outline: z
       .boolean()
       .default(false)
       .describe(
-        'Return a structural outline of the act — the detected chapters, sections, articles, annexes, and recitals as ' +
-          'a heading list, each with its character offset into the body of the requested format — instead of body text. ' +
-          'Use it to see what sections exist, then read one by paging (content_mode "paged") with its offset. ' +
-          'Ignores offset/limit and select. An act with no detectable structure (e.g. case law) returns an empty outline, never an error. ' +
-          'Not applied in content_mode "metadata_only".',
+        'Return a structural outline of the act — chapters, sections, articles, annexes, and recitals as a heading list, each with its character offset — instead of body text. Read a section by paging with its offset. Ignores offset/limit and select; no detectable structure returns an empty outline. Not applied in content_mode "metadata_only".',
       ),
     select: z
       .object({
@@ -184,10 +148,7 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       })
       .optional()
       .describe(
-        'Return only the text of specific sections by type and number, instead of a raw character window. ' +
-          'Roman and Arabic chapter/annex numbers are treated as equivalent. Applies on top of the requested format (html, markdown, xml). ' +
-          'A section that cannot be located, or an act with no detectable structure, is reported in selection.missed with no wrong text returned — ' +
-          'use offset/limit or content_mode "full" to read it. Ignored when outline is true or in content_mode "metadata_only".',
+        'Return only the text of specific sections by type and number, instead of a raw character window (Roman and Arabic numbers are equivalent). A section that cannot be located is reported in selection.missed with no wrong text returned. Ignored when outline is true or in content_mode "metadata_only".',
       ),
   }),
   output: z.object({
@@ -210,15 +171,13 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .string()
       .optional()
       .describe(
-        'Human-readable name of the primary (first) originating EU institution (e.g. "European Parliament", "Council of the EU"). ' +
-          'For co-legislated acts adopted by more than one body, prefer author_institutions for the complete set. Absent when not recorded.',
+        'Human-readable name of the primary (first) originating EU institution (e.g. "European Parliament", "Council of the EU"). For co-legislated acts, prefer author_institutions for the complete set. Absent when not recorded.',
       ),
     author_institutions: z
       .array(z.string().describe('Human-readable EU institution name.'))
       .optional()
       .describe(
-        'All originating EU institutions, for co-legislated acts adopted by more than one body ' +
-          '(e.g. ["European Parliament", "Council of the EU"] for an ordinary-legislative-procedure act). Absent when none recorded.',
+        'All originating EU institutions, for co-legislated acts adopted by more than one body (e.g. ["European Parliament", "Council of the EU"]). Absent when none recorded.',
       ),
     legal_basis: z
       .array(z.string().describe('CELEX number or URI of a legal basis act.'))
@@ -233,15 +192,13 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .boolean()
       .optional()
       .describe(
-        'True when the requested work is a base act with a newer consolidated version available — the returned text ' +
-          'may be outdated. Absent when the act has no consolidated version, or is itself a consolidated version.',
+        'True when the requested work is a base act with a newer consolidated version available — the returned text may be outdated. Absent when the act has no consolidated version, or is itself one.',
       ),
     current_consolidated_celex: z
       .string()
       .optional()
       .describe(
-        'CELEX of the newest consolidated version of the requested base act (e.g. 02014R0833-20260424) — ' +
-          'fetch it with eurlex_get_document, or pass resolve "current_consolidated". Present only when is_superseded is true.',
+        'CELEX of the newest consolidated version of the requested base act (e.g. 02014R0833-20260424) — fetch it with eurlex_get_document, or pass resolve "current_consolidated". Present only when is_superseded is true.',
       ),
     consolidated_as_of: z
       .string()
@@ -253,16 +210,13 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .string()
       .optional()
       .describe(
-        'The originally requested CELEX, echoed when resolve "current_consolidated" served a different (consolidated) work. ' +
-          'celex_number holds the CELEX actually served. Absent when the served work is the one requested.',
+        'The originally requested CELEX, echoed when resolve "current_consolidated" served a different (consolidated) work. celex_number holds the CELEX actually served. Absent when the served work is the one requested.',
       ),
     content: z
       .string()
       .optional()
       .describe(
-        'Body content of the act in the requested format and language. In "paged" mode this is a character window ' +
-          '(see content_offset / content_chars_returned / has_more); in "full" mode the entire body; ' +
-          'omitted in "metadata_only" mode, when the window is empty (offset past the end), or when content is unavailable.',
+        'Body content of the act in the requested format and language. In "paged" mode a character window (see content_offset / content_chars_returned / has_more); in "full" mode the entire body; omitted in "metadata_only" mode, when the window is empty, or when content is unavailable.',
       ),
     content_mode: z
       .string()
@@ -270,8 +224,7 @@ export const eurlex_get_document = tool('eurlex_get_document', {
     content_available: z
       .boolean()
       .describe(
-        'Whether body content was fetched from EUR-Lex. False in "metadata_only" mode (no fetch attempted) — ' +
-          'use content_mode to distinguish "not requested" from "unavailable upstream".',
+        'Whether body content was fetched from EUR-Lex. False in "metadata_only" mode (no fetch attempted) — use content_mode to distinguish "not requested" from "unavailable upstream".',
       ),
     content_offset: z
       .number()
@@ -292,14 +245,12 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .int()
       .optional()
       .describe(
-        'Total character length of the full document body. Present when content was fetched and available; ' +
-          'use with content_offset to page through the entire act.',
+        'Total character length of the full document body. Present when content was fetched and available; use with content_offset to page through the entire act.',
       ),
     has_more: z
       .boolean()
       .describe(
-        'True when body content exists beyond the returned window. Page forward with offset = content_offset + content_chars_returned, ' +
-          'or request content_mode "full" for the entire act in one call. Always false in "metadata_only" mode.',
+        'True when body content exists beyond the returned window. Page forward with offset = content_offset + content_chars_returned, or request content_mode "full". Always false in "metadata_only" mode.',
       ),
     language: z.string().describe('Language code of the returned content.'),
     language_fallback: z
@@ -360,8 +311,7 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .boolean()
       .optional()
       .describe(
-        'Whether any act structure was parsed from the body. Present when outline or select was used; false means the act has no ' +
-          'detectable chapter/article/annex structure — read it via the paging floor (offset/limit or content_mode "full").',
+        'Whether any act structure was parsed from the body. Present when outline or select was used; false means no detectable chapter/article/annex structure — read it via offset/limit or content_mode "full".',
       ),
   }),
 

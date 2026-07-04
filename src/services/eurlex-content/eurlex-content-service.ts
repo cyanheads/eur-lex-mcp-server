@@ -295,11 +295,7 @@ export class EurLexContentService {
             celexNumber,
             reason: 'content_challenge',
             recovery: {
-              hint:
-                'The content host is behind a WAF/bot challenge. Retry shortly; metadata remains ' +
-                'reachable via content_mode "metadata_only". A persistent challenge means ' +
-                'EURLEX_CONTENT_BASE_URL points at a WAF-protected host rather than the EU ' +
-                'Publications Office CELLAR resolver.',
+              hint: 'The content host is behind a WAF/bot challenge. Retry shortly; metadata remains reachable via content_mode "metadata_only". A persistent challenge means EURLEX_CONTENT_BASE_URL points at a WAF-protected host rather than the EU Publications Office CELLAR resolver.',
             },
           },
         );

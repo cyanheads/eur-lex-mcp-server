@@ -18,9 +18,7 @@ const ServerConfigSchema = z.object({
     .url()
     .default('http://publications.europa.eu')
     .describe(
-      'Base URL of the EU Publications Office CELLAR content-negotiation resolver, which serves ' +
-        'act text via /resource/celex/{CELEX}. Replaces the WAF-protected eur-lex.europa.eu ' +
-        'legal-content endpoint, which now returns an AWS WAF bot-challenge stub (issue #16).',
+      'Base URL of the EU Publications Office CELLAR content-negotiation resolver, which serves act text via /resource/celex/{CELEX}. Replaces the WAF-protected eur-lex.europa.eu legal-content endpoint, which now returns an AWS WAF bot-challenge stub (issue #16).',
     ),
   sparqlQueryTimeoutMs: z.coerce
     .number()

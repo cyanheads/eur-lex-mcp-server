@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.9.2](changelog/0.9.x/0.9.2.md) — 2026-07-03
+
+Tool, resource, and prompt descriptions rewritten as concise single strings; the multi-line string-concatenation pattern dropped across the definitions and the server instructions block (now a template literal) — description text only, no schema or behavior change
+
 ## [0.9.1](changelog/0.9.x/0.9.1.md) — 2026-07-03
 
 Tool/resource descriptions lead with capability, with cross-tool workflow guidance moved to server instructions; eurlex_comparative_analysis merges an overlapping focus into its existing axis instead of duplicating it

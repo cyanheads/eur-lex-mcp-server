@@ -18,9 +18,7 @@ import {
 export const eurlex_document_resource = resource('eurlex://document/{celexNumber}', {
   name: 'EUR-Lex document metadata',
   description:
-    'Metadata snapshot for a CELLAR work identified by CELEX number. ' +
-    'Returns human-readable document type and author institution labels, date, title (where available), and in-force flag. ' +
-    'Read-only, stable-URI injectable context for EU acts.',
+    'Metadata snapshot for a CELLAR work by CELEX number — human-readable document type and author institution labels, date, title, and in-force flag.',
   mimeType: 'application/json',
   params: z.object({
     celexNumber: z.string().describe('CELEX number of the EU act (e.g. 32016R0679 for GDPR).'),

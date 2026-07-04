@@ -19,18 +19,17 @@ await createApp({
   tools: allToolDefinitions,
   resources: allResourceDefinitions,
   prompts: allPromptDefinitions,
-  instructions:
-    'EUR-Lex MCP server provides access to the EU CELLAR semantic repository (2.7M+ EU legal works) and the EUR-Lex content API.\n' +
-    '\n' +
-    'Workflow orientation:\n' +
-    '- Subject search: resolve a keyword to EuroVoc concept URIs with eurlex_browse_subjects, then pass a returned URI to the eurovoc_concept filter of eurlex_search_documents (that filter accepts only EuroVoc http://eurovoc.europa.eu/ URIs).\n' +
-    '- Legislation vs case law: eurlex_search_documents covers legislation, treaties, and preparatory acts; eurlex_get_cases covers CJEU and General Court case law with court, case-number, and AG-opinion parameters. Both return CELEX numbers and work URIs.\n' +
-    '- Full text: fetch metadata and body for a CELEX, ELI, or work URI with eurlex_get_document.\n' +
-    '- Relationships: eurlex_get_relations returns the one-hop amendment, repeal, consolidation, legal-basis, and citation edges of an act; fetch a linked consolidated version with eurlex_get_document. For multi-hop traversal beyond the curated tools, use eurlex_query_sparql (read-only SELECT).\n' +
-    '- eurlex_lookup_celex confirms that a CELEX or ELI resolves to a real CELLAR work before you fetch or traverse it.\n' +
-    '\n' +
-    'Identifiers: CELEX format {sector}{year}{type}{number} — e.g. 32016R0679 (GDPR), 62024CJ0629 (case). ELI format http://data.europa.eu/eli/{type}/{year}/{number} — the /oj suffix is optional.\n' +
-    'Document text comes from the EUR-Lex REST API; metadata and relations come from CELLAR SPARQL.',
+  instructions: `EUR-Lex MCP server provides access to the EU CELLAR semantic repository (2.7M+ EU legal works) and the EUR-Lex content API.
+
+Workflow orientation:
+- Subject search: resolve a keyword to EuroVoc concept URIs with eurlex_browse_subjects, then pass a returned URI to the eurovoc_concept filter of eurlex_search_documents (that filter accepts only EuroVoc http://eurovoc.europa.eu/ URIs).
+- Legislation vs case law: eurlex_search_documents covers legislation, treaties, and preparatory acts; eurlex_get_cases covers CJEU and General Court case law with court, case-number, and AG-opinion parameters. Both return CELEX numbers and work URIs.
+- Full text: fetch metadata and body for a CELEX, ELI, or work URI with eurlex_get_document.
+- Relationships: eurlex_get_relations returns the one-hop amendment, repeal, consolidation, legal-basis, and citation edges of an act; fetch a linked consolidated version with eurlex_get_document. For multi-hop traversal beyond the curated tools, use eurlex_query_sparql (read-only SELECT).
+- eurlex_lookup_celex confirms that a CELEX or ELI resolves to a real CELLAR work before you fetch or traverse it.
+
+Identifiers: CELEX format {sector}{year}{type}{number} — e.g. 32016R0679 (GDPR), 62024CJ0629 (case). ELI format http://data.europa.eu/eli/{type}/{year}/{number} — the /oj suffix is optional.
+Document text comes from the EUR-Lex REST API; metadata and relations come from CELLAR SPARQL.`,
   setup(core) {
     const serverConfig = getServerConfig();
     initCellarSparqlService(core.config, core.storage, serverConfig);

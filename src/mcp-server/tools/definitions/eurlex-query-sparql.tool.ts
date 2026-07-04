@@ -45,28 +45,14 @@ function leadingSparqlKeyword(query: string): string | undefined {
 export const eurlex_query_sparql = tool('eurlex_query_sparql', {
   title: 'Raw CELLAR SPARQL Query',
   description:
-    'Execute a raw, read-only SPARQL SELECT query against the CELLAR Virtuoso endpoint. ' +
-    'Only SELECT is accepted: update forms (DELETE, INSERT, LOAD, CLEAR, CREATE, DROP, COPY, MOVE, ADD) and other query forms (ASK, CONSTRUCT, DESCRIBE) are rejected locally before any request is sent. ' +
-    'An escape hatch for CDM ontology traversals that the curated tools do not express. ' +
-    'The server caps all queries at 100 results — include an explicit LIMIT in your query to control the count; ' +
-    'if omitted or above 100 it will be injected or capped automatically. ' +
-    'The CDM ontology prefix is prepended automatically: cdm: = http://publications.europa.eu/ontology/cdm#. ' +
-    'Also auto-includes skos: and xsd: prefixes. ' +
-    'Requires familiarity with the CELLAR CDM ontology. ' +
-    'Key predicates: cdm:resource_legal_id_celex (CELEX number), cdm:work_date_document (date), ' +
-    'cdm:work_has_resource-type (document type), cdm:work_is_about_concept_eurovoc (EuroVoc subject), ' +
-    'cdm:work_cites_work (citation). ' +
-    'CELEX is stored as an xsd:string-typed literal, so match it with FILTER(STR(?celex) = "…"); a plain FILTER(?celex = "…") matches nothing. ' +
-    'For multi-word phrases, single-quote the term inside bif:contains (e.g. "\'data protection\'") to use the full-text index, or FILTER(CONTAINS(LCASE(?title), "keyword")) to scan.',
+    'Run a raw, read-only SPARQL SELECT against the CELLAR Virtuoso endpoint — an escape hatch for CDM ontology traversals the curated tools do not cover. Only SELECT is accepted; update forms and ASK/CONSTRUCT/DESCRIBE are rejected before execution, and results are capped at 100. The cdm:, skos:, and xsd: prefixes are auto-injected.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
     sparql_query: z
       .string()
       .min(10)
       .describe(
-        'A read-only SPARQL SELECT query to execute against CELLAR. Non-SELECT queries (updates such as DELETE/INSERT, or ASK/CONSTRUCT/DESCRIBE) are rejected before execution. ' +
-          'Leading comments and PREFIX/BASE declarations are allowed before the SELECT keyword. The cdm:, skos:, and xsd: prefixes are auto-injected. ' +
-          'LIMIT is injected at 100 if absent or capped to 100 if above that threshold.',
+        'A read-only SPARQL SELECT query. Leading comments and PREFIX/BASE declarations are allowed; the cdm:, skos:, and xsd: prefixes are auto-injected. LIMIT is injected at 100 if absent, or capped to 100. Key CDM predicates: cdm:resource_legal_id_celex (CELEX), cdm:work_date_document (date), cdm:work_has_resource-type (type), cdm:work_is_about_concept_eurovoc (EuroVoc subject), cdm:work_cites_work (citation). CELEX is an xsd:string literal — match it with FILTER(STR(?celex) = "…"). For text, use bif:contains with a single-quoted phrase.',
       ),
     timeout_hint: z
       .number()
@@ -75,8 +61,7 @@ export const eurlex_query_sparql = tool('eurlex_query_sparql', {
       .max(55000)
       .optional()
       .describe(
-        'Optional client-side timeout for this request, in milliseconds (1000–55000). ' +
-          'When omitted, the default timeout applies; the endpoint hard limit is 60 seconds.',
+        'Optional client-side timeout in milliseconds (1000–55000). Defaults apply when omitted; the endpoint hard limit is 60 seconds.',
       ),
   }),
   output: z.object({

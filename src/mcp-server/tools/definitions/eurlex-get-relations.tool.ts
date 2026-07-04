@@ -19,20 +19,14 @@ import {
 export const eurlex_get_relations = tool('eurlex_get_relations', {
   title: 'Get CELLAR Relationship Graph',
   description:
-    'Traverse the CELLAR CDM relationship graph for an EU work: ' +
-    'what it amends, what amends it, what it repeals (explicitly or implicitly), what repealed it, ' +
-    'its consolidated versions, its legal basis, and works that cite it. ' +
-    'Returns one-hop direct relations only, paginated per relation type and direction (offset/limit) with a truncated flag when a cap is hit. ' +
-    'The consolidated_version relation links to the consolidated texts of the act, each a separate CELEX-numbered work. ' +
-    'Requires a valid CELEX number or CELLAR work URI.',
+    'Traverse the one-hop CDM relationship graph of an EU act: what it amends or is amended by, what it repeals or is repealed by (explicit and implicit), its consolidated versions, its legal basis, and works that cite it. Returns direct relations only, paginated per relation type and direction. Requires a CELEX number or CELLAR work URI.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     celex_number: z
       .string()
       .optional()
       .describe(
-        'CELEX number of the work to traverse (e.g. 32016R0679). ' +
-          'Provide exactly one of celex_number or work_uri.',
+        'CELEX number of the work to traverse (e.g. 32016R0679). Provide exactly one of celex_number or work_uri.',
       ),
     work_uri: z
       .string()
@@ -48,19 +42,13 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
       )
       .optional()
       .describe(
-        'CELLAR work resource URI to traverse (e.g. ' +
-          'http://publications.europa.eu/resource/cellar/3e485e15-11bd-11e6-ba9a-01aa75ed71a1). ' +
-          'Used directly without CELEX resolution. Provide exactly one of celex_number or work_uri.',
+        'CELLAR work resource URI to traverse (e.g. http://publications.europa.eu/resource/cellar/3e485e15-11bd-11e6-ba9a-01aa75ed71a1). Used directly without CELEX resolution. Provide exactly one of celex_number or work_uri.',
       ),
     relation_types: z
       .array(z.enum([...RELATION_TYPES]))
       .optional()
       .describe(
-        'Subset of relation types to return. Omit to return all types: ' +
-          'cites (citation graph), amends (what this work amends), amended_by (what amends this work), ' +
-          'repeals (what this work explicitly repeals), repealed_by (what explicitly repealed this work), ' +
-          'implicitly_repeals (what this work implicitly repeals), implicitly_repealed_by (what implicitly repealed this work), ' +
-          'legal_basis (treaty/treaty article this act is based on), consolidated_version (consolidated versions of this act).',
+        'Subset of relation types to return; omit for all. Types: cites, amends, amended_by, repeals, repealed_by, implicitly_repeals, implicitly_repealed_by, legal_basis (treaty/article this act rests on), consolidated_version (consolidated texts of this act).',
       ),
     offset: z
       .number()
@@ -68,8 +56,7 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
       .min(0)
       .default(0)
       .describe(
-        'Pagination offset applied per relation type and per direction — number of related works to skip. Defaults to 0. ' +
-          'Page forward by adding limit each call; incoming edges are ordered newest-first, so higher offsets reach older works.',
+        'Pagination offset applied per relation type and direction — related works to skip (default 0). Page forward by adding limit; incoming edges are newest-first, so higher offsets reach older works.',
       ),
     limit: z
       .number()
@@ -78,10 +65,7 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
       .max(100)
       .default(100)
       .describe(
-        'Maximum related works to return per relation type and per direction (1–100). Defaults to 100. ' +
-          'Incoming edges (e.g. works that cite this act) are ordered by document date descending, so the cap keeps the newest — ' +
-          'page with offset for older ones. For the symmetric cites relation, outgoing and incoming each get this budget independently. ' +
-          'When truncated is true, at least one direction filled its cap and more may exist.',
+        'Maximum related works per relation type and direction (1–100, default 100). Incoming edges are ordered newest-first, so the cap keeps the newest — page with offset for older ones. When truncated is true, at least one direction filled its cap.',
       ),
   }),
   output: z.object({
@@ -89,8 +73,7 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
       .string()
       .optional()
       .describe(
-        'CELEX number of the source work whose relations were traversed. ' +
-          'Absent when the work was addressed directly by work_uri.',
+        'CELEX number of the source work whose relations were traversed. Absent when addressed directly by work_uri.',
       ),
     work_uri: z
       .string()
@@ -102,8 +85,7 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
             relation_type: z
               .string()
               .describe(
-                'Type of relation: cites, amends, amended_by, repeals, repealed_by, ' +
-                  'implicitly_repeals, implicitly_repealed_by, legal_basis, consolidated_version.',
+                'Type of relation: cites, amends, amended_by, repeals, repealed_by, implicitly_repeals, implicitly_repealed_by, legal_basis, consolidated_version.',
               ),
             direction: z
               .string()
@@ -122,8 +104,7 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
     total: z
       .number()
       .describe(
-        'Number of relations returned in this page (not a corpus-wide count). ' +
-          'A direction that filled its per-direction cap sets truncated — page with offset for the rest.',
+        'Number of relations returned in this page (not a corpus-wide count). A direction that filled its cap sets truncated — page with offset for the rest.',
       ),
     offset: z
       .number()
