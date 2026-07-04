@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.9.3](changelog/0.9.x/0.9.3.md) — 2026-07-04
+
+eurlex_get_cases excludes derivative case-law records from default search via new include_derivative option; eurlex_get_relations fixes false consolidated_version truncation and adds requested/empty relation-type fields
+
 ## [0.9.2](changelog/0.9.x/0.9.2.md) — 2026-07-03
 
 Tool, resource, and prompt descriptions rewritten as concise single strings; the multi-line string-concatenation pattern dropped across the definitions and the server instructions block (now a template literal) — description text only, no schema or behavior change
