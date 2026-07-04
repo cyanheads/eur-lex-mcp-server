@@ -230,20 +230,19 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
         );
       }
     }
-    if (input.date_from && input.date_from.trim()) {
+    if (input.date_from?.trim()) {
       filters.push(`FILTER(?date >= "${input.date_from.trim()}"^^xsd:date)`);
     }
-    if (input.date_to && input.date_to.trim()) {
+    if (input.date_to?.trim()) {
       filters.push(`FILTER(?date <= "${input.date_to.trim()}"^^xsd:date)`);
     }
     if (input.in_force === true) {
       filters.push(`FILTER(?inForce = true)`);
     }
 
-    const eurovocClause =
-      input.eurovoc_concept && input.eurovoc_concept.trim()
-        ? `?work cdm:work_is_about_concept_eurovoc <${input.eurovoc_concept.trim()}> .`
-        : '';
+    const eurovocClause = input.eurovoc_concept?.trim()
+      ? `?work cdm:work_is_about_concept_eurovoc <${input.eurovoc_concept.trim()}> .`
+      : '';
 
     /**
      * Author institution filter — a REQUIRED graph pattern (not OPTIONAL) so the

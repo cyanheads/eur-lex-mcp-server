@@ -45,7 +45,7 @@ function enforceLimitInQuery(query: string, max: number): string {
   if (!match) {
     return `${query.trimEnd()}\nLIMIT ${max}`;
   }
-  const existing = parseInt(match[1]!, 10);
+  const existing = parseInt(match[1] ?? '', 10);
   if (existing > max) {
     return query.replace(limitRe, `LIMIT ${max}`);
   }
@@ -109,7 +109,7 @@ export class CellarSparqlService {
     const withPrefixes = rawQuery.includes('PREFIX cdm:') ? rawQuery : SPARQL_PREFIXES + rawQuery;
     const cappedQuery = enforceLimitInQuery(withPrefixes, this.maxResults);
 
-    return withRetry(
+    return await withRetry(
       async () => {
         const body = new URLSearchParams({
           query: cappedQuery,
