@@ -260,6 +260,44 @@ describe('eurlex_document_relations_resource', () => {
     expect(consolidated[0]?.related_celex_number).toBe('02016R0679-20160504');
   });
 
+  // --- #45: filtered consolidated_version artifacts must not set the summary's truncated flag ---
+
+  it('does not set truncated when filtered consolidated_version artifacts fill the summary cap but valid rows are under it (issue #45)', async () => {
+    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    // 25 raw consolidated rows = the SUMMARY_PER_TYPE_LIMIT: one genuine same-act
+    // consolidation plus 24 CELEX-less CONS_TEXT members. The raw page fills the cap,
+    // but only the genuine row survives the filter — the resource must not flag truncation.
+    const consolidatedRaw = [
+      makeRelationBinding({
+        relatedWork: 'http://publications.europa.eu/resource/cellar/genuine',
+        direction: 'incoming',
+        relatedCelex: '02016R0679-20160504',
+      }),
+      ...Array.from({ length: 24 }, (_, i) =>
+        makeRelationBinding({
+          relatedWork: `http://publications.europa.eu/resource/cellar/artifact-${i}`,
+          direction: 'incoming',
+        }),
+      ),
+    ];
+    mockQuery.mockImplementation(
+      routeQuery({ resolve: [makeResolveBinding(GDPR_WORK_URI)], consolidated: consolidatedRaw }),
+    );
+
+    const params = eurlex_document_relations_resource.params.parse({ celexNumber: '32016R0679' });
+    const result = (await eurlex_document_relations_resource.handler(params, ctx)) as Record<
+      string,
+      unknown
+    >;
+
+    const relations = result.relations as Array<Record<string, unknown>>;
+    const consolidated = relations.filter((r) => r.relation_type === 'consolidated_version');
+    expect(consolidated).toHaveLength(1);
+    expect(consolidated[0]?.related_celex_number).toBe('02016R0679-20160504');
+    // The 24 filtered-out artifacts must not raise the summary's truncation flag.
+    expect(result.truncated).toBe(false);
+  });
+
   it('deduplicates identical relation rows', async () => {
     const ctx = createMockContext({ tenantId: 'test-tenant' });
     mockQuery.mockImplementation(

@@ -109,6 +109,16 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
     offset: z
       .number()
       .describe('Pagination offset applied to this response (per relation type and direction).'),
+    requested_relation_types: z
+      .array(z.string())
+      .describe(
+        'The relation types this request traversed — the explicit relation_types list, or all types when it was omitted. Diff against the types present in relations[], or read empty_relation_types, to confirm which requested types returned edges.',
+      ),
+    empty_relation_types: z
+      .array(z.string())
+      .describe(
+        'Requested relation types that returned zero relations in THIS page. Page-scoped: a type can appear here because all its edges sit beyond the current offset/limit window, not only because the act genuinely has none of that relation — so absent-from-here does not prove absent-in-CELLAR. When every requested type is empty the tool throws no_relations instead.',
+      ),
   }),
 
   enrichment: {
@@ -235,12 +245,22 @@ SELECT ?work WHERE {
       ctx.enrich.truncated({ shown: relations.length, cap: perDirectionLimit });
     }
 
+    // #47: make requested-but-empty types explicit. A requested type with zero
+    // edges is silently absent from the flat relations[] array, so a caller can't
+    // tell "no such edges" from "dropped/paged out". Echo the full requested list
+    // and the subset that returned nothing in this page (computed from the
+    // post-filter relations — no extra queries).
+    const presentTypes = new Set(relations.map((r) => r.relation_type));
+    const emptyRelationTypes = requestedTypes.filter((t) => !presentTypes.has(t));
+
     return {
       ...(celexNumber ? { celex_number: celexNumber } : {}),
       work_uri: workUri,
       relations,
       total: relations.length,
       offset: input.offset,
+      requested_relation_types: [...requestedTypes],
+      empty_relation_types: emptyRelationTypes,
     };
   },
 
@@ -250,11 +270,24 @@ SELECT ?work WHERE {
     ];
     if (result.work_uri) lines.push(`**Work URI:** ${result.work_uri}\n`);
 
+    // #47: surface coverage so a non-structuredContent client sees the same
+    // requested-vs-empty signal the structured output carries.
+    lines.push(`**Requested types:** ${result.requested_relation_types.join(', ')}`);
+    lines.push(
+      `**Empty types (this page):** ${
+        result.empty_relation_types.length > 0 ? result.empty_relation_types.join(', ') : 'none'
+      }\n`,
+    );
+
     const grouped = new Map<string, typeof result.relations>();
     for (const r of result.relations) {
       const key = `${r.relation_type} (${r.direction})`;
-      if (!grouped.has(key)) grouped.set(key, []);
-      grouped.get(key)!.push(r);
+      let bucket = grouped.get(key);
+      if (!bucket) {
+        bucket = [];
+        grouped.set(key, bucket);
+      }
+      bucket.push(r);
     }
 
     for (const [group, items] of grouped) {

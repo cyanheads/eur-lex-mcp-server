@@ -84,20 +84,48 @@ const RELATION_SPECS: Record<RelationType, { predicate: string; direction: Direc
  */
 export const DEFAULT_PER_TYPE_LIMIT = 100;
 
+/**
+ * CELEX constraint pushed into a relation arm for `consolidated_version`. It moves
+ * the #32 validity filter from client-side into the SPARQL query so LIMIT/OFFSET
+ * and the per-direction truncation count all operate on valid rows by construction
+ * (issue #45): the related CELEX is required (bound, not OPTIONAL) so CELEX-less
+ * `CONS_TEXT` graph artifacts never enter the page, and — when the source act core
+ * is known — a REGEX pins the related CELEX to a genuine sector-`0` consolidation
+ * of THIS act (`0{actCore}-YYYYMMDD`), dropping consolidations of other acts. With
+ * the filter in-query, a page filled by filtered-out artifacts can no longer raise
+ * a false `truncated` hint. The client-side filter in `traverseRelations` stays as
+ * belt-and-suspenders.
+ */
+interface CelexConstraint {
+  /** Act core (`{year}{type}{number}`) the related CELEX must belong to; absent on the work_uri path. */
+  actCore?: string;
+}
+
 /** One direction's graph pattern for a relation predicate, tagged with its direction. */
 function relationArm(
   workUri: string,
   predicate: string,
   direction: 'outgoing' | 'incoming',
+  celex?: CelexConstraint,
 ): string {
   const edge =
     direction === 'outgoing'
       ? `<${workUri}> ${predicate} ?relatedWork .`
       : `?relatedWork ${predicate} <${workUri}> .`;
+  // A pushed CELEX constraint (consolidated_version) requires the related CELEX,
+  // dropping CELEX-less artifacts in-query; otherwise the CELEX stays OPTIONAL so
+  // related works without one still return. When the act core is known, a REGEX
+  // keeps only genuine consolidations of this act.
+  const celexTriple = celex
+    ? `?relatedWork cdm:resource_legal_id_celex ?relatedCelex .`
+    : `OPTIONAL { ?relatedWork cdm:resource_legal_id_celex ?relatedCelex . }`;
+  const celexFilter = celex?.actCore
+    ? `\n    FILTER(REGEX(STR(?relatedCelex), "^0${celex.actCore}-[0-9]{8}$"))`
+    : '';
   // `?relatedDate` drives the per-direction ordering below; it stays OPTIONAL so
   // related works without a document date still return (they sort last under DESC).
   return `${edge}
-    OPTIONAL { ?relatedWork cdm:resource_legal_id_celex ?relatedCelex . }
+    ${celexTriple}${celexFilter}
     OPTIONAL { ?relatedWork cdm:work_date_document ?relatedDate . }
     BIND("${direction}" AS ?direction)`;
 }
@@ -123,16 +151,17 @@ function buildRelationQuery(
   spec: { predicate: string; direction: Direction },
   limit: number,
   offset: number,
+  celex?: CelexConstraint,
 ): string {
   const paging = `ORDER BY DESC(?relatedDate) LIMIT ${limit} OFFSET ${offset}`;
   if (spec.direction !== 'both') {
     return `SELECT ?relatedWork ?relatedCelex ?direction WHERE {
-    ${relationArm(workUri, spec.predicate, spec.direction)}
+    ${relationArm(workUri, spec.predicate, spec.direction, celex)}
 } ${paging}`;
   }
   const subquery = (direction: 'outgoing' | 'incoming') =>
     `{ SELECT ?relatedWork ?relatedCelex ?direction WHERE {
-    ${relationArm(workUri, spec.predicate, direction)}
+    ${relationArm(workUri, spec.predicate, direction, celex)}
   } ${paging} }`;
   return `SELECT ?relatedWork ?relatedCelex ?direction WHERE {
   ${subquery('outgoing')} UNION ${subquery('incoming')}
@@ -230,15 +259,19 @@ LIMIT 100`;
  * the work_uri-only path). It gates the `consolidated_version` act-number filter:
  * CELLAR asserts the `consolidates` edge for genuine consolidations of this act
  * *and* — as a graph artifact — for consolidations of other acts (e.g. an act
- * this one repealed) plus CELEX-less `CONS_TEXT` member/manifestation works. To
- * keep the list trustworthy, `consolidated_version` rows with no related CELEX
- * are always dropped (they can't be fetched via get_document anyway); when
+ * this one repealed) plus CELEX-less `CONS_TEXT` member/manifestation works. That
+ * filter is pushed into the SPARQL query for `consolidated_version` (see
+ * `CelexConstraint`) so LIMIT/OFFSET and the truncation count operate on valid
+ * rows only (issue #45); the same test is re-applied client-side below as
+ * belt-and-suspenders. `consolidated_version` rows with no related CELEX are
+ * always dropped (they can't be fetched via get_document anyway); when
  * `sourceCelex` is known, rows whose CELEX belongs to a different act are dropped
  * too. Every other relation type is returned unfiltered.
  *
  * `perTypeLimit` bounds each direction of each type; `offset` pages within a
  * direction. Returns the relations plus `truncated` — true when any type's
- * direction filled its cap, so more related works may exist at a higher offset.
+ * direction filled its cap with post-filter rows, so more related works may exist
+ * at a higher offset.
  */
 export async function traverseRelations(
   svc: Pick<CellarSparqlService, 'query'>,
@@ -254,7 +287,19 @@ export async function traverseRelations(
     types.map(async (type) => ({
       type,
       bindings: await svc.query(
-        buildRelationQuery(workUri, RELATION_SPECS[type], perTypeLimit, offset),
+        buildRelationQuery(
+          workUri,
+          RELATION_SPECS[type],
+          perTypeLimit,
+          offset,
+          // Push the #32/#45 validity filter into the query for consolidated_version
+          // only. On the work_uri path the act core is unknown, so the constraint is
+          // present (requires the CELEX, dropping CELEX-less) but carries no act-core
+          // REGEX — keeping cross-act rows, as before.
+          type === 'consolidated_version'
+            ? { ...(sourceActCore ? { actCore: sourceActCore } : {}) }
+            : undefined,
+        ),
         ctx,
       ),
     })),
@@ -264,27 +309,32 @@ export async function traverseRelations(
   const relations: WorkRelation[] = [];
   let truncated = false;
   for (const { type, bindings } of perType) {
-    // Raw rows per direction: a direction whose rows fill the cap may have more
-    // upstream. A symmetric type interleaves two independently-capped directions
-    // in one result set, so count each side separately (against the raw bindings,
-    // before the consolidated_version filter — the cap is what CELLAR returned).
+    // Post-filter rows per direction: a direction whose surviving rows fill the cap
+    // may have more upstream. A symmetric type interleaves two independently-capped
+    // directions in one result set, so count each side separately. Counted AFTER the
+    // consolidated_version filter's `continue`s so filtered-out graph artifacts don't
+    // inflate the count into a false truncation hint (issue #45); counted BEFORE the
+    // dedup `continue` so a full raw page of duplicate rows still flags more upstream.
     const rowsByDirection = new Map<'outgoing' | 'incoming', number>();
     for (const b of bindings) {
       const relatedWorkUri = CellarSparqlService.bindingValue(b, 'relatedWork') ?? '';
       const direction =
         CellarSparqlService.bindingValue(b, 'direction') === 'incoming' ? 'incoming' : 'outgoing';
-      rowsByDirection.set(direction, (rowsByDirection.get(direction) ?? 0) + 1);
       const relatedCelex = CellarSparqlService.bindingValue(b, 'relatedCelex');
 
       // #32: keep the consolidated_version list trustworthy at a glance. A
       // CELEX-less consolidation can't be fetched via get_document; a
       // consolidation whose CELEX belongs to a different act is a graph artifact,
       // not a version of this act. Drop both — but only apply the act-number test
-      // when the source CELEX is known (the work_uri path has no act to match).
+      // when the source CELEX is known (the work_uri path has no act to match). The
+      // SPARQL query already pushes this filter for consolidated_version; this is
+      // the client-side belt-and-suspenders.
       if (type === 'consolidated_version') {
         if (!relatedCelex) continue;
         if (sourceActCore && celexActCore(relatedCelex) !== sourceActCore) continue;
       }
+
+      rowsByDirection.set(direction, (rowsByDirection.get(direction) ?? 0) + 1);
 
       const key = `${type}|${direction}|${relatedWorkUri}`;
       if (seen.has(key)) continue;

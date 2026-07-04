@@ -7,6 +7,7 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_get_relations } from '@/mcp-server/tools/definitions/eurlex-get-relations.tool.js';
+import { RELATION_TYPES } from '@/services/cellar-sparql/relation-traversal.js';
 
 // --- Service mock ---
 const mockQuery = vi.fn();
@@ -531,6 +532,172 @@ describe('eurlex_get_relations', () => {
     expect(result.relations.map((r) => r.relation_type)).toEqual(['amended_by']);
   });
 
+  // --- #45: consolidated_version truncation reflects post-filter rows; filter pushed to SPARQL ---
+
+  it('pushes the consolidated_version validity filter into SPARQL — required CELEX + act-core REGEX (issue #45)', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_relations.errors });
+    mockQuery.mockImplementation(
+      routeQuery({
+        resolve: [makeResolveBinding(GDPR_WORK_URI)],
+        consolidated: [
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/genuine',
+            direction: 'incoming',
+            relatedCelex: '02016R0679-20160504',
+          }),
+        ],
+      }),
+    );
+
+    const input = eurlex_get_relations.input.parse({
+      celex_number: '32016R0679',
+      relation_types: ['consolidated_version'],
+    });
+    await eurlex_get_relations.handler(input, ctx);
+
+    const relSparql = mockQuery.mock.calls
+      .map((c) => c[0] as string)
+      .find((q) => q.includes('cdm:act_consolidated_consolidates_resource_legal'))!;
+    // The related CELEX is required (not OPTIONAL), so CELEX-less artifacts never
+    // enter the page or the truncation count.
+    expect(relSparql).toContain('?relatedWork cdm:resource_legal_id_celex ?relatedCelex .');
+    expect(relSparql).not.toContain(
+      'OPTIONAL { ?relatedWork cdm:resource_legal_id_celex ?relatedCelex . }',
+    );
+    // The act-core REGEX keeps only genuine consolidations of THIS act (32016R0679 → 2016R0679).
+    expect(relSparql).toContain('REGEX(STR(?relatedCelex), "^02016R0679-[0-9]{8}$")');
+  });
+
+  it('requires the CELEX but pushes no act-core REGEX for consolidated_version on the work_uri path (issue #45)', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_relations.errors });
+    mockQuery.mockImplementation(
+      routeQuery({
+        consolidated: [
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/genuine',
+            direction: 'incoming',
+            relatedCelex: '02016R0679-20160504',
+          }),
+        ],
+      }),
+    );
+
+    const input = eurlex_get_relations.input.parse({
+      work_uri: GDPR_WORK_URI,
+      relation_types: ['consolidated_version'],
+    });
+    await eurlex_get_relations.handler(input, ctx);
+
+    const relSparql = mockQuery.mock.calls[0]?.[0] as string;
+    expect(relSparql).toContain('?relatedWork cdm:resource_legal_id_celex ?relatedCelex .');
+    // No source act core is known on the work_uri path, so no REGEX — cross-act rows stay.
+    expect(relSparql).not.toContain('REGEX');
+  });
+
+  it('leaves the CELEX OPTIONAL and adds no REGEX for non-consolidated relation types (issue #45)', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_relations.errors });
+    mockQuery.mockImplementation(
+      routeQuery({
+        resolve: [makeResolveBinding(GDPR_WORK_URI)],
+        amendedBy: [
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/amender',
+            direction: 'incoming',
+            relatedCelex: '32026R1165',
+          }),
+        ],
+      }),
+    );
+
+    const input = eurlex_get_relations.input.parse({
+      celex_number: '32016R0679',
+      relation_types: ['amended_by'],
+    });
+    await eurlex_get_relations.handler(input, ctx);
+
+    const relSparql = mockQuery.mock.calls
+      .map((c) => c[0] as string)
+      .find((q) => !q.includes('SELECT ?work WHERE'))!;
+    expect(relSparql).toContain(
+      'OPTIONAL { ?relatedWork cdm:resource_legal_id_celex ?relatedCelex . }',
+    );
+    expect(relSparql).not.toContain('REGEX');
+  });
+
+  it('does not set truncated when filtered consolidated_version artifacts fill the raw cap but valid rows are under it (issue #45)', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_relations.errors });
+    // Mirrors the live GDPR shape at limit 3: one genuine same-act consolidation, one
+    // cross-act consolidation of the repealed 1995 directive, one CELEX-less CONS_TEXT
+    // member. The raw page fills the cap of 3, but only the genuine row survives the
+    // filter — so no additional valid rows exist beyond this page.
+    mockQuery.mockImplementation(
+      routeQuery({
+        resolve: [makeResolveBinding(GDPR_WORK_URI)],
+        consolidated: [
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/genuine',
+            direction: 'incoming',
+            relatedCelex: '02016R0679-20160504',
+          }),
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/cross-act',
+            direction: 'incoming',
+            relatedCelex: '01995L0046-20180525',
+          }),
+          makeRelationBinding({
+            relatedWork:
+              'http://publications.europa.eu/resource/cellar/69c567aa-0ce3-4ba7-b13d-7142a9225a3c',
+            direction: 'incoming',
+          }),
+        ],
+      }),
+    );
+
+    const input = eurlex_get_relations.input.parse({
+      celex_number: '32016R0679',
+      relation_types: ['consolidated_version'],
+      limit: 3,
+    });
+    const result = await eurlex_get_relations.handler(input, ctx);
+
+    expect(result.total).toBe(1);
+    expect(result.relations[0]?.related_celex_number).toBe('02016R0679-20160504');
+    // The three filtered-out artifacts must not raise a false truncation hint.
+    expect(getEnrichment(ctx).truncated).toBeUndefined();
+  });
+
+  it('still sets truncated for consolidated_version when surviving valid rows fill the cap (issue #45 control)', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_relations.errors });
+    // Two genuine same-act consolidations at a cap of 2 — the valid rows themselves
+    // fill the cap, so more may exist upstream and the truncation hint is honest.
+    mockQuery.mockImplementation(
+      routeQuery({
+        resolve: [makeResolveBinding(GDPR_WORK_URI)],
+        consolidated: [
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/cons-1',
+            direction: 'incoming',
+            relatedCelex: '02016R0679-20160504',
+          }),
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/cons-2',
+            direction: 'incoming',
+            relatedCelex: '02016R0679-20250101',
+          }),
+        ],
+      }),
+    );
+
+    const input = eurlex_get_relations.input.parse({
+      celex_number: '32016R0679',
+      relation_types: ['consolidated_version'],
+      limit: 2,
+    });
+    await eurlex_get_relations.handler(input, ctx);
+
+    expect(getEnrichment(ctx).truncated).toBe(true);
+  });
+
   it('cites traverses both directions (citation graph is symmetric)', async () => {
     const ctx = createMockContext({ errors: eurlex_get_relations.errors });
     mockQuery.mockImplementation(
@@ -814,6 +981,121 @@ describe('eurlex_get_relations', () => {
     expect(relCalls[0]).not.toContain('cdm:work_cites_work');
   });
 
+  // --- #47: requested-but-empty relation types are made explicit ---
+
+  it('echoes requested_relation_types and lists requested-but-empty types (issue #47)', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_relations.errors });
+    // GDPR shape: repeals, legal_basis, consolidated_version return edges; amends,
+    // amended_by, repealed_by are empty this call.
+    mockQuery.mockImplementation(
+      routeQuery({
+        resolve: [makeResolveBinding(GDPR_WORK_URI)],
+        repeals: [
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/dp-directive',
+            direction: 'outgoing',
+            relatedCelex: '31995L0046',
+          }),
+        ],
+        legalBasis: [
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/tfeu-16',
+            direction: 'outgoing',
+            relatedCelex: '12016E016',
+          }),
+        ],
+        consolidated: [
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/cons',
+            direction: 'incoming',
+            relatedCelex: '02016R0679-20160504',
+          }),
+        ],
+      }),
+    );
+
+    const input = eurlex_get_relations.input.parse({
+      celex_number: '32016R0679',
+      relation_types: [
+        'amends',
+        'amended_by',
+        'repeals',
+        'repealed_by',
+        'legal_basis',
+        'consolidated_version',
+      ],
+    });
+    const result = await eurlex_get_relations.handler(input, ctx);
+
+    expect(result.requested_relation_types).toEqual([
+      'amends',
+      'amended_by',
+      'repeals',
+      'repealed_by',
+      'legal_basis',
+      'consolidated_version',
+    ]);
+    // Exactly the three requested types with zero rows, in requested order.
+    expect(result.empty_relation_types).toEqual(['amends', 'amended_by', 'repealed_by']);
+  });
+
+  it('reports no empty types when every requested type returns edges (issue #47)', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_relations.errors });
+    mockQuery.mockImplementation(
+      routeQuery({
+        resolve: [makeResolveBinding(GDPR_WORK_URI)],
+        repeals: [
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/dp-directive',
+            direction: 'outgoing',
+            relatedCelex: '31995L0046',
+          }),
+        ],
+        legalBasis: [
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/tfeu-16',
+            direction: 'outgoing',
+            relatedCelex: '12016E016',
+          }),
+        ],
+      }),
+    );
+
+    const input = eurlex_get_relations.input.parse({
+      celex_number: '32016R0679',
+      relation_types: ['repeals', 'legal_basis'],
+    });
+    const result = await eurlex_get_relations.handler(input, ctx);
+
+    expect(result.requested_relation_types).toEqual(['repeals', 'legal_basis']);
+    expect(result.empty_relation_types).toEqual([]);
+  });
+
+  it('echoes the full default type list in requested_relation_types when relation_types is omitted (issue #47)', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_relations.errors });
+    // Only legal_basis returns an edge; every other default type is empty this call.
+    mockQuery.mockImplementation(
+      routeQuery({
+        resolve: [makeResolveBinding(GDPR_WORK_URI)],
+        legalBasis: [
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/tfeu-16',
+            direction: 'outgoing',
+            relatedCelex: '12016E016',
+          }),
+        ],
+      }),
+    );
+
+    const input = eurlex_get_relations.input.parse({ celex_number: '32016R0679' });
+    const result = await eurlex_get_relations.handler(input, ctx);
+
+    expect(result.requested_relation_types).toEqual([...RELATION_TYPES]);
+    expect(result.empty_relation_types).not.toContain('legal_basis');
+    // Every default type except the one that returned an edge.
+    expect(result.empty_relation_types).toHaveLength(RELATION_TYPES.length - 1);
+  });
+
   // --- work_uri alternative (issue #8) ---
 
   it('uses work_uri directly and skips the CELEX→work resolution', async () => {
@@ -950,6 +1232,8 @@ describe('eurlex_get_relations', () => {
       ],
       total: 2,
       offset: 0,
+      requested_relation_types: ['amended_by', 'legal_basis', 'repeals'],
+      empty_relation_types: ['repeals'],
     };
     const blocks = eurlex_get_relations.format!(output);
     expect(blocks[0]?.type).toBe('text');
@@ -960,5 +1244,32 @@ describe('eurlex_get_relations', () => {
     expect(text).toContain('legal_basis');
     // The pagination offset reaches the text channel (format parity).
     expect(text).toContain('offset 0');
+    // #47: requested + empty type coverage reaches the text channel too. 'repeals'
+    // appears only in the requested/empty lists (not the relations), so its presence
+    // proves both lists render.
+    expect(text).toContain('**Requested types:**');
+    expect(text).toContain('repeals');
+    expect(text).toContain('**Empty types (this page):**');
+  });
+
+  it('format renders "none" for empty_relation_types when every requested type returned edges (issue #47)', () => {
+    const output = {
+      celex_number: '32016R0679',
+      work_uri: GDPR_WORK_URI,
+      relations: [
+        {
+          relation_type: 'legal_basis',
+          direction: 'outgoing',
+          related_work_uri: 'http://publications.europa.eu/resource/cellar/basis',
+        },
+      ],
+      total: 1,
+      offset: 0,
+      requested_relation_types: ['legal_basis'],
+      empty_relation_types: [],
+    };
+    const text = (eurlex_get_relations.format!(output)[0] as { text: string }).text;
+    expect(text).toContain('**Requested types:** legal_basis');
+    expect(text).toContain('**Empty types (this page):** none');
   });
 });
