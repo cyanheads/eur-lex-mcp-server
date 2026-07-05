@@ -34,9 +34,11 @@ export const eurlex_browse_subjects = tool('eurlex_browse_subjects', {
       ),
     language: z
       .string()
-      .regex(/^[a-z]{2,3}$/)
+      .regex(/^[A-Za-z]{2,3}$/)
       .default('en')
-      .describe('Language code for concept labels (e.g. "en", "fr", "de"). Defaults to English.'),
+      .describe(
+        'Language code for concept labels (e.g. "en", "fr", "de"). Case-insensitive — "EN" and "en" behave identically. Defaults to English.',
+      ),
     limit: z
       .number()
       .int()

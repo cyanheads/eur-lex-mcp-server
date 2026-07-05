@@ -92,6 +92,22 @@ describe('eurlex_browse_subjects', () => {
     expect(sparql).toContain('"fr"');
   });
 
+  it('accepts uppercase language codes and lowercases them for SPARQL (issue #46)', async () => {
+    const ctx = createMockContext({ errors: eurlex_browse_subjects.errors });
+    mockQuery.mockResolvedValue([
+      makeConceptBinding({ uri: 'http://eurovoc.europa.eu/1', label: 'vie privée' }),
+    ]);
+
+    // Uppercase passes schema validation (previously a -32602 at the schema gate)…
+    const input = eurlex_browse_subjects.input.parse({ keyword: 'vie', language: 'FR' });
+    await eurlex_browse_subjects.handler(input, ctx);
+
+    // …and the SPARQL language tag is still the normalized lowercase form.
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    expect(sparql).toContain('"fr"');
+    expect(sparql).not.toContain('"FR"');
+  });
+
   it('restricts results to the EuroVoc namespace so every URI is filter-compatible (issue #11)', async () => {
     const ctx = createMockContext({ errors: eurlex_browse_subjects.errors });
     mockQuery.mockResolvedValue([
