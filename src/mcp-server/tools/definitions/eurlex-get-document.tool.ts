@@ -116,7 +116,7 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .min(0)
       .default(0)
       .describe(
-        'Character offset into the body where the returned window starts ("paged" mode only). Page forward by setting offset = content_offset + content_chars_returned from the previous call.',
+        'Character offset into the body where the returned window starts ("paged" mode only). Page forward by setting offset = content_offset + content_chars_returned from the previous call. Offsets are format-specific: an offset is only valid against the same format it was measured in — keep format constant when paging.',
       ),
     limit: z
       .number()
@@ -131,7 +131,7 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .boolean()
       .default(false)
       .describe(
-        'Return a structural outline of the act — chapters, sections, articles, annexes, and recitals as a heading list, each with its character offset — instead of body text. Read a section by paging with its offset. Ignores offset/limit and select; no detectable structure returns an empty outline. Not applied in content_mode "metadata_only".',
+        'Return a structural outline of the act — chapters, sections, articles, annexes, and recitals as a heading list, each with its character offset — instead of body text. Read a section by paging with its offset, keeping the same format: outline offsets are measured in the requested format\'s body and land in the wrong place under any other format. Ignores offset/limit and select; no detectable structure returns an empty outline. Not applied in content_mode "metadata_only".',
       ),
     select: z
       .object({
@@ -148,7 +148,7 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       })
       .optional()
       .describe(
-        'Return only the text of specific sections by type and number, instead of a raw character window (Roman and Arabic numbers are equivalent). A section that cannot be located is reported in selection.missed with no wrong text returned. Ignored when outline is true or in content_mode "metadata_only".',
+        'Return only the text of specific sections by type and number, instead of a raw character window (Roman and Arabic numbers are equivalent). Sections are located in the body of the requested format, so pair select with the same format used for any outline. A section that cannot be located is reported in selection.missed with no wrong text returned. Ignored when outline is true or in content_mode "metadata_only".',
       ),
   }),
   output: z.object({
@@ -192,7 +192,7 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .boolean()
       .optional()
       .describe(
-        'True when the requested work is a base act with a newer consolidated version available — the returned text may be outdated. Absent when the act has no consolidated version, or is itself one.',
+        'True when a newer consolidated version of the requested base act exists (an unofficial reading aid merging later amendments), so the returned text may not include those amendments. Not a repeal/replacement signal — the base act remains the law and may still be in force (see in_force). Absent when the act has no consolidated version, or is itself one.',
       ),
     current_consolidated_celex: z
       .string()
