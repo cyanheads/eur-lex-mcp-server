@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.9.4](changelog/0.9.x/0.9.4.md) — 2026-07-04
+
+eurlex_browse_subjects accepts case-insensitive language codes; eurlex_get_document documents format-specific offsets and clarifies is_superseded does not mean repealed
+
 ## [0.9.3](changelog/0.9.x/0.9.3.md) — 2026-07-04
 
 eurlex_get_cases excludes derivative case-law records from default search via new include_derivative option; eurlex_get_relations fixes false consolidated_version truncation and adds requested/empty relation-type fields
