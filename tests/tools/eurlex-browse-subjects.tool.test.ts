@@ -181,9 +181,63 @@ describe('eurlex_browse_subjects', () => {
     expect(getEnrichment(ctx).truncated).toBeUndefined();
   });
 
+  // --- #51: offset pagination over distinct concepts ---
+
+  it('applies a non-zero offset and limit and echoes the offset (issue #51)', async () => {
+    const ctx = createMockContext({ errors: eurlex_browse_subjects.errors });
+    mockQuery.mockResolvedValue([
+      makeConceptBinding({ uri: 'http://eurovoc.europa.eu/1', label: 'data' }),
+    ]);
+
+    const input = eurlex_browse_subjects.input.parse({ keyword: 'data', offset: 50, limit: 50 });
+    const result = await eurlex_browse_subjects.handler(input, ctx);
+
+    // Offset is echoed to both channels so a paging caller knows which page it holds.
+    expect(result.offset).toBe(50);
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    expect(sparql).toContain('LIMIT 50');
+    expect(sparql).toContain('OFFSET 50');
+    // Deterministic order — the unique concept URI breaks label ties so OFFSET pages don't drift.
+    expect(sparql).toContain('ORDER BY ?label ?concept');
+  });
+
+  it('defaults offset to 0 for the first page (issue #51)', async () => {
+    const ctx = createMockContext({ errors: eurlex_browse_subjects.errors });
+    mockQuery.mockResolvedValue([
+      makeConceptBinding({ uri: 'http://eurovoc.europa.eu/1', label: 'data' }),
+    ]);
+
+    const input = eurlex_browse_subjects.input.parse({ keyword: 'data' });
+    const result = await eurlex_browse_subjects.handler(input, ctx);
+
+    expect(result.offset).toBe(0);
+    expect(mockQuery.mock.calls[0]?.[0] as string).toContain('OFFSET 0');
+  });
+
+  it('groups by concept so OFFSET paginates over distinct concepts, not skos:broader rows (issue #51)', async () => {
+    const ctx = createMockContext({ errors: eurlex_browse_subjects.errors });
+    mockQuery.mockResolvedValue([
+      makeConceptBinding({ uri: 'http://eurovoc.europa.eu/1', label: 'data' }),
+    ]);
+
+    const input = eurlex_browse_subjects.input.parse({ keyword: 'data' });
+    await eurlex_browse_subjects.handler(input, ctx);
+
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    // EuroVoc is polyhierarchical and multi-notation: the OPTIONAL skos:broader and
+    // skos:notation joins bind many rows per concept (e.g. "United States" has nine
+    // parents), so an ungrouped LIMIT/OFFSET paginated over rows, not concepts. GROUP BY
+    // collapses them to one row per concept — the same to-many-join fix eurlex_get_cases
+    // applies via GROUP BY ?celexNumber. ?label is grouped (not sampled) so ORDER BY sorts
+    // the real label string.
+    expect(sparql).toContain('GROUP BY ?concept ?label');
+    expect(sparql).toContain('SAMPLE(?codeValue)');
+    expect(sparql).toContain('SAMPLE(?broaderLabelValue)');
+  });
+
   // --- Format ---
 
-  it('format renders concept URI, label, code, and broader label', () => {
+  it('format renders concept URI, label, code, broader label, and offset', () => {
     const output = {
       concepts: [
         {
@@ -194,6 +248,7 @@ describe('eurlex_browse_subjects', () => {
         },
       ],
       total: 1,
+      offset: 40,
     };
     const blocks = eurlex_browse_subjects.format!(output);
     expect(blocks[0]?.type).toBe('text');
@@ -202,5 +257,7 @@ describe('eurlex_browse_subjects', () => {
     expect(text).toContain('data protection');
     expect(text).toContain('2830');
     expect(text).toContain('information');
+    // Offset reaches content[] so paginating clients see which page this is (#51).
+    expect(text).toContain('offset 40');
   });
 });
