@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.9.5](changelog/0.9.x/0.9.5.md) — 2026-07-09
+
+eurlex_browse_subjects gains offset pagination over distinct, alphabetically-ordered EuroVoc concepts; eurlex_query_sparql text output renders every returned row; framework ^0.10.14 plus a supply-chain and packaging refresh
+
 ## [0.9.4](changelog/0.9.x/0.9.4.md) — 2026-07-04
 
 eurlex_browse_subjects accepts case-insensitive language codes; eurlex_get_document documents format-specific offsets and clarifies is_superseded does not mean repealed
