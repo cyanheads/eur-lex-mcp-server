@@ -203,13 +203,20 @@ describe('eurlex_query_sparql', () => {
     expect(text).toContain('No bindings returned');
   });
 
-  it('format truncates display to first 20 rows with a note', () => {
+  it('format renders every row with no truncation note (#50)', () => {
     const bindings = Array.from({ length: 25 }, (_, i) => ({
       work: { type: 'uri', value: `http://work/${i}` },
     }));
     const output = { bindings, variables: ['work'], total: 25 };
     const blocks = eurlex_query_sparql.format!(output);
     const text = (blocks[0] as { text: string }).text;
-    expect(text).toContain('Showing first 20 of 25 rows');
+    // The full page reaches content[] — including rows past the old 20-row cut.
+    expect(text).toContain('http://work/0');
+    expect(text).toContain('http://work/20');
+    expect(text).toContain('http://work/24');
+    // One table row per binding plus the header/separator rows.
+    expect(text.match(/\| http:\/\/work\//g)).toHaveLength(25);
+    // No truncation note — the text channel no longer drops rows.
+    expect(text).not.toContain('Showing first');
   });
 });

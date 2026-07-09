@@ -146,21 +146,20 @@ export const eurlex_query_sparql = tool('eurlex_query_sparql', {
     if (result.total === 0) {
       lines.push('*No bindings returned.*');
     } else {
-      // Render first 20 rows as a table
-      const displayRows = result.bindings.slice(0, 20);
+      // Render every row. structuredContent carries the full binding set (bounded
+      // only by the service-side maxSparqlResults cap), so the text channel must
+      // render all of it too — a fixed 20-row slice left content[]-only clients
+      // blind to rows 21+ that structuredContent clients could see (#50).
       const header = `| ${result.variables.join(' | ')} |`;
       const sep = `| ${result.variables.map(() => '---').join(' | ')} |`;
       lines.push(header);
       lines.push(sep);
-      for (const row of displayRows) {
+      for (const row of result.bindings) {
         const cells = result.variables.map((v) => {
           const cell = (row as Record<string, { value?: string }>)[v];
           return cell?.value ?? '';
         });
         lines.push(`| ${cells.join(' | ')} |`);
-      }
-      if (result.total > 20) {
-        lines.push(`\n*Showing first 20 of ${result.total} rows.*`);
       }
     }
     return [{ type: 'text', text: lines.join('\n') }];
