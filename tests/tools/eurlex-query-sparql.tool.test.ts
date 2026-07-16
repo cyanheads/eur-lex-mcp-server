@@ -409,11 +409,13 @@ describe('eurlex_query_sparql', () => {
     expect(getEnrichment(ctx).truncated).toBeUndefined();
   });
 
-  it('does not disclose truncation when an uncapped outer query overshoots the ceiling', async () => {
-    // enforceLimitInQuery rewrites only the FIRST LIMIT in the text, so a
-    // subselect's limit can absorb the rewrite and leave the outer query
-    // uncapped — returning more rows than the ceiling. Reporting `shown: 759,
-    // cap: 100` there would contradict itself, so the count must match exactly.
+  it('does not disclose truncation when handed a count above the ceiling (defensive guard)', async () => {
+    // Defense in depth: the service now bounds the outer result to the ceiling
+    // regardless of subselect structure (#63), so a `limitEnforced` page can no
+    // longer overshoot in practice. This asserts the tool's own guard holds even
+    // if one ever did — an over-ceiling count must never emit the self-
+    // contradicting pair `shown: 759, cap: 100`, which is why the disclosure
+    // compares `===`, not `>=`.
     const ctx = createMockContext({ errors: eurlex_query_sparql.errors });
     mockQueryWithVars.mockResolvedValue({
       variables: ['work'],

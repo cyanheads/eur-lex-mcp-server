@@ -187,12 +187,12 @@ export const eurlex_query_sparql = tool('eurlex_query_sparql', {
      * matched 100 rows looks identical to a `LIMIT 500` clamped down to 100 — so
      * `limitEnforced` is what separates them (#52).
      *
-     * The count is compared with `===`, not `>=`: `enforceLimitInQuery` rewrites
-     * only the FIRST `LIMIT` in the query text, so a subselect's limit can absorb
-     * the rewrite and leave the outer query uncapped, returning far more rows than
-     * the ceiling. `>=` would fire there and report the self-contradicting pair
-     * `shown: 759, cap: 100`. Exact equality is the only count the ceiling can
-     * actually produce when it bounds the result.
+     * The count is compared with `===`, not `>=`. `enforceLimitInQuery` bounds the
+     * OUTER result to `maxResults` regardless of subselect structure (#63), so a
+     * full page is exactly `maxResults` rows and any fewer means the query simply
+     * matched fewer — `>=` would buy nothing but the ability to emit the
+     * self-contradicting pair `shown > cap` should that bound ever regress. Exact
+     * equality is the only count a sound ceiling produces when it truncates.
      */
     if (limitEnforced && bindings.length === svc.maxResults) {
       ctx.enrich.truncated({ shown: bindings.length, cap: svc.maxResults });

@@ -240,6 +240,107 @@ describe('CellarSparqlService.queryWithVars limitEnforced (#52)', () => {
   });
 });
 
+// --- #63: the maxResults ceiling must bound the OUTER result the caller receives,
+// regardless of subselect structure, and must never rewrite the caller's own inner
+// LIMIT. Enforcement (raw path) targets the OUTERMOST (brace-depth 0) LIMIT.
+
+describe('CellarSparqlService #63 outer-LIMIT enforcement', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('appends an outer LIMIT when the only LIMIT sits inside a subselect (raw path)', async () => {
+    const { sentQuery } = stubFetchCapturing(rowsPayload(100));
+    const ctx = createMockContext();
+
+    const result = await makeService().queryWithVars(
+      'SELECT ?work ?celex WHERE {\n  { SELECT ?work WHERE { ?work cdm:work_date_document ?d . } LIMIT 500 }\n  ?work cdm:resource_legal_id_celex ?celex .\n}',
+      ctx,
+    );
+
+    // The caller's inner LIMIT 500 is preserved verbatim (not clamped to 100)...
+    expect(sentQuery()).toContain('LIMIT 500');
+    // ...and an outer LIMIT bounds the result the caller actually receives.
+    expect(sentQuery().trimEnd().endsWith('LIMIT 100')).toBe(true);
+    expect(result.limitEnforced).toBe(true);
+  });
+
+  it('rewrites the OUTERMOST LIMIT and leaves a subselect LIMIT untouched (raw path)', async () => {
+    const { sentQuery } = stubFetchCapturing(rowsPayload(100));
+    const ctx = createMockContext();
+
+    await makeService().queryWithVars(
+      'SELECT ?work WHERE {\n  { SELECT ?work WHERE { ?work cdm:work_date_document ?d . } LIMIT 500 }\n  ?work cdm:resource_legal_id_celex ?celex .\n} LIMIT 200',
+      ctx,
+    );
+
+    // The inner subselect LIMIT is the caller's own paging — never rewritten.
+    expect(sentQuery()).toContain('LIMIT 500');
+    // The outer LIMIT 200 (above the ceiling) is the one clamped to 100.
+    expect(sentQuery()).not.toContain('LIMIT 200');
+    expect(sentQuery().trimEnd().endsWith('LIMIT 100')).toBe(true);
+  });
+
+  it('appends the outer LIMIT after a top-level ORDER BY so ordering is preserved (raw path)', async () => {
+    const { sentQuery } = stubFetchCapturing(rowsPayload(100));
+    const ctx = createMockContext();
+
+    await makeService().queryWithVars(
+      'SELECT ?work ?d WHERE {\n  { SELECT ?work WHERE { ?work cdm:work_date_document ?d2 . } LIMIT 500 }\n  ?work cdm:work_date_document ?d .\n} ORDER BY DESC(?d)',
+      ctx,
+    );
+
+    const q = sentQuery();
+    expect(q).toContain('LIMIT 500'); // inner subselect preserved
+    expect(q.trimEnd().endsWith('LIMIT 100')).toBe(true); // cap appended
+    // The cap lands AFTER the ORDER BY, so it's a top-N, not an arbitrary slice.
+    expect(q.indexOf('LIMIT 100')).toBeGreaterThan(q.indexOf('ORDER BY'));
+  });
+
+  it('does not read a "#" inside a full IRI as a comment hiding the top-level LIMIT (raw path)', async () => {
+    const { sentQuery } = stubFetchCapturing(rowsPayload(100));
+    const ctx = createMockContext();
+
+    // The "#" in the cdm IRI must not swallow the trailing "} LIMIT 500" as a line
+    // comment; the outermost LIMIT is found and clamped in place, not missed (which
+    // would wrongly append a second LIMIT and leave 500 standing).
+    await makeService().queryWithVars(
+      'SELECT ?s WHERE { ?s <http://publications.europa.eu/ontology/cdm#work_date_document> ?o } LIMIT 500',
+      ctx,
+    );
+
+    expect(sentQuery()).not.toContain('LIMIT 500');
+    expect(sentQuery()).toContain('LIMIT 100');
+  });
+
+  it('does not read a "}" inside a string literal as closing the WHERE block (raw path)', async () => {
+    const { sentQuery } = stubFetchCapturing(rowsPayload(100));
+    const ctx = createMockContext();
+
+    // The "}" inside the literal must not drop brace depth early; the top-level
+    // LIMIT 500 stays at depth 0 and is clamped in place.
+    await makeService().queryWithVars('SELECT ?s WHERE { ?s rdfs:label "a } b" } LIMIT 500', ctx);
+
+    expect(sentQuery()).not.toContain('LIMIT 500');
+    expect(sentQuery()).toContain('LIMIT 100');
+  });
+
+  it('leaves a UNION-of-subselects untouched on the internal path (no outer LIMIT appended)', async () => {
+    const { sentQuery } = stubFetchCapturing(rowsPayload(50));
+    const ctx = createMockContext();
+
+    // The symmetric relation traversal deliberately sums two per-arm subselect
+    // LIMITs past the ceiling; the internal `query` path must not append an outer
+    // LIMIT that would truncate the merged two-direction result.
+    const unionQuery =
+      'SELECT ?r ?dir WHERE {\n  { SELECT ?r ?dir WHERE { <urn:w> cdm:work_cites_work ?r . BIND("out" AS ?dir) } LIMIT 100 }\n  UNION\n  { SELECT ?r ?dir WHERE { ?r cdm:work_cites_work <urn:w> . BIND("in" AS ?dir) } LIMIT 100 }\n}';
+    await makeService().query(unionQuery, ctx);
+
+    // No outer LIMIT was appended — the query still ends at the WHERE block's brace.
+    expect(sentQuery().trimEnd().endsWith('}')).toBe(true);
+    // Both per-arm LIMITs survive intact.
+    expect(sentQuery().match(/LIMIT 100/g)).toHaveLength(2);
+  });
+});
+
 // --- #26: sparql_error throws carry the declared recovery hint on the wire ---
 
 describe('CellarSparqlService sparql_error recovery (#26)', () => {

@@ -192,8 +192,8 @@ SELECT ?work WHERE {
     // ones under a shared cap. The predicate + direction model lives in
     // relation-traversal.ts. Clamp the per-direction cap to the service ceiling
     // (MAX_SPARQL_RESULTS) up front so both sides of a symmetric query stay
-    // capped consistently — the service's LIMIT enforcement rewrites only the
-    // first LIMIT it finds, which would leave a UNION's second subquery uncapped.
+    // capped consistently — the symmetric UNION has no outer LIMIT and the
+    // internal query path passes its per-arm subselect LIMITs through unchanged.
     const requestedTypes: readonly RelationType[] = input.relation_types ?? RELATION_TYPES;
     const perDirectionLimit = Math.min(input.limit, svc.maxResults);
     // Pass the source CELEX (undefined on the work_uri path) so the shared

@@ -142,9 +142,10 @@ function relationArm(
  * A symmetric type (`cites`, direction `both`) is a UNION of two subqueries, each
  * ordered and capped independently, so a dense outgoing set can't consume the
  * incoming budget and vice versa. The per-direction LIMITs must each be ≤
- * MAX_SPARQL_RESULTS: the service's `enforceLimitInQuery` only rewrites the first
- * LIMIT it finds, so an over-cap here would silently leave the second subquery
- * uncapped — callers pass a limit already clamped to the service ceiling.
+ * MAX_SPARQL_RESULTS: this query carries no outer LIMIT, and the internal `query`
+ * path passes its subselect LIMITs through unchanged (the service imposes an outer
+ * bound only on the raw escape hatch), so an over-cap here would return an
+ * over-budget arm — callers pass a limit already clamped to the service ceiling.
  */
 function buildRelationQuery(
   workUri: string,
