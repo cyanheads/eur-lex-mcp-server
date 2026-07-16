@@ -9,7 +9,7 @@
 | `eurlex_search_documents` | Search EU legislation, case law, treaties, and preparatory acts across the CELLAR corpus. Filters by document type, date range, EuroVoc subject concept, author institution, and in-force status. Returns CELEX numbers, work URIs, document types, and dates — use these with `eurlex_get_document` to fetch full content. | `keyword?`, `document_type?`, `date_from?`, `date_to?`, `eurovoc_concept?`, `in_force?`, `offset?` (default `0`), `limit` (default `20`, max `100`) | `readOnlyHint: true` |
 | `eurlex_get_document` | Fetch the notice (metadata) and full text of a work by CELEX number or ELI URI. Returns structured metadata (title, date, document type, author institution, legal basis, EuroVoc subjects) plus the HTML, Markdown, or Formex4 XML content in the requested language. Large bodies are paged (`content_mode`/`offset`/`limit`) or reachable in full; `outline` returns a structural heading list and `select` returns specific sections by number. Defaults to English; not all works have content in all 24 official languages. | `celex_number` or `eli_uri`, `language?` (default `"EN"`), `format?` (`"html"` default, `"markdown"`, `"xml"` Formex4), `content_mode?` (`"paged"` default, `"full"`, `"metadata_only"`), `offset?`/`limit?`, `outline?`, `select?` (`{ articles?, chapters?, recitals?, annexes? }`) | `readOnlyHint: true, idempotentHint: true` |
 | `eurlex_lookup_celex` | Resolve an EU legal citation — a CELEX number or an ELI URI — to the canonical CELLAR work. Returns the work URI, confirmed CELEX number, document type, date, and whether the work exists in the corpus. The EUR-Lex analog of `courtlistener_lookup_citation`. | `identifier` (CELEX / ELI), `identifier_type?` (`"celex"` \| `"eli"` \| `"auto"`, default `"auto"`) | `readOnlyHint: true, idempotentHint: true` |
-| `eurlex_get_cases` | Search CJEU and General Court case law — judgments, orders, and Advocate General opinions — by case number, party name, subject, or date range. Primary records only by default; derivative information notices, abstracts, and summaries are excluded unless `include_derivative` opts in. Returns case identifier, court, date, document type, and the parties. Distinct from `eurlex_search_documents` because case law has its own CELEX sector (`6`) and practitioners search it differently. | `case_number?`, `keyword?`, `court?` (`"CJEU"` \| `"GC"`), `case_type?` (`"judgment"` \| `"order"` \| `"ag_opinion"`), `include_derivative?` (default `false`), `date_from?`, `date_to?`, `offset?` (default `0`), `limit` (default `20`, max `100`) | `readOnlyHint: true` |
+| `eurlex_get_cases` | Search CJEU and General Court case law — judgments, orders, and Advocate General opinions — by case number, party name, subject, or date range. Primary records only by default; derivative information notices, abstracts, summaries, and corrigenda are excluded unless `include_derivative` opts in. Returns case identifier, court, date, document type, and the parties. Distinct from `eurlex_search_documents` because case law has its own CELEX sector (`6`) and practitioners search it differently. | `case_number?`, `keyword?`, `court?` (`"CJEU"` \| `"GC"`), `case_type?` (`"judgment"` \| `"order"` \| `"ag_opinion"`), `include_derivative?` (default `false`), `date_from?`, `date_to?`, `offset?` (default `0`), `limit` (default `20`, max `100`) | `readOnlyHint: true` |
 | `eurlex_get_relations` | Traverse CELLAR relationship graph for a given work: what amends it, what it amends, the current consolidated version, its legal basis, works that cite it (cited-by), and national transposition measures. This is CELLAR's core value over HTML scraping — the graph traversal that exposes the lifecycle and dependencies of an EU act. | `celex_number` or `work_uri`, `relation_types?` (default: all) | `readOnlyHint: true, idempotentHint: true` |
 | `eurlex_browse_subjects` | Search the EuroVoc multilingual thesaurus to resolve a human-readable term or keyword into EuroVoc concept IDs. Required before using the `eurovoc_concept` filter in `eurlex_search_documents` — agents cannot guess numeric EuroVoc concept IDs. Returns concept URI, preferred label (English), concept code, and broader/narrower hierarchy hints. | `keyword`, `language?` (default `"en"`), `limit` (default `20`, max `50`) | `readOnlyHint: true, openWorldHint: true` |
 | `eurlex_query_sparql` | Execute a raw SPARQL SELECT query against the CELLAR Virtuoso endpoint. The server caps all queries at 100 results — include an explicit LIMIT in your query to control the count; if omitted or above 100 it will be injected/capped. Use only when the curated tools don't cover the needed relationship traversal. Requires familiarity with the CDM ontology (`cdm:` prefix = `http://publications.europa.eu/ontology/cdm#`). | `sparql_query` (LIMIT injected/capped at 100 by service layer), `timeout_hint?` | `readOnlyHint: true` |
@@ -33,7 +33,7 @@
 
 EUR-Lex MCP server wraps the **CELLAR** semantic repository operated by the EU Publications Office — the authoritative, machine-readable database of European Union law covering 2.7M+ works: treaties, regulations, directives, decisions, CJEU/General Court judgments, Advocate General opinions, and preparatory acts.
 
-Access paths: the **CELLAR SPARQL endpoint** (`http://publications.europa.eu/webapi/rdf/sparql`) for metadata and relationship graph queries, and the **EUR-Lex REST content API** (`https://eur-lex.europa.eu/legal-content/{LANG}/TXT/{FORMAT}/?uri=CELEX:{CELEX}`) for document full text.
+Access paths, both served by the EU Publications Office: the **CELLAR SPARQL endpoint** (`http://publications.europa.eu/webapi/rdf/sparql`) for metadata and relationship graph queries, and **CELLAR content negotiation** (`http://publications.europa.eu/resource/celex/{CELEX}`, with `Accept` / `Accept-Language` request headers) for document full text.
 
 Audience: EU and comparative-law practitioners, regulatory and policy analysts, academics, journalists, and AI agents answering "what does EU law say about X", tracing an EU act's lifecycle, or composing EU ↔ US cross-jurisdiction comparisons.
 
@@ -43,13 +43,13 @@ Audience: EU and comparative-law practitioners, regulatory and policy analysts, 
 
 - All queries are read-only; no authenticated or registered-user paths required
 - Every SPARQL query MUST include `LIMIT` (max 100) and support `OFFSET` for pagination; Virtuoso enforces a 60-second query timeout
-- Document content retrieved via EUR-Lex REST (`legal-content` URL), not CELLAR content negotiation (CELLAR work URIs return 400 on direct GET)
+- Document content retrieved via CELLAR content negotiation (`GET /resource/celex/{CELEX}` with `Accept` + `Accept-Language`), the same Publications Office host as the SPARQL metadata path; the legacy `eur-lex.europa.eu/legal-content` endpoint is now behind an AWS WAF bot-challenge and no longer serves act text (issue #16)
 - CELEX number is the primary document identifier; ELI URIs are the secondary
 - Multilingual corpus: default to English (`EN`), expose a `language` parameter; some older acts lack EN translations
 - Keyless: no API key, no registration required; both endpoints are publicly accessible
 - Relationship graph is the server's primary value differentiator — `eurlex_get_relations` must traverse `cdm:work_cites_work`, amendments, consolidations, and legal basis
 - EuroVoc concept IDs are required for subject-filtered searches; `eurlex_browse_subjects` is the prerequisite tool
-- `bif:contains` multi-word full-text search is not available in Virtuoso; keyword search uses `FILTER(CONTAINS(LCASE(?title), ...))` on title or CELEX string patterns
+- Keyword search matches English expression titles through Virtuoso's `bif:contains` full-text phrase index (multi-word input is quoted as a single phrase), with an exact CELEX substring match as a UNION arm; there is no full-text search of act body text
 - `eurlex_query_sparql` is an escape hatch; LIMIT is injected or capped at 100 by the service layer — if the input query omits LIMIT or sets it above 100, the service rewrites it before executing
 
 ---
@@ -59,9 +59,9 @@ Audience: EU and comparative-law practitioners, regulatory and policy analysts, 
 | Service | Wraps | Used By |
 |:--------|:------|:--------|
 | `CellarSparqlService` | CELLAR SPARQL endpoint (`publications.europa.eu/webapi/rdf/sparql`) | All tools except `eurlex_get_document` text fetch |
-| `EurLexContentService` | EUR-Lex REST content API (`eur-lex.europa.eu/legal-content/...`) | `eurlex_get_document`, `eurlex_lookup_celex` (metadata enrichment) |
+| `EurLexContentService` | CELLAR content-negotiation resolver (`publications.europa.eu/resource/celex/...`) | `eurlex_get_document`, `eurlex_lookup_celex` (metadata enrichment) |
 
-Both services are HTTP-only, no auth. `CellarSparqlService` POSTs `application/x-www-form-urlencoded` with `Accept: application/sparql-results+json`. `EurLexContentService` GETs `text/html` or `application/xml`.
+Both services are HTTP-only, no auth. `CellarSparqlService` POSTs `application/x-www-form-urlencoded` with `Accept: application/sparql-results+json`. `EurLexContentService` GETs `/resource/celex/{CELEX}` under content negotiation — `Accept: application/xhtml+xml` / `text/html` for HTML, `application/xml;type=fmx4` for Formex 4 — with an `Accept-Language` ISO 639-2/T code.
 
 ---
 
@@ -70,7 +70,7 @@ Both services are HTTP-only, no auth. `CellarSparqlService` POSTs `application/x
 | Env Var | Required | Default | Description |
 |:--------|:---------|:--------|:------------|
 | `CELLAR_SPARQL_ENDPOINT` | No | `http://publications.europa.eu/webapi/rdf/sparql` | SPARQL endpoint override (e.g., for local Virtuoso mirror) |
-| `EURLEX_CONTENT_BASE_URL` | No | `https://eur-lex.europa.eu` | EUR-Lex content API base URL override |
+| `EURLEX_CONTENT_BASE_URL` | No | `http://publications.europa.eu` | EU Publications Office CELLAR content-resolver base URL override |
 | `SPARQL_QUERY_TIMEOUT_MS` | No | `55000` | Request timeout for SPARQL calls (slightly under Virtuoso's 60s hard limit) |
 | `MAX_SPARQL_RESULTS` | No | `100` | Enforced ceiling on LIMIT in all generated SPARQL queries |
 
@@ -80,7 +80,7 @@ Both services are HTTP-only, no auth. `CellarSparqlService` POSTs `application/x
 
 1. **Config** — `src/config/server-config.ts` with Zod schema for the four env vars above
 2. **`CellarSparqlService`** — SPARQL POST client, result-binding mapper (`binding.value` extraction), LIMIT enforcement, retry on transient 5xx; CDM PREFIX declarations built in
-3. **`EurLexContentService`** — GET client for `legal-content` URL pattern; handles language fallback when EN is unavailable
+3. **`EurLexContentService`** — content-negotiation GET client for `/resource/celex/{CELEX}`; handles language fallback when EN is unavailable
 4. **`eurlex_lookup_celex`** — the foundational tool; validates CELEX/ELI input, resolves to work URI + confirmed CELEX
 5. **`eurlex_browse_subjects`** — EuroVoc thesaurus search via SPARQL; prerequisite for subject-filtered workflows
 6. **`eurlex_search_documents`** — parameterized SPARQL builder; keyword, type, date, EuroVoc, in-force filters
@@ -116,7 +116,7 @@ Both services are HTTP-only, no auth. `CellarSparqlService` POSTs `application/x
 | # | Call | Service | Purpose |
 |:--|:-----|:--------|:--------|
 | 1 | SPARQL: work metadata by CELEX | `CellarSparqlService` | Title, date, type, author institution, EuroVoc concepts, in-force flag |
-| 2 | GET `legal-content/{LANG}/TXT/HTML/?uri=CELEX:{celex}` | `EurLexContentService` | Full HTML text of the act in requested language |
+| 2 | GET `/resource/celex/{celex}` with `Accept: text/html` (or `application/xhtml+xml`) + `Accept-Language` | `EurLexContentService` | Full HTML text of the act in requested language |
 
 If step 2 returns non-200 for the requested language, retry with `EN`. If `EN` also fails, return metadata only with a note that content is unavailable.
 
@@ -142,10 +142,10 @@ CDM relation predicates to traverse (as built — see `RELATION_SPECS` in `relat
 Case law is a distinct sub-audience (litigation practitioners, academics, agents tracking precedent) with different search parameters (case number, court, party, AG opinion type). Merging into one tool with a `document_type` filter buries the case-law-specific parameters. The split mirrors how EUR-Lex itself separates legislation from case law browsing.
 
 **No full-text search across document body text**
-Virtuoso's `bif:contains` with multi-word phrases throws errors (confirmed by probe). CELLAR SPARQL search is metadata-and-title only; full-text body search is not available via the public SPARQL endpoint. The `keyword` parameter on `eurlex_search_documents` and `eurlex_get_cases` uses `FILTER(CONTAINS(LCASE(?title), ...))` on the work title and CELEX string. This is a real limitation — document the constraint clearly in tool descriptions.
+CELLAR SPARQL search is metadata-and-title only; full-text search of act body text is not available via the public SPARQL endpoint. The `keyword` parameter on `eurlex_search_documents` and `eurlex_get_cases` matches English expression titles through Virtuoso's `bif:contains` full-text index (multi-word input quoted as a phrase) and CELEX strings by substring — never the act body. This is a real limitation — document the constraint clearly in tool descriptions.
 
-**Content via EUR-Lex REST, not CELLAR content negotiation**
-Direct `Accept: text/html` GET on CELLAR resource URIs returns 400 (confirmed by probe). The canonical content path is `https://eur-lex.europa.eu/legal-content/{LANG}/TXT/HTML/?uri=CELEX:{celex}`, which returned HTTP 200 with full HTML content (1MB for GDPR). HTML is the primary format; XML/Formex is the secondary for structured processing.
+**Content via CELLAR content negotiation, not EUR-Lex REST (issue #16)**
+The `eur-lex.europa.eu/legal-content` endpoint is now fronted by an AWS WAF that returns a JavaScript bot-challenge stub instead of act text, so content is fetched from the CELLAR resolver at `http://publications.europa.eu/resource/celex/{CELEX}` — the same Publications Office host as the SPARQL metadata path — by content negotiation. `Accept` selects the representation (OJ legislation exposes `application/xhtml+xml`, CJEU judgments expose `text/html`, so the HTML path tries both; Formex 4 uses `application/xml;type=fmx4`) and `Accept-Language` carries an ISO 639-2/T code. Multi-part OJ acts return HTTP 300 (Multiple Choices) and are reassembled from their sibling Formex streams. HTML is the primary format; Markdown is rendered server-side from it. Any response carrying a WAF challenge signature is refused and raised as `ServiceUnavailable`, never surfaced as content.
 
 **`eurlex_query_sparql` as escape hatch (included)**
 CELLAR's CDM ontology has ~200+ predicates; the curated tools cover the 80% case. A raw SPARQL tool is warranted given the wikidata-server precedent and CELLAR's depth. Server-side LIMIT injection (cap to 100) prevents timeout abuse. The tool earns its keep.
@@ -153,8 +153,8 @@ CELLAR's CDM ontology has ~200+ predicates; the curated tools cover the 80% case
 **EuroVoc predicate is `cdm:work_is_about_concept_eurovoc`**
 Not `cdm:work_is_about_subject_matter` (that's a separate EU subject-matter authority) and not `cdm:work_is_about_subject` (the correct name is `work_is_about_concept_eurovoc`). Confirmed by inspecting GDPR's predicate set via SPARQL. The wrong predicate was in the idea doc sketch — this was caught by live API probing.
 
-**No `bif:contains` multi-word search**
-`bif:contains(?title, "data protection")` throws a Virtuoso syntax error. Single-word `bif:contains` may work but is unreliable and undocumented. Use `FILTER(CONTAINS(LCASE(?title), "data"))` instead, and for multi-word, require the agent to supply a single dominant keyword and narrow further with other filters.
+**Title keyword search via the `bif:contains` full-text index (issue #17)**
+The title match runs through Virtuoso's `bif:contains` full-text index rather than a `FILTER(CONTAINS(LCASE(?title), …))` scan: the scan forced the expression graph to be joined for every candidate work before the term was tested, so a broad keyword timed out. Multi-word input is quoted as a single phrase (`bif:contains "'data protection'"`), and an exact CELEX substring match is preserved as a UNION arm; the input is sanitised to letters, digits, and spaces so it cannot break out of the phrase. (The EuroVoc label search in `eurlex_browse_subjects` is a different path and still uses `FILTER(CONTAINS(LCASE(?label), …))`.)
 
 **Resources are supplementary**
 `eurlex://document/{celexNumber}` covers the `tools/list`-stable URI use case; the content is fully reachable through `eurlex_get_document`. No unique data lives only in resources.
@@ -327,9 +327,13 @@ SELECT ?relatedWork ?relatedCelex ?relationType WHERE {
 
 Format: `{sector}{year}{type}{number}` — e.g., `3` (sector) + `2016` (year) + `R` (regulation) + `0679` (serial) = `32016R0679` (GDPR).
 
-### EUR-Lex Content API
+### CELLAR Content Negotiation
 
-- **HTML**: `https://eur-lex.europa.eu/legal-content/{LANG}/TXT/HTML/?uri=CELEX:{celex}` → HTTP 200, `Content-Type: text/html`
-- **XML**: `https://eur-lex.europa.eu/legal-content/{LANG}/TXT/XML/?uri=CELEX:{celex}` → HTTP 200, XML/Formex
-- **ELI**: `https://eur-lex.europa.eu/eli/{type}/{year}/{number}/oj` → HTML (content negotiation to JSON-LD does NOT work on public paths)
-- Language codes: `EN`, `FR`, `DE`, `ES`, `IT`, `PL`, `PT`, `NL`, `CS`, `DA`, `EL`, `ET`, `FI`, `HU`, `LT`, `LV`, `MT`, `RO`, `SK`, `SL`, `SV`, `BG`, `HR`, `GA`
+Act text is fetched from the EU Publications Office CELLAR resolver by content negotiation; the `eur-lex.europa.eu/legal-content` endpoint is now WAF-protected and no longer serves body text (issue #16).
+
+- **URL**: `http://publications.europa.eu/resource/celex/{CELEX}` — format and language come from request headers, not the path
+- **HTML**: `Accept: application/xhtml+xml` (OJ legislation) or `text/html` (CJEU judgments) → HTTP 200 with the act body; the HTML path tries both variants in order
+- **Formex 4 XML**: `Accept: application/xml;type=fmx4` → HTTP 200 for a single-part act, or HTTP 300 (Multiple Choices) listing the sibling part streams, which are fetched and reassembled into one document
+- **Language**: `Accept-Language` requires an ISO 639-2/T three-letter code (`eng`, `fra`, `deu`, …); bibliographic 639-2/B codes (`ger`, `fre`) return HTTP 400. EUR-Lex two-letter codes are mapped before the request, and the fetch falls back to English when the requested language has no content
+- **Bot-challenge guard**: a response carrying an AWS WAF challenge signature is refused and raised as `ServiceUnavailable`, never reported as available content
+- Language codes accepted (mapped to ISO 639-2/T): `EN`, `FR`, `DE`, `ES`, `IT`, `PL`, `PT`, `NL`, `CS`, `DA`, `EL`, `ET`, `FI`, `HU`, `LT`, `LV`, `MT`, `RO`, `SK`, `SL`, `SV`, `BG`, `HR`, `GA`
