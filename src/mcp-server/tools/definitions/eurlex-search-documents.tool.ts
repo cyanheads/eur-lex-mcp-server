@@ -170,6 +170,11 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
       .object({
         keyword: z.string().optional().describe('Keyword filter applied.'),
         document_type: z.string().optional().describe('Document type filter applied.'),
+        include_consolidated: z
+          .boolean()
+          .describe(
+            'Effective include_consolidated value after the false default is applied — whether consolidated texts (CONS_TEXT) of the document_type were folded in. Always present, since the default shapes which records can appear; has effect only when document_type is set.',
+          ),
         date_from: z.string().optional().describe('Start date filter applied.'),
         date_to: z.string().optional().describe('End date filter applied.'),
         eurovoc_concept: z.string().optional().describe('EuroVoc concept URI filter applied.'),
@@ -393,6 +398,9 @@ SELECT
     const queryEcho = {
       ...(keywordInput ? { keyword: keywordInput } : {}),
       ...(input.document_type ? { document_type: input.document_type } : {}),
+      // Echo the effective flag (Zod applies the false default, so it is always a
+      // boolean) — a defaulted false still describes the search semantics (#57).
+      include_consolidated: input.include_consolidated,
       ...(input.date_from ? { date_from: input.date_from } : {}),
       ...(input.date_to ? { date_to: input.date_to } : {}),
       ...(input.eurovoc_concept ? { eurovoc_concept: input.eurovoc_concept } : {}),

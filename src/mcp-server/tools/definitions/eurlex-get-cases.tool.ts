@@ -35,11 +35,19 @@ const CASE_TYPE_RESOURCE_TYPE: Record<string, string> = {
 /**
  * Derivative sector-6 resource-types excluded from the untyped/default search:
  * information notices (INFO_JUDICIAL, INFO_JUR), case-law abstracts (ABSTRACT_JUR),
- * and case summaries (SUM_JUR). Each is a separate CELLAR work with its own CELEX,
- * so at a page limit they crowd distinct primary cases off the page — a keyword
- * search for a landmark ruling could drop the ruling itself entirely (issue #44).
- * A case_type filter already excludes them structurally (it requires a primary
- * resource-type); the untyped path excludes them unless include_derivative opts in.
+ * case summaries (SUM_JUR), and standalone corrigenda (CORRIGENDUM). Each is a
+ * separate CELLAR work with its own CELEX, so at a page limit they crowd distinct
+ * primary cases off the page — a keyword search for a landmark ruling could drop
+ * the ruling itself entirely (issue #44). A case_type filter already excludes them
+ * structurally (it requires a primary resource-type); the untyped path excludes
+ * them unless include_derivative opts in.
+ *
+ * CORRIGENDUM covers the standalone correction works, all carrying the CELEX `…R(nn)`
+ * corrigendum marker (issue #55). No primary judgment/order/AG opinion is typed
+ * CORRIGENDUM, so excluding the type drops only the correction record and never the
+ * corrected case, which is a distinct CELEX. Excluding it explicitly also makes the
+ * exclusion robust: sector-6 corrigenda are currently co-typed INFO_JUDICIAL (already
+ * excluded above), but a corrigendum typed CORRIGENDUM alone would otherwise leak.
  * JUDG_EXTRACT/ORDER_EXTRACT are deliberately NOT here: an OJ extract can be the
  * sole published record of an older case, so excluding it would cost recall.
  */
@@ -48,6 +56,7 @@ const DERIVATIVE_RESOURCE_TYPES = [
   'http://publications.europa.eu/resource/authority/resource-type/INFO_JUR',
   'http://publications.europa.eu/resource/authority/resource-type/ABSTRACT_JUR',
   'http://publications.europa.eu/resource/authority/resource-type/SUM_JUR',
+  'http://publications.europa.eu/resource/authority/resource-type/CORRIGENDUM',
 ] as const;
 
 /**
@@ -76,7 +85,7 @@ function caseNumberToCelexFragment(caseNumber: string): string | null {
 export const eurlex_get_cases = tool('eurlex_get_cases', {
   title: 'Search CJEU/GC Case Law',
   description:
-    'Search CJEU and General Court case law — judgments, orders, and Advocate General opinions — by case number, court, case type, keyword, and date range. By default only these primary records are returned; derivative judicial information notices, case abstracts, and summaries are excluded so distinct cases fill the page (set include_derivative to include them). Keyword matches English case titles (which carry party names) and CELEX strings; there is no full-text body search. Returns each case with its court, date, and type, plus — parsed from the title where present — the parties, subject matter, and case reference.',
+    'Search CJEU and General Court case law — judgments, orders, and Advocate General opinions — by case number, court, case type, keyword, and date range. By default only these primary records are returned; derivative judicial information notices, case abstracts, summaries, and corrigenda are excluded so distinct cases fill the page (set include_derivative to include them). Keyword matches English case titles (which carry party names) and CELEX strings; there is no full-text body search. Returns each case with its court, date, and type, plus — parsed from the title where present — the parties, subject matter, and case reference.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
     case_number: z
@@ -115,7 +124,7 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
       .boolean()
       .default(false)
       .describe(
-        'Include derivative sector-6 records — judicial information notices, case abstracts, and case summaries — alongside primary judgments, orders, and AG opinions. Default false: these are excluded so distinct primary cases fill the page. Ignored when case_type is set (that path already returns a single primary type).',
+        'Include derivative sector-6 records — judicial information notices, case abstracts, case summaries, and corrigenda — alongside primary judgments, orders, and AG opinions. Default false: these are excluded so distinct primary cases fill the page. Ignored when case_type is set (that path already returns a single primary type).',
       ),
     date_from: z
       .union([
@@ -212,6 +221,11 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
         keyword: z.string().optional().describe('Keyword filter applied.'),
         court: z.string().optional().describe('Court filter applied.'),
         case_type: z.string().optional().describe('Case type filter applied.'),
+        include_derivative: z
+          .boolean()
+          .describe(
+            'Effective include_derivative value after the false default is applied — whether derivative sector-6 records (notices, abstracts, summaries, corrigenda) were admitted alongside primary cases. Always present, since the default shapes which records can appear.',
+          ),
         date_from: z.string().optional().describe('Start date filter applied.'),
         date_to: z.string().optional().describe('End date filter applied.'),
       })
@@ -402,6 +416,9 @@ SELECT
       ...(keywordInput ? { keyword: keywordInput } : {}),
       ...(input.court ? { court: input.court } : {}),
       ...(input.case_type ? { case_type: input.case_type } : {}),
+      // Echo the effective flag (Zod applies the false default, so it is always a
+      // boolean) — a defaulted false still describes the search semantics (#57).
+      include_derivative: input.include_derivative,
       ...(input.date_from ? { date_from: input.date_from } : {}),
       ...(input.date_to ? { date_to: input.date_to } : {}),
     };

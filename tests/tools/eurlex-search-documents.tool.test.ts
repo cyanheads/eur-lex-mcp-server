@@ -674,6 +674,45 @@ describe('eurlex_search_documents', () => {
     expect(result.documents[1]?.is_consolidated).toBe(false);
   });
 
+  // --- #57: include_consolidated echoed in query_echo after the default is applied ---
+
+  it('echoes the effective include_consolidated:false in query_echo and content[] on a default call (issue #57)', async () => {
+    const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+    mockQuery.mockResolvedValue([makeDocBinding('32016R0679')]);
+
+    const input = eurlex_search_documents.input.parse({ document_type: 'REG' });
+    const result = await eurlex_search_documents.handler(input, ctx);
+
+    // The false default still shapes which records can appear (consolidated texts
+    // stay out), so it must be echoed even when the caller never supplied it —
+    // pre-fix query_echo omits it entirely.
+    expect(result.query_echo.include_consolidated).toBe(false);
+    // structuredContent ↔ content[] parity: the flag surfaces in the filter summary.
+    const text = (eurlex_search_documents.format!(result)[0] as { text: string }).text;
+    expect(text).toContain('include_consolidated=false');
+  });
+
+  it('echoes include_consolidated:true in query_echo and content[] when the caller opts in (issue #57)', async () => {
+    const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+    mockQuery.mockResolvedValue([makeDocBinding('02014R0833-20260424')]);
+
+    // Mirrors the live-HTTP repro from #57: pre-fix this echoed only document_type
+    // and date_from, dropping the include_consolidated the caller set.
+    const input = eurlex_search_documents.input.parse({
+      document_type: 'REG',
+      include_consolidated: true,
+      date_from: '2026-01-01',
+      limit: 1,
+    });
+    const result = await eurlex_search_documents.handler(input, ctx);
+
+    expect(result.query_echo.include_consolidated).toBe(true);
+    expect(result.query_echo.document_type).toBe('REG');
+    expect(result.query_echo.date_from).toBe('2026-01-01');
+    const text = (eurlex_search_documents.format!(result)[0] as { text: string }).text;
+    expect(text).toContain('include_consolidated=true');
+  });
+
   // --- #28: truncation disclosure ---
 
   it('discloses truncation when the returned page fills the limit', async () => {

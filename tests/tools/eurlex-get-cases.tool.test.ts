@@ -651,6 +651,88 @@ describe('eurlex_get_cases', () => {
     expect(result.cases[0]?.resource_type).toBeUndefined();
   });
 
+  // --- #55: standalone corrigenda excluded on the untyped/default path ---
+
+  it('excludes standalone CORRIGENDUM works on the untyped/default path (issue #55)', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+    mockQuery.mockResolvedValue([
+      makeCaseBinding('62014CJ0362', {
+        types: 'http://publications.europa.eu/resource/authority/resource-type/JUDG',
+      }),
+    ]);
+
+    const input = eurlex_get_cases.input.parse({ keyword: 'corrigendum' });
+    await eurlex_get_cases.handler(input, ctx);
+
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    // A standalone corrigendum (CELEX …R(nn)) is a derivative correction record, not a
+    // primary case, so the default FILTER NOT EXISTS must drop the CORRIGENDUM type
+    // alongside the notice/abstract/summary types — it is absent from the list pre-fix.
+    expect(sparql).toContain('FILTER NOT EXISTS');
+    expect(sparql).toContain('resource-type/CORRIGENDUM');
+  });
+
+  it('include_derivative:true re-admits a standalone corrigendum with resolved labels (issue #55)', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+    // A sector-6 corrigendum carries CORRIGENDUM alongside INFO_JUDICIAL (the live shape).
+    mockQuery.mockResolvedValue([
+      makeCaseBinding('62026TN0267R(01)', {
+        date: '2026-07-13',
+        types:
+          'http://publications.europa.eu/resource/authority/resource-type/CORRIGENDUM ' +
+          'http://publications.europa.eu/resource/authority/resource-type/INFO_JUDICIAL',
+      }),
+    ]);
+
+    const input = eurlex_get_cases.input.parse({
+      keyword: 'corrigendum',
+      include_derivative: true,
+    });
+    const result = await eurlex_get_cases.handler(input, ctx);
+
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    // Opting in skips the exclusion entirely, so the corrigendum is returned with both
+    // type labels resolved (CORRIGENDUM falls back to its raw code, sorting first).
+    expect(sparql).not.toContain('FILTER NOT EXISTS');
+    expect(result.cases[0]?.celex_number).toBe('62026TN0267R(01)');
+    expect(result.cases[0]?.resource_type).toBe('CORRIGENDUM, Judicial Information Notice');
+  });
+
+  // --- #57: include_derivative echoed in query_echo after the default is applied ---
+
+  it('echoes the effective include_derivative:false in query_echo and content[] on a default call (issue #57)', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+    mockQuery.mockResolvedValue([makeCaseBinding('62013CJ0131')]);
+
+    const input = eurlex_get_cases.input.parse({ keyword: 'google' });
+    const result = await eurlex_get_cases.handler(input, ctx);
+
+    // The false default still shapes which records can appear, so it must be echoed
+    // even though the caller never supplied it — pre-fix query_echo omits it entirely.
+    expect(result.query_echo.include_derivative).toBe(false);
+    // structuredContent ↔ content[] parity: the flag surfaces in the filter summary.
+    const text = (eurlex_get_cases.format!(result)[0] as { text: string }).text;
+    expect(text).toContain('include_derivative=false');
+  });
+
+  it('echoes include_derivative:true in query_echo and content[] when the caller opts in (issue #57)', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+    mockQuery.mockResolvedValue([makeCaseBinding('62026TN0267R(01)')]);
+
+    // Mirrors the live-HTTP repro from #57: pre-fix this echoed only `keyword`.
+    const input = eurlex_get_cases.input.parse({
+      keyword: 'Corrigendum',
+      include_derivative: true,
+      limit: 1,
+    });
+    const result = await eurlex_get_cases.handler(input, ctx);
+
+    expect(result.query_echo.include_derivative).toBe(true);
+    expect(result.query_echo.keyword).toBe('Corrigendum');
+    const text = (eurlex_get_cases.format!(result)[0] as { text: string }).text;
+    expect(text).toContain('include_derivative=true');
+  });
+
   // --- Format ---
 
   it('format renders celex, date, type label, and title', () => {
