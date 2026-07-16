@@ -38,18 +38,25 @@ export const SPARQL_ERROR_RECOVERY_HINT =
 /**
  * Inject or cap the LIMIT clause in a SPARQL query to `max`.
  * If the query has no LIMIT, appends one. If it has a LIMIT above `max`, rewrites it.
+ *
+ * `enforced` reports whether the ceiling actually changed the query — true when a
+ * LIMIT was appended or rewritten down, false when the caller's own LIMIT was
+ * already at or under `max` and therefore remains the binding constraint. Callers
+ * need this to interpret a result whose row count equals `max`: without it, a
+ * caller-supplied `LIMIT 100` that genuinely matched 100 rows is indistinguishable
+ * from a `LIMIT 500` clamped to 100 with more rows waiting upstream (#52).
  */
-function enforceLimitInQuery(query: string, max: number): string {
+function enforceLimitInQuery(query: string, max: number): { query: string; enforced: boolean } {
   const limitRe = /\bLIMIT\s+(\d+)/i;
   const match = limitRe.exec(query);
   if (!match) {
-    return `${query.trimEnd()}\nLIMIT ${max}`;
+    return { query: `${query.trimEnd()}\nLIMIT ${max}`, enforced: true };
   }
   const existing = parseInt(match[1] ?? '', 10);
   if (existing > max) {
-    return query.replace(limitRe, `LIMIT ${max}`);
+    return { query: query.replace(limitRe, `LIMIT ${max}`), enforced: true };
   }
-  return query;
+  return { query, enforced: false };
 }
 
 export class CellarSparqlService {
@@ -78,7 +85,7 @@ export class CellarSparqlService {
    *   Falls back to the server-configured `sparqlQueryTimeoutMs` when omitted.
    */
   async query(rawQuery: string, ctx: Context, timeoutMs?: number): Promise<SparqlBinding[]> {
-    return (await this.execute(rawQuery, ctx, timeoutMs)).results.bindings;
+    return (await this.execute(rawQuery, ctx, timeoutMs)).parsed.results.bindings;
   }
 
   /**
@@ -86,30 +93,41 @@ export class CellarSparqlService {
    * (`head.vars`) alongside the binding rows. Unlike deriving variable names
    * from a binding's keys, the projection is reported even when the result set
    * is empty — SPARQL 1.1 carries `head.vars` independent of binding count.
+   *
+   * `limitEnforced` reports whether the `maxResults` ceiling rewrote the query, so
+   * a caller can tell a genuinely complete result from one the server truncated.
    */
   async queryWithVars(
     rawQuery: string,
     ctx: Context,
     timeoutMs?: number,
-  ): Promise<{ variables: string[]; bindings: SparqlBinding[] }> {
-    const parsed = await this.execute(rawQuery, ctx, timeoutMs);
-    return { variables: parsed.head?.vars ?? [], bindings: parsed.results.bindings };
+  ): Promise<{ variables: string[]; bindings: SparqlBinding[]; limitEnforced: boolean }> {
+    const { parsed, limitEnforced } = await this.execute(rawQuery, ctx, timeoutMs);
+    return {
+      variables: parsed.head?.vars ?? [],
+      bindings: parsed.results.bindings,
+      limitEnforced,
+    };
   }
 
   /**
    * POST a SPARQL query to CELLAR and return the parsed SPARQL-results JSON
-   * envelope (`head` + `results`). Shared by `query` and `queryWithVars`.
+   * envelope (`head` + `results`) alongside whether the `maxResults` ceiling
+   * rewrote the query. Shared by `query` and `queryWithVars`.
    */
   private async execute(
     rawQuery: string,
     ctx: Context,
     timeoutMs?: number,
-  ): Promise<SparqlResultsJson> {
+  ): Promise<{ parsed: SparqlResultsJson; limitEnforced: boolean }> {
     const effectiveTimeoutMs = timeoutMs ?? this.timeoutMs;
     const withPrefixes = rawQuery.includes('PREFIX cdm:') ? rawQuery : SPARQL_PREFIXES + rawQuery;
-    const cappedQuery = enforceLimitInQuery(withPrefixes, this.maxResults);
+    const { query: cappedQuery, enforced: limitEnforced } = enforceLimitInQuery(
+      withPrefixes,
+      this.maxResults,
+    );
 
-    return await withRetry(
+    const parsed = await withRetry(
       async () => {
         const body = new URLSearchParams({
           query: cappedQuery,
@@ -173,6 +191,8 @@ export class CellarSparqlService {
         signal: ctx.signal,
       },
     );
+
+    return { parsed, limitEnforced };
   }
 
   /** Extract a string value from a binding field, returning undefined if absent. */

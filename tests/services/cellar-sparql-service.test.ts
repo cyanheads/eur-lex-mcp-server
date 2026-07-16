@@ -41,6 +41,34 @@ function stubFetchJson(payload: unknown): void {
   );
 }
 
+/**
+ * Stub fetch with a JSON payload and capture the SPARQL query actually POSTed,
+ * so a test can assert what the LIMIT ceiling did to the caller's query text.
+ */
+function stubFetchCapturing(payload: unknown): { sentQuery: () => string } {
+  const calls: string[] = [];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (_url: string, init: { body: string }) => {
+      calls.push(new URLSearchParams(init.body).get('query') ?? '');
+      return { ok: true, status: 200, text: async () => JSON.stringify(payload) };
+    }),
+  );
+  return { sentQuery: () => calls[0] ?? '' };
+}
+
+/** A SPARQL-results envelope with `n` throwaway rows. */
+function rowsPayload(n: number): unknown {
+  return {
+    head: { vars: ['work'] },
+    results: {
+      bindings: Array.from({ length: n }, (_, i) => ({
+        work: { type: 'uri', value: `http://work/${i}` },
+      })),
+    },
+  };
+}
+
 // --- #20: CELLAR serializes xsd:boolean as the lexical "1"/"0", not "true"/"false" ---
 
 describe('CellarSparqlService.parseBoolean', () => {
@@ -117,6 +145,98 @@ describe('CellarSparqlService.queryWithVars', () => {
 
     const bindings = await makeService().query('SELECT ?work WHERE { ?s ?p ?o }', ctx);
     expect(bindings).toHaveLength(1);
+  });
+});
+
+// --- #52: whether the maxResults ceiling fired must be observable ---
+//
+// Row count alone cannot disclose truncation: a caller's own `LIMIT 100` that
+// genuinely matched 100 rows is indistinguishable from a `LIMIT 500` the server
+// clamped to 100. queryWithVars reports the enforcement decision so callers can
+// tell the two apart.
+
+describe('CellarSparqlService.queryWithVars limitEnforced (#52)', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('reports limitEnforced when the query carries no LIMIT and the ceiling appends one', async () => {
+    const { sentQuery } = stubFetchCapturing(rowsPayload(100));
+    const ctx = createMockContext();
+
+    const result = await makeService().queryWithVars(
+      'SELECT ?work WHERE { ?work cdm:resource_legal_id_celex ?celex . }',
+      ctx,
+    );
+
+    expect(result.limitEnforced).toBe(true);
+    expect(sentQuery()).toContain('LIMIT 100');
+  });
+
+  it('reports limitEnforced when a LIMIT above the ceiling is rewritten down', async () => {
+    const { sentQuery } = stubFetchCapturing(rowsPayload(100));
+    const ctx = createMockContext();
+
+    const result = await makeService().queryWithVars(
+      'SELECT ?work WHERE { ?work cdm:resource_legal_id_celex ?celex . } LIMIT 500',
+      ctx,
+    );
+
+    expect(result.limitEnforced).toBe(true);
+    // The caller's 500 is gone; the ceiling is what reaches CELLAR.
+    expect(sentQuery()).toContain('LIMIT 100');
+    expect(sentQuery()).not.toContain('LIMIT 500');
+  });
+
+  it('does not report limitEnforced when the caller LIMIT is exactly the ceiling', async () => {
+    // The ambiguous case: 100 rows come back, but the caller's own LIMIT bound
+    // them — nothing was truncated, so this must not read as capped.
+    const { sentQuery } = stubFetchCapturing(rowsPayload(100));
+    const ctx = createMockContext();
+
+    const result = await makeService().queryWithVars(
+      'SELECT ?work WHERE { ?work cdm:resource_legal_id_celex ?celex . } LIMIT 100',
+      ctx,
+    );
+
+    expect(result.limitEnforced).toBe(false);
+    expect(result.bindings).toHaveLength(100);
+    expect(sentQuery()).toContain('LIMIT 100');
+  });
+
+  it('does not report limitEnforced when the caller LIMIT is under the ceiling', async () => {
+    const { sentQuery } = stubFetchCapturing(rowsPayload(10));
+    const ctx = createMockContext();
+
+    const result = await makeService().queryWithVars(
+      'SELECT ?work WHERE { ?work cdm:resource_legal_id_celex ?celex . } LIMIT 10',
+      ctx,
+    );
+
+    expect(result.limitEnforced).toBe(false);
+    // The caller's own LIMIT is left untouched.
+    expect(sentQuery()).toContain('LIMIT 10');
+  });
+
+  it('reports limitEnforced even when the enforced ceiling is not filled', async () => {
+    // Enforcement fired (a LIMIT was appended) but only 76 rows matched — the flag
+    // tracks the rewrite, not the row count. Callers pair the two themselves.
+    stubFetchCapturing(rowsPayload(76));
+    const ctx = createMockContext();
+
+    const result = await makeService().queryWithVars(
+      'SELECT ?work WHERE { ?work cdm:work_date_document "2016-04-27"^^xsd:date . }',
+      ctx,
+    );
+
+    expect(result.limitEnforced).toBe(true);
+    expect(result.bindings).toHaveLength(76);
+  });
+
+  it('query() still returns bare bindings while execute() tracks enforcement', async () => {
+    stubFetchCapturing(rowsPayload(3));
+    const ctx = createMockContext();
+
+    const bindings = await makeService().query('SELECT ?work WHERE { ?s ?p ?o }', ctx);
+    expect(bindings).toHaveLength(3);
   });
 });
 

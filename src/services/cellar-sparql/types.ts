@@ -3,8 +3,21 @@
  * @module services/cellar-sparql/types
  */
 
+/**
+ * A single SPARQL term: an IRI, a blank node, or a literal. Virtuoso tags every
+ * term with `type` and `value`, and adds `datatype` for a typed literal or
+ * `xml:lang` for a language-tagged one — the two are mutually exclusive per the
+ * SPARQL 1.1 JSON results format.
+ */
+export interface SparqlTerm {
+  datatype?: string;
+  type: string;
+  value: string;
+  'xml:lang'?: string;
+}
+
 /** A single binding row from a SPARQL SELECT result. */
-export type SparqlBinding = Record<string, { type: string; value: string; datatype?: string }>;
+export type SparqlBinding = Record<string, SparqlTerm>;
 
 /** The full SPARQL results JSON envelope from Virtuoso. */
 export interface SparqlResultsJson {

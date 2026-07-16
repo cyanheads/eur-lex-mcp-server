@@ -6,6 +6,44 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getCellarSparqlService } from '@/services/cellar-sparql/cellar-sparql-service.js';
+import type { SparqlBinding, SparqlTerm } from '@/services/cellar-sparql/types.js';
+
+/** The XSD namespace, whose `xsd:` prefix this tool auto-injects into every query. */
+const XSD_NAMESPACE = 'http://www.w3.org/2001/XMLSchema#';
+
+/**
+ * Render a datatype IRI. XSD datatypes — practically everything CELLAR emits —
+ * collapse to the `xsd:` prefix the tool already injects, keeping a 100-row table
+ * readable; anything else keeps its full IRI rather than inventing a prefix.
+ */
+function formatDatatype(datatype: string): string {
+  return datatype.startsWith(XSD_NAMESPACE)
+    ? `xsd:${datatype.slice(XSD_NAMESPACE.length)}`
+    : `<${datatype}>`;
+}
+
+/**
+ * Render a SPARQL term in the Turtle/SPARQL syntax the query language itself
+ * uses: `<iri>`, `_:label`, `"lexical"`, `"lexical"@en`, `"lexical"^^xsd:date`.
+ *
+ * `structuredContent` carries the whole term object, but the text table used to
+ * render `value` alone — so a content[]-only client could not tell an IRI from a
+ * literal and lost datatype and language entirely (#54). Quotes and backslashes
+ * inside a lexical form are escaped, so the delimiters stay unambiguous.
+ *
+ * An unbound OPTIONAL variable has no key in the row at all and renders empty.
+ */
+function formatSparqlTerm(term: SparqlTerm | undefined): string {
+  if (!term) return '';
+  if (term.type === 'uri') return `<${term.value}>`;
+  if (term.type === 'bnode') return `_:${term.value}`;
+
+  const lexical = `"${term.value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+  const lang = term['xml:lang'];
+  if (lang) return `${lexical}@${lang}`;
+  if (term.datatype) return `${lexical}^^${formatDatatype(term.datatype)}`;
+  return lexical;
+}
 
 /**
  * Returns the first significant SPARQL keyword (uppercased) after skipping the
@@ -71,7 +109,7 @@ export const eurlex_query_sparql = tool('eurlex_query_sparql', {
           .object({})
           .passthrough()
           .describe(
-            'A single SPARQL result row. Each key is a SELECT variable name; each value is a SPARQL term object with "type" (e.g. "uri", "literal") and "value" (the string value) fields.',
+            'A single SPARQL result row. Each key is a SELECT variable name; each value is a SPARQL term object with "type" ("uri", "literal", or "bnode") and "value" (the string value), plus "datatype" (an IRI) on a typed literal or "xml:lang" (a language tag) on a language-tagged literal — the two are mutually exclusive. A variable left unbound by an OPTIONAL has no key in the row at all.',
           ),
       )
       .describe(
@@ -82,6 +120,17 @@ export const eurlex_query_sparql = tool('eurlex_query_sparql', {
       .describe('Variable names from the SELECT head, in query order.'),
     total: z.number().describe('Number of binding rows returned (capped at 100 by the server).'),
   }),
+
+  enrichment: {
+    truncated: z
+      .boolean()
+      .optional()
+      .describe(
+        'True when the server-enforced result ceiling capped the rows and more may exist upstream — narrow the query with FILTERs to see the rest.',
+      ),
+    shown: z.number().optional().describe('Number of binding rows returned in this response.'),
+    cap: z.number().optional().describe('The server-enforced result ceiling that was applied.'),
+  },
 
   errors: [
     {
@@ -123,13 +172,31 @@ export const eurlex_query_sparql = tool('eurlex_query_sparql', {
 
     // queryWithVars exposes the projected SELECT variables (head.vars), so the
     // result columns are reported even when no rows match — Object.keys on an
-    // empty bindings array would drop them.
-    const { variables, bindings } = await svc.queryWithVars(
+    // empty bindings array would drop them. It also reports whether the server's
+    // LIMIT ceiling rewrote the query (limitEnforced).
+    const { variables, bindings, limitEnforced } = await svc.queryWithVars(
       input.sparql_query,
       ctx,
       input.timeout_hint,
     );
     ctx.log.info('Raw SPARQL query executed', { resultCount: bindings.length });
+
+    /**
+     * Disclose truncation only when the server's ceiling both fired AND filled.
+     * The row count alone is ambiguous — a caller's own `LIMIT 100` that genuinely
+     * matched 100 rows looks identical to a `LIMIT 500` clamped down to 100 — so
+     * `limitEnforced` is what separates them (#52).
+     *
+     * The count is compared with `===`, not `>=`: `enforceLimitInQuery` rewrites
+     * only the FIRST `LIMIT` in the query text, so a subselect's limit can absorb
+     * the rewrite and leave the outer query uncapped, returning far more rows than
+     * the ceiling. `>=` would fire there and report the self-contradicting pair
+     * `shown: 759, cap: 100`. Exact equality is the only count the ceiling can
+     * actually produce when it bounds the result.
+     */
+    if (limitEnforced && bindings.length === svc.maxResults) {
+      ctx.enrich.truncated({ shown: bindings.length, cap: svc.maxResults });
+    }
 
     return {
       bindings,
@@ -155,10 +222,7 @@ export const eurlex_query_sparql = tool('eurlex_query_sparql', {
       lines.push(header);
       lines.push(sep);
       for (const row of result.bindings) {
-        const cells = result.variables.map((v) => {
-          const cell = (row as Record<string, { value?: string }>)[v];
-          return cell?.value ?? '';
-        });
+        const cells = result.variables.map((v) => formatSparqlTerm((row as SparqlBinding)[v]));
         lines.push(`| ${cells.join(' | ')} |`);
       }
     }
