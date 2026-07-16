@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.9.8](changelog/0.9.x/0.9.8.md) — 2026-07-16
+
+eurlex_query_sparql's maxSparqlResults ceiling now bounds the outermost query result instead of the first LIMIT in the text, so a subselect no longer leaves the outer query uncapped or gets the caller's own inner LIMIT silently rewritten
+
 ## [0.9.7](changelog/0.9.x/0.9.7.md) — 2026-07-16
 
 eurlex_search_documents and eurlex_get_cases echo their effective include_consolidated / include_derivative defaults in query_echo and content[]; standalone corrigenda are now explicitly excluded from primary-only case-law results
