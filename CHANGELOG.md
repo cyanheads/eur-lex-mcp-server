@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.9.7](changelog/0.9.x/0.9.7.md) — 2026-07-16
+
+eurlex_search_documents and eurlex_get_cases echo their effective include_consolidated / include_derivative defaults in query_echo and content[]; standalone corrigenda are now explicitly excluded from primary-only case-law results
+
 ## [0.9.6](changelog/0.9.x/0.9.6.md) — 2026-07-16 · 🛡️ Security
 
 Caller-supplied SPARQL literals and IRIs across every tool and resource now route through shared escaping and validation, closing the paths that leaked raw Virtuoso compiler errors; eurlex_query_sparql discloses when the result cap fired and renders full SPARQL terms in text output

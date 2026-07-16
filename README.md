@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.9.6-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/eur-lex-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/eur-lex-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/eur-lex-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.14-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.9.7-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/eur-lex-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/eur-lex-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/eur-lex-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.14-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -334,7 +334,7 @@ The Dockerfile defaults to HTTP transport, stateless session mode, and logs to `
 | `src/index.ts` | `createApp()` entry point — registers tools, resources, and prompts; initializes services. |
 | `src/config` | Server-specific environment variable parsing and validation with Zod. |
 | `src/services/cellar-sparql` | CELLAR SPARQL service — POST client, binding mapper, LIMIT enforcement, CDM PREFIX declarations. |
-| `src/services/eurlex-content` | EUR-Lex content API service — GET client for `legal-content/{LANG}/TXT/` URL pattern with language fallback. |
+| `src/services/eurlex-content` | CELLAR content service — content-negotiation GET client for `/resource/celex/{CELEX}` (`Accept` / `Accept-Language`) with English language fallback. |
 | `src/mcp-server/tools` | Tool definitions (`*.tool.ts`). Seven tools across document search, retrieval, resolution, case law, relations, EuroVoc, and raw SPARQL. |
 | `src/mcp-server/resources` | Resource definitions (`*.resource.ts`). Metadata and relations resources. |
 | `src/mcp-server/prompts` | Prompt definitions (`*.prompt.ts`). Comparative analysis prompt. |
