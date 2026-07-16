@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.9.6](changelog/0.9.x/0.9.6.md) — 2026-07-16 · 🛡️ Security
+
+Caller-supplied SPARQL literals and IRIs across every tool and resource now route through shared escaping and validation, closing the paths that leaked raw Virtuoso compiler errors; eurlex_query_sparql discloses when the result cap fired and renders full SPARQL terms in text output
+
 ## [0.9.5](changelog/0.9.x/0.9.5.md) — 2026-07-09
 
 eurlex_browse_subjects gains offset pagination over distinct, alphabetically-ordered EuroVoc concepts; eurlex_query_sparql text output renders every returned row; framework ^0.10.14 plus a supply-chain and packaging refresh
