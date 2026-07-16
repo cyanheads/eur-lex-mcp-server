@@ -9,6 +9,7 @@ import {
   CellarSparqlService,
   getCellarSparqlService,
 } from '@/services/cellar-sparql/cellar-sparql-service.js';
+import { escapeSparqlLiteral } from '@/services/cellar-sparql/eli-resolution.js';
 
 /**
  * Namespace of actual EuroVoc concepts. CELLAR's skos:Concept space also holds
@@ -130,7 +131,7 @@ SELECT ?concept ?label
   }
   FILTER(STRSTARTS(STR(?concept), "${EUROVOC_CONCEPT_NAMESPACE}"))
   FILTER(LANG(?label) = "${lang}")
-  FILTER(CONTAINS(LCASE(STR(?label)), "${keyword.replace(/"/g, '\\"')}"))
+  FILTER(CONTAINS(LCASE(STR(?label)), "${escapeSparqlLiteral(keyword)}"))
 } GROUP BY ?concept ?label ORDER BY ?label ?concept LIMIT ${input.limit} OFFSET ${input.offset}`;
 
     const bindings = await svc.query(sparql, ctx);

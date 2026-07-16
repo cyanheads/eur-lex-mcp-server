@@ -13,6 +13,7 @@ import {
   CellarSparqlService,
   getCellarSparqlService,
 } from '@/services/cellar-sparql/cellar-sparql-service.js';
+import { escapeSparqlLiteral, isSafeSparqlIri } from '@/services/cellar-sparql/eli-resolution.js';
 import { isConsolidatedCelex } from '@/services/cellar-sparql/relation-traversal.js';
 
 /** CDM resource type URIs for common document categories. */
@@ -96,10 +97,9 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
         z.literal(''),
         z
           .string()
-          .startsWith('http')
-          .refine((v) => !v.includes('>') && !v.includes('"') && !v.includes(' '), {
+          .refine(isSafeSparqlIri, {
             message:
-              'EuroVoc URI must be a valid http URI with no angle brackets, quotes, or spaces.',
+              'EuroVoc URI must be a valid http URI with no whitespace, angle brackets, or quotes.',
           })
           .describe('EuroVoc concept URI (e.g. http://eurovoc.europa.eu/2828).'),
       ])
@@ -295,7 +295,7 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
     let keywordClause = '';
     const keywordInput = input.keyword?.trim();
     if (keywordInput) {
-      const celexTerm = keywordInput.toLowerCase().replace(/"/g, '\\"');
+      const celexTerm = escapeSparqlLiteral(keywordInput.toLowerCase());
       const ftPhrase = keywordInput
         .replace(/[^\p{L}\p{N}\s]+/gu, ' ')
         .replace(/\s+/g, ' ')

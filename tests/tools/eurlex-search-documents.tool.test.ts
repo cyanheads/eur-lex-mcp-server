@@ -7,6 +7,7 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_search_documents } from '@/mcp-server/tools/definitions/eurlex-search-documents.tool.js';
+import { escapeSparqlLiteral } from '@/services/cellar-sparql/eli-resolution.js';
 
 // --- Service mock ---
 const mockQuery = vi.fn();
@@ -299,6 +300,54 @@ describe('eurlex_search_documents', () => {
     // the CELEX substring match still runs so the query stays well-formed.
     expect(sparql).not.toContain('bif:contains');
     expect(sparql).toContain('cdm:resource_legal_id_celex ?kwCelex');
+  });
+
+  // --- #62: keyword CELEX arm escaping routes through the shared helper ---
+  //
+  // The former hand-rolled `keywordInput.toLowerCase().replace(/"/g, '\\"')` was a
+  // quote-only pass with no backslash pass. A keyword ending in `\` then escaped
+  // the closing quote of the CELEX arm's literal, the literal never terminated,
+  // and Virtuoso's raw SP030 compiler error — carrying the internal query text and
+  // PREFIX block — reached the client in place of this tool's own result. The
+  // built query text is the discriminating assertion: a mocked query returns its
+  // fixture whatever it is handed, so asserting on the result alone proves nothing.
+
+  it('escapes a trailing backslash in the keyword CELEX arm (#62)', async () => {
+    const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+    mockQuery.mockResolvedValue([makeDocBinding('32016R0679')]);
+
+    const keyword = 'data\\';
+    const input = eurlex_search_documents.input.parse({ keyword });
+    await eurlex_search_documents.handler(input, ctx);
+
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    // The CELEX arm lowercases before escaping, so the helper sees the lowercased value.
+    expect(sparql).toContain(
+      `CONTAINS(LCASE(STR(?kwCelex)), "${escapeSparqlLiteral(keyword.toLowerCase())}")`,
+    );
+    // The unterminated form the quote-only pass produced is gone.
+    expect(sparql).not.toContain(String.raw`"data\"))`);
+    // The full-text arm strips the backslash independently, so the UNION still
+    // matches on the sanitized phrase — a backslash keyword is a normal search,
+    // not an error and not necessarily an empty result.
+    expect(sparql).toContain(`bif:contains "'data'"`);
+  });
+
+  it('escapes an embedded quote-and-backslash sequence in the keyword (#62)', async () => {
+    const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+    mockQuery.mockResolvedValue([makeDocBinding('32016R0679')]);
+
+    const keyword = 'data\\" x';
+    const input = eurlex_search_documents.input.parse({ keyword });
+    await eurlex_search_documents.handler(input, ctx);
+
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    expect(sparql).toContain(
+      `CONTAINS(LCASE(STR(?kwCelex)), "${escapeSparqlLiteral(keyword.toLowerCase())}")`,
+    );
+    // Every backslash and quote from the input is escaped, so the only unescaped
+    // double quotes in the arm are the literal's own delimiters.
+    expect(sparql).not.toContain(String.raw`"data\\" x"`);
   });
 
   // --- Dedup of multi-resource-type works (issue #14) ---
@@ -716,5 +765,39 @@ describe('eurlex_search_documents', () => {
     const blocks = eurlex_search_documents.format!(output);
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('12345ABC');
+  });
+
+  // --- #60: control characters in eurovoc_concept must not reach the SPARQL IRI ---
+
+  describe('control characters in eurovoc_concept (#60)', () => {
+    const EUROVOC_URI = 'http://eurovoc.europa.eu/2828';
+
+    /**
+     * eurovoc_concept is interpolated into `<${…}> .` as a subject filter, so an
+     * IRI-forbidden character builds a malformed IRI and leaks Virtuoso's compiler
+     * error — with the internal query text attached — in place of the tool's own
+     * error. Confirmed live for a newline and for `<`. The guard this replaced tested
+     * only for `>`, `"` and a literal space; it omitted `<` entirely, so the opening
+     * bracket that terminates the IRI early passed straight through.
+     */
+    it.each([
+      ['a newline', `${EUROVOC_URI}\nX`],
+      ['a tab', `${EUROVOC_URI}\tX`],
+      ['a carriage return', `${EUROVOC_URI}\rX`],
+      ['a space', `${EUROVOC_URI} X`],
+      ['an opening angle bracket', `${EUROVOC_URI}<X`],
+      ['a closing angle bracket', `${EUROVOC_URI}>X`],
+      ['a double quote', `${EUROVOC_URI}"X`],
+    ])('rejects a eurovoc_concept containing %s at the schema, before any query', (_label, uri) => {
+      expect(() => eurlex_search_documents.input.parse({ eurovoc_concept: uri })).toThrow();
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    it('still accepts a legitimate eurovoc_concept, and "" for an omitted filter', () => {
+      expect(() =>
+        eurlex_search_documents.input.parse({ eurovoc_concept: EUROVOC_URI }),
+      ).not.toThrow();
+      expect(() => eurlex_search_documents.input.parse({ eurovoc_concept: '' })).not.toThrow();
+    });
   });
 });

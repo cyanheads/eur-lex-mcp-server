@@ -14,6 +14,7 @@ import {
   CellarSparqlService,
   getCellarSparqlService,
 } from '@/services/cellar-sparql/cellar-sparql-service.js';
+import { escapeSparqlLiteral } from '@/services/cellar-sparql/eli-resolution.js';
 
 /**
  * Case type → CDM resource-type authority URI. A case_type filter tests the
@@ -258,7 +259,7 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
         filters.push(`FILTER(CONTAINS(STR(?celexNumber), "${celexFragment}"))`);
       } else {
         // Fallback for non-standard formats: substring match on CELEX
-        const cn = input.case_number.trim().replace(/"/g, '\\"');
+        const cn = escapeSparqlLiteral(input.case_number.trim());
         filters.push(`FILTER(CONTAINS(LCASE(STR(?celexNumber)), LCASE("${cn}")))`);
       }
     }
@@ -278,7 +279,7 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
     let keywordClause = '';
     const keywordInput = input.keyword?.trim();
     if (keywordInput) {
-      const celexTerm = keywordInput.toLowerCase().replace(/"/g, '\\"');
+      const celexTerm = escapeSparqlLiteral(keywordInput.toLowerCase());
       const ftPhrase = keywordInput
         .replace(/[^\p{L}\p{N}\s]+/gu, ' ')
         .replace(/\s+/g, ' ')

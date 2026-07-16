@@ -14,7 +14,11 @@ import {
   CellarSparqlService,
   getCellarSparqlService,
 } from '@/services/cellar-sparql/cellar-sparql-service.js';
-import { escapeSparqlLiteral, resolveEliToWork } from '@/services/cellar-sparql/eli-resolution.js';
+import {
+  escapeSparqlLiteral,
+  isSafeSparqlIri,
+  resolveEliToWork,
+} from '@/services/cellar-sparql/eli-resolution.js';
 import {
   type CurrentConsolidated,
   findCurrentConsolidated,
@@ -71,16 +75,9 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       ),
     work_uri: z
       .string()
-      .refine(
-        (v) =>
-          !v ||
-          (v.startsWith('http') &&
-            !v.includes('>') &&
-            !v.includes('<') &&
-            !v.includes('"') &&
-            !v.includes(' ')),
-        { message: 'work_uri must be a valid http URI with no angle brackets, quotes, or spaces.' },
-      )
+      .refine((v) => !v || isSafeSparqlIri(v), {
+        message: 'work_uri must be a valid http URI with no whitespace, angle brackets, or quotes.',
+      })
       .optional()
       .describe(
         'CELLAR work resource URI to fetch (e.g. http://publications.europa.eu/resource/cellar/3e485e15-11bd-11e6-ba9a-01aa75ed71a1) — the form returned by eurlex_lookup_celex, eurlex_get_relations, and eurlex_search_documents. Provide exactly one of celex_number, eli_uri, or work_uri.',

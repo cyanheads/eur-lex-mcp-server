@@ -7,6 +7,7 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_browse_subjects } from '@/mcp-server/tools/definitions/eurlex-browse-subjects.tool.js';
+import { escapeSparqlLiteral } from '@/services/cellar-sparql/eli-resolution.js';
 
 // --- Service mock ---
 const mockQuery = vi.fn();
@@ -149,6 +150,53 @@ describe('eurlex_browse_subjects', () => {
       code: JsonRpcErrorCode.NotFound,
       data: { reason: 'no_concepts' },
     });
+  });
+
+  // --- #62: keyword escaping routes through the shared helper ---
+  //
+  // The former hand-rolled `keyword.replace(/"/g, '\\"')` was a quote-only pass
+  // with no backslash pass. A keyword ending in `\` then escaped the closing
+  // quote, the literal never terminated, and Virtuoso's raw SP030 compiler error
+  // — carrying the internal query text and PREFIX block — reached the client in
+  // place of this tool's own no_concepts. Asserting only on the thrown error would
+  // pass against the unescaped keyword too (a mocked query returns its fixture
+  // whatever it is handed); the built query text is the discriminating part.
+
+  it('escapes a trailing backslash in the keyword so the SPARQL literal terminates (#62)', async () => {
+    const ctx = createMockContext({ errors: eurlex_browse_subjects.errors });
+    mockQuery.mockResolvedValue([]);
+
+    const input = eurlex_browse_subjects.input.parse({ keyword: 'data\\' });
+    await expect(eurlex_browse_subjects.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: { reason: 'no_concepts' },
+    });
+
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    // The literal carries exactly what the shared helper produces.
+    expect(sparql).toContain(`CONTAINS(LCASE(STR(?label)), "${escapeSparqlLiteral('data\\')}")`);
+    // The unterminated form the quote-only pass produced is gone.
+    expect(sparql).not.toContain(String.raw`"data\"))`);
+  });
+
+  it('escapes an embedded quote-and-backslash sequence in the keyword (#62)', async () => {
+    const ctx = createMockContext({ errors: eurlex_browse_subjects.errors });
+    mockQuery.mockResolvedValue([]);
+
+    const keyword = 'data\\" x';
+    const input = eurlex_browse_subjects.input.parse({ keyword });
+    await expect(eurlex_browse_subjects.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'no_concepts' },
+    });
+
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    // Keyword is lowercased before escaping, so the helper sees the lowercased value.
+    expect(sparql).toContain(
+      `CONTAINS(LCASE(STR(?label)), "${escapeSparqlLiteral(keyword.toLowerCase())}")`,
+    );
+    // Every backslash and quote from the input is escaped, so the only unescaped
+    // double quotes in the FILTER are the literal's own delimiters.
+    expect(sparql).not.toContain(String.raw`"data\\" x"`);
   });
 
   // --- #28: truncation disclosure ---

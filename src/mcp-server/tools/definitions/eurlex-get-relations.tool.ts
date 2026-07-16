@@ -9,7 +9,7 @@ import {
   CellarSparqlService,
   getCellarSparqlService,
 } from '@/services/cellar-sparql/cellar-sparql-service.js';
-import { escapeSparqlLiteral } from '@/services/cellar-sparql/eli-resolution.js';
+import { escapeSparqlLiteral, isSafeSparqlIri } from '@/services/cellar-sparql/eli-resolution.js';
 import {
   RELATION_TYPES,
   type RelationType,
@@ -30,16 +30,9 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
       ),
     work_uri: z
       .string()
-      .refine(
-        (v) =>
-          !v ||
-          (v.startsWith('http') &&
-            !v.includes('>') &&
-            !v.includes('<') &&
-            !v.includes('"') &&
-            !v.includes(' ')),
-        { message: 'work_uri must be a valid http URI with no angle brackets, quotes, or spaces.' },
-      )
+      .refine((v) => !v || isSafeSparqlIri(v), {
+        message: 'work_uri must be a valid http URI with no whitespace, angle brackets, or quotes.',
+      })
       .optional()
       .describe(
         'CELLAR work resource URI to traverse (e.g. http://publications.europa.eu/resource/cellar/3e485e15-11bd-11e6-ba9a-01aa75ed71a1). Used directly without CELEX resolution. Provide exactly one of celex_number or work_uri.',

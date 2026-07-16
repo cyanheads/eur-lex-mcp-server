@@ -6,6 +6,7 @@
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_document_relations_resource } from '@/mcp-server/resources/definitions/eurlex-document-relations.resource.js';
+import { escapeSparqlLiteral } from '@/services/cellar-sparql/eli-resolution.js';
 
 // --- Service mock ---
 const mockQuery = vi.fn();
@@ -345,5 +346,41 @@ describe('eurlex_document_relations_resource', () => {
     await expect(eurlex_document_relations_resource.handler(params, ctx)).rejects.toThrow(
       'No CELLAR work',
     );
+  });
+
+  // --- #61: SPARQL literal escaping routes through the shared helper ---
+  //
+  // This resource built its resolve query the same hand-rolled, quote-only way
+  // eurlex://document/{celexNumber} did: no backslash pass, so a CELEX ending in
+  // `\` escaped the closing quote, the literal never terminated, and Virtuoso's
+  // raw SP030 error — internal query text attached — replaced the not_found.
+
+  it('escapes a trailing backslash in the resolve query so the literal terminates (#61)', async () => {
+    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    mockQuery.mockImplementation(routeQuery({ resolve: [] }));
+
+    const celexNumber = '32016R0679\\';
+    const params = eurlex_document_relations_resource.params.parse({ celexNumber });
+    // The resource's own declared error, not a leaked backend compiler error.
+    await expect(eurlex_document_relations_resource.handler(params, ctx)).rejects.toThrow(
+      'No CELLAR work',
+    );
+
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    expect(sparql).toContain(`FILTER(STR(?celex) = "${escapeSparqlLiteral(celexNumber)}")`);
+    // The unterminated form the quote-only pass produced is gone.
+    expect(sparql).not.toContain(String.raw`= "32016R0679\")`);
+  });
+
+  it('leaves an ordinary CELEX byte-identical through the shared helper (#61)', async () => {
+    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    mockQuery.mockImplementation(routeQuery({ resolve: [makeResolveBinding(GDPR_WORK_URI)] }));
+
+    const params = eurlex_document_relations_resource.params.parse({ celexNumber: '32016R0679' });
+    await eurlex_document_relations_resource.handler(params, ctx);
+
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    // No regression for the overwhelmingly common input: escaping is a no-op.
+    expect(sparql).toContain('FILTER(STR(?celex) = "32016R0679")');
   });
 });

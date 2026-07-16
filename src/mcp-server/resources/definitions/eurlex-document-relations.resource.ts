@@ -9,6 +9,7 @@ import {
   CellarSparqlService,
   getCellarSparqlService,
 } from '@/services/cellar-sparql/cellar-sparql-service.js';
+import { escapeSparqlLiteral } from '@/services/cellar-sparql/eli-resolution.js';
 import { RELATION_TYPES, traverseRelations } from '@/services/cellar-sparql/relation-traversal.js';
 
 /**
@@ -32,7 +33,11 @@ export const eurlex_document_relations_resource = resource(
     async handler(params, ctx) {
       const svc = getCellarSparqlService();
       const celexNumber = params.celexNumber.trim();
-      const safeCelexNumber = celexNumber.replace(/"/g, '\\"');
+      // The shared helper, not a local quote-only pass: a hand-rolled escape without
+      // a backslash pass lets a trailing `\` escape the closing quote, so the literal
+      // never terminates and Virtuoso's raw compiler error — internal query text
+      // attached — reaches the client in place of this resource's not_found (#61).
+      const safeCelexNumber = escapeSparqlLiteral(celexNumber);
 
       // Resolve to work URI first
       const resolveSparql = `

@@ -7,6 +7,7 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_get_cases } from '@/mcp-server/tools/definitions/eurlex-get-cases.tool.js';
+import { escapeSparqlLiteral } from '@/services/cellar-sparql/eli-resolution.js';
 
 // --- Service mock ---
 const mockQuery = vi.fn();
@@ -286,6 +287,76 @@ describe('eurlex_get_cases', () => {
     expect(sparql).not.toContain('CONTAINS(LCASE(COALESCE(STR(?title)');
     // CELEX substring matching is preserved as a UNION arm.
     expect(sparql).toContain('cdm:resource_legal_id_celex ?kwCelex');
+  });
+
+  // --- #62: case_number and keyword escaping route through the shared helper ---
+  //
+  // Both sites hand-rolled a quote-only `.replace(/"/g, '\\"')` with no backslash
+  // pass. A value ending in `\` then escaped the closing quote, the literal never
+  // terminated, and Virtuoso's raw SP030 compiler error — carrying the internal
+  // query text and PREFIX block — reached the client in place of this tool's own
+  // no_results. Asserting only on the thrown error would pass against the
+  // unescaped value too (a mocked query returns its fixture whatever it is
+  // handed); the built query text is the discriminating part.
+
+  it('escapes a trailing backslash in the case_number fallback (#62)', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+    mockQuery.mockResolvedValue([]);
+
+    // A non-standard format misses caseNumberToCelexFragment and takes the
+    // substring-match fallback — the path that builds the literal.
+    const caseNumber = 'ZZ\\';
+    const input = eurlex_get_cases.input.parse({ case_number: caseNumber });
+    await expect(eurlex_get_cases.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: { reason: 'no_results' },
+    });
+
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    expect(sparql).toContain(`LCASE("${escapeSparqlLiteral(caseNumber)}")`);
+    // The unterminated form the quote-only pass produced is gone.
+    expect(sparql).not.toContain(String.raw`LCASE("ZZ\")`);
+  });
+
+  it('escapes a trailing backslash in the keyword CELEX arm (#62)', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+    mockQuery.mockResolvedValue([]);
+
+    const keyword = 'data\\';
+    const input = eurlex_get_cases.input.parse({ keyword });
+    await expect(eurlex_get_cases.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'no_results' },
+    });
+
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    // The CELEX arm lowercases before escaping, so the helper sees the lowercased value.
+    expect(sparql).toContain(
+      `CONTAINS(LCASE(STR(?kwCelex)), "${escapeSparqlLiteral(keyword.toLowerCase())}")`,
+    );
+    expect(sparql).not.toContain(String.raw`"data\"))`);
+  });
+
+  /**
+   * Escaping must stay the LAST step. Flipping it ahead of the `.trim()` is
+   * observable: the escape turns a real trailing tab into the two non-whitespace
+   * characters `\` + `t`, which a later trim can no longer strip, so a literal
+   * `\t` would survive into the query where the trimmed value should be bare.
+   * (The `.toLowerCase()` on the keyword arm above is order-inert by contrast —
+   * the escape's output alphabet is case-invariant — so only trim can catch this.)
+   */
+  it('trims the case_number before escaping, not after (#62)', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+    mockQuery.mockResolvedValue([]);
+
+    const input = eurlex_get_cases.input.parse({ case_number: 'ZZ-1\t' });
+    await expect(eurlex_get_cases.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'no_results' },
+    });
+
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    expect(sparql).toContain('LCASE("ZZ-1")');
+    // Escaping first would leave an escaped tab the trim could not remove.
+    expect(sparql).not.toContain(String.raw`ZZ-1\t`);
   });
 
   // --- Dedup of multi-resource-type works (issue #14) ---

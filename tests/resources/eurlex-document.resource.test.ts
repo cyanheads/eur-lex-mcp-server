@@ -6,6 +6,7 @@
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_document_resource } from '@/mcp-server/resources/definitions/eurlex-document.resource.js';
+import { escapeSparqlLiteral } from '@/services/cellar-sparql/eli-resolution.js';
 
 // --- Service mock ---
 const mockQuery = vi.fn();
@@ -188,5 +189,56 @@ describe('eurlex_document_resource', () => {
 
     const params = eurlex_document_resource.params.parse({ celexNumber: '99999X0000' });
     await expect(eurlex_document_resource.handler(params, ctx)).rejects.toThrow('No CELLAR work');
+  });
+
+  // --- #61: SPARQL literal escaping routes through the shared helper ---
+  //
+  // The former hand-rolled `celexNumber.replace(/"/g, '\\"')` was a quote-only
+  // pass with no backslash pass. A CELEX ending in `\` then escaped the closing
+  // quote, the literal never terminated, and Virtuoso's raw SP030 compiler error
+  // — carrying the internal query text and PREFIX block — reached the client in
+  // place of this resource's own not_found.
+
+  it('escapes a trailing backslash so the SPARQL literal terminates (#61)', async () => {
+    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    mockQuery.mockResolvedValue([]);
+
+    const celexNumber = '32016R0679\\';
+    const params = eurlex_document_resource.params.parse({ celexNumber });
+    // The resource's own declared error, not a leaked backend compiler error.
+    await expect(eurlex_document_resource.handler(params, ctx)).rejects.toThrow('No CELLAR work');
+
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    // The literal carries exactly what the shared helper produces.
+    expect(sparql).toContain(`FILTER(STR(?celexNumber) = "${escapeSparqlLiteral(celexNumber)}")`);
+    // The unterminated form the quote-only pass produced is gone.
+    expect(sparql).not.toContain(String.raw`= "32016R0679\")`);
+  });
+
+  it('escapes an embedded quote-and-backslash sequence (#61)', async () => {
+    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    mockQuery.mockResolvedValue([]);
+
+    const celexNumber = '32016R0679\\" x';
+    const params = eurlex_document_resource.params.parse({ celexNumber });
+    await expect(eurlex_document_resource.handler(params, ctx)).rejects.toThrow('No CELLAR work');
+
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    expect(sparql).toContain(`FILTER(STR(?celexNumber) = "${escapeSparqlLiteral(celexNumber)}")`);
+    // Every backslash and quote from the input is escaped, so the only unescaped
+    // double quotes in the FILTER are the literal's own delimiters.
+    expect(sparql).not.toContain(String.raw`= "32016R0679\\" x")`);
+  });
+
+  it('leaves an ordinary CELEX byte-identical through the shared helper (#61)', async () => {
+    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    mockQuery.mockResolvedValue([makeMetaBinding({ celex: '32016R0679' })]);
+
+    const params = eurlex_document_resource.params.parse({ celexNumber: '32016R0679' });
+    await eurlex_document_resource.handler(params, ctx);
+
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    // No regression for the overwhelmingly common input: escaping is a no-op.
+    expect(sparql).toContain('FILTER(STR(?celexNumber) = "32016R0679")');
   });
 });

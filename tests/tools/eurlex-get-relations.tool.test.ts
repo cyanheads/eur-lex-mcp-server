@@ -1272,4 +1272,32 @@ describe('eurlex_get_relations', () => {
     expect(text).toContain('**Requested types:** legal_basis');
     expect(text).toContain('**Empty types (this page):** none');
   });
+
+  // --- #60: control characters in work_uri must not reach the SPARQL IRI ---
+
+  describe('control characters in work_uri (#60)', () => {
+    /**
+     * work_uri is interpolated straight into `<${workUri}>` when a relation arm is
+     * built, so a value carrying an IRI-forbidden character produces a malformed IRI
+     * and leaks Virtuoso's compiler error — with the internal query text attached —
+     * in place of the tool's own error. Confirmed live for a tab and a newline. The
+     * guard this replaced tested only for a literal space.
+     */
+    it.each([
+      ['a newline', `${GDPR_WORK_URI}\nX`],
+      ['a tab', `${GDPR_WORK_URI}\tX`],
+      ['a carriage return', `${GDPR_WORK_URI}\rX`],
+      ['a space', `${GDPR_WORK_URI} X`],
+      ['an opening angle bracket', `${GDPR_WORK_URI}<X`],
+      ['a closing angle bracket', `${GDPR_WORK_URI}>X`],
+      ['a double quote', `${GDPR_WORK_URI}"X`],
+    ])('rejects a work_uri containing %s at the schema, before any query', (_label, uri) => {
+      expect(() => eurlex_get_relations.input.parse({ work_uri: uri })).toThrow();
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    it('still accepts a legitimate work_uri', () => {
+      expect(() => eurlex_get_relations.input.parse({ work_uri: GDPR_WORK_URI })).not.toThrow();
+    });
+  });
 });

@@ -1152,4 +1152,88 @@ describe('eurlex_get_document', () => {
       expect(mockFetchContent).toHaveBeenCalledWith('32024R2822', 'EN', 'html', expect.anything());
     });
   });
+
+  // --- #53: control characters in an identifier must not reach the query raw ---
+
+  describe('control characters in an identifier (#53)', () => {
+    const WORK_URI =
+      'http://publications.europa.eu/resource/cellar/3e485e15-11bd-11e6-ba9a-01aa75ed71a1';
+
+    /**
+     * These assert on the SPARQL text the service actually receives, not just on the
+     * thrown error. A mocked query returns whatever it is told to regardless of what
+     * was asked, so "handler throws not_found" passes just as well against the raw
+     * unescaped identifier that made the real endpoint reject the query — the leak
+     * is only visible in the query text.
+     */
+    const queriesIssued = () => mockSparqlQuery.mock.calls.map((c) => c[0] as string);
+
+    it('escapes an embedded newline in celex_number and returns the tool own not_found', async () => {
+      const ctx = createMockContext({ errors: eurlex_get_document.errors });
+      mockSparqlQuery.mockResolvedValue([]); // identifier matches no work
+
+      const input = eurlex_get_document.input.parse({
+        celex_number: '32016R0679\nGDPR',
+        content_mode: 'metadata_only',
+      });
+      const err = await eurlex_get_document.handler(input, ctx).catch((e: unknown) => e);
+
+      const queries = queriesIssued();
+      expect(queries.length).toBeGreaterThan(0);
+      // The raw newline would end the short literal and make the query unparseable.
+      for (const q of queries) expect(q).not.toContain('32016R0679\nGDPR');
+      expect(queries.some((q) => q.includes(String.raw`32016R0679\nGDPR`))).toBe(true);
+
+      // A valid query that matches nothing is the tool's own not_found — not a
+      // backend compiler error carrying the internal query text.
+      expect(err).toMatchObject({
+        code: JsonRpcErrorCode.NotFound,
+        data: { reason: 'not_found' },
+      });
+    });
+
+    it('escapes an embedded newline in eli_uri', async () => {
+      const ctx = createMockContext({ errors: eurlex_get_document.errors });
+      mockSparqlQuery.mockResolvedValue([]); // ELI resolves to no work
+
+      const input = eurlex_get_document.input.parse({
+        eli_uri: 'http://data.europa.eu/eli/reg/2016/679\nX',
+        content_mode: 'metadata_only',
+      });
+      const err = await eurlex_get_document.handler(input, ctx).catch((e: unknown) => e);
+
+      const queries = queriesIssued();
+      expect(queries.length).toBeGreaterThan(0);
+      for (const q of queries) expect(q).not.toContain('679\nX');
+      expect(queries.some((q) => q.includes(String.raw`679\nX`))).toBe(true);
+
+      expect(err).toMatchObject({
+        code: JsonRpcErrorCode.NotFound,
+        data: { reason: 'not_found' },
+      });
+    });
+
+    /**
+     * work_uri is interpolated into a `<…>` IRI rather than a literal, so escaping
+     * does not apply — the schema has to reject the value outright. The guard this
+     * replaced tested only for a literal space, so a tab or newline passed it and
+     * built a malformed IRI (both confirmed live to leak Virtuoso's error).
+     */
+    it.each([
+      ['a newline', `${WORK_URI}\nX`],
+      ['a tab', `${WORK_URI}\tX`],
+      ['a carriage return', `${WORK_URI}\rX`],
+      ['a space', `${WORK_URI} X`],
+      ['an opening angle bracket', `${WORK_URI}<X`],
+      ['a closing angle bracket', `${WORK_URI}>X`],
+      ['a double quote', `${WORK_URI}"X`],
+    ])('rejects a work_uri containing %s at the schema, before any query', (_label, uri) => {
+      expect(() => eurlex_get_document.input.parse({ work_uri: uri })).toThrow();
+      expect(mockSparqlQuery).not.toHaveBeenCalled();
+    });
+
+    it('still accepts a legitimate work_uri', () => {
+      expect(() => eurlex_get_document.input.parse({ work_uri: WORK_URI })).not.toThrow();
+    });
+  });
 });

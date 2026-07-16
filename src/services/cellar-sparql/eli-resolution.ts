@@ -4,6 +4,10 @@
  * (`cdm:resource_legal_eli`, an `xsd:anyURI` literal), so a bare work-level ELI is
  * normalized to its `/oj` form on a miss. Extracted from eurlex_lookup_celex (#5) so
  * both tools resolve ELIs identically rather than duplicating the mechanism.
+ *
+ * Also home to the SPARQL-safety primitives every CELLAR query builder shares —
+ * `escapeSparqlLiteral` for values interpolated into a `"…"` literal, and
+ * `isSafeSparqlIri` for URIs interpolated into a `<…>` IRI.
  * @module services/cellar-sparql/eli-resolution
  */
 
@@ -32,9 +36,47 @@ export function isBareWorkLevelEli(eli: string): boolean {
   return /^[^/]+\/\d{4}\/[^/]+$/.test(path);
 }
 
-/** Escape backslashes then double-quotes for safe interpolation into a SPARQL string literal. */
+/**
+ * Escape a value for interpolation into a SPARQL short string literal (`"…"`).
+ *
+ * The passes are order-dependent: the backslash pass must run first, because every
+ * later pass introduces a backslash of its own. Escaping a newline before the
+ * backslash pass would double it, turning the escape back into a literal backslash
+ * followed by `n`.
+ *
+ * A short literal cannot span lines, so an unescaped newline makes the whole query
+ * unparseable and Virtuoso's raw compiler error surfaces in place of the tool's own
+ * not-found (#53). Virtuoso happens to accept a raw CR or tab in this position, but
+ * both are escaped anyway — the SPARQL grammar excludes them, and correctness here
+ * should not rest on one endpoint's leniency.
+ */
 export function escapeSparqlLiteral(value: string): string {
-  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  return value
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, '\\n')
+    .replace(/\r/g, '\\r')
+    .replace(/\t/g, '\\t');
+}
+
+/**
+ * Characters that cannot appear inside a SPARQL IRI reference (`<…>`): any
+ * whitespace — including the tab and newline a bare space check misses — plus the
+ * angle brackets that delimit the IRI and a double quote.
+ */
+const UNSAFE_SPARQL_IRI_CHARS = /[\s<>"]/;
+
+/**
+ * True when `value` is an http URI safe to interpolate into a SPARQL `<…>` IRI.
+ *
+ * Caller-supplied URIs reach the query as `<${uri}>`, so a value carrying an IRI-
+ * forbidden character builds an unparseable query and leaks Virtuoso's raw compiler
+ * error — with the internal query text attached — in place of the tool's own error
+ * (#53, #60). Real CELLAR work URIs and EuroVoc concept URIs contain none of these
+ * characters, so the check has no false-positive risk against genuine values.
+ */
+export function isSafeSparqlIri(value: string): boolean {
+  return value.startsWith('http') && !UNSAFE_SPARQL_IRI_CHARS.test(value);
 }
 
 /**
