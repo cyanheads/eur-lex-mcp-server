@@ -312,6 +312,13 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       ),
   }),
 
+  enrichment: {
+    truncated: z.boolean().optional().describe('True when the returned body window was capped.'),
+    shown: z.number().int().optional().describe('Number of body characters returned.'),
+    cap: z.number().int().optional().describe('Maximum body characters allowed in the window.'),
+    notice: z.string().optional().describe('How to retrieve the remaining document content.'),
+  },
+
   errors: [
     {
       reason: 'invalid_identifier_args',
@@ -642,6 +649,14 @@ SELECT ?${variable} WHERE {
           if (windowText.length > 0) result.content = windowText;
         }
       }
+    }
+
+    if (result.has_more) {
+      ctx.enrich.truncated({
+        shown: result.content_chars_returned ?? 0,
+        cap: input.limit,
+        guidance: `More document content is available. Continue with offset=${(result.content_offset ?? 0) + (result.content_chars_returned ?? 0)}, or use content_mode "full".`,
+      });
     }
 
     return result;

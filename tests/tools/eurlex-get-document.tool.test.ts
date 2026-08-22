@@ -4,7 +4,7 @@
  */
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_get_document } from '@/mcp-server/tools/definitions/eurlex-get-document.tool.js';
 
@@ -375,7 +375,6 @@ describe('eurlex_get_document', () => {
   });
 
   it('content_mode "paged" returns contiguous windows that reconstruct the full body; has_more flips on the last page', async () => {
-    const ctx = createMockContext({ errors: eurlex_get_document.errors });
     const body = 'abcdefghij'.repeat(2_500); // 25,000 chars
     mockSparqlQuery.mockResolvedValue([makeMetaBinding({ celex: '32016R0679' })]);
     mockFetchContent.mockResolvedValue({
@@ -385,8 +384,9 @@ describe('eurlex_get_document', () => {
       language: 'EN',
     });
 
-    const page = (offset: number) =>
-      eurlex_get_document.handler(
+    const page = async (offset: number) => {
+      const ctx = createMockContext({ errors: eurlex_get_document.errors });
+      const result = await eurlex_get_document.handler(
         eurlex_get_document.input.parse({
           celex_number: '32016R0679',
           content_mode: 'paged',
@@ -395,28 +395,43 @@ describe('eurlex_get_document', () => {
         }),
         ctx,
       );
+      return { result, enrichment: getEnrichment(ctx) };
+    };
 
-    const p1 = await page(0);
+    const { result: p1, enrichment: enrichment1 } = await page(0);
     expect(p1.content_offset).toBe(0);
     expect(p1.content_chars_returned).toBe(10_000);
     expect(p1.content_chars_total).toBe(25_000);
     expect(p1.has_more).toBe(true);
+    expect(enrichment1).toMatchObject({
+      truncated: true,
+      shown: 10_000,
+      cap: 10_000,
+      notice: expect.stringContaining('offset=10000'),
+    });
 
     // Page 2 starts exactly where page 1 ended — no gap, no overlap.
     const next2 = (p1.content_offset ?? 0) + (p1.content_chars_returned ?? 0);
     expect(next2).toBe(10_000);
-    const p2 = await page(next2);
+    const { result: p2, enrichment: enrichment2 } = await page(next2);
     expect(p2.content_offset).toBe(10_000);
     expect(p2.content_chars_returned).toBe(10_000);
     expect(p2.has_more).toBe(true);
+    expect(enrichment2).toMatchObject({
+      truncated: true,
+      shown: 10_000,
+      cap: 10_000,
+      notice: expect.stringContaining('offset=20000'),
+    });
 
     // Final page.
     const next3 = (p2.content_offset ?? 0) + (p2.content_chars_returned ?? 0);
     expect(next3).toBe(20_000);
-    const p3 = await page(next3);
+    const { result: p3, enrichment: enrichment3 } = await page(next3);
     expect(p3.content_offset).toBe(20_000);
     expect(p3.content_chars_returned).toBe(5_000);
     expect(p3.has_more).toBe(false);
+    expect(enrichment3.truncated).toBeUndefined();
 
     // Contiguous pages reconstruct 100% of the act, and the last page's tail is the true end.
     const reconstructed = (p1.content ?? '') + (p2.content ?? '') + (p3.content ?? '');
@@ -988,7 +1003,9 @@ describe('eurlex_get_document', () => {
       const input = eurlex_get_document.input.parse({
         work_uri: 'http://publications.europa.eu/resource/cellar/no-celex-uuid',
       });
-      const err = await eurlex_get_document.handler(input, ctx).catch((e: unknown) => e);
+      const err = await Promise.resolve(eurlex_get_document.handler(input, ctx)).catch(
+        (e: unknown) => e,
+      );
       expect(err).toMatchObject({
         code: JsonRpcErrorCode.NotFound,
         data: { reason: 'not_found' },
@@ -1176,7 +1193,9 @@ describe('eurlex_get_document', () => {
         celex_number: '32016R0679\nGDPR',
         content_mode: 'metadata_only',
       });
-      const err = await eurlex_get_document.handler(input, ctx).catch((e: unknown) => e);
+      const err = await Promise.resolve(eurlex_get_document.handler(input, ctx)).catch(
+        (e: unknown) => e,
+      );
 
       const queries = queriesIssued();
       expect(queries.length).toBeGreaterThan(0);
@@ -1200,7 +1219,9 @@ describe('eurlex_get_document', () => {
         eli_uri: 'http://data.europa.eu/eli/reg/2016/679\nX',
         content_mode: 'metadata_only',
       });
-      const err = await eurlex_get_document.handler(input, ctx).catch((e: unknown) => e);
+      const err = await Promise.resolve(eurlex_get_document.handler(input, ctx)).catch(
+        (e: unknown) => e,
+      );
 
       const queries = queriesIssued();
       expect(queries.length).toBeGreaterThan(0);
