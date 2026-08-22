@@ -748,7 +748,7 @@ describe('eurlex_get_cases', () => {
       ],
       total: 1,
       offset: 0,
-      query_echo: { keyword: 'google' },
+      query_echo: { keyword: 'google', include_derivative: false },
     };
     const blocks = eurlex_get_cases.format!(output);
     expect(blocks[0]?.type).toBe('text');
@@ -770,7 +770,7 @@ describe('eurlex_get_cases', () => {
       ],
       total: 1,
       offset: 0,
-      query_echo: {},
+      query_echo: { include_derivative: false },
     };
     const blocks = eurlex_get_cases.format!(output);
     const text = (blocks[0] as { text: string }).text;
@@ -862,7 +862,7 @@ describe('eurlex_get_cases', () => {
       ],
       total: 1,
       offset: 0,
-      query_echo: { case_type: 'judgment' },
+      query_echo: { case_type: 'judgment', include_derivative: false },
     };
     const blocks = eurlex_get_cases.format!(output);
     const text = (blocks[0] as { text: string }).text;

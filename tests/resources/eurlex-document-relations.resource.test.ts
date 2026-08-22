@@ -104,7 +104,7 @@ describe('eurlex_document_relations_resource', () => {
       }),
     );
 
-    const params = eurlex_document_relations_resource.params.parse({ celexNumber: '32016R0679' });
+    const params = eurlex_document_relations_resource.params!.parse({ celexNumber: '32016R0679' });
     const result = await eurlex_document_relations_resource.handler(params, ctx);
 
     expect((result as Record<string, unknown>).celex_number).toBe('32016R0679');
@@ -136,7 +136,7 @@ describe('eurlex_document_relations_resource', () => {
       routeQuery({ resolve: [makeResolveBinding(GDPR_WORK_URI)], amendedBy: manyAmenders }),
     );
 
-    const params = eurlex_document_relations_resource.params.parse({ celexNumber: '32016R0679' });
+    const params = eurlex_document_relations_resource.params!.parse({ celexNumber: '32016R0679' });
     const result = (await eurlex_document_relations_resource.handler(params, ctx)) as Record<
       string,
       unknown
@@ -175,7 +175,7 @@ describe('eurlex_document_relations_resource', () => {
       }),
     );
 
-    const params = eurlex_document_relations_resource.params.parse({ celexNumber: '32012R0528' });
+    const params = eurlex_document_relations_resource.params!.parse({ celexNumber: '32012R0528' });
     const result = await eurlex_document_relations_resource.handler(params, ctx);
 
     const relations = (result as Record<string, unknown>).relations as Array<
@@ -210,7 +210,7 @@ describe('eurlex_document_relations_resource', () => {
       }),
     );
 
-    const params = eurlex_document_relations_resource.params.parse({ celexNumber: '32016R0679' });
+    const params = eurlex_document_relations_resource.params!.parse({ celexNumber: '32016R0679' });
     const result = await eurlex_document_relations_resource.handler(params, ctx);
 
     const relations = (result as Record<string, unknown>).relations as Array<
@@ -250,7 +250,7 @@ describe('eurlex_document_relations_resource', () => {
       }),
     );
 
-    const params = eurlex_document_relations_resource.params.parse({ celexNumber: '32016R0679' });
+    const params = eurlex_document_relations_resource.params!.parse({ celexNumber: '32016R0679' });
     const result = await eurlex_document_relations_resource.handler(params, ctx);
 
     const relations = (result as Record<string, unknown>).relations as Array<
@@ -285,7 +285,7 @@ describe('eurlex_document_relations_resource', () => {
       routeQuery({ resolve: [makeResolveBinding(GDPR_WORK_URI)], consolidated: consolidatedRaw }),
     );
 
-    const params = eurlex_document_relations_resource.params.parse({ celexNumber: '32016R0679' });
+    const params = eurlex_document_relations_resource.params!.parse({ celexNumber: '32016R0679' });
     const result = (await eurlex_document_relations_resource.handler(params, ctx)) as Record<
       string,
       unknown
@@ -317,7 +317,7 @@ describe('eurlex_document_relations_resource', () => {
       }),
     );
 
-    const params = eurlex_document_relations_resource.params.parse({ celexNumber: '32016R0679' });
+    const params = eurlex_document_relations_resource.params!.parse({ celexNumber: '32016R0679' });
     const result = await eurlex_document_relations_resource.handler(params, ctx);
 
     const relations = (result as Record<string, unknown>).relations as unknown[];
@@ -328,7 +328,7 @@ describe('eurlex_document_relations_resource', () => {
     const ctx = createMockContext({ tenantId: 'test-tenant' });
     mockQuery.mockImplementation(routeQuery({ resolve: [makeResolveBinding(GDPR_WORK_URI)] }));
 
-    const params = eurlex_document_relations_resource.params.parse({ celexNumber: '32016R0679' });
+    const params = eurlex_document_relations_resource.params!.parse({ celexNumber: '32016R0679' });
     const result = await eurlex_document_relations_resource.handler(params, ctx);
 
     const relations = (result as Record<string, unknown>).relations as unknown[];
@@ -342,7 +342,7 @@ describe('eurlex_document_relations_resource', () => {
     const ctx = createMockContext({ tenantId: 'test-tenant' });
     mockQuery.mockImplementation(routeQuery({ resolve: [] }));
 
-    const params = eurlex_document_relations_resource.params.parse({ celexNumber: '99999X0000' });
+    const params = eurlex_document_relations_resource.params!.parse({ celexNumber: '99999X0000' });
     await expect(eurlex_document_relations_resource.handler(params, ctx)).rejects.toThrow(
       'No CELLAR work',
     );
@@ -360,7 +360,7 @@ describe('eurlex_document_relations_resource', () => {
     mockQuery.mockImplementation(routeQuery({ resolve: [] }));
 
     const celexNumber = '32016R0679\\';
-    const params = eurlex_document_relations_resource.params.parse({ celexNumber });
+    const params = eurlex_document_relations_resource.params!.parse({ celexNumber });
     // The resource's own declared error, not a leaked backend compiler error.
     await expect(eurlex_document_relations_resource.handler(params, ctx)).rejects.toThrow(
       'No CELLAR work',
@@ -376,7 +376,7 @@ describe('eurlex_document_relations_resource', () => {
     const ctx = createMockContext({ tenantId: 'test-tenant' });
     mockQuery.mockImplementation(routeQuery({ resolve: [makeResolveBinding(GDPR_WORK_URI)] }));
 
-    const params = eurlex_document_relations_resource.params.parse({ celexNumber: '32016R0679' });
+    const params = eurlex_document_relations_resource.params!.parse({ celexNumber: '32016R0679' });
     await eurlex_document_relations_resource.handler(params, ctx);
 
     const sparql = mockQuery.mock.calls[0]?.[0] as string;

@@ -754,7 +754,7 @@ describe('eurlex_search_documents', () => {
       ],
       total: 1,
       offset: 0,
-      query_echo: { keyword: 'gdpr' },
+      query_echo: { keyword: 'gdpr', include_consolidated: false },
     };
     const blocks = eurlex_search_documents.format!(output);
     expect(blocks[0]?.type).toBe('text');
@@ -781,7 +781,7 @@ describe('eurlex_search_documents', () => {
       ],
       total: 1,
       offset: 0,
-      query_echo: {},
+      query_echo: { include_consolidated: false },
     };
     const blocks = eurlex_search_documents.format!(output);
     const text = (blocks[0] as { text: string }).text;
@@ -799,7 +799,7 @@ describe('eurlex_search_documents', () => {
       ],
       total: 1,
       offset: 0,
-      query_echo: {},
+      query_echo: { include_consolidated: false },
     };
     const blocks = eurlex_search_documents.format!(output);
     const text = (blocks[0] as { text: string }).text;

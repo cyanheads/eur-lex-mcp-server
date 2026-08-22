@@ -8,8 +8,8 @@ import { eurlex_comparative_analysis } from '@/mcp-server/prompts/definitions/eu
 
 describe('eurlex_comparative_analysis', () => {
   type GenArgs = Parameters<typeof eurlex_comparative_analysis.generate>[0];
-  const renderText = (args: GenArgs) => {
-    const messages = eurlex_comparative_analysis.generate(args);
+  const renderText = async (args: GenArgs) => {
+    const messages = await eurlex_comparative_analysis.generate(args);
     return (messages[0]!.content as { type: string; text: string }).text;
   };
   // Numbered analysis-framework headers whose bold title mentions enforcement.
@@ -18,9 +18,9 @@ describe('eurlex_comparative_analysis', () => {
 
   // --- Happy path: required args only ---
 
-  it('generates a valid user message for a domain with no focus', () => {
+  it('generates a valid user message for a domain with no focus', async () => {
     const args = eurlex_comparative_analysis.args!.parse({ domain: 'data privacy' });
-    const messages = eurlex_comparative_analysis.generate(args);
+    const messages = await eurlex_comparative_analysis.generate(args);
 
     expect(messages).toBeInstanceOf(Array);
     expect(messages.length).toBeGreaterThan(0);
@@ -40,12 +40,12 @@ describe('eurlex_comparative_analysis', () => {
     expect(text).toContain('courtlistener_search_opinions');
   });
 
-  it('incorporates focus into the generated prompt when provided', () => {
+  it('incorporates focus into the generated prompt when provided', async () => {
     const args = eurlex_comparative_analysis.args!.parse({
       domain: 'antitrust',
       focus: 'enforcement mechanisms',
     });
-    const messages = eurlex_comparative_analysis.generate(args);
+    const messages = await eurlex_comparative_analysis.generate(args);
     const text = (messages[0]!.content as { type: string; text: string }).text;
 
     expect(text).toContain('antitrust');
@@ -54,8 +54,8 @@ describe('eurlex_comparative_analysis', () => {
 
   // --- #37: focus normalization — an overlapping focus never spawns a second section ---
 
-  it('merges an overlapping focus into its axis without a duplicate section', () => {
-    const text = renderText(
+  it('merges an overlapping focus into its axis without a duplicate section', async () => {
+    const text = await renderText(
       eurlex_comparative_analysis.args!.parse({
         domain: 'data privacy',
         focus: 'enforcement mechanisms',
@@ -72,8 +72,8 @@ describe('eurlex_comparative_analysis', () => {
     expect(enforcementSections(text)).toHaveLength(1);
   });
 
-  it('adds a dedicated section for a focus that overlaps no axis', () => {
-    const text = renderText(
+  it('adds a dedicated section for a focus that overlaps no axis', async () => {
+    const text = await renderText(
       eurlex_comparative_analysis.args!.parse({
         domain: 'data privacy',
         focus: 'cross-border data transfers',
@@ -89,23 +89,21 @@ describe('eurlex_comparative_analysis', () => {
     expect(enforcementSections(text)).toHaveLength(1);
   });
 
-  it.each([
-    'enforcement',
-    'penalties',
-    'remedies',
-    'recent developments',
-  ])('folds overlapping focus "%s" into an existing axis rather than duplicating', (focus) => {
-    const text = renderText(
-      eurlex_comparative_analysis.args!.parse({ domain: 'data privacy', focus }),
-    );
-    // Overlapping focus keeps the generic swing-slot section and adds no deep dive.
-    expect(text).toContain('**Key differences**');
-    expect(text).not.toContain('Deep dive into this specific aspect');
-  });
+  it.each(['enforcement', 'penalties', 'remedies', 'recent developments'])(
+    'folds overlapping focus "%s" into an existing axis rather than duplicating',
+    async (focus) => {
+      const text = await renderText(
+        eurlex_comparative_analysis.args!.parse({ domain: 'data privacy', focus }),
+      );
+      // Overlapping focus keeps the generic swing-slot section and adds no deep dive.
+      expect(text).toContain('**Key differences**');
+      expect(text).not.toContain('Deep dive into this specific aspect');
+    },
+  );
 
-  it('uses generic "Key differences" section when focus is omitted', () => {
+  it('uses generic "Key differences" section when focus is omitted', async () => {
     const args = eurlex_comparative_analysis.args!.parse({ domain: 'AI regulation' });
-    const messages = eurlex_comparative_analysis.generate(args);
+    const messages = await eurlex_comparative_analysis.generate(args);
     const text = (messages[0]!.content as { type: string; text: string }).text;
 
     expect(text).toContain('Key differences');
@@ -113,9 +111,9 @@ describe('eurlex_comparative_analysis', () => {
     expect(text).not.toContain('undefined');
   });
 
-  it('message structure conforms to MCP message shape', () => {
+  it('message structure conforms to MCP message shape', async () => {
     const args = eurlex_comparative_analysis.args!.parse({ domain: 'food safety' });
-    const messages = eurlex_comparative_analysis.generate(args);
+    const messages = await eurlex_comparative_analysis.generate(args);
 
     for (const msg of messages) {
       expect(msg).toHaveProperty('role');

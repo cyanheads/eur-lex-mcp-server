@@ -65,7 +65,7 @@ describe('eurlex_document_resource', () => {
       }),
     ]);
 
-    const params = eurlex_document_resource.params.parse({ celexNumber: '32016R0679' });
+    const params = eurlex_document_resource.params!.parse({ celexNumber: '32016R0679' });
     const result = await eurlex_document_resource.handler(params, ctx);
 
     expect(result).toMatchObject({
@@ -98,7 +98,7 @@ describe('eurlex_document_resource', () => {
       }),
     ]);
 
-    const params = eurlex_document_resource.params.parse({ celexNumber: '32016R0679' });
+    const params = eurlex_document_resource.params!.parse({ celexNumber: '32016R0679' });
     const result = (await eurlex_document_resource.handler(params, ctx)) as Record<string, unknown>;
 
     // No raw authority URIs leak: type and author are human-readable labels.
@@ -121,7 +121,7 @@ describe('eurlex_document_resource', () => {
       }),
     ]);
 
-    const params = eurlex_document_resource.params.parse({ celexNumber: '32024R2822' });
+    const params = eurlex_document_resource.params!.parse({ celexNumber: '32024R2822' });
     const result = (await eurlex_document_resource.handler(params, ctx)) as Record<string, unknown>;
 
     expect(result.author_institution).toBe('European Commission');
@@ -132,7 +132,7 @@ describe('eurlex_document_resource', () => {
     const ctx = createMockContext({ tenantId: 'test-tenant' });
     mockQuery.mockResolvedValue([makeMetaBinding({ celex: '32016R0679' })]);
 
-    const params = eurlex_document_resource.params.parse({ celexNumber: '32016R0679' });
+    const params = eurlex_document_resource.params!.parse({ celexNumber: '32016R0679' });
     const result = await eurlex_document_resource.handler(params, ctx);
 
     expect((result as Record<string, unknown>).celex_number).toBe('32016R0679');
@@ -145,7 +145,7 @@ describe('eurlex_document_resource', () => {
     const ctx = createMockContext({ tenantId: 'test-tenant' });
     mockQuery.mockResolvedValue([makeMetaBinding({ celex: '32016R0679', inForce: 'false' })]);
 
-    const params = eurlex_document_resource.params.parse({ celexNumber: '32016R0679' });
+    const params = eurlex_document_resource.params!.parse({ celexNumber: '32016R0679' });
     const result = await eurlex_document_resource.handler(params, ctx);
 
     expect((result as Record<string, unknown>).in_force).toBe(false);
@@ -157,7 +157,7 @@ describe('eurlex_document_resource', () => {
     const ctx = createMockContext({ tenantId: 'test-tenant' });
     mockQuery.mockResolvedValue([makeMetaBinding({ celex: '32016R0679', inForce: '1' })]);
 
-    const params = eurlex_document_resource.params.parse({ celexNumber: '32016R0679' });
+    const params = eurlex_document_resource.params!.parse({ celexNumber: '32016R0679' });
     const result = await eurlex_document_resource.handler(params, ctx);
 
     expect((result as Record<string, unknown>).in_force).toBe(true);
@@ -171,7 +171,7 @@ describe('eurlex_document_resource', () => {
       makeMetaBinding({ celex: '32016R0679', title: 'General Data Protection Regulation' }),
     ]);
 
-    const params = eurlex_document_resource.params.parse({ celexNumber: '32016R0679' });
+    const params = eurlex_document_resource.params!.parse({ celexNumber: '32016R0679' });
     const result = await eurlex_document_resource.handler(params, ctx);
 
     expect((result as Record<string, unknown>).title).toBe('General Data Protection Regulation');
@@ -187,7 +187,7 @@ describe('eurlex_document_resource', () => {
     const ctx = createMockContext({ tenantId: 'test-tenant' });
     mockQuery.mockResolvedValue([]);
 
-    const params = eurlex_document_resource.params.parse({ celexNumber: '99999X0000' });
+    const params = eurlex_document_resource.params!.parse({ celexNumber: '99999X0000' });
     await expect(eurlex_document_resource.handler(params, ctx)).rejects.toThrow('No CELLAR work');
   });
 
@@ -204,7 +204,7 @@ describe('eurlex_document_resource', () => {
     mockQuery.mockResolvedValue([]);
 
     const celexNumber = '32016R0679\\';
-    const params = eurlex_document_resource.params.parse({ celexNumber });
+    const params = eurlex_document_resource.params!.parse({ celexNumber });
     // The resource's own declared error, not a leaked backend compiler error.
     await expect(eurlex_document_resource.handler(params, ctx)).rejects.toThrow('No CELLAR work');
 
@@ -220,7 +220,7 @@ describe('eurlex_document_resource', () => {
     mockQuery.mockResolvedValue([]);
 
     const celexNumber = '32016R0679\\" x';
-    const params = eurlex_document_resource.params.parse({ celexNumber });
+    const params = eurlex_document_resource.params!.parse({ celexNumber });
     await expect(eurlex_document_resource.handler(params, ctx)).rejects.toThrow('No CELLAR work');
 
     const sparql = mockQuery.mock.calls[0]?.[0] as string;
@@ -234,7 +234,7 @@ describe('eurlex_document_resource', () => {
     const ctx = createMockContext({ tenantId: 'test-tenant' });
     mockQuery.mockResolvedValue([makeMetaBinding({ celex: '32016R0679' })]);
 
-    const params = eurlex_document_resource.params.parse({ celexNumber: '32016R0679' });
+    const params = eurlex_document_resource.params!.parse({ celexNumber: '32016R0679' });
     await eurlex_document_resource.handler(params, ctx);
 
     const sparql = mockQuery.mock.calls[0]?.[0] as string;

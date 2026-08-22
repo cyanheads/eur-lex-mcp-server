@@ -19,6 +19,7 @@ import {
 function makeService(): CellarSparqlService {
   const serverConfig = {
     cellarSparqlEndpoint: 'http://cellar.test/sparql',
+    eurLexContentBaseUrl: 'http://content.test',
     sparqlQueryTimeoutMs: 5_000,
     maxSparqlResults: 100,
   } satisfies ServerConfig;

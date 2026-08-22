@@ -4,7 +4,7 @@ description: >
   DataCanvas primitive reference — a Tier 3 SQL/analytical workspace for tabular MCP servers, backed by DuckDB. Use when registering tables from upstream APIs, running ad-hoc SQL across them, and exporting results. Covers the acquire → register → query → export flow, per-table TTL, the token-sharing pattern for multi-agent collaboration, env config, and Cloudflare Workers fail-closed behavior.
 metadata:
   author: cyanheads
-  version: "1.9"
+  version: "2.1"
   audience: external
   type: reference
 ---
@@ -205,7 +205,7 @@ const result = await instance.query("SELECT total FROM sales_by_region WHERE reg
 
 ### `instance.importFrom(sourceCanvasId, sourceTableName, options?)`
 
-Copy a table from another canvas the caller controls into this one. The lifecycle wrapper validates tenancy on both ids before the provider sees either. Round-trips through a sandbox-rooted Parquet temp file so `TIMESTAMP`/`DATE`/`BLOB` columns survive losslessly.
+Copy a table from another canvas the caller controls into this one. The lifecycle wrapper validates tenancy on both ids before the provider sees either. Round-trips through a Parquet file under the scratch root (`CANVAS_TEMP_PATH`) so `TIMESTAMP`/`DATE`/`BLOB` columns survive losslessly.
 
 ```ts
 const imported = await target.importFrom(source.canvasId, 'orders', { asName: 'orders_copy' });
@@ -222,7 +222,7 @@ Export a canvas table. Path-based exports are sandboxed to `CANVAS_EXPORT_PATH` 
 // Path target — written inside the sandbox.
 await instance.export('g_with_obs', { format: 'parquet', path: 'observations.parquet' });
 
-// Stream target — copied to a temp file in the sandbox, piped to the stream, unlinked.
+// Stream target — copied to a file under the scratch root, piped to the stream, unlinked.
 await instance.export('g_with_obs', { format: 'csv', stream: writableStream });
 ```
 
@@ -274,6 +274,7 @@ If your tool surfaces row data via `structuredContent`, the JSON-safe shape flow
 | `CANVAS_PROVIDER_TYPE` | `canvas.providerType` | `none` (also: `duckdb`) |
 | `CANVAS_DEFAULT_MEMORY_LIMIT_MB` | `canvas.defaultMemoryLimitMb` | `1024` |
 | `CANVAS_EXPORT_PATH` | `canvas.exportRootPath` | `./.canvas-exports` |
+| `CANVAS_TEMP_PATH` | `canvas.tempRootPath` | `<os.tmpdir()>/mcp-canvas` |
 | `CANVAS_MAX_CANVASES_PER_TENANT` | `canvas.maxCanvasesPerTenant` | `100` |
 | `CANVAS_TTL_MS` | `canvas.ttlMs` | `86_400_000` (24 h) |
 | `CANVAS_ABSOLUTE_CAP_MS` | `canvas.absoluteCapMs` | `604_800_000` (7 d) |
@@ -295,7 +296,7 @@ Most canvas use cases are public-data analytics: fetch from an upstream API, sta
 | Table naming | `spillover()` auto-names the table `spilled_<id>`; pass `tableName` for a stable handle. A dataframe-query surface commonly adds its own `df_<id>` convention. |
 | Access control | Possession of the `canvas_id` is access — unguessable in practice (see [token-sharing model](#the-token-sharing-model)). TTL + the framework rate limiter backstop brute force. |
 | Enable flag | None of your own — canvas presence is the gate (`CANVAS_PROVIDER_TYPE=duckdb`; `getCanvas()` returns `undefined` otherwise). |
-| Tools | A fetcher that spills **plus a `dataframe_query` tool — mandatory once anything emits a `canvas_id`**: a token with no query tool in the same server is dead output (the agent can't reach the staged data). `dataframe_describe` is strongly recommended — it lets the agent discover staged table and column names before writing SQL. `dataframe_drop` is optional. None are framework-provided; you register them. |
+| Tools | A fetcher that spills **plus the dataframe trio — all three ship whenever canvas is integrated**. `dataframe_query` is mandatory once anything emits a `canvas_id`: a token with no query tool in the same server is dead output (the agent can't reach the staged data). `dataframe_describe` is required alongside it — the agent discovers staged table and column names before writing SQL. `dataframe_drop` is implemented but **opt-in via a server env var**: when the flag is off, register it with `disabledTool()` (see `add-tool`) so it stays visible in the manifest with the enable hint while uncallable. None are framework-provided; you register them. |
 | Fetcher output | Two things in one response: the inline preview (answer to the immediate question) and the table handle (escape hatch for follow-up SQL via `dataframe_query`). Neither replaces the other. |
 
 > The `MCP_HTTP_MAX_BODY_BYTES` request-body cap is **inbound-only** — it bounds the JSON-RPC request, not the upstream data a handler stages into the canvas or the rows it returns. Canvas servers send small requests (queries, SQL, canvas IDs) regardless of dataset size, so the cap never constrains canvas ingestion.

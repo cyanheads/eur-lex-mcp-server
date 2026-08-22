@@ -6,8 +6,10 @@
  *
  * @module vitest.config
  */
-import { defineConfig, mergeConfig } from 'vitest/config';
+
+// @ts-expect-error @cyanheads/mcp-ts-core publishes this runtime config without a declaration file.
 import coreConfig from '@cyanheads/mcp-ts-core/vitest.config';
+import { defineConfig, mergeConfig } from 'vitest/config';
 
 const alias = { '@/': new URL('./src/', import.meta.url).pathname };
 

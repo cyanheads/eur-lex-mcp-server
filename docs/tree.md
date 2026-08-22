@@ -1,11 +1,9 @@
 # eur-lex-mcp-server - Directory Structure
 
-Generated on: 2026-07-16 09:10:33
+Generated on: 2026-08-22 21:20:34
 
 ```text
 eur-lex-mcp-server/
-├── .agents/
-├── .claude/
 ├── .claude-plugin/
 │   └── plugin.json
 ├── .codex-plugin/
@@ -16,6 +14,8 @@ eur-lex-mcp-server/
 │   │   ├── bug_report.yml
 │   │   ├── config.yml
 │   │   └── feature_request.yml
+│   ├── CODE_OF_CONDUCT.md
+│   ├── CONTRIBUTING.md
 │   ├── FUNDING.yml
 │   └── SECURITY.md
 ├── .vscode/

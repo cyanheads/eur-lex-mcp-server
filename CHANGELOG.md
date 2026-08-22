@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.9.9](changelog/0.9.x/0.9.9.md) — 2026-08-22
+
+eurlex_get_document adds continuation guidance for paged bodies; mcp-ts-core 0.12.3 brings MCP 2026-07-28, strict tool inputs, structured error envelopes, explicit stateless HTTP, and refreshed tooling
+
 ## [0.9.8](changelog/0.9.x/0.9.8.md) — 2026-07-16
 
 eurlex_query_sparql's maxSparqlResults ceiling now bounds the outermost query result instead of the first LIMIT in the text, so a subselect no longer leaves the outer query uncapped or gets the caller's own inner LIMIT silently rewritten
