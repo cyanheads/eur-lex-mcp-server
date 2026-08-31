@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.9.9-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/eur-lex-mcp-server) [![MCP Server](https://img.shields.io/badge/MCP%20Server-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/eur-lex-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/eur-lex-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.9.10-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/eur-lex-mcp-server) [![MCP Server](https://img.shields.io/badge/MCP%20Server-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/eur-lex-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/eur-lex-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -33,7 +33,7 @@ Seven tools covering EU legal research — document discovery, content retrieval
 
 | Tool | Description |
 |:-----|:------------|
-| `eurlex_search_documents` | Search EU legislation, treaties, and preparatory acts across the CELLAR corpus. Filters by document type, date range, EuroVoc concept, author institution, and in-force status. |
+| `eurlex_search_documents` | Search EU legislation, treaties, and preparatory acts across the CELLAR corpus. Filters by document category, date range, EuroVoc concept, author institution, and in-force status; consolidated texts can be folded in through the selected basic-act family. |
 | `eurlex_get_document` | Fetch structured metadata and full text (HTML, Markdown, or Formex4 XML) for a work by CELEX number or ELI URI. |
 | `eurlex_lookup_celex` | Resolve an EU legal citation — a CELEX number or an ELI URI — to the canonical CELLAR work. |
 | `eurlex_get_cases` | Search CJEU and General Court case law — judgments, orders, and Advocate General opinions — by case number, party name, subject, or date range. |
@@ -46,7 +46,8 @@ Seven tools covering EU legal research — document discovery, content retrieval
 Search EU legislation, treaties, preparatory acts, and more across the 2.7M+ work CELLAR corpus.
 
 - Keyword search across work titles and CELEX string patterns
-- Filter by document type (`REG`, `DIR`, `DEC`, `TREATY`, and more)
+- Filter by document category (`REG`, `DIR`, `DEC`, `TREATY`, and more), with each category expanding to its reviewed CELLAR authority family
+- Optionally include consolidated texts whose basic act belongs to the selected category
 - Date range filtering (`date_from`, `date_to`)
 - EuroVoc concept filtering — use `eurlex_browse_subjects` first to resolve concept IDs
 - Filter to in-force acts only

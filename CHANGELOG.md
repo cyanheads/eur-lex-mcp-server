@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.9.10](changelog/0.9.x/0.9.10.md) — 2026-08-30
+
+eurlex_search_documents now maps each public document category to the exact CELLAR authority family and only admits consolidated texts through the selected basic act, with labels/docs covering the newly returned variants
+
 ## [0.9.9](changelog/0.9.x/0.9.9.md) — 2026-08-22
 
 eurlex_get_document adds continuation guidance for paged bodies; mcp-ts-core 0.12.3 brings MCP 2026-07-28, strict tool inputs, structured error envelopes, explicit stateless HTTP, and refreshed tooling
