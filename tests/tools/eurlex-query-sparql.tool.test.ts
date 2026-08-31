@@ -320,7 +320,50 @@ describe('eurlex_query_sparql', () => {
     const text = (eurlex_query_sparql.format!(output)[0] as { text: string }).text;
 
     // Delimiters stay unambiguous — an embedded quote cannot close the literal.
-    expect(text).toContain(String.raw`"say \"hi\" \\ bye"`);
+    expect(text).toContain(String.raw`"say \\"hi\\" \\\\ bye"`);
+  });
+
+  it('format makes only literal lexical content safe inside the GFM table layer', () => {
+    const output = {
+      bindings: [
+        {
+          iri: { type: 'uri', value: 'http://example.org/resource' },
+          literal: {
+            type: 'literal',
+            value: 'a|b\r\n<tag>*bold*_under_`code` &copy; [link](url)',
+          },
+          typed: {
+            type: 'literal',
+            datatype: 'http://www.w3.org/2001/XMLSchema#string',
+            value: 'say "hi" \\ bye',
+          },
+          lang: { type: 'literal', 'xml:lang': 'en', value: 'left|right\nnext' },
+          blank: { type: 'bnode', value: 'node-1' },
+          // `missing` stays unbound.
+        },
+      ],
+      variables: ['iri', 'literal', 'typed', 'lang', 'blank', 'missing'],
+      total: 1,
+    };
+    const before = structuredClone(output.bindings);
+
+    const text = (eurlex_query_sparql.format!(output)[0] as { text: string }).text;
+    const tableLines = text.split('\n').filter((line) => line.startsWith('| '));
+    expect(tableLines).toHaveLength(3);
+    const row = tableLines[2] ?? '';
+
+    // Six cells plus the two table-edge delimiters; the lexical pipe is escaped.
+    expect(row.match(/(?<!\\)\|/g)).toHaveLength(7);
+    expect(row).toContain('"a\\|b\\\\r\\\\n\\<tag\\>\\*bold\\*\\_under\\_\\`code\\`');
+    expect(row).toContain('\\&copy; \\[link\\](url)');
+    expect(row).toContain(String.raw`"say \\"hi\\" \\\\ bye"^^xsd:string`);
+    expect(row).toContain('"left\\|right\\\\nnext"@en');
+
+    // The Markdown-safety layer never rewrites structural term syntax.
+    expect(row).toContain('<http://example.org/resource>');
+    expect(row).toContain('_:node-1');
+    expect(row).toMatch(/\|\s*\|$/);
+    expect(output.bindings).toEqual(before);
   });
 
   it('format keeps every row when rendering term metadata (#50 parity preserved)', () => {

@@ -23,6 +23,26 @@ function formatDatatype(datatype: string): string {
 }
 
 /**
+ * Encode a literal lexical form for the Markdown layer after applying the
+ * SPARQL string escapes that preserve its term identity. Only lexical content
+ * is encoded; term delimiters, datatype suffixes, and language tags are added
+ * afterward and remain ordinary SPARQL/Turtle syntax.
+ */
+function formatLiteralLexical(value: string): string {
+  const sparqlEscaped = value
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\r\n/g, '\\r\\n')
+    .replace(/\r/g, '\\r')
+    .replace(/\n/g, '\\n');
+
+  return sparqlEscaped
+    .replace(/\\/g, '\\\\')
+    .replace(/\|/g, '\\|')
+    .replace(/([<>&*_[\]`~])/g, '\\$1');
+}
+
+/**
  * Render a SPARQL term in the Turtle/SPARQL syntax the query language itself
  * uses: `<iri>`, `_:label`, `"lexical"`, `"lexical"@en`, `"lexical"^^xsd:date`.
  *
@@ -38,7 +58,7 @@ function formatSparqlTerm(term: SparqlTerm | undefined): string {
   if (term.type === 'uri') return `<${term.value}>`;
   if (term.type === 'bnode') return `_:${term.value}`;
 
-  const lexical = `"${term.value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+  const lexical = `"${formatLiteralLexical(term.value)}"`;
   const lang = term['xml:lang'];
   if (lang) return `${lexical}@${lang}`;
   if (term.datatype) return `${lexical}^^${formatDatatype(term.datatype)}`;
