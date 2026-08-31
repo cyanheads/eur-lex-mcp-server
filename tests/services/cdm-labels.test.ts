@@ -144,6 +144,11 @@ const RESOURCE_TYPE_BASE = 'http://publications.europa.eu/resource/authority/res
 const REG_URI = `${RESOURCE_TYPE_BASE}REG`;
 const REG_IMPL_URI = `${RESOURCE_TYPE_BASE}REG_IMPL`;
 const REG_DEL_URI = `${RESOURCE_TYPE_BASE}REG_DEL`;
+const DIR_IMPL_URI = `${RESOURCE_TYPE_BASE}DIR_IMPL`;
+const DEC_FRAMW_URI = `${RESOURCE_TYPE_BASE}DEC_FRAMW`;
+const VIEW_AG_URI = `${RESOURCE_TYPE_BASE}VIEW_AG`;
+const PROP_REG_URI = `${RESOURCE_TYPE_BASE}PROP_REG`;
+const RECO_URI = `${RESOURCE_TYPE_BASE}RECO`;
 
 /**
  * Derivative sector-6 case-law resource-types, verified against the live authority
@@ -177,6 +182,14 @@ describe('resolveResourceTypeLabel', () => {
     // Regression guard: the real CELLAR codes must not fall through to the raw segment.
     expect(resolveResourceTypeLabel(INFO_JUDICIAL_URI)).not.toBe('INFO_JUDICIAL');
     expect(resolveResourceTypeLabel(SUM_JUR_URI)).not.toBe('SUM_JUR');
+  });
+
+  it('resolves newly admitted document-family types to human-readable labels (#65)', () => {
+    expect(resolveResourceTypeLabel(DIR_IMPL_URI)).toBe('Implementing Directive');
+    expect(resolveResourceTypeLabel(DEC_FRAMW_URI)).toBe('Framework Decision');
+    expect(resolveResourceTypeLabel(VIEW_AG_URI)).toBe('AG View');
+    expect(resolveResourceTypeLabel(PROP_REG_URI)).toBe('Proposal for a Regulation');
+    expect(resolveResourceTypeLabel(RECO_URI)).toBe('Recommendation');
   });
 
   it('falls back to the last path segment for an unmapped resource-type URI', () => {

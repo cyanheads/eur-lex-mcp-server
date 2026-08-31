@@ -16,26 +16,56 @@ import {
 import { escapeSparqlLiteral, isSafeSparqlIri } from '@/services/cellar-sparql/eli-resolution.js';
 import { isConsolidatedCelex } from '@/services/cellar-sparql/relation-traversal.js';
 
-/** CDM resource type URIs for common document categories. */
-const DOCUMENT_TYPE_URIS: Record<string, string> = {
-  REG: 'http://publications.europa.eu/resource/authority/resource-type/REG',
-  DIR: 'http://publications.europa.eu/resource/authority/resource-type/DIR',
-  DEC: 'http://publications.europa.eu/resource/authority/resource-type/DEC',
-  TREATY: 'http://publications.europa.eu/resource/authority/resource-type/TREATY',
-  JUDG: 'http://publications.europa.eu/resource/authority/resource-type/JUDG',
-  OPIN_AG: 'http://publications.europa.eu/resource/authority/resource-type/OPIN_AG',
-  PROP: 'http://publications.europa.eu/resource/authority/resource-type/PROP_DIR',
-  REC: 'http://publications.europa.eu/resource/authority/resource-type/REC_SOFT',
-};
+const RESOURCE_TYPE_BASE = 'http://publications.europa.eu/resource/authority/resource-type/';
+
+const DOCUMENT_TYPES = ['REG', 'DIR', 'DEC', 'TREATY', 'JUDG', 'OPIN_AG', 'PROP', 'REC'] as const;
+type DocumentType = (typeof DOCUMENT_TYPES)[number];
+
+/**
+ * Exact CELLAR authority codes admitted by each public document category.
+ *
+ * The resource-type authority scheme exposes these as separate top concepts, so
+ * category membership cannot be derived from a hierarchy or URI prefix. Draft
+ * regulation/directive/decision/recommendation concepts describe proposals and
+ * are deliberately excluded from the corresponding adopted-act families.
+ */
+const DOCUMENT_TYPE_FAMILIES = {
+  REG: ['REG', 'REG_ADOPT_INTERNATION', 'REG_DEL', 'REG_FINANC', 'REG_IMPL'],
+  DIR: ['DIR', 'DIR_DEL', 'DIR_IMPL'],
+  DEC: ['DEC', 'DEC_ADOPT_INTERNATION', 'DEC_DEL', 'DEC_ENTSCHEID', 'DEC_FRAMW', 'DEC_IMPL'],
+  TREATY: ['TREATY'],
+  JUDG: ['JUDG'],
+  OPIN_AG: ['OPIN_AG', 'VIEW_AG'],
+  PROP: [
+    'AMEND_PROP',
+    'AMEND_PROP_DEC',
+    'AMEND_PROP_DIR',
+    'AMEND_PROP_REG',
+    'JOINT_PROP_DEC',
+    'JOINT_PROP_REG',
+    'PROP_ACT',
+    'PROP_DEC',
+    'PROP_DEC_IMPL',
+    'PROP_DEC_NO_ADDRESSEE',
+    'PROP_DIR',
+    'PROP_DRAFT',
+    'PROP_JOINT_ACTION',
+    'PROP_OPIN',
+    'PROP_RECO',
+    'PROP_REG',
+    'PROP_REG_IMPL',
+    'PROP_RES',
+  ],
+  REC: ['RECO', 'RECO_ADOPT_INTERNATION', 'RECO_DEC', 'RECO_RECO', 'RECO_REG'],
+} as const satisfies Record<DocumentType, readonly string[]>;
 
 /**
  * CDM resource-type URI for consolidated texts. A point-in-time consolidation of
  * an act (e.g. 02014R0833-20260424) carries this type — NOT its base type (REG,
- * DIR, …) — so a `?type = <base>` filter excludes consolidations unless it is
- * widened to also admit this URI. Confirmed live against CELLAR for a known
- * consolidation.
+ * DIR, …). Its document category therefore comes from the basic act reached by
+ * `cdm:act_consolidated_based_on_resource_legal`, not from this generic type.
  */
-const CONS_TEXT_URI = 'http://publications.europa.eu/resource/authority/resource-type/CONS_TEXT';
+const CONS_TEXT_URI = `${RESOURCE_TYPE_BASE}CONS_TEXT`;
 
 export const eurlex_search_documents = tool('eurlex_search_documents', {
   title: 'Search EU Documents',
@@ -53,20 +83,20 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
       .union([
         z.literal(''),
         z
-          .enum(['REG', 'DIR', 'DEC', 'TREATY', 'JUDG', 'OPIN_AG', 'PROP', 'REC'])
+          .enum(DOCUMENT_TYPES)
           .describe(
             'Document type: REG=Regulation, DIR=Directive, DEC=Decision, TREATY=Treaty, JUDG=Judgment, OPIN_AG=AG Opinion, PROP=Proposal, REC=Recommendation.',
           ),
       ])
       .optional()
       .describe(
-        'Document type: REG=Regulation, DIR=Directive, DEC=Decision, TREATY=Treaty, JUDG=Judgment, OPIN_AG=AG Opinion, PROP=Proposal, REC=Recommendation. Omit to search all types. A type filter excludes consolidated texts (CONS_TEXT) — set include_consolidated to fold them back in.',
+        'Document category: REG=Regulations, DIR=Directives, DEC=Decisions, TREATY=Treaties, JUDG=Judgments, OPIN_AG=AG Opinions, PROP=Proposals, REC=Recommendations. Each category includes its explicit CELLAR authority variants (for example, delegated and implementing regulations). Omit to search all types. Consolidated texts are excluded unless include_consolidated is true.',
       ),
     include_consolidated: z
       .boolean()
       .default(false)
       .describe(
-        'When true and document_type is set, also match consolidated texts (CONS_TEXT) of that type — point-in-time versions that a plain type filter omits. No effect when document_type is omitted. Consolidated rows are always tagged is_consolidated: true.',
+        'When true and document_type is set, also match consolidated texts whose basic act belongs to that document category. No effect when document_type is omitted. Consolidated rows are always tagged is_consolidated: true.',
       ),
     date_from: z
       .union([
@@ -173,7 +203,7 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
         include_consolidated: z
           .boolean()
           .describe(
-            'Effective include_consolidated value after the false default is applied — whether consolidated texts (CONS_TEXT) of the document_type were folded in. Always present, since the default shapes which records can appear; has effect only when document_type is set.',
+            'Effective include_consolidated value after the false default is applied — whether consolidated texts whose basic act belongs to the document_type category were included. Always present, since the default shapes which records can appear; has effect only when document_type is set.',
           ),
         date_from: z.string().optional().describe('Start date filter applied.'),
         date_to: z.string().optional().describe('End date filter applied.'),
@@ -222,18 +252,23 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
     const svc = getCellarSparqlService();
 
     const filters: string[] = [];
+    let documentTypeClause = '';
     if (input.document_type) {
-      const typeUri = DOCUMENT_TYPE_URIS[input.document_type];
-      if (typeUri) {
-        // A consolidated text carries resource-type CONS_TEXT, not its base type,
-        // so a bare `?type = <base>` filter drops it. When the caller opts in,
-        // widen the filter to also admit CONS_TEXT rows (issue #30).
-        filters.push(
-          input.include_consolidated
-            ? `FILTER(?type = <${typeUri}> || ?type = <${CONS_TEXT_URI}>)`
-            : `FILTER(?type = <${typeUri}>)`,
-        );
-      }
+      const typeValues = DOCUMENT_TYPE_FAMILIES[input.document_type]
+        .map((code) => `<${RESOURCE_TYPE_BASE}${code}>`)
+        .join(' ');
+      documentTypeClause = `VALUES ?selectedType { ${typeValues} }
+  ${
+    input.include_consolidated
+      ? `{
+    ?work cdm:work_has_resource-type ?selectedType .
+  } UNION {
+    ?work cdm:work_has_resource-type <${CONS_TEXT_URI}> ;
+      cdm:act_consolidated_based_on_resource_legal ?basicAct .
+    ?basicAct cdm:work_has_resource-type ?selectedType .
+  }`
+      : '?work cdm:work_has_resource-type ?selectedType .'
+  }`;
     }
     if (input.date_from?.trim()) {
       filters.push(`FILTER(?date >= "${input.date_from.trim()}"^^xsd:date)`);
@@ -380,6 +415,7 @@ SELECT
   (SAMPLE(?date) AS ?docDate)
   (MAX(?title) AS ?docTitle) WHERE {
   ?work cdm:resource_legal_id_celex ?celexNumber .
+  ${documentTypeClause}
   OPTIONAL { ?work cdm:work_has_resource-type ?type . }
   OPTIONAL { ?work cdm:work_date_document ?date . }
   OPTIONAL {

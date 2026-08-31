@@ -16,8 +16,22 @@ export const ENG_LANGUAGE_URI = 'http://publications.europa.eu/resource/authorit
  */
 export const RESOURCE_TYPE_LABELS: Record<string, string> = {
   'http://publications.europa.eu/resource/authority/resource-type/REG': 'Regulation',
+  'http://publications.europa.eu/resource/authority/resource-type/REG_ADOPT_INTERNATION':
+    'Regulation Adopted by International Bodies',
+  'http://publications.europa.eu/resource/authority/resource-type/REG_FINANC':
+    'Financial Regulation',
   'http://publications.europa.eu/resource/authority/resource-type/DIR': 'Directive',
+  'http://publications.europa.eu/resource/authority/resource-type/DIR_DEL': 'Delegated Directive',
+  'http://publications.europa.eu/resource/authority/resource-type/DIR_IMPL':
+    'Implementing Directive',
   'http://publications.europa.eu/resource/authority/resource-type/DEC': 'Decision',
+  'http://publications.europa.eu/resource/authority/resource-type/DEC_ADOPT_INTERNATION':
+    'Decision Adopted by International Bodies',
+  'http://publications.europa.eu/resource/authority/resource-type/DEC_DEL': 'Delegated Decision',
+  'http://publications.europa.eu/resource/authority/resource-type/DEC_ENTSCHEID': 'Decision',
+  'http://publications.europa.eu/resource/authority/resource-type/DEC_FRAMW': 'Framework Decision',
+  'http://publications.europa.eu/resource/authority/resource-type/DEC_IMPL':
+    'Implementing Decision',
   'http://publications.europa.eu/resource/authority/resource-type/TREATY': 'Treaty',
   'http://publications.europa.eu/resource/authority/resource-type/JUDG': 'Judgment',
   'http://publications.europa.eu/resource/authority/resource-type/ORDER': 'Order',
@@ -25,7 +39,48 @@ export const RESOURCE_TYPE_LABELS: Record<string, string> = {
   'http://publications.europa.eu/resource/authority/resource-type/AG_OPI': 'AG Opinion',
   'http://publications.europa.eu/resource/authority/resource-type/VIEW_AG': 'AG View',
   'http://publications.europa.eu/resource/authority/resource-type/RULING': 'Ruling',
-  'http://publications.europa.eu/resource/authority/resource-type/PROP_DIR': 'Proposal',
+  'http://publications.europa.eu/resource/authority/resource-type/AMEND_PROP': 'Amended Proposal',
+  'http://publications.europa.eu/resource/authority/resource-type/AMEND_PROP_DEC':
+    'Amended Proposal for a Decision',
+  'http://publications.europa.eu/resource/authority/resource-type/AMEND_PROP_DIR':
+    'Amended Proposal for a Directive',
+  'http://publications.europa.eu/resource/authority/resource-type/AMEND_PROP_REG':
+    'Amended Proposal for a Regulation',
+  'http://publications.europa.eu/resource/authority/resource-type/JOINT_PROP_DEC':
+    'Joint Proposal for a Decision',
+  'http://publications.europa.eu/resource/authority/resource-type/JOINT_PROP_REG':
+    'Joint Proposal for a Regulation',
+  'http://publications.europa.eu/resource/authority/resource-type/PROP_ACT': 'Proposal for an Act',
+  'http://publications.europa.eu/resource/authority/resource-type/PROP_DEC':
+    'Proposal for a Decision',
+  'http://publications.europa.eu/resource/authority/resource-type/PROP_DEC_IMPL':
+    'Proposal for an Implementing Decision',
+  'http://publications.europa.eu/resource/authority/resource-type/PROP_DEC_NO_ADDRESSEE':
+    'Proposal for a Decision without Addressee',
+  'http://publications.europa.eu/resource/authority/resource-type/PROP_DIR':
+    'Proposal for a Directive',
+  'http://publications.europa.eu/resource/authority/resource-type/PROP_DRAFT': 'Draft Proposal',
+  'http://publications.europa.eu/resource/authority/resource-type/PROP_JOINT_ACTION':
+    'Proposal for a Joint Action',
+  'http://publications.europa.eu/resource/authority/resource-type/PROP_OPIN':
+    'Proposal for an Opinion',
+  'http://publications.europa.eu/resource/authority/resource-type/PROP_RECO':
+    'Proposal for a Recommendation',
+  'http://publications.europa.eu/resource/authority/resource-type/PROP_REG':
+    'Proposal for a Regulation',
+  'http://publications.europa.eu/resource/authority/resource-type/PROP_REG_IMPL':
+    'Proposal for an Implementing Regulation',
+  'http://publications.europa.eu/resource/authority/resource-type/PROP_RES':
+    'Proposal for a Resolution',
+  'http://publications.europa.eu/resource/authority/resource-type/RECO': 'Recommendation',
+  'http://publications.europa.eu/resource/authority/resource-type/RECO_ADOPT_INTERNATION':
+    'Recommendation Adopted by International Bodies',
+  'http://publications.europa.eu/resource/authority/resource-type/RECO_DEC':
+    'Recommendation for a Decision',
+  'http://publications.europa.eu/resource/authority/resource-type/RECO_RECO':
+    'Recommendation for a Recommendation',
+  'http://publications.europa.eu/resource/authority/resource-type/RECO_REG':
+    'Recommendation for a Regulation',
   'http://publications.europa.eu/resource/authority/resource-type/REC_SOFT': 'Recommendation',
   'http://publications.europa.eu/resource/authority/resource-type/RES': 'Resolution',
   'http://publications.europa.eu/resource/authority/resource-type/AGREE_INTERNATION':

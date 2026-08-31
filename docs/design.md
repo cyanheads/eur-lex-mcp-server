@@ -6,7 +6,7 @@
 
 | Name | Description | Key Inputs | Annotations |
 |:-----|:------------|:-----------|:------------|
-| `eurlex_search_documents` | Search EU legislation, case law, treaties, and preparatory acts across the CELLAR corpus. Filters by document type, date range, EuroVoc subject concept, author institution, and in-force status. Returns CELEX numbers, work URIs, document types, and dates — use these with `eurlex_get_document` to fetch full content. | `keyword?`, `document_type?`, `date_from?`, `date_to?`, `eurovoc_concept?`, `in_force?`, `offset?` (default `0`), `limit` (default `20`, max `100`) | `readOnlyHint: true` |
+| `eurlex_search_documents` | Search EU legislation, case law, treaties, and preparatory acts across the CELLAR corpus. Filters by document category, date range, EuroVoc subject concept, author institution, and in-force status. Each category maps to an explicit family of CELLAR authority types; consolidated texts remain excluded unless requested, then qualify through the type of their basic act. Returns CELEX numbers, work URIs, document types, and dates — use these with `eurlex_get_document` to fetch full content. | `keyword?`, `document_type?`, `include_consolidated?` (default `false`), `date_from?`, `date_to?`, `eurovoc_concept?`, `author_institution?`, `in_force?`, `offset?` (default `0`), `limit` (default `20`, max `100`) | `readOnlyHint: true` |
 | `eurlex_get_document` | Fetch the notice (metadata) and full text of a work by CELEX number or ELI URI. Returns structured metadata (title, date, document type, author institution, legal basis, EuroVoc subjects) plus the HTML, Markdown, or Formex4 XML content in the requested language. Large bodies are paged (`content_mode`/`offset`/`limit`) or reachable in full; `outline` returns a structural heading list and `select` returns specific sections by number. Defaults to English; not all works have content in all 24 official languages. | `celex_number` or `eli_uri`, `language?` (default `"EN"`), `format?` (`"html"` default, `"markdown"`, `"xml"` Formex4), `content_mode?` (`"paged"` default, `"full"`, `"metadata_only"`), `offset?`/`limit?`, `outline?`, `select?` (`{ articles?, chapters?, recitals?, annexes? }`) | `readOnlyHint: true, idempotentHint: true` |
 | `eurlex_lookup_celex` | Resolve an EU legal citation — a CELEX number or an ELI URI — to the canonical CELLAR work. Returns the work URI, confirmed CELEX number, document type, date, and whether the work exists in the corpus. The EUR-Lex analog of `courtlistener_lookup_citation`. | `identifier` (CELEX / ELI), `identifier_type?` (`"celex"` \| `"eli"` \| `"auto"`, default `"auto"`) | `readOnlyHint: true, idempotentHint: true` |
 | `eurlex_get_cases` | Search CJEU and General Court case law — judgments, orders, and Advocate General opinions — by case number, party name, subject, or date range. Primary records only by default; derivative information notices, abstracts, summaries, and corrigenda are excluded unless `include_derivative` opts in. Returns case identifier, court, date, document type, and the parties. Distinct from `eurlex_search_documents` because case law has its own CELEX sector (`6`) and practitioners search it differently. | `case_number?`, `keyword?`, `court?` (`"CJEU"` \| `"GC"`), `case_type?` (`"judgment"` \| `"order"` \| `"ag_opinion"`), `include_derivative?` (default `false`), `date_from?`, `date_to?`, `offset?` (default `0`), `limit` (default `20`, max `100`) | `readOnlyHint: true` |
@@ -95,16 +95,17 @@ Both services are HTTP-only, no auth. `CellarSparqlService` POSTs `application/x
 
 ## Domain Mapping
 
-| Noun | CELEX Sector | CDM Type URI | Operations |
-|:-----|:-------------|:-------------|:-----------|
-| Regulation | `3` + `R` | `resource-type/REG` | search, get, get-relations, lookup |
-| Directive | `3` + `L` | `resource-type/DIR` | search, get, get-relations, lookup |
-| Decision | `3` + `D` | `resource-type/DEC` | search, get, get-relations, lookup |
-| Treaty | `1` | `resource-type/TREATY` | search, get, lookup |
-| CJEU Judgment | `6` + `CJ` | `resource-type/JUDG` | get-cases, get, lookup |
-| General Court Judgment | `6` + `TJ` | `resource-type/JUDG` | get-cases, get, lookup |
-| AG Opinion | `6` + `CC` / `6` + `CX` | `resource-type/OPIN_AG` | get-cases, get, lookup |
-| Preparatory Act | `5` | Various | search, get, lookup |
+| Noun | CELEX Sector | Search authority family | Operations |
+|:-----|:-------------|:------------------------|:-----------|
+| Regulation | `3` + `R` | `REG`, `REG_ADOPT_INTERNATION`, `REG_DEL`, `REG_FINANC`, `REG_IMPL` | search, get, get-relations, lookup |
+| Directive | `3` + `L` | `DIR`, `DIR_DEL`, `DIR_IMPL` | search, get, get-relations, lookup |
+| Decision | `3` + `D` | `DEC`, `DEC_ADOPT_INTERNATION`, `DEC_DEL`, `DEC_ENTSCHEID`, `DEC_FRAMW`, `DEC_IMPL` | search, get, get-relations, lookup |
+| Treaty | `1` | `TREATY` | search, get, lookup |
+| CJEU Judgment | `6` + `CJ` | `JUDG` | get-cases, get, lookup |
+| General Court Judgment | `6` + `TJ` | `JUDG` | get-cases, get, lookup |
+| AG Opinion | `6` + `CC` / `6` + `CX` | `OPIN_AG`, `VIEW_AG` | get-cases, get, lookup |
+| Proposal | `5` | `AMEND_PROP`, `AMEND_PROP_DEC`, `AMEND_PROP_DIR`, `AMEND_PROP_REG`, `JOINT_PROP_DEC`, `JOINT_PROP_REG`, `PROP_ACT`, `PROP_DEC`, `PROP_DEC_IMPL`, `PROP_DEC_NO_ADDRESSEE`, `PROP_DIR`, `PROP_DRAFT`, `PROP_JOINT_ACTION`, `PROP_OPIN`, `PROP_RECO`, `PROP_REG`, `PROP_REG_IMPL`, `PROP_RES` | search, get, lookup |
+| Recommendation | `3` + `H` | `RECO`, `RECO_ADOPT_INTERNATION`, `RECO_DEC`, `RECO_RECO`, `RECO_REG` | search, get, lookup |
 | EuroVoc Concept | — | `skos:Concept` | browse-subjects |
 
 ---
@@ -155,6 +156,9 @@ Not `cdm:work_is_about_subject_matter` (that's a separate EU subject-matter auth
 
 **Title keyword search via the `bif:contains` full-text index (issue #17)**
 The title match runs through Virtuoso's `bif:contains` full-text index rather than a `FILTER(CONTAINS(LCASE(?title), …))` scan: the scan forced the expression graph to be joined for every candidate work before the term was tested, so a broad keyword timed out. Multi-word input is quoted as a single phrase (`bif:contains "'data protection'"`), and an exact CELEX substring match is preserved as a UNION arm; the input is sanitised to letters, digits, and spaces so it cannot break out of the phrase. (The EuroVoc label search in `eurlex_browse_subjects` is a different path and still uses `FILTER(CONTAINS(LCASE(?label), …))`.)
+
+**Document categories use explicit authority families; consolidations follow the basic-act edge**
+The CELLAR resource-type authority publishes the variants as separate top concepts, without a hierarchy that can safely expand `REG`, `DIR`, or the other public categories. `eurlex_search_documents` therefore uses a reviewed exact-code family for each `document_type`; name-prefix matching is not part of the contract, and draft regulation/directive/decision/recommendation concepts remain proposal records rather than adopted-act family members. When `include_consolidated` is enabled, a `CONS_TEXT` work qualifies only when `cdm:act_consolidated_based_on_resource_legal` reaches a basic act in the selected family. The broader `cdm:act_consolidated_consolidates_resource_legal` relation remains appropriate for relationship traversal, but is not a type discriminator because it can also point to amendments and prior consolidations.
 
 **Resources are supplementary**
 `eurlex://document/{celexNumber}` covers the `tools/list`-stable URI use case; the content is fully reachable through `eurlex_get_document`. No unique data lives only in resources.
@@ -272,11 +276,18 @@ Search by type + date:
 ```sparql
 PREFIX cdm: <http://publications.europa.eu/ontology/cdm#>
 SELECT ?work ?celexNumber ?type ?date WHERE {
+  VALUES ?selectedType {
+    <http://publications.europa.eu/resource/authority/resource-type/REG>
+    <http://publications.europa.eu/resource/authority/resource-type/REG_ADOPT_INTERNATION>
+    <http://publications.europa.eu/resource/authority/resource-type/REG_DEL>
+    <http://publications.europa.eu/resource/authority/resource-type/REG_FINANC>
+    <http://publications.europa.eu/resource/authority/resource-type/REG_IMPL>
+  }
   ?work cdm:resource_legal_id_celex ?celexNumber .
-  ?work cdm:work_has_resource-type ?type .
+  ?work cdm:work_has_resource-type ?selectedType .
+  OPTIONAL { ?work cdm:work_has_resource-type ?type . }
   ?work cdm:work_date_document ?date .
   FILTER(?date >= "2023-01-01"^^xsd:date)
-  FILTER(?type = <http://publications.europa.eu/resource/authority/resource-type/REG>)
 } ORDER BY DESC(?date) LIMIT 20 OFFSET 0
 ```
 

@@ -9,6 +9,38 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_search_documents } from '@/mcp-server/tools/definitions/eurlex-search-documents.tool.js';
 import { escapeSparqlLiteral } from '@/services/cellar-sparql/eli-resolution.js';
 
+const RESOURCE_TYPE_BASE = 'http://publications.europa.eu/resource/authority/resource-type/';
+
+const EXPECTED_DOCUMENT_TYPE_FAMILIES = {
+  REG: ['REG', 'REG_ADOPT_INTERNATION', 'REG_DEL', 'REG_FINANC', 'REG_IMPL'],
+  DIR: ['DIR', 'DIR_DEL', 'DIR_IMPL'],
+  DEC: ['DEC', 'DEC_ADOPT_INTERNATION', 'DEC_DEL', 'DEC_ENTSCHEID', 'DEC_FRAMW', 'DEC_IMPL'],
+  TREATY: ['TREATY'],
+  JUDG: ['JUDG'],
+  OPIN_AG: ['OPIN_AG', 'VIEW_AG'],
+  PROP: [
+    'AMEND_PROP',
+    'AMEND_PROP_DEC',
+    'AMEND_PROP_DIR',
+    'AMEND_PROP_REG',
+    'JOINT_PROP_DEC',
+    'JOINT_PROP_REG',
+    'PROP_ACT',
+    'PROP_DEC',
+    'PROP_DEC_IMPL',
+    'PROP_DEC_NO_ADDRESSEE',
+    'PROP_DIR',
+    'PROP_DRAFT',
+    'PROP_JOINT_ACTION',
+    'PROP_OPIN',
+    'PROP_RECO',
+    'PROP_REG',
+    'PROP_REG_IMPL',
+    'PROP_RES',
+  ],
+  REC: ['RECO', 'RECO_ADOPT_INTERNATION', 'RECO_DEC', 'RECO_RECO', 'RECO_REG'],
+} as const;
+
 // --- Service mock ---
 const mockQuery = vi.fn();
 vi.mock('@/services/cellar-sparql/cellar-sparql-service.js', () => ({
@@ -99,15 +131,71 @@ describe('eurlex_search_documents', () => {
     expect(sparql).toContain('OFFSET 20');
   });
 
-  it('applies document_type filter to SPARQL', async () => {
-    const ctx = createMockContext({ errors: eurlex_search_documents.errors });
-    mockQuery.mockResolvedValue([makeDocBinding('32016L0680')]);
+  it.each(Object.entries(EXPECTED_DOCUMENT_TYPE_FAMILIES))(
+    'applies the verified %s authority-type family with exact VALUES membership',
+    async (documentType, expectedCodes) => {
+      const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+      mockQuery.mockResolvedValue([makeDocBinding('32016L0680')]);
 
-    const input = eurlex_search_documents.input.parse({ document_type: 'DIR' });
-    await eurlex_search_documents.handler(input, ctx);
+      const input = eurlex_search_documents.input.parse({ document_type: documentType });
+      await eurlex_search_documents.handler(input, ctx);
+
+      const sparql = mockQuery.mock.calls[0]?.[0] as string;
+      const valuesBlock = /VALUES \?selectedType \{([^}]*)\}/.exec(sparql)?.[1] ?? '';
+      const actualCodes = [...valuesBlock.matchAll(/resource-type\/([^>]+)>/g)].map(
+        ([, code]) => code,
+      );
+      expect(actualCodes).toEqual(expectedCodes);
+    },
+  );
+
+  it('keeps drafts and lookalike authority types outside finalized-act families', async () => {
+    const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+    mockQuery.mockResolvedValue([makeDocBinding('32026R1844')]);
+
+    await eurlex_search_documents.handler(
+      eurlex_search_documents.input.parse({ document_type: 'REG' }),
+      ctx,
+    );
 
     const sparql = mockQuery.mock.calls[0]?.[0] as string;
-    expect(sparql).toContain('http://publications.europa.eu/resource/authority/resource-type/DIR');
+    expect(sparql).not.toContain(`<${RESOURCE_TYPE_BASE}REG_DRAFT>`);
+    expect(sparql).not.toContain(`<${RESOURCE_TYPE_BASE}REG_IMPL_DRAFT>`);
+    expect(sparql).not.toContain(`<${RESOURCE_TYPE_BASE}DIRECTORY>`);
+  });
+
+  it('targets live RECO types instead of the unbound REC_SOFT code', async () => {
+    const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+    mockQuery.mockResolvedValue([makeDocBinding('32026H1835')]);
+
+    await eurlex_search_documents.handler(
+      eurlex_search_documents.input.parse({ document_type: 'REC' }),
+      ctx,
+    );
+
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    expect(sparql).toContain(`<${RESOURCE_TYPE_BASE}RECO>`);
+    expect(sparql).not.toContain(`<${RESOURCE_TYPE_BASE}REC_SOFT>`);
+    expect(sparql).not.toContain(`<${RESOURCE_TYPE_BASE}RECO_DRAFT>`);
+  });
+
+  it('returns and renders a newly admitted sibling type with its human-readable label', async () => {
+    const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+    mockQuery.mockResolvedValue([
+      makeDocBinding('32011L0042', {
+        types: `${RESOURCE_TYPE_BASE}DIR_IMPL`,
+        title: 'Implementing directive example',
+      }),
+    ]);
+
+    const result = await eurlex_search_documents.handler(
+      eurlex_search_documents.input.parse({ document_type: 'DIR' }),
+      ctx,
+    );
+
+    expect(result.documents[0]?.resource_type).toBe('Implementing Directive');
+    const text = (eurlex_search_documents.format!(result)[0] as { text: string }).text;
+    expect(text).toContain('**Type:** Implementing Directive');
   });
 
   it('applies date_from and date_to filters', async () => {
@@ -134,8 +222,25 @@ describe('eurlex_search_documents', () => {
     const input = eurlex_search_documents.input.parse({ keyword: 'nonexistent-term-xyz' });
     await expect(eurlex_search_documents.handler(input, ctx)).rejects.toMatchObject({
       code: JsonRpcErrorCode.NotFound,
+      data: {
+        reason: 'no_results',
+        recovery: {
+          hint: 'Broaden the search by removing filters, trying a shorter keyword, or expanding the date range.',
+        },
+      },
+    });
+  });
+
+  it('reports no_results when an offset is past the end of the result set', async () => {
+    const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+    mockQuery.mockResolvedValue([]);
+
+    const input = eurlex_search_documents.input.parse({ keyword: 'data', offset: 10_000 });
+    await expect(eurlex_search_documents.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
       data: { reason: 'no_results' },
     });
+    expect(mockQuery.mock.calls[0]?.[0]).toContain('OFFSET 10000');
   });
 
   it('includes query_echo in the response', async () => {
@@ -605,7 +710,7 @@ describe('eurlex_search_documents', () => {
 
   // --- Consolidated texts: include_consolidated filter + is_consolidated tag (issue #30) ---
 
-  it('the default type filter stays narrow and excludes CONS_TEXT (issue #30)', async () => {
+  it('the default type-family join stays narrow and excludes CONS_TEXT (issues #30, #65)', async () => {
     const ctx = createMockContext({ errors: eurlex_search_documents.errors });
     mockQuery.mockResolvedValue([makeDocBinding('32014R0833')]);
 
@@ -616,13 +721,12 @@ describe('eurlex_search_documents', () => {
     await eurlex_search_documents.handler(input, ctx);
 
     const sparql = mockQuery.mock.calls[0]?.[0] as string;
-    expect(sparql).toContain(
-      'FILTER(?type = <http://publications.europa.eu/resource/authority/resource-type/REG>)',
-    );
+    expect(sparql).toContain('VALUES ?selectedType {');
+    expect(sparql).toContain('?work cdm:work_has_resource-type ?selectedType');
     expect(sparql).not.toContain('resource-type/CONS_TEXT');
   });
 
-  it('include_consolidated broadens the type filter to admit CONS_TEXT (issue #30)', async () => {
+  it('include_consolidated admits only CONS_TEXT whose basic act is in the selected family (#66)', async () => {
     const ctx = createMockContext({ errors: eurlex_search_documents.errors });
     mockQuery.mockResolvedValue([makeDocBinding('02014R0833-20260424')]);
 
@@ -631,14 +735,27 @@ describe('eurlex_search_documents', () => {
       document_type: 'REG',
       include_consolidated: true,
     });
-    await eurlex_search_documents.handler(input, ctx);
+    const result = await eurlex_search_documents.handler(input, ctx);
 
     const sparql = mockQuery.mock.calls[0]?.[0] as string;
-    // The filter now matches the base type OR the consolidated resource-type.
-    expect(sparql).toContain(
-      'FILTER(?type = <http://publications.europa.eu/resource/authority/resource-type/REG> || ' +
-        '?type = <http://publications.europa.eu/resource/authority/resource-type/CONS_TEXT>)',
-    );
+    expect(sparql).toContain('?work cdm:work_has_resource-type ?selectedType');
+    expect(sparql).toContain(`?work cdm:work_has_resource-type <${RESOURCE_TYPE_BASE}CONS_TEXT>`);
+    expect(sparql).toContain('cdm:act_consolidated_based_on_resource_legal ?basicAct');
+    expect(sparql).toContain('?basicAct cdm:work_has_resource-type ?selectedType');
+    // Live cross-family counterexample: 02007D0777-20150613 is based on the
+    // DEC_ENTSCHEID work 32007D0777 but `consolidates` also reaches REG/REG_IMPL amendments.
+    expect(sparql).not.toContain('cdm:act_consolidated_consolidates_resource_legal');
+    // Live missing-duplicate counterexample: 02004R1356-20081127 has the correct
+    // `based_on` edge to 32004R1356 without a matching `consolidates` edge.
+    expect(sparql).not.toMatch(/based_on_resource_legal[\s\S]+consolidates_resource_legal/);
+
+    expect(result.documents[0]).toMatchObject({
+      celex_number: '02014R0833-20260424',
+      is_consolidated: true,
+    });
+    const text = (eurlex_search_documents.format!(result)[0] as { text: string }).text;
+    expect(text).toContain('### 02014R0833-20260424');
+    expect(text).toContain('**Consolidated:** true');
   });
 
   it('include_consolidated adds no CONS_TEXT clause when document_type is omitted (issue #30)', async () => {
