@@ -32,6 +32,8 @@ import {
 } from '@/services/eurlex-content/act-structure.js';
 import {
   type ContentFormat,
+  type ContentUnavailabilityReason,
+  EURLEX_LANGUAGES,
   type EurLexLanguage,
   getEurLexContentService,
 } from '@/services/eurlex-content/eurlex-content-service.js';
@@ -39,12 +41,33 @@ import {
 /**
  * Default character window returned for body content in "paged" mode — bounds a
  * single call while keeping small acts whole. The tail of a larger act is never
- * lost: page forward with `offset`, or request `content_mode: "full"`.
+ * lost: page forward with `offset`.
  */
 const DEFAULT_CONTENT_LIMIT = 25_000;
 
-/** Hard ceiling on one paged window. Use `content_mode: "full"` for the whole body in a single call. */
+/** Hard ceiling on any one body window, including an oversized "full" request. */
 const MAX_CONTENT_LIMIT = 100_000;
+
+/** Case-insensitive pattern derived from the canonical supported-language list. */
+const EURLEX_LANGUAGE_PATTERN = new RegExp(
+  `^(?:${EURLEX_LANGUAGES.map((code) =>
+    [...code].map((letter) => `[${letter}${letter.toLowerCase()}]`).join(''),
+  ).join('|')})$`,
+);
+
+/**
+ * Present HTML/XML source as literal text without allowing source-owned tildes
+ * to close the surrounding CommonMark fence.
+ */
+function formatLiteralSource(content: string, format: 'html' | 'xml'): string {
+  let longestTildeRun = 0;
+  for (const run of content.matchAll(/~+/g)) {
+    longestTildeRun = Math.max(longestTildeRun, run[0].length);
+  }
+  const fence = '~'.repeat(Math.max(3, longestTildeRun + 1));
+  const closingSeparator = content.endsWith('\n') ? '' : '\n';
+  return `${fence}${format}\n${content}${closingSeparator}${fence}`;
+}
 
 /**
  * Per-dimension row cap for the multi-valued metadata queries (authors, legal
@@ -58,7 +81,7 @@ const META_DIMENSION_LIMIT = 100;
 export const eurlex_get_document = tool('eurlex_get_document', {
   title: 'Get EU Document',
   description:
-    'Fetch the metadata and full text of an EU act by CELEX number, ELI URI, or work URI. Returns structured metadata (title, date, type, author institution, legal basis, EuroVoc subjects, in-force status) plus the act body as HTML, Markdown, or Formex4 XML, defaulting to English with automatic fallback. Large bodies are paged by default (offset/limit with has_more) or returned whole with content_mode "full"; use outline: true for a heading map and select to pull specific articles, chapters, recitals, or annexes.',
+    'Fetch the metadata and full text of an EU act by CELEX number, ELI URI, or work URI. Returns structured metadata (title, date, type, author institution, legal basis, EuroVoc subjects, in-force status) plus the act body as HTML, Markdown, or Formex4 XML, defaulting to English with automatic fallback. Ordinary offset-based paged windows and full-mode windows are capped at 100,000 characters; page with offset/limit to reconstruct larger acts, or use outline: true for a heading map and select to pull specific articles, chapters, recitals, or annexes.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     celex_number: z
@@ -90,10 +113,12 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       ),
     language: z
       .string()
-      .regex(/^[A-Za-z]{2,3}$/)
+      .regex(EURLEX_LANGUAGE_PATTERN, 'language must be one of the 24 supported EUR-Lex codes')
+      .overwrite((value) => value.toUpperCase())
+      .pipe(z.enum(EURLEX_LANGUAGES))
       .default('EN')
       .describe(
-        'Language code for document content (ISO 639-1 uppercase, e.g. EN, FR, DE). Defaults to EN, and falls back to EN if the requested language is unavailable.',
+        'One of the 24 supported two-letter EUR-Lex language codes (e.g. EN, FR, DE), accepted case-insensitively and normalized to uppercase. Defaults to EN, and falls back to EN if the requested language is unavailable.',
       ),
     format: z
       .enum(['html', 'xml', 'markdown'])
@@ -105,7 +130,7 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .enum(['metadata_only', 'paged', 'full'])
       .default('paged')
       .describe(
-        'How much of the body to return. "paged" (default) returns a bounded character window (see offset/limit); "full" returns the entire body in one call (large acts can be hundreds of KB); "metadata_only" skips the content fetch. offset and limit apply only to "paged".',
+        `How much of the body to return. "paged" (default) returns an offset/limit window; "full" requests from the start and returns at most ${MAX_CONTENT_LIMIT} characters with continuation metadata when more exists; "metadata_only" skips the content fetch. offset and limit apply only to "paged".`,
       ),
     offset: z
       .number()
@@ -122,7 +147,7 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .max(MAX_CONTENT_LIMIT)
       .default(DEFAULT_CONTENT_LIMIT)
       .describe(
-        `Maximum characters to return in this window ("paged" mode only). Default ${DEFAULT_CONTENT_LIMIT}, max ${MAX_CONTENT_LIMIT}. For the entire body in one response, use content_mode "full".`,
+        `Maximum characters to return in this window ("paged" mode only). Default ${DEFAULT_CONTENT_LIMIT}, max ${MAX_CONTENT_LIMIT}. Follow has_more and the returned offsets until false to reconstruct the complete body.`,
       ),
     outline: z
       .boolean()
@@ -213,7 +238,7 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .string()
       .optional()
       .describe(
-        'Body content of the act in the requested format and language. In "paged" mode a character window (see content_offset / content_chars_returned / has_more); in "full" mode the entire body; omitted in "metadata_only" mode, when the window is empty, or when content is unavailable.',
+        `Body content of the act in the requested format and language. In "paged" mode this is the requested window; in "full" mode it starts at zero and is capped at ${MAX_CONTENT_LIMIT} characters. Omitted in "metadata_only" mode, when the window is empty, or when content is unavailable.`,
       ),
     content_mode: z
       .string()
@@ -222,6 +247,17 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .boolean()
       .describe(
         'Whether body content was fetched from EUR-Lex. False in "metadata_only" mode (no fetch attempted) — use content_mode to distinguish "not requested" from "unavailable upstream".',
+      ),
+    content_status: z
+      .enum(['not_requested', 'available', 'unavailable'])
+      .describe(
+        'Body resolution status: "not_requested" for metadata-only calls, "available" when a body was resolved, or "unavailable" after ordinary resolution attempts returned no usable body.',
+      ),
+    content_unavailability_reason: z
+      .enum(['no_representation', 'upstream_failure', 'multipart_incomplete'])
+      .optional()
+      .describe(
+        'Why content_status is "unavailable": no representation exists, the upstream request failed, or a multipart Formex body could not be assembled completely.',
       ),
     content_offset: z
       .number()
@@ -247,9 +283,15 @@ export const eurlex_get_document = tool('eurlex_get_document', {
     has_more: z
       .boolean()
       .describe(
-        'True when body content exists beyond the returned window. Page forward with offset = content_offset + content_chars_returned, or request content_mode "full". Always false in "metadata_only" mode.',
+        'True when body content exists beyond the returned window. Continue in "paged" mode with offset = content_offset + content_chars_returned until false. Always false in "metadata_only" mode.',
       ),
     language: z.string().describe('Language code of the returned content.'),
+    requested_language: z
+      .string()
+      .optional()
+      .describe(
+        'Originally requested language code when English fallback changed the effective language reported in language.',
+      ),
     language_fallback: z
       .string()
       .optional()
@@ -334,18 +376,11 @@ export const eurlex_get_document = tool('eurlex_get_document', {
         'Verify the identifier with eurlex_lookup_celex; a CELLAR work with no CELEX cannot be fetched as a document.',
     },
     {
-      reason: 'language_unavailable',
-      code: JsonRpcErrorCode.NotFound,
-      when: 'Requested language has no content in EUR-Lex after fallback to English also failed.',
-      recovery:
-        'Retry with language "EN" explicitly, or accept content_available: false and use metadata only.',
-    },
-    {
-      reason: 'content_fetch_failed',
+      reason: 'content_challenge',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'EUR-Lex content API returned non-200 after language fallback attempts.',
+      when: 'The primary content response is an AWS WAF bot-challenge interstitial rather than legal text.',
       recovery:
-        'The EUR-Lex content API may be temporarily unavailable. Retry after a short delay.',
+        'Retry shortly, or use content_mode "metadata_only" while the content host challenge persists.',
     },
   ],
 
@@ -408,7 +443,7 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       requestedCelex = resolvedCelex;
     }
 
-    const language = (input.language.trim().toUpperCase() || 'EN') as EurLexLanguage;
+    const language = input.language as EurLexLanguage;
     const format = input.format as ContentFormat;
 
     // Metadata fetch (#33): one query per multi-valued dimension, never a
@@ -521,10 +556,11 @@ SELECT ?${variable} WHERE {
 
     // Step 2: assemble metadata, then shape the body per content_mode. The body
     // is one navigable mechanism — "metadata_only" skips the fetch entirely,
-    // "full" returns the whole body, and "paged" returns a bounded
+    // "full" returns the first per-call window, and "paged" returns a bounded
     // [offset, offset+limit) window with content_chars_total + has_more so the
-    // tail is always reachable. The same shaped `content` feeds both
-    // structuredContent and format(); there is no separate truncation downstream.
+    // tail is always reachable through subsequent calls. The same shaped
+    // `content` feeds both structuredContent and format(); there is no separate
+    // truncation downstream.
     const result: {
       celex_number: string;
       requested_celex?: string;
@@ -543,11 +579,14 @@ SELECT ?${variable} WHERE {
       content?: string;
       content_mode: string;
       content_available: boolean;
+      content_status: 'not_requested' | 'available' | 'unavailable';
+      content_unavailability_reason?: ContentUnavailabilityReason;
       content_offset?: number;
       content_chars_returned?: number;
       content_chars_total?: number;
       has_more: boolean;
       language: string;
+      requested_language?: string;
       language_fallback?: string;
       content_format: string;
       outline?: ActHeading[];
@@ -557,6 +596,7 @@ SELECT ?${variable} WHERE {
       celex_number: metaResult.confirmedCelex,
       content_mode: input.content_mode,
       content_available: false,
+      content_status: input.content_mode === 'metadata_only' ? 'not_requested' : 'unavailable',
       has_more: false,
       language,
       content_format: format,
@@ -597,9 +637,16 @@ SELECT ?${variable} WHERE {
 
     if (body) {
       result.content_available = body.contentAvailable;
+      result.content_status = body.contentAvailable ? 'available' : 'unavailable';
       result.language = body.language;
+      if (body.language !== language) {
+        result.requested_language = language;
+      }
       if (body.languageFallback) {
         result.language_fallback = body.languageFallback;
+      }
+      if (!body.contentAvailable && body.unavailabilityReason) {
+        result.content_unavailability_reason = body.unavailabilityReason;
       }
 
       if (body.contentAvailable && body.content) {
@@ -633,10 +680,11 @@ SELECT ?${variable} WHERE {
           result.content_chars_returned = selection.text.length;
           if (selection.text.length > 0) result.content = selection.text;
         } else if (input.content_mode === 'full') {
-          result.content = full;
+          const windowText = full.slice(0, MAX_CONTENT_LIMIT);
+          result.content = windowText;
           result.content_offset = 0;
-          result.content_chars_returned = total;
-          result.has_more = false;
+          result.content_chars_returned = windowText.length;
+          result.has_more = windowText.length < total;
         } else {
           // Bounded [offset, offset+limit) window over the full body. offset is
           // clamped to the body length so over-paging returns an empty window
@@ -652,10 +700,12 @@ SELECT ?${variable} WHERE {
     }
 
     if (result.has_more) {
+      const nextOffset = (result.content_offset ?? 0) + (result.content_chars_returned ?? 0);
+      const cap = input.content_mode === 'full' ? MAX_CONTENT_LIMIT : input.limit;
       ctx.enrich.truncated({
         shown: result.content_chars_returned ?? 0,
-        cap: input.limit,
-        guidance: `More document content is available. Continue with offset=${(result.content_offset ?? 0) + (result.content_chars_returned ?? 0)}, or use content_mode "full".`,
+        cap,
+        guidance: `More document content is available. Continue with content_mode="paged" and offset=${nextOffset}.`,
       });
     }
 
@@ -700,7 +750,16 @@ SELECT ?${variable} WHERE {
       lines.push(`**EuroVoc Subjects:** ${result.eurovoc_subjects.join(', ')}`);
     }
     lines.push(`**Language:** ${result.language} | **Format:** ${result.content_format}`);
+    if (result.requested_language) {
+      lines.push(
+        `**Requested language:** ${result.requested_language} | **Effective content language:** ${result.language}`,
+      );
+    }
     if (result.language_fallback) lines.push(`*Note: ${result.language_fallback}*`);
+    lines.push(`**Content status:** ${result.content_status}`);
+    if (result.content_unavailability_reason) {
+      lines.push(`**Content unavailable because:** ${result.content_unavailability_reason}`);
+    }
 
     // Body rendering honors the same window as structuredContent.content — the
     // shaped content is emitted verbatim with a navigation line; no second cut.
@@ -718,7 +777,12 @@ SELECT ?${variable} WHERE {
       // Navigation status — always rendered so every navigation field (content_mode,
       // content_offset, content_chars_returned/total, has_more) reaches the text
       // channel too, whichever view (window / outline / selection) shaped the body.
-      if (result.content_mode === 'full') {
+      if (result.content_mode === 'full' && result.has_more) {
+        lines.push(
+          `**Body** (full request, capped): characters ${start}–${end} of ${total} (${returned} returned). ` +
+            `Continue with content_mode="paged" and offset=${end}.`,
+        );
+      } else if (result.content_mode === 'full') {
         lines.push(
           `**Body** (full): full body — ${returned} of ${total} characters from offset ${start}.`,
         );
@@ -726,7 +790,7 @@ SELECT ?${variable} WHERE {
         lines.push(
           `**Body** (${result.content_mode}): characters ${start}–${end} of ${total} (${returned} returned).` +
             (result.has_more
-              ? ` More available — page forward with offset=${end}, or content_mode="full" for the entire act.`
+              ? ` More available — continue with content_mode="paged" and offset=${end}.`
               : ''),
         );
       }
@@ -771,7 +835,11 @@ SELECT ?${variable} WHERE {
         lines.push('');
         lines.push('---');
         lines.push('');
-        lines.push(result.content);
+        lines.push(
+          result.content_format === 'html' || result.content_format === 'xml'
+            ? formatLiteralSource(result.content, result.content_format)
+            : result.content,
+        );
       } else if (!result.outline && !result.selection) {
         lines.push('');
         lines.push(

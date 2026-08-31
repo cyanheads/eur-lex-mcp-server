@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.9.10-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/eur-lex-mcp-server) [![MCP Server](https://img.shields.io/badge/MCP%20Server-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/eur-lex-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/eur-lex-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.10.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/eur-lex-mcp-server) [![MCP Server](https://img.shields.io/badge/MCP%20Server-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/eur-lex-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/eur-lex-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -34,7 +34,7 @@ Seven tools covering EU legal research — document discovery, content retrieval
 | Tool | Description |
 |:-----|:------------|
 | `eurlex_search_documents` | Search EU legislation, treaties, and preparatory acts across the CELLAR corpus. Filters by document category, date range, EuroVoc concept, author institution, and in-force status; consolidated texts can be folded in through the selected basic-act family. |
-| `eurlex_get_document` | Fetch structured metadata and full text (HTML, Markdown, or Formex4 XML) for a work by CELEX number or ELI URI. |
+| `eurlex_get_document` | Fetch structured metadata and full text (HTML, Markdown, or Formex4 XML) for a work by CELEX number, ELI URI, or CELLAR work URI. |
 | `eurlex_lookup_celex` | Resolve an EU legal citation — a CELEX number or an ELI URI — to the canonical CELLAR work. |
 | `eurlex_get_cases` | Search CJEU and General Court case law — judgments, orders, and Advocate General opinions — by case number, party name, subject, or date range. |
 | `eurlex_get_relations` | Traverse the CELLAR relationship graph: amendment chain, consolidated versions, legal basis, citation network, and national transposition measures. |
@@ -60,12 +60,13 @@ Search EU legislation, treaties, preparatory acts, and more across the 2.7M+ wor
 
 Fetch the notice and full text of an EU legal act.
 
-- Accepts CELEX numbers (e.g., `32016R0679`) or ELI URIs
+- Accepts CELEX numbers (e.g., `32016R0679`), ELI URIs, or CELLAR work URIs
 - Returns structured metadata: title, date, document type, author institution, legal basis, EuroVoc subjects, in-force flag
 - Full text in HTML (default), Markdown, or Formex4 XML — `format: "markdown"` converts the act body to clean Markdown server-side (recitals and numbered points as readable text, genuine data tables as GFM)
-- Content shaping for large acts: `content_mode` `"paged"` (default) returns a bounded character window (`offset` + `limit`) with `content_chars_total` and `has_more` so you can page to the end; `"full"` returns the whole body in one call; `"metadata_only"` skips the body
+- Content shaping for large acts: ordinary offset-based `"paged"` windows and `"full"` windows are capped at 100,000 characters; `content_mode` `"paged"` (default) returns the requested character window (`offset` + `limit`), while `"full"` returns the first window from offset zero. Both include `content_chars_total`, `content_offset`, `content_chars_returned`, and `has_more`, so repeated paged calls can reconstruct the complete body without loss; `"metadata_only"` skips the body, while structural outline/selection behavior is unchanged
 - Navigate structure instead of raw offsets: `outline: true` returns the act's chapters, articles, annexes, and recitals as a heading list (each with its character offset), and `select` (e.g. `{ articles: "1,5,17" }`) returns just those sections' text — degrading cleanly to the paging floor for acts with no detectable structure (e.g. case law)
-- Supports all 24 official EU languages; defaults to English with automatic fallback when a translation is unavailable
+- Supports the 24 EUR-Lex language codes case-insensitively, normalizes them to uppercase, defaults to English, and automatically falls back to English when a requested translation is unavailable
+- Preserves the exact shaped body in structured output; HTML and XML are shown literally in the text response inside a source-safe tilde fence, while Markdown remains rendered Markdown
 - Older acts and some CJEU judgments may lack English translations
 
 ---
@@ -147,14 +148,14 @@ EUR-Lex-specific:
 - `CellarSparqlService` POSTs `application/x-www-form-urlencoded` SPARQL with CDM prefix declarations built in; server-side LIMIT enforcement (max 100) prevents Virtuoso timeout abuse
 - `EurLexContentService` fetches act text from the CELLAR content-negotiation resolver (`/resource/celex/{CELEX}` with `Accept` / `Accept-Language` headers); HTML and Formex4 XML pass through, Markdown is converted server-side from the HTML body
 - Virtuoso error classification: HTTP 200 with `Virtuoso 37000 Error` body is parsed and re-raised as `ServiceUnavailable` (transient/timeout) or `InvalidParams` (syntax error)
-- Language fallback on document fetch: if the requested language is unavailable, retries with English; returns metadata-only with a note when English also fails
+- Language fallback on document fetch: if the requested language is unavailable, retries with English and reports requested/effective language parity; ordinary absence after both attempts remains a successful metadata response with `content_status` and a typed unavailability cause, while a WAF challenge remains a typed `content_challenge` error
 - Typed error contracts on every tool — structured `reason` codes let agents branch on outcomes without parsing text
 
 Agent-friendly output:
 
 - EuroVoc prerequisite guidance in server-level instructions — agents are directed to `eurlex_browse_subjects` before attempting concept-filtered searches
 - `eurlex_lookup_celex` surfaces CELEX confirmation and work existence upfront, preventing downstream errors in document or relation fetches
-- Typed `unavailable` reasons and `language_unavailable` signals let agents retry or explain to users with structured data, not string parsing
+- `content_status`, `content_unavailability_reason`, and requested/effective language fields let agents distinguish skipped, available, absent, upstream-failed, and incomplete multipart content without string parsing
 - Relationship graph output carries relation type labels alongside CELLAR URIs and resolved CELEX numbers for human-readable downstream use
 
 ---

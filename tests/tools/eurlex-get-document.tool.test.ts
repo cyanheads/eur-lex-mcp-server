@@ -3,10 +3,12 @@
  * @module tests/tools/eurlex-get-document.tool.test
  */
 
+import { z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_get_document } from '@/mcp-server/tools/definitions/eurlex-get-document.tool.js';
+import { EURLEX_LANGUAGES } from '@/services/eurlex-content/eurlex-content-service.js';
 
 // --- Service mocks ---
 const mockSparqlQuery = vi.fn();
@@ -26,7 +28,8 @@ vi.mock('@/services/cellar-sparql/cellar-sparql-service.js', () => ({
   },
 }));
 
-vi.mock('@/services/eurlex-content/eurlex-content-service.js', () => ({
+vi.mock('@/services/eurlex-content/eurlex-content-service.js', async (importOriginal) => ({
+  ...(await importOriginal()),
   getEurLexContentService: () => ({ fetchContent: mockFetchContent }),
 }));
 
@@ -187,6 +190,55 @@ describe('eurlex_get_document', () => {
 
     expect(result.language_fallback).toContain('FR');
     expect(result.language).toBe('EN');
+    expect(result.requested_language).toBe('FR');
+    expect(result.content_status).toBe('available');
+
+    const text = (eurlex_get_document.format!(result)[0] as { text: string }).text;
+    expect(text).toContain('**Requested language:** FR');
+    expect(text).toContain('**Effective content language:** EN');
+    expect(text).toContain('**Content status:** available');
+  });
+
+  it('accepts every supported language case-insensitively and normalizes to uppercase', () => {
+    for (const language of EURLEX_LANGUAGES) {
+      expect(
+        eurlex_get_document.input.parse({
+          celex_number: '32016R0679',
+          language: language.toLowerCase(),
+        }).language,
+      ).toBe(language);
+    }
+  });
+
+  it.each(['ZZ', 'ENG', 'e'])(
+    'rejects unsupported language %s before the handler runs',
+    (language) => {
+      expect(() =>
+        eurlex_get_document.input.parse({ celex_number: '32016R0679', language }),
+      ).toThrow();
+      expect(mockSparqlQuery).not.toHaveBeenCalled();
+      expect(mockFetchContent).not.toHaveBeenCalled();
+    },
+  );
+
+  it('advertises the case-insensitive supported-language constraint to MCP clients', () => {
+    const schema = z.toJSONSchema(eurlex_get_document.input, { io: 'input' });
+    const languageSchema = schema.properties?.language as { pattern?: string };
+
+    expect(languageSchema.pattern).toBeDefined();
+    const advertisedConstraint = new RegExp(languageSchema.pattern ?? '');
+    expect(advertisedConstraint.test('eN')).toBe(true);
+    expect(advertisedConstraint.test('Fr')).toBe(true);
+    expect(advertisedConstraint.test('ZZ')).toBe(false);
+    expect(advertisedConstraint.test('ENG')).toBe(false);
+  });
+
+  it('advertises only reachable document error reasons', () => {
+    expect(eurlex_get_document.errors?.map((entry) => entry.reason)).toEqual([
+      'invalid_identifier_args',
+      'not_found',
+      'content_challenge',
+    ]);
   });
 
   it('returns content_available: false when content fetch fails', async () => {
@@ -197,6 +249,7 @@ describe('eurlex_get_document', () => {
       contentAvailable: false,
       format: 'html',
       language: 'EN',
+      unavailabilityReason: 'upstream_failure',
     });
 
     const input = eurlex_get_document.input.parse({ celex_number: '32016R0679' });
@@ -204,6 +257,12 @@ describe('eurlex_get_document', () => {
 
     expect(result.content_available).toBe(false);
     expect(result.content).toBeUndefined();
+    expect(result.content_status).toBe('unavailable');
+    expect(result.content_unavailability_reason).toBe('upstream_failure');
+
+    const text = (eurlex_get_document.format!(result)[0] as { text: string }).text;
+    expect(text).toContain('**Content status:** unavailable');
+    expect(text).toContain('upstream_failure');
   });
 
   // --- Title traversal (issue #7) ---
@@ -344,6 +403,7 @@ describe('eurlex_get_document', () => {
     expect(result.content_mode).toBe('metadata_only');
     expect(result.content).toBeUndefined();
     expect(result.content_available).toBe(false);
+    expect(result.content_status).toBe('not_requested');
     expect(result.has_more).toBe(false);
     expect(result.content_chars_total).toBeUndefined();
     // No body fetch is attempted — the whole point of metadata_only.
@@ -371,6 +431,81 @@ describe('eurlex_get_document', () => {
     expect(result.content_chars_total).toBe(50_000);
     expect(result.content_chars_returned).toBe(50_000);
     expect(result.content_offset).toBe(0);
+    expect(result.has_more).toBe(false);
+  });
+
+  it('caps an oversized full request at the body ceiling and reconstructs the rest through paged calls', async () => {
+    const body = `${'A'.repeat(100_000)}${'B'.repeat(25_000)}`;
+    mockSparqlQuery.mockResolvedValue([makeMetaBinding({ celex: '32016R0679' })]);
+    mockFetchContent.mockResolvedValue({
+      content: body,
+      contentAvailable: true,
+      format: 'html',
+      language: 'EN',
+    });
+
+    const fullCtx = createMockContext({ errors: eurlex_get_document.errors });
+    const first = await eurlex_get_document.handler(
+      eurlex_get_document.input.parse({
+        celex_number: '32016R0679',
+        content_mode: 'full',
+      }),
+      fullCtx,
+    );
+
+    expect(first.content).toBe(body.slice(0, 100_000));
+    expect(first.content_offset).toBe(0);
+    expect(first.content_chars_returned).toBe(100_000);
+    expect(first.content_chars_total).toBe(125_000);
+    expect(first.has_more).toBe(true);
+    expect(getEnrichment(fullCtx)).toMatchObject({
+      truncated: true,
+      shown: 100_000,
+      cap: 100_000,
+      notice: expect.stringContaining('content_mode="paged"'),
+    });
+
+    const tail = await eurlex_get_document.handler(
+      eurlex_get_document.input.parse({
+        celex_number: '32016R0679',
+        content_mode: 'paged',
+        offset: 100_000,
+        limit: 100_000,
+      }),
+      createMockContext({ errors: eurlex_get_document.errors }),
+    );
+    expect((first.content ?? '') + (tail.content ?? '')).toBe(body);
+    expect(tail.content_offset).toBe(100_000);
+    expect(tail.content_chars_returned).toBe(25_000);
+    expect(tail.has_more).toBe(false);
+
+    const text = (eurlex_get_document.format!(first)[0] as { text: string }).text;
+    expect(text).toContain(first.content!);
+    expect(text).not.toContain(body);
+    expect(text).toContain('content_mode="paged"');
+    expect(text).toContain('offset=100000');
+  });
+
+  it('returns a full body exactly at the ceiling without continuation', async () => {
+    const body = 'E'.repeat(100_000);
+    mockSparqlQuery.mockResolvedValue([makeMetaBinding({ celex: '32016R0679' })]);
+    mockFetchContent.mockResolvedValue({
+      content: body,
+      contentAvailable: true,
+      format: 'html',
+      language: 'EN',
+    });
+
+    const result = await eurlex_get_document.handler(
+      eurlex_get_document.input.parse({
+        celex_number: '32016R0679',
+        content_mode: 'full',
+      }),
+      createMockContext({ errors: eurlex_get_document.errors }),
+    );
+
+    expect(result.content).toBe(body);
+    expect(result.content_chars_returned).toBe(100_000);
     expect(result.has_more).toBe(false);
   });
 
@@ -503,6 +638,7 @@ describe('eurlex_get_document', () => {
       eurovoc_subjects: ['http://ev1', 'http://ev2'],
       content_mode: 'paged',
       content_available: false,
+      content_status: 'unavailable' as const,
       has_more: false,
       language: 'EN',
       content_format: 'html',
@@ -529,6 +665,7 @@ describe('eurlex_get_document', () => {
       eurovoc_subjects: subjects,
       content_mode: 'metadata_only',
       content_available: false,
+      content_status: 'not_requested' as const,
       has_more: false,
       language: 'EN',
       content_format: 'html',
@@ -618,6 +755,7 @@ describe('eurlex_get_document', () => {
       celex_number: '32016R0679',
       content_mode: 'full',
       content_available: true,
+      content_status: 'available' as const,
       content: body,
       content_offset: 0,
       content_chars_returned: 9_000,
@@ -631,6 +769,55 @@ describe('eurlex_get_document', () => {
     expect(text).not.toContain('truncated');
     expect(text).toContain(body); // full body present, uncut
     expect(text).toContain('full body');
+  });
+
+  it.each(['html', 'xml'] as const)(
+    'format presents %s source literally inside a dynamically safe tilde fence',
+    (contentFormat) => {
+      const body =
+        '  <tag data-x="&copy;">*bold* _under_ `code`</tag>\n| a | b |\n~~~~~~\n  tail  ';
+      const output = {
+        celex_number: '32016R0679',
+        content_mode: 'paged',
+        content_available: true,
+        content_status: 'available' as const,
+        content: body,
+        content_offset: 0,
+        content_chars_returned: body.length,
+        content_chars_total: body.length,
+        has_more: false,
+        language: 'EN',
+        content_format: contentFormat,
+      };
+
+      const text = (eurlex_get_document.format!(output)[0] as { text: string }).text;
+      const opening = text.match(/^(~+)(?:html|xml)$/m);
+      expect(opening?.[1]?.length).toBeGreaterThan(6);
+      const fence = opening?.[1] ?? '';
+      expect(text).toContain(`${fence}${contentFormat}\n${body}\n${fence}`);
+      expect(text).not.toContain(`\n---\n\n${body}`);
+    },
+  );
+
+  it('format continues to render Markdown body content as Markdown', () => {
+    const body = '## Article 1\n\n| A | B |\n| - | - |\n| 1 | 2 |';
+    const output = {
+      celex_number: '32016R0679',
+      content_mode: 'paged',
+      content_available: true,
+      content_status: 'available' as const,
+      content: body,
+      content_offset: 0,
+      content_chars_returned: body.length,
+      content_chars_total: body.length,
+      has_more: false,
+      language: 'EN',
+      content_format: 'markdown',
+    };
+
+    const text = (eurlex_get_document.format!(output)[0] as { text: string }).text;
+    expect(text).toContain(`\n---\n\n${body}`);
+    expect(text).not.toMatch(/^~+markdown$/m);
   });
 
   // --- Outline mode and structural selectors (issue #12) ---
@@ -829,6 +1016,7 @@ describe('eurlex_get_document', () => {
         celex_number: '32016R0679',
         content_mode: 'paged',
         content_available: true,
+        content_status: 'available' as const,
         has_more: false,
         language: 'EN',
         content_format: 'html',
@@ -857,6 +1045,7 @@ describe('eurlex_get_document', () => {
         celex_number: '32016R0679',
         content_mode: 'paged',
         content_available: true,
+        content_status: 'available' as const,
         has_more: false,
         language: 'EN',
         content_format: 'html',

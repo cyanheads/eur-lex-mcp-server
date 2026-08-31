@@ -156,7 +156,9 @@ describe('EurLexContentService', () => {
   });
 
   it('reports content unavailable (not an error) when no manifestation exists in any language', async () => {
-    mockFetch.mockResolvedValue(new Response('Resource not found.', { status: 404 }));
+    mockFetch.mockImplementation(() =>
+      Promise.resolve(new Response('Resource not found.', { status: 404 })),
+    );
 
     const result = await makeService().fetchContent(
       '39999R9999',
@@ -167,6 +169,41 @@ describe('EurLexContentService', () => {
 
     expect(result.contentAvailable).toBe(false);
     expect(result.content).toBe('');
+    expect(result.unavailabilityReason).toBe('no_representation');
+  });
+
+  it('classifies a non-404 upstream response as an upstream failure', async () => {
+    mockFetch.mockResolvedValue(new Response('service unavailable', { status: 503 }));
+
+    const result = await makeService().fetchContent(
+      '32016R0679',
+      'EN',
+      'html',
+      createMockContext(),
+    );
+
+    expect(result.contentAvailable).toBe(false);
+    expect(result.unavailabilityReason).toBe('upstream_failure');
+  });
+
+  it('retains an upstream failure across the requested-language and English fallback attempts', async () => {
+    mockFetch.mockImplementation((_url: string, init: { headers: Record<string, string> }) =>
+      Promise.resolve(
+        init.headers['Accept-Language'] === 'fra'
+          ? new Response('not found', { status: 404 })
+          : new Response('service unavailable', { status: 503 }),
+      ),
+    );
+
+    const result = await makeService().fetchContent(
+      '32016R0679',
+      'FR',
+      'html',
+      createMockContext(),
+    );
+
+    expect(result.contentAvailable).toBe(false);
+    expect(result.unavailabilityReason).toBe('upstream_failure');
   });
 
   // --- Multi-part Formex 4 assembly for the xml format (issue #18) ---
@@ -272,6 +309,7 @@ describe('EurLexContentService', () => {
 
       expect(result.contentAvailable).toBe(false);
       expect(result.content).toBe('');
+      expect(result.unavailabilityReason).toBe('multipart_incomplete');
     });
 
     it('falls back to content_available: false when a 300 lists no discoverable parts', async () => {
@@ -288,7 +326,27 @@ describe('EurLexContentService', () => {
       );
 
       expect(result.contentAvailable).toBe(false);
+      expect(result.unavailabilityReason).toBe('multipart_incomplete');
       expect(headersOf(mockFetch.mock.calls[0]).Accept).toBe('application/xml;type=fmx4');
+    });
+
+    it('treats a sibling WAF challenge as multipart_incomplete without weakening the primary challenge error', async () => {
+      mockFetch.mockImplementation(
+        routeMultipart({
+          '/DOC_1': () => new Response(FORMEX_DOC_1, { status: 200 }),
+          '/DOC_2': () => new Response(AWS_WAF_CHALLENGE_HTML, { status: 200 }),
+        }),
+      );
+
+      const result = await makeService().fetchContent(
+        '32016R0679',
+        'EN',
+        'xml',
+        createMockContext(),
+      );
+
+      expect(result.contentAvailable).toBe(false);
+      expect(result.unavailabilityReason).toBe('multipart_incomplete');
     });
   });
 
@@ -358,5 +416,27 @@ describe('EurLexContentService', () => {
     await expect(
       makeService().fetchContent('32016R0679', 'EN', 'html', createMockContext()),
     ).rejects.toThrow(/bot-challenge/i);
+  });
+
+  it('refuses the challenge when the WAF serves it with a non-2xx status', async () => {
+    mockFetch.mockResolvedValue(new Response(AWS_WAF_CHALLENGE_HTML, { status: 403 }));
+
+    await expect(
+      makeService().fetchContent('32016R0679', 'EN', 'html', createMockContext()),
+    ).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      data: { reason: 'content_challenge' },
+    });
+  });
+
+  it('refuses the challenge before treating a 404 response as an absent representation', async () => {
+    mockFetch.mockResolvedValue(new Response(AWS_WAF_CHALLENGE_HTML, { status: 404 }));
+
+    await expect(
+      makeService().fetchContent('32016R0679', 'EN', 'html', createMockContext()),
+    ).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      data: { reason: 'content_challenge' },
+    });
   });
 });

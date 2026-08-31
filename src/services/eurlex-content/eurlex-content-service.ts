@@ -48,31 +48,40 @@ export type ContentFormat = 'html' | 'xml' | 'markdown';
 type WireFormat = 'html' | 'xml';
 
 /** Language codes supported by EUR-Lex (24 official EU languages). */
-export type EurLexLanguage =
-  | 'EN'
-  | 'FR'
-  | 'DE'
-  | 'ES'
-  | 'IT'
-  | 'PL'
-  | 'PT'
-  | 'NL'
-  | 'CS'
-  | 'DA'
-  | 'EL'
-  | 'ET'
-  | 'FI'
-  | 'HU'
-  | 'LT'
-  | 'LV'
-  | 'MT'
-  | 'RO'
-  | 'SK'
-  | 'SL'
-  | 'SV'
-  | 'BG'
-  | 'HR'
-  | 'GA';
+export const EURLEX_LANGUAGES = [
+  'EN',
+  'FR',
+  'DE',
+  'ES',
+  'IT',
+  'PL',
+  'PT',
+  'NL',
+  'CS',
+  'DA',
+  'EL',
+  'ET',
+  'FI',
+  'HU',
+  'LT',
+  'LV',
+  'MT',
+  'RO',
+  'SK',
+  'SL',
+  'SV',
+  'BG',
+  'HR',
+  'GA',
+] as const;
+
+export type EurLexLanguage = (typeof EURLEX_LANGUAGES)[number];
+
+/** Why an ordinary content fetch completed without a usable body. */
+export type ContentUnavailabilityReason =
+  | 'no_representation'
+  | 'upstream_failure'
+  | 'multipart_incomplete';
 
 /**
  * Map EUR-Lex two-letter language codes to the ISO 639-2/T (terminological,
@@ -200,9 +209,28 @@ ${children.join('\n')}
  */
 type FetchOutcome =
   | { kind: 'content'; text: string }
-  | { kind: 'none' }
+  | { kind: 'no_representation' }
+  | { kind: 'upstream_failure' }
   | { kind: 'challenge' }
   | { kind: 'multipart'; body: string };
+
+type LanguageFetchOutcome =
+  | { kind: 'content'; text: string }
+  | { kind: 'unavailable'; reason: ContentUnavailabilityReason };
+
+const UNAVAILABILITY_PRIORITY: Record<ContentUnavailabilityReason, number> = {
+  no_representation: 0,
+  upstream_failure: 1,
+  multipart_incomplete: 2,
+};
+
+/** Keep the most specific/actionable cause observed across variants and fallback attempts. */
+function combineUnavailabilityReasons(
+  left: ContentUnavailabilityReason,
+  right: ContentUnavailabilityReason,
+): ContentUnavailabilityReason {
+  return UNAVAILABILITY_PRIORITY[right] > UNAVAILABILITY_PRIORITY[left] ? right : left;
+}
 
 export interface FetchContentResult {
   content: string;
@@ -211,6 +239,8 @@ export interface FetchContentResult {
   language: EurLexLanguage;
   /** Set when a language fallback occurred. */
   languageFallback?: string;
+  /** Set when contentAvailable is false. */
+  unavailabilityReason?: ContentUnavailabilityReason;
 }
 
 export class EurLexContentService {
@@ -233,7 +263,8 @@ export class EurLexContentService {
   /**
    * Fetch the full text content of an EU act by CELEX number.
    * If the requested language is unavailable, falls back to English.
-   * Returns `contentAvailable: false` with an empty string if both attempts fail.
+   * Returns `contentAvailable: false` with an empty string and a classified
+   * unavailability reason if both attempts fail ordinarily.
    *
    * Throws ServiceUnavailable if the content host returns an AWS WAF bot-challenge
    * stub — a challenge is never reported as available content.
@@ -249,43 +280,61 @@ export class EurLexContentService {
     const wireFormat: WireFormat = format === 'markdown' ? 'html' : format;
 
     const primary = await this.fetchForLanguage(celexNumber, language, wireFormat, ctx);
-    if (primary !== null) {
-      return { content: renderContent(primary, format), language, format, contentAvailable: true };
+    if (primary.kind === 'content') {
+      return {
+        content: renderContent(primary.text, format),
+        language,
+        format,
+        contentAvailable: true,
+      };
     }
 
     // Language fallback: try English if primary language failed.
     if (language !== 'EN') {
       const fallback = await this.fetchForLanguage(celexNumber, 'EN', wireFormat, ctx);
-      if (fallback !== null) {
+      if (fallback.kind === 'content') {
         return {
-          content: renderContent(fallback, format),
+          content: renderContent(fallback.text, format),
           language: 'EN',
           format,
           contentAvailable: true,
           languageFallback: `Requested language ${language} unavailable; returned English content.`,
         };
       }
+      return {
+        content: '',
+        language,
+        format,
+        contentAvailable: false,
+        unavailabilityReason: combineUnavailabilityReasons(primary.reason, fallback.reason),
+      };
     }
 
-    return { content: '', language, format, contentAvailable: false };
+    return {
+      content: '',
+      language,
+      format,
+      contentAvailable: false,
+      unavailabilityReason: primary.reason,
+    };
   }
 
   /**
    * Resolve content for one language by trying each `Accept` variant for the
-   * format. Returns the first non-empty body, or null when none of the variants
-   * yield content (so the caller can fall back to English). Throws when a variant
-   * returns a bot-challenge stub.
+   * format. Returns the first non-empty body, or a classified unavailable result
+   * when none of the variants yield content (so the caller can fall back to
+   * English). Throws when a primary variant returns a bot-challenge stub.
    */
   private async fetchForLanguage(
     celexNumber: string,
     language: EurLexLanguage,
     format: WireFormat,
     ctx: Context,
-  ): Promise<string | null> {
+  ): Promise<LanguageFetchOutcome> {
     const isoLanguage = LANGUAGE_TO_ISO_639_2[language];
-    if (!isoLanguage) return null;
 
     const url = this.buildContentUrl(celexNumber);
+    let reason: ContentUnavailabilityReason = 'no_representation';
     for (const accept of ACCEPT_BY_FORMAT[format]) {
       const outcome = await this.fetchUrl(url, accept, isoLanguage, ctx);
       if (outcome.kind === 'challenge') {
@@ -302,27 +351,31 @@ export class EurLexContentService {
       }
       // A 300 (multi-part Formex, xml path only): follow the sibling part
       // references and assemble the full act. Assembly is best-effort — on
-      // failure fall through so the variant loop ends in `null` (unavailable),
-      // never a throw.
+      // failure falls through so the variant loop ends as unavailable, never a
+      // throw.
       if (outcome.kind === 'multipart') {
         const assembled = await this.assembleFormexParts(outcome.body, accept, isoLanguage, ctx);
-        if (assembled !== null) return assembled;
+        if (assembled !== null) return { kind: 'content', text: assembled };
+        reason = combineUnavailabilityReasons(reason, 'multipart_incomplete');
         continue;
       }
-      if (outcome.kind === 'content') return outcome.text;
+      if (outcome.kind === 'content') return outcome;
+      if (outcome.kind === 'upstream_failure') {
+        reason = combineUnavailabilityReasons(reason, 'upstream_failure');
+      }
     }
-    return null;
+    return { kind: 'unavailable', reason };
   }
 
   /**
    * Single content-negotiation GET for one URL / `Accept` / `Accept-Language`.
    * A 300 (Multiple Choices — multi-part Formex, xml path only) resolves to
-   * `multipart` carrying the index body; other non-2xx (404 = no datastream of
-   * that type, 4xx/5xx) and network failures resolve to `none` so callers can
-   * try the next variant or language; a WAF challenge body resolves to
-   * `challenge`. The inner function only throws on a `fetch` rejection, so
-   * `withRetry` retries transient network errors but never a 300, 404, or a
-   * challenge.
+   * `multipart` carrying the index body. A 404 or short body resolves to
+   * `no_representation`; other non-2xx and exhausted network failures resolve to
+   * `upstream_failure`, so callers can try the next variant or language. A WAF
+   * challenge body resolves to `challenge`. The inner function only throws on a
+   * `fetch` rejection, so `withRetry` retries transient network errors but never
+   * a 300, 404, or challenge.
    */
   private fetchUrl(
     url: string,
@@ -338,12 +391,13 @@ export class EurLexContentService {
           redirect: 'follow',
         });
 
-        if (response.status === 300) return { kind: 'multipart', body: await response.text() };
-        if (!response.ok) return { kind: 'none' };
-
         const text = await response.text();
         if (isChallengeResponse(text)) return { kind: 'challenge' };
-        if (text.trim().length < MIN_CONTENT_LENGTH) return { kind: 'none' };
+        if (response.status === 300) return { kind: 'multipart', body: text };
+        if (response.status === 404) return { kind: 'no_representation' };
+        if (!response.ok) return { kind: 'upstream_failure' };
+
+        if (text.trim().length < MIN_CONTENT_LENGTH) return { kind: 'no_representation' };
         return { kind: 'content', text };
       },
       {
@@ -352,7 +406,7 @@ export class EurLexContentService {
         maxRetries: 2,
         signal: ctx.signal,
       },
-    ).catch((): FetchOutcome => ({ kind: 'none' }));
+    ).catch((): FetchOutcome => ({ kind: 'upstream_failure' }));
   }
 
   /**
