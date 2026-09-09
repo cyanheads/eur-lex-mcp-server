@@ -111,8 +111,8 @@ Traverse the CELLAR relationship graph for a given work.
 
 Resolve human-readable terms to EuroVoc concept IDs.
 
-- Full-text search across the multilingual EuroVoc thesaurus
-- Returns concept URI, preferred label, concept code, and broader/narrower hierarchy hints
+- Full-text search across the multilingual EuroVoc thesaurus, matching both preferred and alternative (non-preferred) labels
+- Returns concept URI, preferred label, concept code, broader/narrower hierarchy hints, and the alternative label that matched when one did
 - Supports all EU official languages; defaults to English
 - Required before using the `eurovoc_concept` filter in `eurlex_search_documents`
 
