@@ -204,9 +204,13 @@ describe('eurlex_document_resource', () => {
     mockQuery.mockResolvedValue([]);
 
     const celexNumber = '32016R0679\\';
-    const params = eurlex_document_resource.params!.parse({ celexNumber });
+    // The CELEX shape gate refuses the backslash outright, so no query is built
+    // from it; escaping below is the second line of defense behind that gate.
+    expect(() => eurlex_document_resource.params!.parse({ celexNumber })).toThrow();
     // The resource's own declared error, not a leaked backend compiler error.
-    await expect(eurlex_document_resource.handler(params, ctx)).rejects.toThrow('No CELLAR work');
+    await expect(eurlex_document_resource.handler({ celexNumber }, ctx)).rejects.toThrow(
+      'No CELLAR work',
+    );
 
     const sparql = mockQuery.mock.calls[0]?.[0] as string;
     // The literal carries exactly what the shared helper produces.
@@ -220,8 +224,10 @@ describe('eurlex_document_resource', () => {
     mockQuery.mockResolvedValue([]);
 
     const celexNumber = '32016R0679\\" x';
-    const params = eurlex_document_resource.params!.parse({ celexNumber });
-    await expect(eurlex_document_resource.handler(params, ctx)).rejects.toThrow('No CELLAR work');
+    expect(() => eurlex_document_resource.params!.parse({ celexNumber })).toThrow();
+    await expect(eurlex_document_resource.handler({ celexNumber }, ctx)).rejects.toThrow(
+      'No CELLAR work',
+    );
 
     const sparql = mockQuery.mock.calls[0]?.[0] as string;
     expect(sparql).toContain(`FILTER(STR(?celexNumber) = "${escapeSparqlLiteral(celexNumber)}")`);
@@ -240,5 +246,70 @@ describe('eurlex_document_resource', () => {
     const sparql = mockQuery.mock.calls[0]?.[0] as string;
     // No regression for the overwhelmingly common input: escaping is a no-op.
     expect(sparql).toContain('FILTER(STR(?celexNumber) = "32016R0679")');
+  });
+
+  // --- #69: CELEX shape gate on the path parameter ---
+
+  describe('CELEX shape validation (#69)', () => {
+    it.each([
+      ['a bare zero', '0'],
+      ['a stray word', 'hello'],
+      ['whitespace only', '   '],
+      ['an empty path segment', ''],
+      ['a value with an embedded newline', '32016R0679\nGDPR'],
+    ])('rejects %s before any CELLAR request', (_label, value) => {
+      expect(() => eurlex_document_resource.params!.parse({ celexNumber: value })).toThrow();
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    /**
+     * Slash-bearing CELEX values (11957A/PRO/CJ/09, C/2026/01104) are deliberately
+     * absent: the SDK expands `{celexNumber}` to `([^/]+)`, so `eurlex://document/
+     * 11957A/PRO/CJ/09` can never match this template regardless of what the schema
+     * accepts. Those values stay on the eurlex_get_document tool's table, which is
+     * the reachable surface for them.
+     */
+    it.each([
+      ['sector 0, consolidated version', '02016R0679-20160504'],
+      ['sector 3, regulation', '32016R0679'],
+      ['sector 3, corrigendum marker', '32016R0679R(02)'],
+      ['sector 6, case law', '62024CJ0629'],
+      ['sector 7, national implementing measure', '72014L0056FIN_240353'],
+      ['sector E, EFTA document', 'E2016C0186'],
+    ])('accepts a real %s', (_label, celex) => {
+      expect(() => eurlex_document_resource.params!.parse({ celexNumber: celex })).not.toThrow();
+    });
+  });
+
+  // --- CELEX input normalization on the path parameter ---
+
+  describe('CELEX normalization', () => {
+    it('trims surrounding whitespace before validating', () => {
+      expect(
+        eurlex_document_resource.params!.parse({ celexNumber: '   32016R0679   ' }).celexNumber,
+      ).toBe('32016R0679');
+    });
+
+    it('uppercases a lowercase CELEX before validating', () => {
+      expect(
+        eurlex_document_resource.params!.parse({ celexNumber: '32016r0679' }).celexNumber,
+      ).toBe('32016R0679');
+    });
+
+    it('still rejects a whitespace-only value, which trims to empty', () => {
+      expect(() => eurlex_document_resource.params!.parse({ celexNumber: '   ' })).toThrow();
+    });
+
+    it('hands the handler the normalized CELEX', async () => {
+      const ctx = createMockContext({ tenantId: 'test-tenant' });
+      mockQuery.mockResolvedValue([makeMetaBinding({ celex: '32016R0679' })]);
+
+      const params = eurlex_document_resource.params!.parse({ celexNumber: ' 32016r0679 ' });
+      await eurlex_document_resource.handler(params, ctx);
+
+      expect(mockQuery.mock.calls[0]?.[0] as string).toContain(
+        'FILTER(STR(?celexNumber) = "32016R0679")',
+      );
+    });
   });
 });

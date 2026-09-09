@@ -169,7 +169,23 @@ export class CellarSparqlService {
    *   Falls back to the server-configured `sparqlQueryTimeoutMs` when omitted.
    */
   async query(rawQuery: string, ctx: Context, timeoutMs?: number): Promise<SparqlBinding[]> {
-    return (await this.execute(rawQuery, ctx, timeoutMs, false)).parsed.results.bindings;
+    return (await this.execute(rawQuery, ctx, timeoutMs, false, this.maxResults)).parsed.results
+      .bindings;
+  }
+
+  /**
+   * Execute a trusted, self-bounded internal query that may fetch exactly one
+   * private row beyond `maxResults`. Paged tools use that row only to prove a
+   * continuation exists, then remove it before returning public output. The raw
+   * SPARQL path remains capped at `maxResults` through `queryWithVars`.
+   */
+  async queryWithContinuation(
+    rawQuery: string,
+    ctx: Context,
+    timeoutMs?: number,
+  ): Promise<SparqlBinding[]> {
+    return (await this.execute(rawQuery, ctx, timeoutMs, false, this.maxResults + 1)).parsed.results
+      .bindings;
   }
 
   /**
@@ -188,7 +204,13 @@ export class CellarSparqlService {
     ctx: Context,
     timeoutMs?: number,
   ): Promise<{ variables: string[]; bindings: SparqlBinding[]; limitEnforced: boolean }> {
-    const { parsed, limitEnforced } = await this.execute(rawQuery, ctx, timeoutMs, true);
+    const { parsed, limitEnforced } = await this.execute(
+      rawQuery,
+      ctx,
+      timeoutMs,
+      true,
+      this.maxResults,
+    );
     return {
       variables: parsed.head?.vars ?? [],
       bindings: parsed.results.bindings,
@@ -205,18 +227,21 @@ export class CellarSparqlService {
    *   `LIMIT` if the query has none of its own, so an untrusted query is bounded
    *   even when only a subselect carries a `LIMIT`. When false (internal, trusted,
    *   self-bounded queries), leave a LIMIT-less query untouched.
+   * @param limitCeiling - Maximum top-level LIMIT accepted on this execution
+   *   path. Trusted pagination may raise it by one for a private sentinel row.
    */
   private async execute(
     rawQuery: string,
     ctx: Context,
     timeoutMs: number | undefined,
     boundOuterResult: boolean,
+    limitCeiling: number,
   ): Promise<{ parsed: SparqlResultsJson; limitEnforced: boolean }> {
     const effectiveTimeoutMs = timeoutMs ?? this.timeoutMs;
     const withPrefixes = rawQuery.includes('PREFIX cdm:') ? rawQuery : SPARQL_PREFIXES + rawQuery;
     const { query: cappedQuery, enforced: limitEnforced } = enforceLimitInQuery(
       withPrefixes,
-      this.maxResults,
+      limitCeiling,
       boundOuterResult,
     );
 

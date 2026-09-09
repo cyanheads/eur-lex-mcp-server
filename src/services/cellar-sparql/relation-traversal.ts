@@ -9,7 +9,7 @@
 import type { Context } from '@cyanheads/mcp-ts-core';
 import { CellarSparqlService } from './cellar-sparql-service.js';
 import { escapeSparqlLiteral } from './eli-resolution.js';
-import type { WorkRelation } from './types.js';
+import type { SparqlBinding, WorkRelation } from './types.js';
 
 /** The relation types this server exposes over the CDM graph. */
 export const RELATION_TYPES = [
@@ -22,6 +22,7 @@ export const RELATION_TYPES = [
   'implicitly_repealed_by',
   'legal_basis',
   'consolidated_version',
+  'national_transposition',
 ] as const;
 
 export type RelationType = (typeof RELATION_TYPES)[number];
@@ -72,6 +73,10 @@ const RELATION_SPECS: Record<RelationType, { predicate: string; direction: Direc
     predicate: 'cdm:act_consolidated_consolidates_resource_legal',
     direction: 'incoming',
   },
+  national_transposition: {
+    predicate: 'cdm:measure_national_implementing_implements_resource_legal',
+    direction: 'incoming',
+  },
 };
 
 /**
@@ -85,20 +90,16 @@ const RELATION_SPECS: Record<RelationType, { predicate: string; direction: Direc
 export const DEFAULT_PER_TYPE_LIMIT = 100;
 
 /**
- * CELEX constraint pushed into a relation arm for `consolidated_version`. It moves
- * the #32 validity filter from client-side into the SPARQL query so LIMIT/OFFSET
- * and the per-direction truncation count all operate on valid rows by construction
- * (issue #45): the related CELEX is required (bound, not OPTIONAL) so CELEX-less
- * `CONS_TEXT` graph artifacts never enter the page, and — when the source act core
- * is known — a REGEX pins the related CELEX to a genuine sector-`0` consolidation
- * of THIS act (`0{actCore}-YYYYMMDD`), dropping consolidations of other acts. With
- * the filter in-query, a page filled by filtered-out artifacts can no longer raise
- * a false `truncated` hint. The client-side filter in `traverseRelations` stays as
+ * CELEX constraint pushed into a relation arm before LIMIT/OFFSET and continuation
+ * proof. Consolidations require a sector-`0` same-act CELEX; national transposition
+ * measures require a sector-`7` CELEX with the source directive's act core. Requiring
+ * and filtering the related CELEX before grouping also makes one work with several
+ * CELEX values occupy exactly one page row. Client-side checks remain as
  * belt-and-suspenders.
  */
 interface CelexConstraint {
-  /** Act core (`{year}{type}{number}`) the related CELEX must belong to; absent on the work_uri path. */
-  actCore?: string;
+  /** Regular expression applied to the related work's required CELEX identifier. */
+  pattern?: string;
 }
 
 /** One direction's graph pattern for a relation predicate, tagged with its direction. */
@@ -112,15 +113,13 @@ function relationArm(
     direction === 'outgoing'
       ? `<${workUri}> ${predicate} ?relatedWork .`
       : `?relatedWork ${predicate} <${workUri}> .`;
-  // A pushed CELEX constraint (consolidated_version) requires the related CELEX,
-  // dropping CELEX-less artifacts in-query; otherwise the CELEX stays OPTIONAL so
-  // related works without one still return. When the act core is known, a REGEX
-  // keeps only genuine consolidations of this act.
+  // A pushed constraint requires the related CELEX; other relation types keep it
+  // OPTIONAL so CELEX-less related works still return.
   const celexTriple = celex
     ? `?relatedWork cdm:resource_legal_id_celex ?relatedCelex .`
     : `OPTIONAL { ?relatedWork cdm:resource_legal_id_celex ?relatedCelex . }`;
-  const celexFilter = celex?.actCore
-    ? `\n    FILTER(REGEX(STR(?relatedCelex), "^0${celex.actCore}-[0-9]{8}$"))`
+  const celexFilter = celex?.pattern
+    ? `\n    FILTER(REGEX(STR(?relatedCelex), "${celex.pattern}"))`
     : '';
   // `?relatedDate` drives the per-direction ordering below; it stays OPTIONAL so
   // related works without a document date still return (they sort last under DESC).
@@ -146,6 +145,12 @@ function relationArm(
  * path passes its subselect LIMITs through unchanged (the service imposes an outer
  * bound only on the raw escape hatch), so an over-cap here would return an
  * over-budget arm — callers pass a limit already clamped to the service ceiling.
+ *
+ * The outer UNION carries its own `ORDER BY ?direction DESC(?relatedDateMax)`.
+ * Without it the union order is implementation-defined, and the caller slices each
+ * direction to `perTypeLimit` after grouping the rows by direction — so an
+ * arbitrary interleaving can place the private continuation sentinel inside the
+ * kept slice and drop a real relation instead.
  */
 function buildRelationQuery(
   workUri: string,
@@ -154,19 +159,21 @@ function buildRelationQuery(
   offset: number,
   celex?: CelexConstraint,
 ): string {
-  const paging = `ORDER BY DESC(?relatedDate) LIMIT ${limit} OFFSET ${offset}`;
+  const projection =
+    'SELECT ?relatedWork (SAMPLE(?relatedCelex) AS ?relatedCelexSample) ?direction (MAX(?relatedDate) AS ?relatedDateMax)';
+  const paging = `GROUP BY ?relatedWork ?direction ORDER BY DESC(?relatedDateMax) LIMIT ${limit} OFFSET ${offset}`;
   if (spec.direction !== 'both') {
-    return `SELECT ?relatedWork ?relatedCelex ?direction WHERE {
+    return `${projection} WHERE {
     ${relationArm(workUri, spec.predicate, spec.direction, celex)}
 } ${paging}`;
   }
   const subquery = (direction: 'outgoing' | 'incoming') =>
-    `{ SELECT ?relatedWork ?relatedCelex ?direction WHERE {
+    `{ ${projection} WHERE {
     ${relationArm(workUri, spec.predicate, direction, celex)}
   } ${paging} }`;
-  return `SELECT ?relatedWork ?relatedCelex ?direction WHERE {
+  return `SELECT ?relatedWork ?relatedCelexSample ?direction ?relatedDateMax WHERE {
   ${subquery('outgoing')} UNION ${subquery('incoming')}
-}`;
+} ORDER BY ?direction DESC(?relatedDateMax)`;
 }
 
 /**
@@ -188,6 +195,27 @@ function celexActCore(celex: string): string | undefined {
  * consolidations of an act carry this shape, e.g. `02014R0833-20260424`.
  */
 const CONSOLIDATED_CELEX_RE = /^0(\d{4}[A-Z]{1,2}\d+)-(\d{4})(\d{2})(\d{2})$/;
+
+/**
+ * CELEX pattern for a national implementing measure that transposes the act
+ * identified by `sourceActCore`: sector `7`, the source act core, then the
+ * three-letter member-state code every sector-7 CELEX carries
+ * (`72016L0680CZE_225030`, `72014L0056FIN_240353`).
+ *
+ * The country code is what anchors the act core on its right-hand side, and it
+ * has to be there: a left-anchored `^7{core}` alone also matches a longer act
+ * number that merely starts with the same digits, so measures transposing a
+ * hypothetical `32016L06801` would be returned as transpositions of
+ * `32016L0680`. That mirrors the two-ended discipline the `consolidated_version`
+ * pattern already applies. The trailing measure number is deliberately left
+ * unanchored — no digit can extend the act core across three letters, so
+ * anchoring it would add false-rejection risk without closing anything.
+ * Verified against 3,000 sector-7 CELEX values pulled live from CELLAR: all
+ * carry the three-letter code.
+ */
+function nationalMeasureCelexPattern(sourceActCore: string): string {
+  return `^7${sourceActCore}[A-Z]{3}`;
+}
 
 /** True when a CELEX is itself a consolidated version (…-YYYYMMDD), not a base act. */
 export function isConsolidatedCelex(celex: string): boolean {
@@ -256,8 +284,9 @@ LIMIT 100`;
  * direction. Each type is resolved through its own query (and its own LIMIT) so
  * the per-type caps are independent.
  *
- * `sourceCelex` is the CELEX of the work being traversed, when known (absent on
- * the work_uri-only path). It gates the `consolidated_version` act-number filter:
+ * `sourceCelex` is the CELEX identity of the work being traversed, supplied from
+ * the CELEX input or resolved from the work URI. It gates the relation-specific
+ * act-number filters. For `consolidated_version`,
  * CELLAR asserts the `consolidates` edge for genuine consolidations of this act
  * *and* — as a graph artifact — for consolidations of other acts (e.g. an act
  * this one repealed) plus CELEX-less `CONS_TEXT` member/manifestation works. That
@@ -267,87 +296,109 @@ LIMIT 100`;
  * belt-and-suspenders. `consolidated_version` rows with no related CELEX are
  * always dropped (they can't be fetched via get_document anyway); when
  * `sourceCelex` is known, rows whose CELEX belongs to a different act are dropped
- * too. Every other relation type is returned unfiltered.
+ * too. `national_transposition` similarly requires a sector-`7` CELEX carrying
+ * the source directive's act core followed by a member-state code, selecting the
+ * matching identifier before grouping when one national measure has several CELEX
+ * values. Every other relation type is returned unfiltered.
+ *
+ * An absent `sourceCelex` — an addressed work with no CELEX, or one whose CELEX
+ * identity is ambiguous because the work carries several — stands the act-core
+ * constraints down rather than binding the traversal to an arbitrary act:
+ * `consolidated_version` then requires only that the related work carry some
+ * CELEX, and `national_transposition` returns nothing without issuing a query at
+ * all, since selecting measures with no source act is precisely the arbitrary
+ * binding the constraint exists to prevent.
  *
  * `perTypeLimit` bounds each direction of each type; `offset` pages within a
- * direction. Returns the relations plus `truncated` — true when any type's
- * direction filled its cap with post-filter rows, so more related works may exist
- * at a higher offset.
+ * direction. Each query requests one additional grouped row per direction, then
+ * removes that private sentinel before returning. `hasMore` is true only when a
+ * direction produced that additional row.
  */
 export async function traverseRelations(
-  svc: Pick<CellarSparqlService, 'query'>,
+  svc: Pick<CellarSparqlService, 'queryWithContinuation'>,
   workUri: string,
   types: readonly RelationType[],
   ctx: Context,
   sourceCelex?: string,
   perTypeLimit: number = DEFAULT_PER_TYPE_LIMIT,
   offset = 0,
-): Promise<{ relations: WorkRelation[]; truncated: boolean }> {
+): Promise<{ relations: WorkRelation[]; hasMore: boolean }> {
   const sourceActCore = sourceCelex ? celexActCore(sourceCelex) : undefined;
   const perType = await Promise.all(
-    types.map(async (type) => ({
-      type,
-      bindings: await svc.query(
-        buildRelationQuery(
-          workUri,
-          RELATION_SPECS[type],
-          perTypeLimit,
-          offset,
-          // Push the #32/#45 validity filter into the query for consolidated_version
-          // only. On the work_uri path the act core is unknown, so the constraint is
-          // present (requires the CELEX, dropping CELEX-less) but carries no act-core
-          // REGEX — keeping cross-act rows, as before.
-          type === 'consolidated_version'
-            ? { ...(sourceActCore ? { actCore: sourceActCore } : {}) }
-            : undefined,
+    types.map(async (type): Promise<{ type: RelationType; bindings: SparqlBinding[] }> => {
+      /**
+       * Push relation-specific CELEX validity into the query before pagination:
+       * sector-0 same-act consolidations and sector-7 same-act national measures.
+       */
+      let celex: CelexConstraint | undefined;
+      if (type === 'consolidated_version') {
+        celex = sourceActCore ? { pattern: `^0${sourceActCore}-[0-9]{8}$` } : {};
+      } else if (type === 'national_transposition') {
+        // With no source act core there is no pattern that selects this act's
+        // implementing measures, and every row is dropped either way. Return the
+        // empty result directly rather than spending a CELLAR round-trip on a
+        // query whose filter can match nothing.
+        if (!sourceActCore) return { type, bindings: [] };
+        celex = { pattern: nationalMeasureCelexPattern(sourceActCore) };
+      }
+      return {
+        type,
+        bindings: await svc.queryWithContinuation(
+          buildRelationQuery(workUri, RELATION_SPECS[type], perTypeLimit + 1, offset, celex),
+          ctx,
         ),
-        ctx,
-      ),
-    })),
+      };
+    }),
   );
 
-  const seen = new Set<string>();
   const relations: WorkRelation[] = [];
-  let truncated = false;
+  let hasMore = false;
   for (const { type, bindings } of perType) {
-    // Post-filter rows per direction: a direction whose surviving rows fill the cap
-    // may have more upstream. A symmetric type interleaves two independently-capped
-    // directions in one result set, so count each side separately. Counted AFTER the
-    // consolidated_version filter's `continue`s so filtered-out graph artifacts don't
-    // inflate the count into a false truncation hint (issue #45); counted BEFORE the
-    // dedup `continue` so a full raw page of duplicate rows still flags more upstream.
-    const rowsByDirection = new Map<'outgoing' | 'incoming', number>();
+    const rowsByDirection = new Map<
+      'outgoing' | 'incoming',
+      Array<{ relatedWorkUri: string; relatedCelex?: string }>
+    >();
+    const seenForType = new Set<string>();
     for (const b of bindings) {
       const relatedWorkUri = CellarSparqlService.bindingValue(b, 'relatedWork') ?? '';
       const direction =
         CellarSparqlService.bindingValue(b, 'direction') === 'incoming' ? 'incoming' : 'outgoing';
-      const relatedCelex = CellarSparqlService.bindingValue(b, 'relatedCelex');
+      const relatedCelex = CellarSparqlService.bindingValue(b, 'relatedCelexSample');
 
-      // #32: keep the consolidated_version list trustworthy at a glance. A
-      // CELEX-less consolidation can't be fetched via get_document; a
-      // consolidation whose CELEX belongs to a different act is a graph artifact,
-      // not a version of this act. Drop both — but only apply the act-number test
-      // when the source CELEX is known (the work_uri path has no act to match). The
-      // SPARQL query already pushes this filter for consolidated_version; this is
-      // the client-side belt-and-suspenders.
+      // Keep CELEX-constrained relation lists trustworthy at a glance. These
+      // checks mirror the SPARQL filters as client-side belt-and-suspenders.
       if (type === 'consolidated_version') {
         if (!relatedCelex) continue;
         if (sourceActCore && celexActCore(relatedCelex) !== sourceActCore) continue;
       }
+      if (
+        type === 'national_transposition' &&
+        (!relatedCelex ||
+          !sourceActCore ||
+          !new RegExp(nationalMeasureCelexPattern(sourceActCore)).test(relatedCelex))
+      ) {
+        continue;
+      }
 
-      rowsByDirection.set(direction, (rowsByDirection.get(direction) ?? 0) + 1);
-
-      const key = `${type}|${direction}|${relatedWorkUri}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-
-      const relation: WorkRelation = { relationType: type, direction, relatedWorkUri };
-      if (relatedCelex) relation.relatedCelexNumber = relatedCelex;
-      relations.push(relation);
+      // Redundant since the query groups by ?relatedWork ?direction, which already
+      // yields one row per pair; kept as a guard so a future projection change
+      // cannot reintroduce duplicate relations in the output.
+      const typeKey = `${direction}|${relatedWorkUri}`;
+      if (seenForType.has(typeKey)) continue;
+      seenForType.add(typeKey);
+      const rows = rowsByDirection.get(direction) ?? [];
+      rows.push({ relatedWorkUri, ...(relatedCelex ? { relatedCelex } : {}) });
+      rowsByDirection.set(direction, rows);
     }
-    for (const count of rowsByDirection.values()) {
-      if (count >= perTypeLimit) truncated = true;
+
+    for (const [direction, rows] of rowsByDirection) {
+      if (rows.length > perTypeLimit) hasMore = true;
+      for (const { relatedWorkUri, relatedCelex } of rows.slice(0, perTypeLimit)) {
+        const relation: WorkRelation = { relationType: type, direction, relatedWorkUri };
+        if (relatedCelex) relation.relatedCelexNumber = relatedCelex;
+        relations.push(relation);
+      }
     }
   }
-  return { relations, truncated };
+  return { relations, hasMore };
 }

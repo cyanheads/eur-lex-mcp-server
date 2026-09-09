@@ -12,7 +12,11 @@ import { escapeSparqlLiteral } from '@/services/cellar-sparql/eli-resolution.js'
 const mockQuery = vi.fn();
 // maxResults mirrors the real service ceiling; the handler clamps the summary cap to it.
 vi.mock('@/services/cellar-sparql/cellar-sparql-service.js', () => ({
-  getCellarSparqlService: () => ({ query: mockQuery, maxResults: 100 }),
+  getCellarSparqlService: () => ({
+    query: mockQuery,
+    queryWithContinuation: mockQuery,
+    maxResults: 100,
+  }),
   CellarSparqlService: {
     bindingValue: (binding: Record<string, { value?: string }> | undefined, field: string) =>
       binding?.[field]?.value,
@@ -21,6 +25,9 @@ vi.mock('@/services/cellar-sparql/cellar-sparql-service.js', () => ({
 
 const GDPR_WORK_URI =
   'http://publications.europa.eu/resource/cellar/3e485e15-d3d0-11e5-8cd4-01aa75ed71a1';
+const DIRECTIVE_680_WORK_URI = 'http://publications.europa.eu/resource/cellar/directive-2016-680';
+const CZECH_MEASURE_WORK_URI =
+  'http://publications.europa.eu/resource/cellar/002d2e00-f978-11e4-a4c8-01aa75ed71a1';
 
 type Row = Record<string, { type: string; value: string }>;
 
@@ -28,6 +35,10 @@ function makeResolveBinding(workUri: string): Row {
   return { work: { type: 'uri', value: workUri } };
 }
 
+/**
+ * A relation row as the per-type query projects it — the CELEX arrives under the
+ * aggregate alias `?relatedCelexSample`, the only key the traversal reads.
+ */
 function makeRelationBinding(opts: {
   relatedWork: string;
   direction: 'outgoing' | 'incoming';
@@ -37,7 +48,7 @@ function makeRelationBinding(opts: {
     relatedWork: { type: 'uri', value: opts.relatedWork },
     direction: { type: 'literal', value: opts.direction },
   };
-  if (opts.relatedCelex) b.relatedCelex = { type: 'literal', value: opts.relatedCelex };
+  if (opts.relatedCelex) b.relatedCelexSample = { type: 'literal', value: opts.relatedCelex };
   return b;
 }
 
@@ -53,6 +64,7 @@ function routeQuery(handlers: {
   implicitlyRepealedBy?: Row[];
   legalBasis?: Row[];
   consolidated?: Row[];
+  nationalTransposition?: Row[];
 }) {
   return async (q: string): Promise<Row[]> => {
     // Tolerate any unrecognized call shape (e.g. a stray no-arg call from the
@@ -62,6 +74,8 @@ function routeQuery(handlers: {
     if (q.includes('cdm:work_cites_work')) return handlers.cites ?? [];
     if (q.includes('cdm:act_consolidated_consolidates_resource_legal'))
       return handlers.consolidated ?? [];
+    if (q.includes('cdm:measure_national_implementing_implements_resource_legal'))
+      return handlers.nationalTransposition ?? [];
     if (q.includes('cdm:resource_legal_based_on_resource_legal')) return handlers.legalBasis ?? [];
     // Implicit repeal is checked before explicit — same shared-predicate,
     // direction-by-triple-side pattern as amends/amended_by.
@@ -118,13 +132,14 @@ describe('eurlex_document_relations_resource', () => {
     expect(relations[0]?.related_celex_number).toBe('32022R0000');
     // #39: a lightly-related act does not fill the summary cap.
     expect((result as Record<string, unknown>).truncated).toBe(false);
+    expect((result as Record<string, unknown>).continuation).toBeUndefined();
   });
 
-  // --- #39: the summary orders + caps per direction and discloses truncation ---
+  // --- #71: the summary exposes continuation only with exact proof ---
 
-  it('orders each relation query newest-first and discloses truncation when the summary cap fills', async () => {
+  it('does not disclose continuation for an exactly-full final summary page', async () => {
     const ctx = createMockContext({ tenantId: 'test-tenant' });
-    // 25 incoming amenders = the SUMMARY_PER_TYPE_LIMIT, so the direction is full.
+    // 25 incoming amenders = the public summary cap, with no 26th sentinel row.
     const manyAmenders = Array.from({ length: 25 }, (_, i) =>
       makeRelationBinding({
         relatedWork: `http://publications.europa.eu/resource/cellar/amender-${i}`,
@@ -142,13 +157,43 @@ describe('eurlex_document_relations_resource', () => {
       unknown
     >;
 
-    expect(result.truncated).toBe(true);
+    expect(result.truncated).toBe(false);
+    expect(result.continuation).toBeUndefined();
     // Incoming edges are ordered newest-first so the summary keeps the most recent.
     const relSparql = mockQuery.mock.calls
       .map((c) => c[0] as string)
       .find((q) => !q.includes('SELECT ?work WHERE'))!;
-    expect(relSparql).toContain('ORDER BY DESC(?relatedDate)');
-    expect(relSparql).toContain('LIMIT 25');
+    expect(relSparql).toContain('ORDER BY DESC(?relatedDateMax)');
+    expect(relSparql).toContain('LIMIT 26');
+  });
+
+  it('caps the summary and adds machine-readable expanded-traversal guidance when proven', async () => {
+    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    const manyAmenders = Array.from({ length: 26 }, (_, i) =>
+      makeRelationBinding({
+        relatedWork: `http://publications.europa.eu/resource/cellar/amender-${i}`,
+        direction: 'incoming',
+        relatedCelex: `3202${i % 10}R${1000 + i}`,
+      }),
+    );
+    mockQuery.mockImplementation(
+      routeQuery({ resolve: [makeResolveBinding(GDPR_WORK_URI)], amendedBy: manyAmenders }),
+    );
+
+    const params = eurlex_document_relations_resource.params!.parse({ celexNumber: '32016R0679' });
+    const result = (await eurlex_document_relations_resource.handler(params, ctx)) as Record<
+      string,
+      unknown
+    >;
+
+    expect(result.truncated).toBe(true);
+    expect(result.relations).toHaveLength(25);
+    expect(result.continuation).toEqual({
+      kind: 'expanded_traversal',
+      tool: 'eurlex_get_relations',
+      input: { celex_number: '32016R0679' },
+    });
+    expect(JSON.stringify(result.continuation)).not.toContain('offset');
   });
 
   // --- #19: amendment + consolidation relations now surface on the resource ---
@@ -184,6 +229,43 @@ describe('eurlex_document_relations_resource', () => {
     const types = relations.map((r) => r.relation_type);
     expect(types).toContain('amended_by');
     expect(types).toContain('consolidated_version');
+  });
+
+  it('surfaces the directive-matching national transposition measure (#56)', async () => {
+    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    mockQuery.mockImplementation(
+      routeQuery({
+        resolve: [makeResolveBinding(DIRECTIVE_680_WORK_URI)],
+        nationalTransposition: [
+          makeRelationBinding({
+            relatedWork: CZECH_MEASURE_WORK_URI,
+            direction: 'incoming',
+            relatedCelex: '72016L0680CZE_225030',
+          }),
+        ],
+      }),
+    );
+
+    const params = eurlex_document_relations_resource.params!.parse({
+      celexNumber: '32016L0680',
+    });
+    const result = (await eurlex_document_relations_resource.handler(params, ctx)) as Record<
+      string,
+      unknown
+    >;
+
+    expect(result.relations).toContainEqual({
+      relation_type: 'national_transposition',
+      direction: 'incoming',
+      related_work_uri: CZECH_MEASURE_WORK_URI,
+      related_celex_number: '72016L0680CZE_225030',
+    });
+    const sparql = mockQuery.mock.calls
+      .map((call) => call[0] as string)
+      .find((query) =>
+        query.includes('cdm:measure_national_implementing_implements_resource_legal'),
+      )!;
+    expect(sparql).toContain('REGEX(STR(?relatedCelex), "^72016L0680[A-Z]{3}")');
   });
 
   // --- #31: repeal relations surface through the resource's shared traversal ---
@@ -360,9 +442,11 @@ describe('eurlex_document_relations_resource', () => {
     mockQuery.mockImplementation(routeQuery({ resolve: [] }));
 
     const celexNumber = '32016R0679\\';
-    const params = eurlex_document_relations_resource.params!.parse({ celexNumber });
+    // The CELEX shape gate refuses the backslash outright, so no query is built
+    // from it; escaping below is the second line of defense behind that gate.
+    expect(() => eurlex_document_relations_resource.params!.parse({ celexNumber })).toThrow();
     // The resource's own declared error, not a leaked backend compiler error.
-    await expect(eurlex_document_relations_resource.handler(params, ctx)).rejects.toThrow(
+    await expect(eurlex_document_relations_resource.handler({ celexNumber }, ctx)).rejects.toThrow(
       'No CELLAR work',
     );
 
@@ -382,5 +466,80 @@ describe('eurlex_document_relations_resource', () => {
     const sparql = mockQuery.mock.calls[0]?.[0] as string;
     // No regression for the overwhelmingly common input: escaping is a no-op.
     expect(sparql).toContain('FILTER(STR(?celex) = "32016R0679")');
+  });
+
+  // --- #69: CELEX shape gate on the path parameter ---
+
+  describe('CELEX shape validation (#69)', () => {
+    it.each([
+      ['a bare zero', '0'],
+      ['a stray word', 'hello'],
+      ['whitespace only', '   '],
+      ['an empty path segment', ''],
+      ['a value with an embedded newline', '32016R0679\nGDPR'],
+    ])('rejects %s before any CELLAR request', (_label, value) => {
+      expect(() =>
+        eurlex_document_relations_resource.params!.parse({ celexNumber: value }),
+      ).toThrow();
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    /**
+     * Slash-bearing CELEX values (11957A/PRO/CJ/09, C/2026/01104) are deliberately
+     * absent: the SDK expands `{celexNumber}` to `([^/]+)`, so
+     * `eurlex://document/11957A/PRO/CJ/09/relations` can never match this template
+     * regardless of what the schema accepts. Those values stay on the
+     * eurlex_get_relations tool's table, which is the reachable surface for them.
+     */
+    it.each([
+      ['sector 0, consolidated version', '02016R0679-20160504'],
+      ['sector 3, regulation', '32016R0679'],
+      ['sector 3, corrigendum marker', '32016R0679R(02)'],
+      ['sector 6, case law', '62024CJ0629'],
+      ['sector 7, national implementing measure', '72014L0056FIN_240353'],
+      ['sector E, EFTA document', 'E2016C0186'],
+    ])('accepts a real %s', (_label, celex) => {
+      expect(() =>
+        eurlex_document_relations_resource.params!.parse({ celexNumber: celex }),
+      ).not.toThrow();
+    });
+  });
+
+  // --- CELEX input normalization on the path parameter ---
+
+  describe('CELEX normalization', () => {
+    it('trims surrounding whitespace before validating', () => {
+      expect(
+        eurlex_document_relations_resource.params!.parse({ celexNumber: '   32016R0679   ' })
+          .celexNumber,
+      ).toBe('32016R0679');
+    });
+
+    it('uppercases a lowercase CELEX before validating', () => {
+      expect(
+        eurlex_document_relations_resource.params!.parse({ celexNumber: '32016r0679' }).celexNumber,
+      ).toBe('32016R0679');
+    });
+
+    it('still rejects a whitespace-only value, which trims to empty', () => {
+      expect(() =>
+        eurlex_document_relations_resource.params!.parse({ celexNumber: '   ' }),
+      ).toThrow();
+    });
+
+    it('hands the handler the normalized CELEX', async () => {
+      const ctx = createMockContext({ tenantId: 'test-tenant' });
+      mockQuery.mockImplementation(routeQuery({ resolve: [makeResolveBinding(GDPR_WORK_URI)] }));
+
+      const params = eurlex_document_relations_resource.params!.parse({
+        celexNumber: ' 32016r0679 ',
+      });
+      const result = await eurlex_document_relations_resource.handler(params, ctx);
+
+      expect(mockQuery.mock.calls[0]?.[0] as string).toContain(
+        'FILTER(STR(?celex) = "32016R0679")',
+      );
+      expect(result).toMatchObject({ celex_number: '32016R0679' });
+    });
   });
 });

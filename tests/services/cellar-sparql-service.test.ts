@@ -241,6 +241,39 @@ describe('CellarSparqlService.queryWithVars limitEnforced (#52)', () => {
   });
 });
 
+// --- #72: trusted paged tools may fetch one private sentinel row without
+// widening the raw-SPARQL ceiling exposed through queryWithVars. ---
+
+describe('CellarSparqlService.queryWithContinuation (#72)', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('permits exactly maxResults + 1 on the trusted internal path', async () => {
+    const { sentQuery } = stubFetchCapturing(rowsPayload(101));
+    const ctx = createMockContext();
+
+    const bindings = await makeService().queryWithContinuation(
+      'SELECT ?work WHERE { ?work cdm:resource_legal_id_celex ?celex . } LIMIT 101',
+      ctx,
+    );
+
+    expect(bindings).toHaveLength(101);
+    expect(sentQuery()).toContain('LIMIT 101');
+  });
+
+  it('does not let the trusted allowance exceed one sentinel row', async () => {
+    const { sentQuery } = stubFetchCapturing(rowsPayload(101));
+    const ctx = createMockContext();
+
+    await makeService().queryWithContinuation(
+      'SELECT ?work WHERE { ?work cdm:resource_legal_id_celex ?celex . } LIMIT 500',
+      ctx,
+    );
+
+    expect(sentQuery()).toContain('LIMIT 101');
+    expect(sentQuery()).not.toContain('LIMIT 500');
+  });
+});
+
 // --- #63: the maxResults ceiling must bound the OUTER result the caller receives,
 // regardless of subselect structure, and must never rewrite the caller's own inner
 // LIMIT. Enforcement (raw path) targets the OUTERMOST (brace-depth 0) LIMIT.

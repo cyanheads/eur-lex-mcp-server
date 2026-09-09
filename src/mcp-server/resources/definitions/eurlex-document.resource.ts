@@ -14,7 +14,7 @@ import {
   CellarSparqlService,
   getCellarSparqlService,
 } from '@/services/cellar-sparql/cellar-sparql-service.js';
-import { escapeSparqlLiteral } from '@/services/cellar-sparql/eli-resolution.js';
+import { CELEX_PATTERN, escapeSparqlLiteral } from '@/services/cellar-sparql/eli-resolution.js';
 
 export const eurlex_document_resource = resource('eurlex://document/{celexNumber}', {
   name: 'EUR-Lex document metadata',
@@ -22,7 +22,16 @@ export const eurlex_document_resource = resource('eurlex://document/{celexNumber
     'Metadata snapshot for a CELLAR work by CELEX number — human-readable document type and author institution labels, date, title, and in-force flag.',
   mimeType: 'application/json',
   params: z.object({
-    celexNumber: z.string().describe('CELEX number of the EU act (e.g. 32016R0679 for GDPR).'),
+    celexNumber: z
+      .string()
+      .overwrite((value) => value.trim().toUpperCase())
+      .regex(
+        CELEX_PATTERN,
+        'celexNumber must be a CELEX identifier — a sector character followed by the year, type letters, and number (e.g. 32016R0679). Resolve a citation to its CELEX with eurlex_lookup_celex first.',
+      )
+      .describe(
+        'CELEX number of the EU act (e.g. 32016R0679 for GDPR). Surrounding whitespace is trimmed and the value is uppercased before validation. A CELEX containing "/" (e.g. 11957A/PRO/CJ/09) cannot be addressed here — the URI template stops at the path separator, so fetch it with the eurlex_get_document tool instead.',
+      ),
   }),
 
   async handler(params, ctx) {

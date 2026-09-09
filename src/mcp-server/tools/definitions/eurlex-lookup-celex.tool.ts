@@ -10,15 +10,22 @@ import {
   getCellarSparqlService,
 } from '@/services/cellar-sparql/cellar-sparql-service.js';
 import {
+  CELEX_PATTERN,
   escapeSparqlLiteral,
   isEliUri,
   resolveEliToWork,
 } from '@/services/cellar-sparql/eli-resolution.js';
 import type { SparqlBinding } from '@/services/cellar-sparql/types.js';
 
-/** Detect CELEX number format: starts with a sector digit. */
+/**
+ * Detect CELEX number format, using the same structural floor the CELEX-typed
+ * inputs elsewhere validate against. The former local pattern opened on `[1-9]`,
+ * so it excluded sector 0 and a consolidated CELEX such as
+ * `02016R0679-20160504` was detected as neither CELEX nor ELI under
+ * identifier_type "auto".
+ */
 function isCelex(identifier: string): boolean {
-  return /^[1-9]\d{4}[A-Z]+\d+/.test(identifier.trim());
+  return CELEX_PATTERN.test(identifier.trim());
 }
 
 type IdentifierType = 'celex' | 'eli' | 'auto';
@@ -52,7 +59,7 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
     found: z
       .boolean()
       .describe(
-        'True when the identifier resolves to a CELLAR work; false when a well-formed CELEX/ELI matches no work in the corpus. A malformed or undetectable identifier raises ambiguous_identifier instead.',
+        'True when the identifier resolves to a CELLAR work; false when a well-formed CELEX/ELI matches no work in the corpus. Only an identifier_type "auto" value that, after trimming, is neither an ELI URI nor CELEX-shaped (uppercase) raises ambiguous_identifier instead.',
       ),
     work_uri: z.string().optional().describe('CELLAR work URI (stable resource identifier).'),
     celex_number: z.string().optional().describe('Confirmed CELEX number for the resolved work.'),
@@ -69,7 +76,7 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
     {
       reason: 'ambiguous_identifier',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'identifier_type is "auto" and the identifier format could not be determined.',
+      when: 'identifier_type is "auto" and the identifier, after trimming, is neither an ELI URI nor CELEX-shaped (uppercase), so no lookup branch applies.',
       recovery: 'Supply identifier_type explicitly as "celex" or "eli" to resolve the ambiguity.',
     },
   ],

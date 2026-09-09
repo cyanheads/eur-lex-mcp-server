@@ -9,7 +9,7 @@ import {
   CellarSparqlService,
   getCellarSparqlService,
 } from '@/services/cellar-sparql/cellar-sparql-service.js';
-import { escapeSparqlLiteral } from '@/services/cellar-sparql/eli-resolution.js';
+import { CELEX_PATTERN, escapeSparqlLiteral } from '@/services/cellar-sparql/eli-resolution.js';
 import { RELATION_TYPES, traverseRelations } from '@/services/cellar-sparql/relation-traversal.js';
 
 /**
@@ -24,10 +24,19 @@ export const eurlex_document_relations_resource = resource(
   {
     name: 'EUR-Lex document relations',
     description:
-      'One-hop CDM relationship summary for a CELLAR work by CELEX number: amendment chain, consolidations, legal basis, and cited-by.',
+      'One-hop CDM relationship summary for a CELLAR work by CELEX number: amendment chain, consolidations, national transposition measures, legal basis, and citations.',
     mimeType: 'application/json',
     params: z.object({
-      celexNumber: z.string().describe('CELEX number of the EU act (e.g. 32016R0679 for GDPR).'),
+      celexNumber: z
+        .string()
+        .overwrite((value) => value.trim().toUpperCase())
+        .regex(
+          CELEX_PATTERN,
+          'celexNumber must be a CELEX identifier — a sector character followed by the year, type letters, and number (e.g. 32016R0679). Resolve a citation to its CELEX with eurlex_lookup_celex first.',
+        )
+        .describe(
+          'CELEX number of the EU act (e.g. 32016R0679 for GDPR). Surrounding whitespace is trimmed and the value is uppercased before validation. A CELEX containing "/" (e.g. 11957A/PRO/CJ/09) cannot be addressed here — the URI template stops at the path separator, so traverse it with the eurlex_get_relations tool instead.',
+        ),
     }),
 
     async handler(params, ctx) {
@@ -57,12 +66,12 @@ SELECT ?work WHERE {
       // Summarize all relation types via the shared traversal — one query per
       // type so amendment and consolidation relations (modeled one-directionally
       // in CELLAR) actually surface. Passing the CELEX lets the traversal apply
-      // the consolidated_version act-number filter (#32). Incoming edges come
-      // ordered newest-first, so this lightweight summary keeps the most recent
-      // within its per-direction cap. See relation-traversal.ts. The cap is
-      // clamped to the service ceiling so both sides of a symmetric query stay
-      // capped consistently.
-      const { relations: workRelations, truncated } = await traverseRelations(
+      // relation-specific act-number filters for consolidations and national
+      // transposition measures. Incoming edges come ordered newest-first, so
+      // this lightweight summary keeps the most recent within its per-direction
+      // cap. See relation-traversal.ts. The cap is clamped to the service ceiling
+      // so both sides of a symmetric query stay capped consistently.
+      const { relations: workRelations, hasMore } = await traverseRelations(
         svc,
         workUri,
         RELATION_TYPES,
@@ -82,9 +91,16 @@ SELECT ?work WHERE {
         work_uri: workUri,
         relations,
         total: relations.length,
-        // True when a relation direction filled the summary cap — the fuller,
-        // pageable list is available via the eurlex_get_relations tool.
-        truncated,
+        truncated: hasMore,
+        ...(hasMore
+          ? {
+              continuation: {
+                kind: 'expanded_traversal' as const,
+                tool: 'eurlex_get_relations' as const,
+                input: { celex_number: celexNumber },
+              },
+            }
+          : {}),
       };
     },
   },

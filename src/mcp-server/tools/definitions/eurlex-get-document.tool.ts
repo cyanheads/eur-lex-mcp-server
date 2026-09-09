@@ -15,6 +15,7 @@ import {
   getCellarSparqlService,
 } from '@/services/cellar-sparql/cellar-sparql-service.js';
 import {
+  CELEX_PATTERN,
   escapeSparqlLiteral,
   isSafeSparqlIri,
   resolveEliToWork,
@@ -85,7 +86,19 @@ export const eurlex_get_document = tool('eurlex_get_document', {
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     celex_number: z
-      .string()
+      .union([
+        z.literal(''),
+        z
+          .string()
+          .overwrite((value) => value.trim().toUpperCase())
+          .regex(
+            CELEX_PATTERN,
+            'celex_number must be a CELEX identifier — a sector character followed by the year, type letters, and number (e.g. 32016R0679). Resolve a citation to its CELEX with eurlex_lookup_celex first.',
+          )
+          .describe(
+            'CELEX number of the act (e.g. 32016R0679 for GDPR). Surrounding whitespace is trimmed and the value is uppercased before validation.',
+          ),
+      ])
       .optional()
       .describe(
         'CELEX number of the act to fetch (e.g. 32016R0679 for GDPR). Provide exactly one of celex_number, eli_uri, or work_uri.',

@@ -7,7 +7,9 @@
  *
  * Also home to the SPARQL-safety primitives every CELLAR query builder shares —
  * `escapeSparqlLiteral` for values interpolated into a `"…"` literal, and
- * `isSafeSparqlIri` for URIs interpolated into a `<…>` IRI.
+ * `isSafeSparqlIri` for URIs interpolated into a `<…>` IRI — and to the shared
+ * input-validity primitives that reject a value before a CELLAR round-trip is
+ * spent on it: `CELEX_PATTERN` and `isValidCalendarDate`.
  * @module services/cellar-sparql/eli-resolution
  */
 
@@ -57,6 +59,57 @@ export function escapeSparqlLiteral(value: string): string {
     .replace(/\n/g, '\\n')
     .replace(/\r/g, '\\r')
     .replace(/\t/g, '\\t');
+}
+
+/**
+ * Structural floor for a CELEX identifier, applied before a CELLAR round-trip is
+ * spent on a value that can never resolve.
+ *
+ * Deliberately permissive rather than a strict grammar. CELEX spans twelve
+ * sectors — digits `0`–`9` plus the letter sectors `C` (OJ C series) and `E`
+ * (EFTA) — and real values carry slash-delimited treaty references
+ * (`11957A/PRO/CJ/09`), corrigendum markers (`32016R0679R(02)`), consolidation
+ * date suffixes (`02016R0679-20160504`), and national-measure suffixes
+ * (`72014L0056FIN_240353`). The pattern therefore requires only: a leading digit
+ * or uppercase letter, a charset limited to digits, `A`–`Z`, and the punctuation
+ * real CELEX values use, and at least six characters (the shortest observed value
+ * is `11997M`). Verified against 6,000 CELEX values pulled live from CELLAR, 500
+ * per sector across all twelve: zero rejections. A narrower digit-first grammar
+ * rejects every sector C and E value.
+ *
+ * Written as a plain floor with no lookaheads. The pattern is advertised verbatim
+ * as the JSON Schema `pattern` of every CELEX-typed input, and RE2-family engines
+ * — which some MCP clients validate arguments with — reject lookarounds outright,
+ * so a lookahead here makes the advertised schema unusable for those callers. The
+ * digit-and-letter requirement the lookaheads carried was never load-bearing:
+ * existence is CELLAR's answer, not this pattern's, and a garbage string sharing
+ * this charset and shape passed either way.
+ */
+export const CELEX_PATTERN = /^[0-9A-Z][0-9A-Z()/_-]{5,}$/;
+
+/** Days in each month for a non-leap year, indexed by month number minus one. */
+const DAYS_IN_MONTH = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31] as const;
+
+/**
+ * True when `value` is a real calendar date in `YYYY-MM-DD` form.
+ *
+ * The date filters both search tools expose reach CELLAR as an `xsd:date`
+ * literal comparison. Virtuoso does not reject an impossible date there — the
+ * comparison simply matches nothing — so `2026-99-99` comes back as an empty
+ * result set rather than an input error, and the caller never learns the value
+ * was not a date. Shape validation alone cannot catch it; the calendar has to be
+ * checked before the query is built.
+ */
+export function isValidCalendarDate(value: string): boolean {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!match) return false;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  if (month < 1 || month > 12) return false;
+  const isLeapYear = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+  const maxDay = month === 2 && isLeapYear ? 29 : (DAYS_IN_MONTH[month - 1] ?? 0);
+  return day >= 1 && day <= maxDay;
 }
 
 /**

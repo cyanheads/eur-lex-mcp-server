@@ -261,4 +261,78 @@ describe('eurlex_lookup_celex', () => {
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('**Found:** false');
   });
+
+  // --- #69: auto-detection reuses the shared CELEX shape ---
+
+  describe('sector coverage in auto-detection (#69)', () => {
+    it('detects a sector-0 consolidated CELEX rather than throwing ambiguous_identifier', async () => {
+      const ctx = createMockContext({ errors: eurlex_lookup_celex.errors });
+      mockQuery.mockResolvedValue([makeBinding('02016R0679-20160504')]);
+
+      const input = eurlex_lookup_celex.input.parse({
+        identifier: '02016R0679-20160504',
+        identifier_type: 'auto',
+      });
+      const result = await eurlex_lookup_celex.handler(input, ctx);
+
+      expect(result.found).toBe(true);
+      expect(result.celex_number).toBe('02016R0679-20160504');
+      // The CELEX branch ran: an exact-match on the CELEX literal, not an ELI lookup.
+      const sparql = mockQuery.mock.calls[0]?.[0] as string;
+      expect(sparql).toContain('FILTER(STR(?celexNumber) = "02016R0679-20160504")');
+    });
+
+    it.each([
+      ['sector 1, treaty reference with slashes', '11957A/PRO/CJ/09'],
+      ['sector 6, case law', '62024CJ0629'],
+      ['sector 7, national implementing measure', '72014L0056FIN_240353'],
+      ['sector C, OJ C series', 'C/2026/01104'],
+      ['sector E, EFTA document', 'E2016C0186'],
+    ])('detects %s through auto', async (_label, celex) => {
+      const ctx = createMockContext({ errors: eurlex_lookup_celex.errors });
+      mockQuery.mockResolvedValue([makeBinding(celex)]);
+
+      const input = eurlex_lookup_celex.input.parse({ identifier: celex, identifier_type: 'auto' });
+      const result = await eurlex_lookup_celex.handler(input, ctx);
+
+      expect(result.found).toBe(true);
+      expect(mockQuery.mock.calls[0]?.[0] as string).toContain('cdm:resource_legal_id_celex');
+    });
+
+    it('leaves ELI detection unaffected through auto and through the explicit type', async () => {
+      const eli = 'http://data.europa.eu/eli/reg/2016/679';
+
+      const autoCtx = createMockContext({ errors: eurlex_lookup_celex.errors });
+      mockQuery.mockResolvedValue([makeBinding('32016R0679')]);
+      const autoInput = eurlex_lookup_celex.input.parse({
+        identifier: eli,
+        identifier_type: 'auto',
+      });
+      await eurlex_lookup_celex.handler(autoInput, autoCtx);
+      expect(mockQuery.mock.calls[0]?.[0] as string).toContain('cdm:resource_legal_eli');
+
+      mockQuery.mockClear();
+      const explicitCtx = createMockContext({ errors: eurlex_lookup_celex.errors });
+      const explicitInput = eurlex_lookup_celex.input.parse({
+        identifier: eli,
+        identifier_type: 'eli',
+      });
+      await eurlex_lookup_celex.handler(explicitInput, explicitCtx);
+      expect(mockQuery.mock.calls[0]?.[0] as string).toContain('cdm:resource_legal_eli');
+    });
+
+    it('still throws ambiguous_identifier for a value that is neither shape', async () => {
+      const ctx = createMockContext({ errors: eurlex_lookup_celex.errors });
+
+      const input = eurlex_lookup_celex.input.parse({
+        identifier: 'not an identifier',
+        identifier_type: 'auto',
+      });
+      await expect(eurlex_lookup_celex.handler(input, ctx)).rejects.toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        data: { reason: 'ambiguous_identifier' },
+      });
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+  });
 });

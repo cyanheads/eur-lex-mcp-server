@@ -24,14 +24,14 @@ const EUROVOC_CONCEPT_NAMESPACE = 'http://eurovoc.europa.eu/';
 export const eurlex_browse_subjects = tool('eurlex_browse_subjects', {
   title: 'Browse EuroVoc Subjects',
   description:
-    'Search the EuroVoc thesaurus, resolving a keyword into concept URIs usable in the eurovoc_concept subject filter of eurlex_search_documents. Returns each concept URI, its preferred label in the requested language, code, and broader (parent) label, ordered alphabetically by label.',
+    'Search the EuroVoc thesaurus, resolving a keyword into concept URIs usable in the eurovoc_concept subject filter of eurlex_search_documents. Matches both preferred and alternative (non-preferred) labels, so a common synonym reaches the concept it stands for. Returns each concept URI, its preferred label in the requested language, code, broader (parent) label, and the alternative label that matched when one did, ordered alphabetically by preferred label.',
   annotations: { readOnlyHint: true, openWorldHint: true, idempotentHint: true },
   input: z.object({
     keyword: z
       .string()
       .min(1)
       .describe(
-        'Search term to match against EuroVoc concept labels (e.g. "privacy", "agriculture", "trade").',
+        'Search term matched against EuroVoc preferred and alternative concept labels (e.g. "privacy", "agriculture", "product liability").',
       ),
     language: z
       .string()
@@ -70,19 +70,32 @@ export const eurlex_browse_subjects = tool('eurlex_browse_subjects', {
               .string()
               .optional()
               .describe('Preferred label of the broader (parent) concept, if available.'),
+            matched_label: z
+              .string()
+              .optional()
+              .describe(
+                'Alternative (non-preferred) EuroVoc label that matched the keyword, when the concept was reached through one. Absent when the keyword matched the preferred label alone.',
+              ),
           })
           .describe('A single EuroVoc concept with its URI, label, code, and hierarchy context.'),
       )
       .describe('Matching EuroVoc concepts ordered alphabetically by label.'),
     total: z.number().describe('Number of concepts returned in this response.'),
     offset: z.number().describe('Pagination offset used for this response.'),
+    has_more: z
+      .boolean()
+      .describe('True only when CELLAR returned an additional valid row beyond this page.'),
+    next_offset: z
+      .number()
+      .optional()
+      .describe('Offset for the next page. Present only when has_more is true.'),
   }),
 
   enrichment: {
     truncated: z
       .boolean()
       .optional()
-      .describe('True when the returned list was capped at the limit and more concepts may exist.'),
+      .describe('True when an additional CELLAR row proves more concepts exist beyond this page.'),
     shown: z.number().optional().describe('Number of concepts returned in this response.'),
     cap: z.number().optional().describe('The limit that was applied to this response.'),
   },
@@ -91,13 +104,14 @@ export const eurlex_browse_subjects = tool('eurlex_browse_subjects', {
     {
       reason: 'no_concepts',
       code: JsonRpcErrorCode.NotFound,
-      when: 'No EuroVoc concepts matched the keyword in the requested language.',
+      when: 'The first page (offset 0) was empty — no EuroVoc concepts matched the keyword in the requested language. A later page that comes back empty returns an empty success instead.',
       recovery: 'Try a broader or simpler term, or retry with language "en" for wider coverage.',
     },
   ],
 
   async handler(input, ctx) {
     const svc = getCellarSparqlService();
+    const pageLimit = Math.min(input.limit, svc.maxResults);
     const keyword = input.keyword.toLowerCase().trim();
     const lang = input.language.toLowerCase().trim() || 'en';
 
@@ -116,11 +130,24 @@ export const eurlex_browse_subjects = tool('eurlex_browse_subjects', {
      * alias. ORDER BY ?label ?concept is a deterministic alphabetical order (the
      * unique concept URI breaks ties) so OFFSET pages are stable and non-overlapping;
      * no relevance signal is computed.
+     *
+     * The keyword is matched against alternative labels as well as the preferred
+     * one. EuroVoc carries its non-preferred terms — the exact phrases people
+     * type — on `skos:altLabel`, so a prefLabel-only match dead-ends on concepts
+     * that exist ("product liability" is an English altLabel of concept 3635,
+     * prefLabel "producer's liability"). A keyword-filtered OPTIONAL binds
+     * `?altValue` only when an alternative label matches, and `|| BOUND(?altValue)`
+     * admits the concept on that basis; `SAMPLE(?altValue)` reports which term hit.
+     * CELLAR asserts the plain SKOS form directly, so no `skosxl:literalForm` join
+     * is needed. Grouping and ordering are untouched — `?label` is always the
+     * prefLabel, never the matched alternative — so a concept reachable by both
+     * paths still returns exactly one row and page boundaries are unaffected.
      */
     const sparql = `
 SELECT ?concept ?label
   (SAMPLE(?codeValue) AS ?code)
-  (SAMPLE(?broaderLabelValue) AS ?broaderLabel) WHERE {
+  (SAMPLE(?broaderLabelValue) AS ?broaderLabel)
+  (SAMPLE(?altValue) AS ?matchedLabel) WHERE {
   ?concept a skos:Concept .
   ?concept skos:prefLabel ?label .
   OPTIONAL { ?concept skos:notation ?codeValue . }
@@ -129,12 +156,17 @@ SELECT ?concept ?label
     ?broader skos:prefLabel ?broaderLabelValue .
     FILTER(LANG(?broaderLabelValue) = "${lang}")
   }
+  OPTIONAL {
+    ?concept skos:altLabel ?altValue .
+    FILTER(LANG(?altValue) = "${lang}")
+    FILTER(CONTAINS(LCASE(STR(?altValue)), "${escapeSparqlLiteral(keyword)}"))
+  }
   FILTER(STRSTARTS(STR(?concept), "${EUROVOC_CONCEPT_NAMESPACE}"))
   FILTER(LANG(?label) = "${lang}")
-  FILTER(CONTAINS(LCASE(STR(?label)), "${escapeSparqlLiteral(keyword)}"))
-} GROUP BY ?concept ?label ORDER BY ?label ?concept LIMIT ${input.limit} OFFSET ${input.offset}`;
+  FILTER(CONTAINS(LCASE(STR(?label)), "${escapeSparqlLiteral(keyword)}") || BOUND(?altValue))
+} GROUP BY ?concept ?label ORDER BY ?label ?concept LIMIT ${pageLimit + 1} OFFSET ${input.offset}`;
 
-    const bindings = await svc.query(sparql, ctx);
+    const bindings = await svc.queryWithContinuation(sparql, ctx);
     ctx.log.info('EuroVoc subject browse', {
       keyword,
       language: lang,
@@ -142,7 +174,7 @@ SELECT ?concept ?label
       resultCount: bindings.length,
     });
 
-    if (bindings.length === 0) {
+    if (bindings.length === 0 && input.offset === 0) {
       throw ctx.fail(
         'no_concepts',
         `No EuroVoc concepts found for "${input.keyword}" in language "${lang}"`,
@@ -152,12 +184,14 @@ SELECT ?concept ?label
       );
     }
 
-    const concepts = bindings.map((b) => {
+    const hasMore = bindings.length > pageLimit;
+    const concepts = bindings.slice(0, pageLimit).map((b) => {
       const entry: {
         concept_uri: string;
         pref_label: string;
         concept_code?: string;
         broader_label?: string;
+        matched_label?: string;
       } = {
         concept_uri: CellarSparqlService.bindingValue(b, 'concept') ?? '',
         pref_label: CellarSparqlService.bindingValue(b, 'label') ?? '',
@@ -166,26 +200,37 @@ SELECT ?concept ?label
       if (code) entry.concept_code = code;
       const broaderLabel = CellarSparqlService.bindingValue(b, 'broaderLabel');
       if (broaderLabel) entry.broader_label = broaderLabel;
+      const matchedLabel = CellarSparqlService.bindingValue(b, 'matchedLabel');
+      if (matchedLabel) entry.matched_label = matchedLabel;
       return entry;
     });
 
-    // A full page means the limit capped the list — page forward with offset for more.
-    if (concepts.length >= input.limit) {
-      ctx.enrich.truncated({ shown: concepts.length, cap: input.limit });
+    if (hasMore) {
+      ctx.enrich.truncated({ shown: concepts.length, cap: pageLimit });
     }
 
-    return { concepts, total: concepts.length, offset: input.offset };
+    return {
+      concepts,
+      total: concepts.length,
+      offset: input.offset,
+      has_more: hasMore,
+      ...(hasMore ? { next_offset: input.offset + pageLimit } : {}),
+    };
   },
 
   format: (result) => {
     const lines: string[] = [
       `## EuroVoc Concepts (${result.total} found, offset ${result.offset})\n`,
+      `**Has more:** ${result.has_more}`,
     ];
+    if (result.next_offset !== undefined) lines.push(`**Next offset:** ${result.next_offset}`);
+    lines.push('');
     for (const c of result.concepts) {
       lines.push(`### ${c.pref_label}`);
       lines.push(`**URI:** ${c.concept_uri}`);
       if (c.concept_code) lines.push(`**Code:** ${c.concept_code}`);
       if (c.broader_label) lines.push(`**Broader:** ${c.broader_label}`);
+      if (c.matched_label) lines.push(`**Matched via:** ${c.matched_label}`);
       lines.push('');
     }
     return [{ type: 'text', text: lines.join('\n') }];

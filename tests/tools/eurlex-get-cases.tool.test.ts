@@ -4,15 +4,20 @@
  */
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_get_cases } from '@/mcp-server/tools/definitions/eurlex-get-cases.tool.js';
 import { escapeSparqlLiteral } from '@/services/cellar-sparql/eli-resolution.js';
 
 // --- Service mock ---
 const mockQuery = vi.fn();
+let mockMaxResults = 100;
 vi.mock('@/services/cellar-sparql/cellar-sparql-service.js', () => ({
-  getCellarSparqlService: () => ({ query: mockQuery }),
+  getCellarSparqlService: () => ({
+    query: mockQuery,
+    queryWithContinuation: mockQuery,
+    maxResults: mockMaxResults,
+  }),
   CellarSparqlService: {
     bindingValue: (binding: Record<string, { value?: string }> | undefined, field: string) =>
       binding?.[field]?.value,
@@ -52,7 +57,10 @@ function makeCaseBinding(
 }
 
 describe('eurlex_get_cases', () => {
-  beforeEach(() => mockQuery.mockReset());
+  beforeEach(() => {
+    mockQuery.mockReset();
+    mockMaxResults = 100;
+  });
 
   // --- Happy paths ---
 
@@ -199,7 +207,7 @@ describe('eurlex_get_cases', () => {
 
     expect(result.offset).toBe(10);
     const sparql = mockQuery.mock.calls[0]?.[0] as string;
-    expect(sparql).toContain('LIMIT 5');
+    expect(sparql).toContain('LIMIT 6');
     expect(sparql).toContain('OFFSET 10');
   });
 
@@ -266,6 +274,27 @@ describe('eurlex_get_cases', () => {
       code: JsonRpcErrorCode.NotFound,
       data: { reason: 'no_results' },
     });
+  });
+
+  it('returns an empty successful page when a non-zero offset is exhausted', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+    mockQuery.mockResolvedValue([]);
+
+    const input = eurlex_get_cases.input.parse({ keyword: 'google', offset: 200, limit: 20 });
+    const result = await eurlex_get_cases.handler(input, ctx);
+
+    expect(result).toMatchObject({
+      cases: [],
+      total: 0,
+      offset: 200,
+      has_more: false,
+      query_echo: { keyword: 'google', include_derivative: false },
+    });
+    expect(result.next_offset).toBeUndefined();
+    expect(getEnrichment(ctx).truncated).toBeUndefined();
+    expect((eurlex_get_cases.format!(result)[0] as { text: string }).text).toContain(
+      '**Has more:** false',
+    );
   });
 
   // --- Keyword full-text search (issue #17) ---
@@ -415,7 +444,7 @@ describe('eurlex_get_cases', () => {
     const result = await eurlex_get_cases.handler(input, ctx);
 
     const sparql = mockQuery.mock.calls[0]?.[0] as string;
-    expect(sparql).toMatch(/GROUP BY \?celexNumber[\s\S]*LIMIT 2/);
+    expect(sparql).toMatch(/GROUP BY \?celexNumber[\s\S]*LIMIT 3/);
     expect(result.total).toBe(2);
     expect(new Set(result.cases.map((c) => c.work_uri)).size).toBe(2);
   });
@@ -519,6 +548,8 @@ describe('eurlex_get_cases', () => {
     expect(() => eurlex_get_cases.input.parse({ court: 'SUPREME' })).toThrow();
     expect(() => eurlex_get_cases.input.parse({ case_type: 'appeal' })).toThrow();
     expect(() => eurlex_get_cases.input.parse({ date_from: '2016' })).toThrow();
+    expect(() => eurlex_get_cases.input.parse({ limit: 101 })).toThrow();
+    expect(() => eurlex_get_cases.input.parse({ offset: -1 })).toThrow();
   });
 
   // --- Whitespace-only keyword normalization (issue #25) ---
@@ -549,28 +580,70 @@ describe('eurlex_get_cases', () => {
     expect(result.query_echo.keyword).toBe('google');
   });
 
-  // --- #28: truncation disclosure ---
+  // --- #72: proven continuation ---
 
-  it('discloses truncation when the returned page fills the limit', async () => {
+  it('does not disclose continuation for an exactly-full final page', async () => {
     const ctx = createMockContext({ errors: eurlex_get_cases.errors });
     mockQuery.mockResolvedValue([makeCaseBinding('62013CJ0131'), makeCaseBinding('62020TJ0022')]);
 
     const input = eurlex_get_cases.input.parse({ keyword: 'x', limit: 2 });
-    await eurlex_get_cases.handler(input, ctx);
+    const result = await eurlex_get_cases.handler(input, ctx);
 
-    const enriched = getEnrichment(ctx);
-    expect(enriched.truncated).toBe(true);
-    expect(enriched.shown).toBe(2);
-    expect(enriched.cap).toBe(2);
+    expect(result.cases).toHaveLength(2);
+    expect(result.has_more).toBe(false);
+    expect(result.next_offset).toBeUndefined();
+    expect(getEnrichment(ctx).truncated).toBeUndefined();
   });
 
-  it('does not disclose truncation when the page is short of the limit', async () => {
+  it('returns one-row continuation proof without exposing the sentinel row', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+    mockQuery.mockResolvedValue([
+      makeCaseBinding('62013CJ0131'),
+      makeCaseBinding('62020TJ0022'),
+      makeCaseBinding('62024CJ0001'),
+    ]);
+
+    const input = eurlex_get_cases.input.parse({ keyword: 'x', limit: 2 });
+    const result = await eurlex_get_cases.handler(input, ctx);
+
+    expect(result.cases).toHaveLength(2);
+    expect(result.has_more).toBe(true);
+    expect(result.next_offset).toBe(2);
+    expect(mockQuery.mock.calls[0]?.[0]).toContain('LIMIT 3');
+    expect(getEnrichment(ctx)).toMatchObject({ truncated: true, shown: 2, cap: 2 });
+    const text = (eurlex_get_cases.format!(result)[0] as { text: string }).text;
+    expect(text).toContain('**Has more:** true');
+    expect(text).toContain('**Next offset:** 2');
+  });
+
+  it('uses the service ceiling as the effective page size when it is lower than limit', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+    mockMaxResults = 2;
+    mockQuery.mockResolvedValue([
+      makeCaseBinding('62013CJ0131'),
+      makeCaseBinding('62020TJ0022'),
+      makeCaseBinding('62024CJ0001'),
+    ]);
+
+    const input = eurlex_get_cases.input.parse({ keyword: 'x', limit: 100 });
+    const result = await eurlex_get_cases.handler(input, ctx);
+
+    expect(result.cases).toHaveLength(2);
+    expect(result.has_more).toBe(true);
+    expect(result.next_offset).toBe(2);
+    expect(mockQuery.mock.calls[0]?.[0]).toContain('LIMIT 3');
+    expect(getEnrichment(ctx)).toMatchObject({ truncated: true, shown: 2, cap: 2 });
+  });
+
+  it('does not disclose continuation when the page is short of the limit', async () => {
     const ctx = createMockContext({ errors: eurlex_get_cases.errors });
     mockQuery.mockResolvedValue([makeCaseBinding('62013CJ0131')]);
 
     const input = eurlex_get_cases.input.parse({ keyword: 'x', limit: 2 });
-    await eurlex_get_cases.handler(input, ctx);
+    const result = await eurlex_get_cases.handler(input, ctx);
 
+    expect(result.has_more).toBe(false);
+    expect(result.next_offset).toBeUndefined();
     expect(getEnrichment(ctx).truncated).toBeUndefined();
   });
 
@@ -748,6 +821,7 @@ describe('eurlex_get_cases', () => {
       ],
       total: 1,
       offset: 0,
+      has_more: false,
       query_echo: { keyword: 'google', include_derivative: false },
     };
     const blocks = eurlex_get_cases.format!(output);
@@ -758,6 +832,7 @@ describe('eurlex_get_cases', () => {
     expect(text).toContain('2014-05-13');
     expect(text).toContain('Judgment');
     expect(text).toContain('keyword="google"');
+    expect(text).toContain('**Has more:** false');
   });
 
   it('format handles sparse case (no title or type)', () => {
@@ -770,6 +845,7 @@ describe('eurlex_get_cases', () => {
       ],
       total: 1,
       offset: 0,
+      has_more: false,
       query_echo: { include_derivative: false },
     };
     const blocks = eurlex_get_cases.format!(output);
@@ -862,6 +938,7 @@ describe('eurlex_get_cases', () => {
       ],
       total: 1,
       offset: 0,
+      has_more: false,
       query_echo: { case_type: 'judgment', include_derivative: false },
     };
     const blocks = eurlex_get_cases.format!(output);
@@ -875,5 +952,169 @@ describe('eurlex_get_cases', () => {
     expect(text).toContain('**Case reference:** Case C-97/23 P.');
     // The full raw title stays available as a labelled line (format parity).
     expect(text).toContain('**Full title:** Judgment of the Court of 10 February 2026.#WhatsApp');
+  });
+
+  // --- #77: impossible calendar dates and inverted ranges ---
+
+  describe('date-range validity (#77)', () => {
+    it.each([
+      ['an impossible month and day', '2026-99-99'],
+      ['month 13', '2026-13-01'],
+      ['day 00', '2026-01-00'],
+      ['a leap day in a common year', '2023-02-29'],
+    ])('rejects %s in date_from before any CELLAR request', async (_label, value) => {
+      const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+
+      const input = eurlex_get_cases.input.parse({ date_from: value, limit: 1 });
+      const err = await Promise.resolve(eurlex_get_cases.handler(input, ctx)).catch(
+        (e: unknown) => e,
+      );
+
+      expect(err).toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        data: { reason: 'invalid_date_range' },
+      });
+      // The message names the offending field and value, not a generic complaint.
+      expect((err as { message: string }).message).toContain('date_from');
+      expect((err as { message: string }).message).toContain(value);
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    it('rejects an impossible date in date_to and names that field', async () => {
+      const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+
+      const input = eurlex_get_cases.input.parse({ date_to: '2026-13-01', limit: 1 });
+      const err = await Promise.resolve(eurlex_get_cases.handler(input, ctx)).catch(
+        (e: unknown) => e,
+      );
+
+      expect(err).toMatchObject({ data: { reason: 'invalid_date_range' } });
+      expect((err as { message: string }).message).toContain('date_to');
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    it('accepts the leap day 2024-02-29 and builds its filter clause', async () => {
+      const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+      mockQuery.mockResolvedValue([makeCaseBinding('62024CJ0629')]);
+
+      const input = eurlex_get_cases.input.parse({ date_from: '2024-02-29', limit: 1 });
+      await eurlex_get_cases.handler(input, ctx);
+
+      expect(mockQuery.mock.calls[0]?.[0] as string).toContain('"2024-02-29"^^xsd:date');
+    });
+
+    it('names the expected date shape when the schema rejects a malformed date', () => {
+      // The shape gate fires before the handler, so its own message is the only
+      // guidance the caller gets — a bare "Invalid string" leaves them guessing.
+      const parsed = eurlex_get_cases.input.safeParse({ date_to: '2016-5-4', limit: 1 });
+      expect(parsed.success).toBe(false);
+      expect(JSON.stringify(parsed.error?.issues)).toContain(
+        'date_to must be a calendar date in YYYY-MM-DD form, zero-padded (e.g. 2016-05-04).',
+      );
+    });
+
+    it('rejects an inverted range and says so', async () => {
+      const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+
+      const input = eurlex_get_cases.input.parse({
+        date_from: '2020-12-31',
+        date_to: '2020-01-01',
+        limit: 1,
+      });
+      const err = await Promise.resolve(eurlex_get_cases.handler(input, ctx)).catch(
+        (e: unknown) => e,
+      );
+
+      expect(err).toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        data: { reason: 'invalid_date_range' },
+      });
+      expect((err as { message: string }).message).toContain('inverted');
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    it('accepts equal endpoints as a valid single-day range', async () => {
+      const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+      mockQuery.mockResolvedValue([makeCaseBinding('62024CJ0629')]);
+
+      const input = eurlex_get_cases.input.parse({
+        date_from: '2020-01-01',
+        date_to: '2020-01-01',
+        limit: 1,
+      });
+      await eurlex_get_cases.handler(input, ctx);
+
+      const sparql = mockQuery.mock.calls[0]?.[0] as string;
+      expect(sparql).toContain('FILTER(?date >= "2020-01-01"^^xsd:date)');
+      expect(sparql).toContain('FILTER(?date <= "2020-01-01"^^xsd:date)');
+    });
+
+    it('leaves date_to alone as a valid single-bound filter', async () => {
+      const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+      mockQuery.mockResolvedValue([makeCaseBinding('62024CJ0629')]);
+
+      const input = eurlex_get_cases.input.parse({ date_to: '2020-01-01', limit: 1 });
+      const result = await eurlex_get_cases.handler(input, ctx);
+
+      const sparql = mockQuery.mock.calls[0]?.[0] as string;
+      expect(sparql).toContain('FILTER(?date <= "2020-01-01"^^xsd:date)');
+      expect(sparql).not.toContain('FILTER(?date >= ');
+      expect(result.query_echo.date_to).toBe('2020-01-01');
+      expect(result.query_echo.date_from).toBeUndefined();
+    });
+
+    it('runs no calendar check on blank date fields, which stay out of the echo', async () => {
+      const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+      mockQuery.mockResolvedValue([makeCaseBinding('62024CJ0629')]);
+
+      const input = eurlex_get_cases.input.parse({
+        keyword: 'competition',
+        date_from: '',
+        date_to: '',
+      });
+      const result = await eurlex_get_cases.handler(input, ctx);
+
+      expect(mockQuery.mock.calls[0]?.[0] as string).not.toContain('xsd:date');
+      expect(result.query_echo.date_from).toBeUndefined();
+      expect(result.query_echo.date_to).toBeUndefined();
+    });
+
+    it.each([
+      ['a year alone', '2016'],
+      ['a single-digit month and day', '2026-2-9'],
+      ['a leading-whitespace value', ' 2026-01-01'],
+      ['a trailing-whitespace value', '2026-01-01 '],
+    ])('still rejects %s at the schema, not the handler', (_label, value) => {
+      expect(() => eurlex_get_cases.input.parse({ date_from: value })).toThrow();
+      expect(() => eurlex_get_cases.input.parse({ date_to: value })).toThrow();
+    });
+
+    /**
+     * Both public surfaces must carry the diagnosis: Claude Code reads
+     * structuredContent, Claude Desktop reads content[]. Driving the definition
+     * through the real handler factory is what proves the pair, rather than
+     * inspecting the thrown error alone.
+     */
+    it('reaches the caller on both content[] and structuredContent.error', async () => {
+      const result = await runToolContract(eurlex_get_cases, { date_from: '2026-99-99', limit: 1 });
+
+      expect(result.isError).toBe(true);
+      const structured = result.structuredContent as {
+        error?: {
+          code?: number;
+          message?: string;
+          data?: { reason?: string; recovery?: { hint?: string } };
+        };
+      };
+      expect(structured.error?.code).toBe(JsonRpcErrorCode.ValidationError);
+      expect(structured.error?.data?.reason).toBe('invalid_date_range');
+      expect(structured.error?.data?.recovery?.hint).toContain('YYYY-MM-DD');
+
+      const text = result.content
+        .map((block) => (block as { text?: string }).text ?? '')
+        .join('\n');
+      expect(text).toContain('2026-99-99');
+      expect(text).toContain(structured.error?.data?.recovery?.hint as string);
+    });
   });
 });

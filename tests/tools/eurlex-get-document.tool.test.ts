@@ -1374,14 +1374,32 @@ describe('eurlex_get_document', () => {
      */
     const queriesIssued = () => mockSparqlQuery.mock.calls.map((c) => c[0] as string);
 
+    it('rejects an embedded newline in celex_number at the schema (#69)', () => {
+      // The CELEX shape gate refuses the control character outright, so no query
+      // is built from it at all.
+      expect(() =>
+        eurlex_get_document.input.parse({
+          celex_number: '32016R0679\nGDPR',
+          content_mode: 'metadata_only',
+        }),
+      ).toThrow();
+      expect(mockSparqlQuery).not.toHaveBeenCalled();
+    });
+
     it('escapes an embedded newline in celex_number and returns the tool own not_found', async () => {
       const ctx = createMockContext({ errors: eurlex_get_document.errors });
       mockSparqlQuery.mockResolvedValue([]); // identifier matches no work
 
-      const input = eurlex_get_document.input.parse({
+      // Escaping is the second line of defense behind that schema gate, so exercise
+      // it directly: parse a well-formed payload, then substitute the hostile
+      // identifier the handler must still neutralize on its own.
+      const input = {
+        ...eurlex_get_document.input.parse({
+          celex_number: '32016R0679',
+          content_mode: 'metadata_only',
+        }),
         celex_number: '32016R0679\nGDPR',
-        content_mode: 'metadata_only',
-      });
+      };
       const err = await Promise.resolve(eurlex_get_document.handler(input, ctx)).catch(
         (e: unknown) => e,
       );
@@ -1444,6 +1462,96 @@ describe('eurlex_get_document', () => {
 
     it('still accepts a legitimate work_uri', () => {
       expect(() => eurlex_get_document.input.parse({ work_uri: WORK_URI })).not.toThrow();
+    });
+  });
+
+  // --- #69: CELEX shape gate at the schema layer ---
+
+  describe('CELEX shape validation (#69)', () => {
+    it.each([
+      ['a bare zero', '0'],
+      ['a stray word', 'hello'],
+      ['whitespace only', '   '],
+    ])('rejects %s before any CELLAR request', (_label, value) => {
+      expect(() => eurlex_get_document.input.parse({ celex_number: value })).toThrow();
+      expect(mockSparqlQuery).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['sector 0, consolidated version', '02016R0679-20160504'],
+      ['sector 1, treaty reference with slashes', '11957A/PRO/CJ/09'],
+      ['sector 2, external relations', '22001D0815'],
+      ['sector 3, regulation', '32016R0679'],
+      ['sector 3, corrigendum marker', '32016R0679R(02)'],
+      ['sector 4, complementary legislation', '42002D0234'],
+      ['sector 5, preparatory act', '52016PC0001'],
+      ['sector 6, case law', '62024CJ0629'],
+      ['sector 7, national implementing measure', '72014L0056FIN_240353'],
+      ['sector 8, national case law', '82003PT1111(51)'],
+      ['sector 9, parliamentary question', '91980E001013'],
+      ['sector C, OJ C series', 'C/2026/01104'],
+      ['sector E, EFTA document', 'E2016C0186'],
+    ])('accepts a real %s', (_label, celex) => {
+      expect(() => eurlex_get_document.input.parse({ celex_number: celex })).not.toThrow();
+    });
+
+    it('still routes celex_number "" to the handler and its identifier guard', async () => {
+      const ctx = createMockContext({ errors: eurlex_get_document.errors });
+
+      // The blank-field convention survives the new pattern: "" is a union member,
+      // so a form client's empty box reaches the handler's friendly guard rather
+      // than a schema rejection.
+      const input = eurlex_get_document.input.parse({ celex_number: '' });
+      await expect(eurlex_get_document.handler(input, ctx)).rejects.toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        data: { reason: 'invalid_identifier_args' },
+      });
+      expect(mockSparqlQuery).not.toHaveBeenCalled();
+    });
+  });
+
+  // --- CELEX input normalization ---
+
+  describe('CELEX normalization', () => {
+    it('trims surrounding whitespace before validating', () => {
+      expect(eurlex_get_document.input.parse({ celex_number: ' 32016R0679 ' }).celex_number).toBe(
+        '32016R0679',
+      );
+    });
+
+    it('uppercases a lowercase CELEX before validating', () => {
+      expect(eurlex_get_document.input.parse({ celex_number: '32016r0679' }).celex_number).toBe(
+        '32016R0679',
+      );
+    });
+
+    /**
+     * A whitespace-only value is not the `''` union member, so it takes the regex
+     * branch, trims to `''` there, and fails the six-character floor — a schema
+     * rejection, not the handler's identifier guard.
+     */
+    it('still rejects a whitespace-only celex_number at the schema', () => {
+      expect(() => eurlex_get_document.input.parse({ celex_number: '   ' })).toThrow();
+      expect(mockSparqlQuery).not.toHaveBeenCalled();
+    });
+
+    it('hands the handler the normalized CELEX', async () => {
+      const ctx = createMockContext({ errors: eurlex_get_document.errors });
+      mockSparqlQuery.mockResolvedValue([makeMetaBinding({ celex: '32016R0679' })]);
+      mockFetchContent.mockResolvedValue({
+        content: 'body',
+        contentAvailable: true,
+        format: 'html',
+        language: 'EN',
+      });
+
+      const input = eurlex_get_document.input.parse({ celex_number: '   32016r0679   ' });
+      const result = await eurlex_get_document.handler(input, ctx);
+
+      expect(result.celex_number).toBe('32016R0679');
+      expect(mockSparqlQuery.mock.calls[0]?.[0] as string).toContain(
+        'FILTER(STR(?celexNumber) = "32016R0679")',
+      );
     });
   });
 });

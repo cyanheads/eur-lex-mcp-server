@@ -13,7 +13,11 @@ import {
   CellarSparqlService,
   getCellarSparqlService,
 } from '@/services/cellar-sparql/cellar-sparql-service.js';
-import { escapeSparqlLiteral, isSafeSparqlIri } from '@/services/cellar-sparql/eli-resolution.js';
+import {
+  escapeSparqlLiteral,
+  isSafeSparqlIri,
+  isValidCalendarDate,
+} from '@/services/cellar-sparql/eli-resolution.js';
 import { isConsolidatedCelex } from '@/services/cellar-sparql/relation-traversal.js';
 
 const RESOURCE_TYPE_BASE = 'http://publications.europa.eu/resource/authority/resource-type/';
@@ -103,7 +107,10 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
         z.literal(''),
         z
           .string()
-          .regex(/^\d{4}-\d{2}-\d{2}$/)
+          .regex(
+            /^\d{4}-\d{2}-\d{2}$/,
+            'date_from must be a calendar date in YYYY-MM-DD form, zero-padded (e.g. 2016-05-04).',
+          )
           .describe('Start date in ISO 8601 format (YYYY-MM-DD).'),
       ])
       .optional()
@@ -115,7 +122,10 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
         z.literal(''),
         z
           .string()
-          .regex(/^\d{4}-\d{2}-\d{2}$/)
+          .regex(
+            /^\d{4}-\d{2}-\d{2}$/,
+            'date_to must be a calendar date in YYYY-MM-DD form, zero-padded (e.g. 2016-05-04).',
+          )
           .describe('End date in ISO 8601 format (YYYY-MM-DD).'),
       ])
       .optional()
@@ -196,6 +206,13 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
       .number()
       .describe('Number of documents returned in this page (not a corpus-wide count).'),
     offset: z.number().describe('Pagination offset used for this response.'),
+    has_more: z
+      .boolean()
+      .describe('True only when CELLAR returned an additional valid row beyond this page.'),
+    next_offset: z
+      .number()
+      .optional()
+      .describe('Offset for the next page. Present only when has_more is true.'),
     query_echo: z
       .object({
         keyword: z.string().optional().describe('Keyword filter applied.'),
@@ -218,9 +235,7 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
     truncated: z
       .boolean()
       .optional()
-      .describe(
-        'True when the returned page was capped at the limit and more documents may exist.',
-      ),
+      .describe('True when an additional CELLAR row proves more documents exist beyond this page.'),
     shown: z.number().optional().describe('Number of documents returned in this page.'),
     cap: z.number().optional().describe('The limit that was applied to this page.'),
   },
@@ -234,9 +249,16 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
         'Supply at least one filter: keyword, document_type, date_from/date_to, eurovoc_concept, author_institution, or in_force.',
     },
     {
+      reason: 'invalid_date_range',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'date_from or date_to is not a real calendar date, or date_from falls after date_to.',
+      recovery:
+        'Supply each date as a real calendar day in YYYY-MM-DD form, with date_from on or before date_to.',
+    },
+    {
       reason: 'no_results',
       code: JsonRpcErrorCode.NotFound,
-      when: 'The query returned zero bindings — no matching documents in CELLAR.',
+      when: 'The first page (offset 0) returned zero bindings — no matching documents in CELLAR. A later page that comes back empty returns an empty success instead.',
       recovery:
         'Broaden the search by removing filters, trying a shorter keyword, or expanding the date range.',
     },
@@ -250,6 +272,38 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
 
   async handler(input, ctx) {
     const svc = getCellarSparqlService();
+    const pageLimit = Math.min(input.limit, svc.maxResults);
+
+    /**
+     * Date-range validity, checked before any clause is built and before the
+     * no_filters gate. The schema pins the `YYYY-MM-DD` shape only, so an
+     * impossible calendar day or an inverted range still reaches CELLAR as an
+     * `xsd:date` comparison that Virtuoso answers with zero bindings — the caller
+     * would see no_results and never learn the input was at fault. Ordering
+     * matters against the no_filters gate too: the caller did supply a filter, it
+     * just failed validation, so no_filters would be the wrong diagnosis. Both
+     * values are shape- and calendar-valid by the time the range is compared, so
+     * a lexicographic comparison of the ISO strings is a chronological one.
+     */
+    const dateFrom = input.date_from?.trim();
+    const dateTo = input.date_to?.trim();
+    if (dateFrom && !isValidCalendarDate(dateFrom)) {
+      throw ctx.fail('invalid_date_range', `date_from "${dateFrom}" is not a real calendar date.`, {
+        ...ctx.recoveryFor('invalid_date_range'),
+      });
+    }
+    if (dateTo && !isValidCalendarDate(dateTo)) {
+      throw ctx.fail('invalid_date_range', `date_to "${dateTo}" is not a real calendar date.`, {
+        ...ctx.recoveryFor('invalid_date_range'),
+      });
+    }
+    if (dateFrom && dateTo && dateFrom > dateTo) {
+      throw ctx.fail(
+        'invalid_date_range',
+        `Date range is inverted: date_from "${dateFrom}" falls after date_to "${dateTo}".`,
+        { ...ctx.recoveryFor('invalid_date_range') },
+      );
+    }
 
     const filters: string[] = [];
     let documentTypeClause = '';
@@ -270,11 +324,11 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
       : '?work cdm:work_has_resource-type ?selectedType .'
   }`;
     }
-    if (input.date_from?.trim()) {
-      filters.push(`FILTER(?date >= "${input.date_from.trim()}"^^xsd:date)`);
+    if (dateFrom) {
+      filters.push(`FILTER(?date >= "${dateFrom}"^^xsd:date)`);
     }
-    if (input.date_to?.trim()) {
-      filters.push(`FILTER(?date <= "${input.date_to.trim()}"^^xsd:date)`);
+    if (dateTo) {
+      filters.push(`FILTER(?date <= "${dateTo}"^^xsd:date)`);
     }
     if (input.in_force === true) {
       filters.push(`FILTER(?inForce = true)`);
@@ -369,8 +423,8 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
     const hasEffectiveFilter =
       !!keywordInput ||
       !!input.document_type ||
-      !!input.date_from?.trim() ||
-      !!input.date_to?.trim() ||
+      !!dateFrom ||
+      !!dateTo ||
       !!input.eurovoc_concept?.trim() ||
       !!authorInput ||
       input.in_force === true;
@@ -429,7 +483,7 @@ SELECT
   ${keywordClause}
   ${inForceClause}
   ${filters.join('\n  ')}
-} GROUP BY ?celexNumber ORDER BY DESC(?docDate) LIMIT ${input.limit} OFFSET ${input.offset}`;
+} GROUP BY ?celexNumber ORDER BY DESC(?docDate) LIMIT ${pageLimit + 1} OFFSET ${input.offset}`;
 
     const queryEcho = {
       ...(keywordInput ? { keyword: keywordInput } : {}),
@@ -444,7 +498,7 @@ SELECT
       ...(input.in_force !== undefined ? { in_force: input.in_force } : {}),
     };
 
-    const bindings = await svc.query(sparql, ctx);
+    const bindings = await svc.queryWithContinuation(sparql, ctx);
     ctx.log.info('Document search', {
       keyword: input.keyword,
       documentType: input.document_type,
@@ -452,7 +506,7 @@ SELECT
       offset: input.offset,
     });
 
-    if (bindings.length === 0) {
+    if (bindings.length === 0 && input.offset === 0) {
       const filterSummary = Object.entries(queryEcho)
         .map(([k, v]) => `${k}=${String(v)}`)
         .join(', ');
@@ -463,7 +517,8 @@ SELECT
       );
     }
 
-    const documents = bindings.map((b) => {
+    const hasMore = bindings.length > pageLimit;
+    const documents = bindings.slice(0, pageLimit).map((b) => {
       const celexNumber = CellarSparqlService.bindingValue(b, 'celex') ?? '';
       const doc: {
         work_uri: string;
@@ -489,18 +544,27 @@ SELECT
       return doc;
     });
 
-    // A full page means the limit capped the list — page forward with offset for more.
-    if (documents.length >= input.limit) {
-      ctx.enrich.truncated({ shown: documents.length, cap: input.limit });
+    if (hasMore) {
+      ctx.enrich.truncated({ shown: documents.length, cap: pageLimit });
     }
 
-    return { documents, total: documents.length, offset: input.offset, query_echo: queryEcho };
+    return {
+      documents,
+      total: documents.length,
+      offset: input.offset,
+      has_more: hasMore,
+      ...(hasMore ? { next_offset: input.offset + pageLimit } : {}),
+      query_echo: queryEcho,
+    };
   },
 
   format: (result) => {
     const lines: string[] = [
       `## EU Documents (${result.total} results, offset ${result.offset})\n`,
+      `**Has more:** ${result.has_more}`,
     ];
+    if (result.next_offset !== undefined) lines.push(`**Next offset:** ${result.next_offset}`);
+    lines.push('');
     const echoEntries = Object.entries(result.query_echo);
     if (echoEntries.length > 0) {
       lines.push(

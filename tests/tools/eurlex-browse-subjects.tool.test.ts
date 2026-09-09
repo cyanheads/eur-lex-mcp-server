@@ -11,8 +11,13 @@ import { escapeSparqlLiteral } from '@/services/cellar-sparql/eli-resolution.js'
 
 // --- Service mock ---
 const mockQuery = vi.fn();
+let mockMaxResults = 100;
 vi.mock('@/services/cellar-sparql/cellar-sparql-service.js', () => ({
-  getCellarSparqlService: () => ({ query: mockQuery }),
+  getCellarSparqlService: () => ({
+    query: mockQuery,
+    queryWithContinuation: mockQuery,
+    maxResults: mockMaxResults,
+  }),
   CellarSparqlService: {
     bindingValue: (binding: Record<string, { value?: string }> | undefined, field: string) =>
       binding?.[field]?.value,
@@ -24,6 +29,7 @@ function makeConceptBinding(opts: {
   label: string;
   code?: string;
   broaderLabel?: string;
+  matchedLabel?: string;
 }): Record<string, { type: string; value: string }> {
   const b: Record<string, { type: string; value: string }> = {
     concept: { type: 'uri', value: opts.uri },
@@ -31,11 +37,17 @@ function makeConceptBinding(opts: {
   };
   if (opts.code) b.code = { type: 'literal', value: opts.code };
   if (opts.broaderLabel) b.broaderLabel = { type: 'literal', value: opts.broaderLabel };
+  // Mirrors SAMPLE(?altValue): bound only when the keyword matched an alternative
+  // label, so its absence is how a prefLabel-only hit is represented.
+  if (opts.matchedLabel) b.matchedLabel = { type: 'literal', value: opts.matchedLabel };
   return b;
 }
 
 describe('eurlex_browse_subjects', () => {
-  beforeEach(() => mockQuery.mockReset());
+  beforeEach(() => {
+    mockQuery.mockReset();
+    mockMaxResults = 100;
+  });
 
   // --- Happy paths ---
 
@@ -136,7 +148,12 @@ describe('eurlex_browse_subjects', () => {
     await eurlex_browse_subjects.handler(input, ctx);
 
     const sparql = mockQuery.mock.calls[0]?.[0] as string;
-    expect(sparql).toContain('LIMIT 5');
+    expect(sparql).toContain('LIMIT 6');
+  });
+
+  it('rejects pagination values outside the public boundary', () => {
+    expect(() => eurlex_browse_subjects.input.parse({ keyword: 'data', limit: 51 })).toThrow();
+    expect(() => eurlex_browse_subjects.input.parse({ keyword: 'data', offset: -1 })).toThrow();
   });
 
   // --- Error contract: no_concepts ---
@@ -150,6 +167,26 @@ describe('eurlex_browse_subjects', () => {
       code: JsonRpcErrorCode.NotFound,
       data: { reason: 'no_concepts' },
     });
+  });
+
+  it('returns an empty successful page when a non-zero offset is exhausted', async () => {
+    const ctx = createMockContext({ errors: eurlex_browse_subjects.errors });
+    mockQuery.mockResolvedValue([]);
+
+    const input = eurlex_browse_subjects.input.parse({ keyword: 'data', offset: 200, limit: 20 });
+    const result = await eurlex_browse_subjects.handler(input, ctx);
+
+    expect(result).toEqual({
+      concepts: [],
+      total: 0,
+      offset: 200,
+      has_more: false,
+    });
+    expect(result.next_offset).toBeUndefined();
+    expect(getEnrichment(ctx).truncated).toBeUndefined();
+    expect((eurlex_browse_subjects.format!(result)[0] as { text: string }).text).toContain(
+      '**Has more:** false',
+    );
   });
 
   // --- #62: keyword escaping routes through the shared helper ---
@@ -199,9 +236,9 @@ describe('eurlex_browse_subjects', () => {
     expect(sparql).not.toContain(String.raw`"data\\" x"`);
   });
 
-  // --- #28: truncation disclosure ---
+  // --- #72: proven continuation ---
 
-  it('discloses truncation when the returned page fills the limit', async () => {
+  it('does not disclose continuation for an exactly-full final page', async () => {
     const ctx = createMockContext({ errors: eurlex_browse_subjects.errors });
     mockQuery.mockResolvedValue([
       makeConceptBinding({ uri: 'http://eurovoc.europa.eu/1', label: 'a' }),
@@ -209,23 +246,65 @@ describe('eurlex_browse_subjects', () => {
     ]);
 
     const input = eurlex_browse_subjects.input.parse({ keyword: 'data', limit: 2 });
-    await eurlex_browse_subjects.handler(input, ctx);
+    const result = await eurlex_browse_subjects.handler(input, ctx);
 
-    const enriched = getEnrichment(ctx);
-    expect(enriched.truncated).toBe(true);
-    expect(enriched.shown).toBe(2);
-    expect(enriched.cap).toBe(2);
+    expect(result.concepts).toHaveLength(2);
+    expect(result.has_more).toBe(false);
+    expect(result.next_offset).toBeUndefined();
+    expect(getEnrichment(ctx).truncated).toBeUndefined();
   });
 
-  it('does not disclose truncation when the page is short of the limit', async () => {
+  it('returns one-row continuation proof without exposing the sentinel row', async () => {
+    const ctx = createMockContext({ errors: eurlex_browse_subjects.errors });
+    mockQuery.mockResolvedValue([
+      makeConceptBinding({ uri: 'http://eurovoc.europa.eu/1', label: 'a' }),
+      makeConceptBinding({ uri: 'http://eurovoc.europa.eu/2', label: 'b' }),
+      makeConceptBinding({ uri: 'http://eurovoc.europa.eu/3', label: 'c' }),
+    ]);
+
+    const input = eurlex_browse_subjects.input.parse({ keyword: 'data', limit: 2 });
+    const result = await eurlex_browse_subjects.handler(input, ctx);
+
+    expect(result.concepts).toHaveLength(2);
+    expect(result.has_more).toBe(true);
+    expect(result.next_offset).toBe(2);
+    expect(mockQuery.mock.calls[0]?.[0]).toContain('LIMIT 3');
+    expect(getEnrichment(ctx)).toMatchObject({ truncated: true, shown: 2, cap: 2 });
+    const text = (eurlex_browse_subjects.format!(result)[0] as { text: string }).text;
+    expect(text).toContain('**Has more:** true');
+    expect(text).toContain('**Next offset:** 2');
+  });
+
+  it('uses the service ceiling as the effective page size when it is lower than limit', async () => {
+    const ctx = createMockContext({ errors: eurlex_browse_subjects.errors });
+    mockMaxResults = 2;
+    mockQuery.mockResolvedValue([
+      makeConceptBinding({ uri: 'http://eurovoc.europa.eu/1', label: 'a' }),
+      makeConceptBinding({ uri: 'http://eurovoc.europa.eu/2', label: 'b' }),
+      makeConceptBinding({ uri: 'http://eurovoc.europa.eu/3', label: 'c' }),
+    ]);
+
+    const input = eurlex_browse_subjects.input.parse({ keyword: 'data', limit: 50 });
+    const result = await eurlex_browse_subjects.handler(input, ctx);
+
+    expect(result.concepts).toHaveLength(2);
+    expect(result.has_more).toBe(true);
+    expect(result.next_offset).toBe(2);
+    expect(mockQuery.mock.calls[0]?.[0]).toContain('LIMIT 3');
+    expect(getEnrichment(ctx)).toMatchObject({ truncated: true, shown: 2, cap: 2 });
+  });
+
+  it('does not disclose continuation when the page is short of the limit', async () => {
     const ctx = createMockContext({ errors: eurlex_browse_subjects.errors });
     mockQuery.mockResolvedValue([
       makeConceptBinding({ uri: 'http://eurovoc.europa.eu/1', label: 'a' }),
     ]);
 
     const input = eurlex_browse_subjects.input.parse({ keyword: 'data', limit: 2 });
-    await eurlex_browse_subjects.handler(input, ctx);
+    const result = await eurlex_browse_subjects.handler(input, ctx);
 
+    expect(result.has_more).toBe(false);
+    expect(result.next_offset).toBeUndefined();
     expect(getEnrichment(ctx).truncated).toBeUndefined();
   });
 
@@ -243,7 +322,7 @@ describe('eurlex_browse_subjects', () => {
     // Offset is echoed to both channels so a paging caller knows which page it holds.
     expect(result.offset).toBe(50);
     const sparql = mockQuery.mock.calls[0]?.[0] as string;
-    expect(sparql).toContain('LIMIT 50');
+    expect(sparql).toContain('LIMIT 51');
     expect(sparql).toContain('OFFSET 50');
     // Deterministic order — the unique concept URI breaks label ties so OFFSET pages don't drift.
     expect(sparql).toContain('ORDER BY ?label ?concept');
@@ -297,6 +376,7 @@ describe('eurlex_browse_subjects', () => {
       ],
       total: 1,
       offset: 40,
+      has_more: false,
     };
     const blocks = eurlex_browse_subjects.format!(output);
     expect(blocks[0]?.type).toBe('text');
@@ -307,5 +387,168 @@ describe('eurlex_browse_subjects', () => {
     expect(text).toContain('information');
     // Offset reaches content[] so paginating clients see which page this is (#51).
     expect(text).toContain('offset 40');
+    expect(text).toContain('**Has more:** false');
+  });
+
+  // --- #70: alternative (non-preferred) EuroVoc labels ---
+
+  describe('alternative label matching (#70)', () => {
+    it('queries skos:altLabel under the same keyword and language filters', async () => {
+      const ctx = createMockContext({ errors: eurlex_browse_subjects.errors });
+      mockQuery.mockResolvedValue([
+        makeConceptBinding({ uri: 'http://eurovoc.europa.eu/3635', label: "producer's liability" }),
+      ]);
+
+      const input = eurlex_browse_subjects.input.parse({ keyword: 'Product Liability' });
+      await eurlex_browse_subjects.handler(input, ctx);
+
+      const sparql = mockQuery.mock.calls[0]?.[0] as string;
+      expect(sparql).toContain('?concept skos:altLabel ?altValue .');
+      expect(sparql).toContain('FILTER(LANG(?altValue) = "en")');
+      expect(sparql).toContain('FILTER(CONTAINS(LCASE(STR(?altValue)), "product liability"))');
+      // The preferred-label filter is widened rather than replaced, so a concept
+      // reached by either path qualifies.
+      expect(sparql).toContain(
+        'FILTER(CONTAINS(LCASE(STR(?label)), "product liability") || BOUND(?altValue))',
+      );
+      expect(sparql).toContain('(SAMPLE(?altValue) AS ?matchedLabel)');
+      // Grouping and ordering key on the preferred label, never the matched one.
+      expect(sparql).toContain('GROUP BY ?concept ?label ORDER BY ?label ?concept');
+    });
+
+    it('escapes the keyword in the alternative-label filter too', async () => {
+      const ctx = createMockContext({ errors: eurlex_browse_subjects.errors });
+      mockQuery.mockResolvedValue([
+        makeConceptBinding({ uri: 'http://eurovoc.europa.eu/1', label: 'x' }),
+      ]);
+
+      const keyword = 'a"b\\c';
+      const input = eurlex_browse_subjects.input.parse({ keyword });
+      await eurlex_browse_subjects.handler(input, ctx);
+
+      const sparql = mockQuery.mock.calls[0]?.[0] as string;
+      const escaped = escapeSparqlLiteral(keyword.toLowerCase());
+      expect(sparql).toContain(`FILTER(CONTAINS(LCASE(STR(?altValue)), "${escaped}"))`);
+    });
+
+    it('surfaces a concept reached only through an alternative label', async () => {
+      const ctx = createMockContext({ errors: eurlex_browse_subjects.errors });
+      mockQuery.mockResolvedValue([
+        makeConceptBinding({
+          uri: 'http://eurovoc.europa.eu/3635',
+          label: "producer's liability",
+          code: '3635',
+          matchedLabel: 'product liability',
+        }),
+      ]);
+
+      const input = eurlex_browse_subjects.input.parse({ keyword: 'product liability' });
+      const result = await eurlex_browse_subjects.handler(input, ctx);
+
+      expect(result.total).toBe(1);
+      expect(result.concepts[0]?.concept_uri).toBe('http://eurovoc.europa.eu/3635');
+      // The row stays keyed by the preferred label; the alternative says why it hit.
+      expect(result.concepts[0]?.pref_label).toBe("producer's liability");
+      expect(result.concepts[0]?.matched_label).toBe('product liability');
+    });
+
+    it('returns one row for a concept matching both label paths', async () => {
+      const ctx = createMockContext({ errors: eurlex_browse_subjects.errors });
+      // Grouping is unchanged, so CELLAR collapses both paths into a single row
+      // whose matched label is bound alongside the preferred one.
+      mockQuery.mockResolvedValue([
+        makeConceptBinding({
+          uri: 'http://eurovoc.europa.eu/3497',
+          label: 'liability',
+          matchedLabel: 'collective liability',
+        }),
+      ]);
+
+      const input = eurlex_browse_subjects.input.parse({ keyword: 'liability' });
+      const result = await eurlex_browse_subjects.handler(input, ctx);
+
+      expect(result.concepts).toHaveLength(1);
+      expect(result.concepts[0]?.pref_label).toBe('liability');
+      expect(result.concepts[0]?.matched_label).toBe('collective liability');
+    });
+
+    it('omits matched_label for a preferred-label-only hit', async () => {
+      const ctx = createMockContext({ errors: eurlex_browse_subjects.errors });
+      mockQuery.mockResolvedValue([
+        makeConceptBinding({ uri: 'http://eurovoc.europa.eu/3497', label: 'liability' }),
+      ]);
+
+      const input = eurlex_browse_subjects.input.parse({ keyword: 'liability' });
+      const result = await eurlex_browse_subjects.handler(input, ctx);
+
+      expect(result.concepts[0]).not.toHaveProperty('matched_label');
+    });
+
+    it('still throws no_concepts when neither label path matches', async () => {
+      const ctx = createMockContext({ errors: eurlex_browse_subjects.errors });
+      mockQuery.mockResolvedValue([]);
+
+      const input = eurlex_browse_subjects.input.parse({ keyword: 'zzzznotathing' });
+      await expect(eurlex_browse_subjects.handler(input, ctx)).rejects.toMatchObject({
+        code: JsonRpcErrorCode.NotFound,
+        data: {
+          reason: 'no_concepts',
+          recovery: { hint: expect.stringContaining('broader') as unknown as string },
+        },
+      });
+    });
+
+    it('leaves the continuation sentinel and OFFSET paging untouched', async () => {
+      const ctx = createMockContext({ errors: eurlex_browse_subjects.errors });
+      // limit 2 requests 3 rows; the third is the private sentinel proving more exist.
+      mockQuery.mockResolvedValue([
+        makeConceptBinding({ uri: 'http://eurovoc.europa.eu/1', label: 'liability a' }),
+        makeConceptBinding({ uri: 'http://eurovoc.europa.eu/2', label: 'liability b' }),
+        makeConceptBinding({ uri: 'http://eurovoc.europa.eu/3', label: 'liability c' }),
+      ]);
+
+      const input = eurlex_browse_subjects.input.parse({
+        keyword: 'liability',
+        limit: 2,
+        offset: 4,
+      });
+      const result = await eurlex_browse_subjects.handler(input, ctx);
+
+      expect(mockQuery.mock.calls[0]?.[0] as string).toContain('LIMIT 3 OFFSET 4');
+      expect(result.total).toBe(2);
+      expect(result.has_more).toBe(true);
+      expect(result.next_offset).toBe(6);
+      expect(result.concepts.map((c) => c.concept_uri)).toEqual([
+        'http://eurovoc.europa.eu/1',
+        'http://eurovoc.europa.eu/2',
+      ]);
+    });
+
+    it('renders matched_label in format() and omits the line when absent', () => {
+      const withAlt = eurlex_browse_subjects.format!({
+        concepts: [
+          {
+            concept_uri: 'http://eurovoc.europa.eu/3635',
+            pref_label: "producer's liability",
+            concept_code: '3635',
+            matched_label: 'product liability',
+          },
+        ],
+        total: 1,
+        offset: 0,
+        has_more: false,
+      });
+      const withAltText = (withAlt[0] as { text: string }).text;
+      expect(withAltText).toContain("### producer's liability");
+      expect(withAltText).toContain('**Matched via:** product liability');
+
+      const withoutAlt = eurlex_browse_subjects.format!({
+        concepts: [{ concept_uri: 'http://eurovoc.europa.eu/3497', pref_label: 'liability' }],
+        total: 1,
+        offset: 0,
+        has_more: false,
+      });
+      expect((withoutAlt[0] as { text: string }).text).not.toContain('**Matched via:**');
+    });
   });
 });
