@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.11.0](changelog/0.11.x/0.11.0.md) — 2026-09-09
+
+Proven pagination continuation across every paged tool, a national_transposition relation type, and calendar-validated date ranges.
+
 ## [0.10.0](changelog/0.10.x/0.10.0.md) — 2026-08-30 · ⚠️ Breaking
 
 Document retrieval now uses capped full-content windows with explicit paged continuation.

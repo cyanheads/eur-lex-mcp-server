@@ -1,6 +1,6 @@
 # eur-lex-mcp-server - Directory Structure
 
-Generated on: 2026-08-31 04:59:11
+Generated on: 2026-09-09 23:19:19
 
 ```text
 eur-lex-mcp-server/
@@ -24,6 +24,7 @@ eur-lex-mcp-server/
 ├── changelog/
 │   ├── 0.1.x/
 │   ├── 0.10.x/
+│   ├── 0.11.x/
 │   ├── 0.2.x/
 │   ├── 0.3.x/
 │   ├── 0.4.x/
@@ -122,6 +123,8 @@ eur-lex-mcp-server/
 │   │   │   └── server-json.md
 │   │   └── SKILL.md
 │   ├── release-and-publish/
+│   │   └── SKILL.md
+│   ├── release-pr-review/
 │   │   └── SKILL.md
 │   ├── report-issue-framework/
 │   │   └── SKILL.md
