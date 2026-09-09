@@ -4,7 +4,7 @@ description: >
   Reference for core and server configuration in `@cyanheads/mcp-ts-core`. Covers env var tables with defaults, priority order, server-specific Zod schema pattern, and Workers lazy-parsing requirement.
 metadata:
   author: cyanheads
-  version: "1.13"
+  version: "1.16"
   audience: external
   type: reference
 ---
@@ -26,6 +26,8 @@ Managed by `@cyanheads/mcp-ts-core`. Validated via Zod from environment variable
 1. `name`/`version`/`title`/`websiteUrl`/`description`/`icons` options passed to `createApp()` or `createWorkerHandler()`
 2. Environment variables
 3. `package.json` fields
+
+**Where `package.json` is read from:** the application root — the nearest `package.json` at or above the process entry module (`process.argv[1]`), which is the served package on every launch path (`npx`, `.mcpb`, a client config naming `dist/index.js`), none of which run from the package root. The launching client's working directory is never the anchor: a stdio client starts the server from wherever it happens to be, so reading identity from there makes a server report a foreign project's name and version. When the entry module is a tool installed under the project's own `node_modules` and the process runs from that project — a test runner is the usual case — the project's manifest wins. With no manifest reachable, the framework's own identity is the fallback.
 
 ---
 
@@ -75,7 +77,7 @@ await createApp({
 |:--------|:-----------------|:--------|:------|
 | `NODE_ENV` | `environment` | `development` | Aliases: `dev`→`development`, `prod`→`production`, `test`→`testing` |
 | `MCP_LOG_LEVEL` | `logLevel` | `debug` | Aliases: `warn`→`warning`, `err`→`error`, `fatal`/`silent`→`emerg`, `trace`→`debug`, `information`→`info` |
-| `LOGS_DIR` | `logsPath` | `<project-root>/logs` | Node.js only; absolute or relative to project root |
+| `LOGS_DIR` | `logsPath` | `<app-root>/logs` | Node.js only; absolute paths are used verbatim, relative ones resolve against the application root (see Core config) — never the framework's install directory |
 
 ### Transport
 
@@ -88,12 +90,11 @@ await createApp({
 | `MCP_HTTP_MAX_BODY_BYTES` | `mcpHttpMaxBodyBytes` | `1048576` (1 MiB) | Max **inbound** JSON-RPC request body; oversized requests get `413` before per-request allocation. Does **not** cap upstream data staged into a canvas or response sizes. `0` disables (defer to runtime/proxy). |
 | `MCP_HTTP_MAX_PORT_RETRIES` | `mcpHttpMaxPortRetries` | `15` | Rungs of the port ladder walked when a bind collides; each rung tries `port + 1`. See [Port binding](#port-binding) |
 | `MCP_HTTP_PORT_RETRY_DELAY_MS` | `mcpHttpPortRetryDelayMs` | `50` | Delay between port retries (ms) |
-| `MCP_SESSION_MODE` | `mcpSessionMode` | `auto` | `stateless` \| `stateful` \| `auto` |
+| `MCP_SESSION_MODE` | `mcpSessionMode` | `auto` | `stateless` \| `stateful` \| `auto`; `auto` resolves to `stateful`. `stateless` also disables the 2025-era multi-round-trip shim, so v1 HTTP clients cannot answer a `ctx.requestInput` round — 2026-07-28 clients and stdio are unaffected |
 | `MCP_STATEFUL_SESSION_STALE_TIMEOUT_MS` | `mcpStatefulSessionStaleTimeoutMs` | `1800000` | 30 min; stale session eviction |
 | `MCP_HTTP_RESUMABILITY` | `mcpHttpResumability` | `true` | SSE stream replay under stateful HTTP. On by default — selecting a session mode is the opt-in. Kill switch only; no effect on stateless serving or the session-less 2026-07-28 era |
 | `MCP_HTTP_RESUMABILITY_MAX_EVENTS` | `mcpHttpResumabilityMaxEvents` | `512` | Events retained per session for replay; oldest evicted first. Lower it on a server whose tools return large results |
 | `MCP_HTTP_RESUMABILITY_TTL_MS` | `mcpHttpResumabilityTtlMs` | `300000` | 5 min; how long a retained event stays replayable |
-| `MCP_RESPONSE_VERBOSITY` | `mcpResponseVerbosity` | `standard` | `minimal` \| `standard` \| `full` |
 | `MCP_ALLOWED_ORIGINS` | `mcpAllowedOrigins` | — | Comma-separated list; omit to allow all |
 | `MCP_SERVER_RESOURCE_IDENTIFIER` | `mcpServerResourceIdentifier` | — | RFC 8707 resource indicator URL |
 | `MCP_PUBLIC_URL` | `mcpPublicUrl` | — | Public-facing origin for reverse proxies (Cloudflare Tunnel, nginx, ALB) so emitted URLs carry the correct scheme |
@@ -129,19 +130,6 @@ await createApp({
 | `DEV_MCP_CLIENT_ID` | `devMcpClientId` | — | Dev-only: override client ID |
 | `DEV_MCP_SCOPES` | `devMcpScopes` | — | Dev-only: comma-separated scope overrides |
 
-#### OAuth proxy (optional sub-object)
-
-Activated when `OAUTH_PROXY_AUTHORIZATION_URL` or `OAUTH_PROXY_TOKEN_URL` is set.
-
-| Env Var | `AppConfig` field | Notes |
-|:--------|:-----------------|:------|
-| `OAUTH_PROXY_AUTHORIZATION_URL` | `oauthProxy.authorizationUrl` | Proxy authorization endpoint |
-| `OAUTH_PROXY_TOKEN_URL` | `oauthProxy.tokenUrl` | Proxy token endpoint |
-| `OAUTH_PROXY_REVOCATION_URL` | `oauthProxy.revocationUrl` | Optional |
-| `OAUTH_PROXY_ISSUER_URL` | `oauthProxy.issuerUrl` | Optional |
-| `OAUTH_PROXY_SERVICE_DOCUMENTATION_URL` | `oauthProxy.serviceDocumentationUrl` | Optional |
-| `OAUTH_PROXY_DEFAULT_CLIENT_REDIRECT_URIS` | `oauthProxy.defaultClientRedirectUris` | Comma-separated list |
-
 ---
 
 ### Storage
@@ -172,13 +160,13 @@ Activated when `OAUTH_PROXY_AUTHORIZATION_URL` or `OAUTH_PROXY_TOKEN_URL` is set
 
 #### Supabase (optional sub-object)
 
-Activated when both `SUPABASE_URL` and `SUPABASE_ANON_KEY` are set.
+Activated when `SUPABASE_URL` is set.
 
 | Env Var | `AppConfig` field | Notes |
 |:--------|:-----------------|:------|
 | `SUPABASE_URL` | `supabase.url` | Required to activate |
-| `SUPABASE_ANON_KEY` | `supabase.anonKey` | Required to activate |
-| `SUPABASE_SERVICE_ROLE_KEY` | `supabase.serviceRoleKey` | Optional; elevated access |
+| `SUPABASE_SERVICE_ROLE_KEY` | `supabase.serviceRoleKey` | Required by the `supabase` storage provider (admin client) |
+| `SUPABASE_ANON_KEY` | `supabase.anonKey` | Optional; for the server's own public client — the framework never reads it |
 
 ---
 
