@@ -139,6 +139,132 @@ describe('eurlex_get_document', () => {
     expect(result.in_force).toBe(false);
   });
 
+  describe('legal_basis and eurovoc_subjects resolve inline (#67)', () => {
+    const core = makeMetaBinding({ celex: '32016R0679' });
+    const LB = 'http://publications.europa.eu/resource/cellar/fc797fa2-af0e-4cbd-8e74-5ed41139e4dc';
+    /** Route each dimension query to its own rows, as the live service would. */
+    const routeQueries = (rows: {
+      legalBasis?: Record<string, { type: string; value: string }>[];
+      eurovoc?: Record<string, { type: string; value: string }>[];
+    }) =>
+      mockSparqlQuery.mockImplementation(async (sparql: string) => {
+        if (sparql.includes('cdm:resource_legal_based_on_resource_legal'))
+          return rows.legalBasis ?? [];
+        if (sparql.includes('cdm:work_is_about_concept_eurovoc')) return rows.eurovoc ?? [];
+        if (sparql.includes('cdm:work_created_by_agent')) return [];
+        return [core];
+      });
+
+    it('returns CELEX beside each legal basis URI and a label beside each concept, on both surfaces', async () => {
+      const ctx = createMockContext({ errors: eurlex_get_document.errors });
+      routeQueries({
+        legalBasis: [
+          {
+            legalBasis: { type: 'uri', value: LB },
+            celex: { type: 'literal', value: '12012E016' },
+          },
+        ],
+        eurovoc: [
+          {
+            eurovoc: { type: 'uri', value: 'http://eurovoc.europa.eu/5181' },
+            label: { type: 'literal', value: 'data protection' },
+          },
+          {
+            eurovoc: { type: 'uri', value: 'http://eurovoc.europa.eu/2828' },
+            label: { type: 'literal', value: 'protection of privacy' },
+          },
+        ],
+      });
+
+      const input = eurlex_get_document.input.parse({
+        celex_number: '32016R0679',
+        content_mode: 'metadata_only',
+      });
+      const result = await eurlex_get_document.handler(input, ctx);
+
+      expect(result.legal_basis).toEqual([{ work_uri: LB, celex_number: '12012E016' }]);
+      expect(result.eurovoc_subjects).toEqual([
+        { concept_uri: 'http://eurovoc.europa.eu/5181', label: 'data protection' },
+        { concept_uri: 'http://eurovoc.europa.eu/2828', label: 'protection of privacy' },
+      ]);
+
+      const queries = mockSparqlQuery.mock.calls.map((c) => c[0] as string);
+      const legalBasisQuery = queries.find((q) =>
+        q.includes('cdm:resource_legal_based_on_resource_legal'),
+      );
+      expect(legalBasisQuery).toContain(
+        'OPTIONAL { ?legalBasis cdm:resource_legal_id_celex ?celexValue . }',
+      );
+      expect(legalBasisQuery).toContain('GROUP BY ?legalBasis');
+      const eurovocQuery = queries.find((q) => q.includes('cdm:work_is_about_concept_eurovoc'));
+      expect(eurovocQuery).toContain('?eurovoc skos:prefLabel ?labelValue');
+      expect(eurovocQuery).toContain('FILTER(LANG(?labelValue) = "en")');
+      expect(eurovocQuery).toContain('GROUP BY ?eurovoc');
+
+      const text = (eurlex_get_document.format!(result)[0] as { text: string }).text;
+      expect(text).toContain(`**Legal Basis:** 12012E016 (${LB})`);
+      expect(text).toContain('data protection (http://eurovoc.europa.eu/5181)');
+      expect(text).toContain('protection of privacy (http://eurovoc.europa.eu/2828)');
+    });
+
+    it('keeps a URI whose CELEX or label is unbound and omits the optional property', async () => {
+      const ctx = createMockContext({ errors: eurlex_get_document.errors });
+      routeQueries({
+        legalBasis: [{ legalBasis: { type: 'uri', value: LB } }],
+        eurovoc: [{ eurovoc: { type: 'uri', value: 'http://eurovoc.europa.eu/9999' } }],
+      });
+
+      const input = eurlex_get_document.input.parse({
+        celex_number: '32016R0679',
+        content_mode: 'metadata_only',
+      });
+      const result = await eurlex_get_document.handler(input, ctx);
+
+      expect(result.legal_basis).toEqual([{ work_uri: LB }]);
+      expect(result.legal_basis?.[0]).not.toHaveProperty('celex_number');
+      expect(result.eurovoc_subjects).toEqual([{ concept_uri: 'http://eurovoc.europa.eu/9999' }]);
+      expect(result.eurovoc_subjects?.[0]).not.toHaveProperty('label');
+
+      const text = (eurlex_get_document.format!(result)[0] as { text: string }).text;
+      expect(text).toContain(`**Legal Basis:** ${LB}`);
+      expect(text).toContain('**EuroVoc Subjects:** http://eurovoc.europa.eu/9999');
+    });
+
+    it('omits both fields for a document with no legal basis and no subjects', async () => {
+      const ctx = createMockContext({ errors: eurlex_get_document.errors });
+      routeQueries({});
+
+      const input = eurlex_get_document.input.parse({
+        celex_number: '12012E016',
+        content_mode: 'metadata_only',
+      });
+      const result = await eurlex_get_document.handler(input, ctx);
+
+      expect(result).not.toHaveProperty('legal_basis');
+      expect(result).not.toHaveProperty('eurovoc_subjects');
+      const text = (eurlex_get_document.format!(result)[0] as { text: string }).text;
+      expect(text).not.toContain('**Legal Basis:**');
+      expect(text).not.toContain('**EuroVoc Subjects:**');
+    });
+
+    it('filters EuroVoc labels by the requested language', async () => {
+      const ctx = createMockContext({ errors: eurlex_get_document.errors });
+      routeQueries({});
+
+      const input = eurlex_get_document.input.parse({
+        celex_number: '32016R0679',
+        language: 'fr',
+        content_mode: 'metadata_only',
+      });
+      await eurlex_get_document.handler(input, ctx);
+
+      const eurovocQuery = mockSparqlQuery.mock.calls
+        .map((c) => c[0] as string)
+        .find((q) => q.includes('cdm:work_is_about_concept_eurovoc'));
+      expect(eurovocQuery).toContain('FILTER(LANG(?labelValue) = "fr")');
+    });
+  });
+
   it('aggregates legal_basis and eurovoc_subjects from multi-row result', async () => {
     const ctx = createMockContext({ errors: eurlex_get_document.errors });
     const base = makeMetaBinding({ celex: '32016R0679' });
@@ -170,8 +296,11 @@ describe('eurlex_get_document', () => {
     const input = eurlex_get_document.input.parse({ celex_number: '32016R0679' });
     const result = await eurlex_get_document.handler(input, ctx);
 
-    expect(result.legal_basis).toHaveLength(2);
-    expect(result.eurovoc_subjects).toHaveLength(2);
+    expect(result.legal_basis).toEqual([{ work_uri: 'http://lb1' }, { work_uri: 'http://lb2' }]);
+    expect(result.eurovoc_subjects).toEqual([
+      { concept_uri: 'http://ev1' },
+      { concept_uri: 'http://ev2' },
+    ]);
   });
 
   it('includes language_fallback when content service reports fallback', async () => {
@@ -634,8 +763,11 @@ describe('eurlex_get_document', () => {
       date: '2016-04-27',
       resource_type: 'http://publications.europa.eu/resource/authority/resource-type/REG',
       in_force: true,
-      legal_basis: ['http://lb1'],
-      eurovoc_subjects: ['http://ev1', 'http://ev2'],
+      legal_basis: [{ work_uri: 'http://lb1', celex_number: '12012E016' }],
+      eurovoc_subjects: [
+        { concept_uri: 'http://ev1', label: 'data protection' },
+        { concept_uri: 'http://ev2' },
+      ],
       content_mode: 'paged',
       content_available: false,
       content_status: 'unavailable' as const,
@@ -659,7 +791,9 @@ describe('eurlex_get_document', () => {
     // A real act (GDPR) carries 9 subjects; structuredContent has all of them, so
     // the text channel must too — the old .slice(0, 5) + "(+N more)" cut lost the
     // rest for content[]-only clients.
-    const subjects = Array.from({ length: 9 }, (_, i) => `http://eurovoc.europa.eu/${1000 + i}`);
+    const subjects = Array.from({ length: 9 }, (_, i) => ({
+      concept_uri: `http://eurovoc.europa.eu/${1000 + i}`,
+    }));
     const output = {
       celex_number: '32016R0679',
       eurovoc_subjects: subjects,
@@ -671,7 +805,7 @@ describe('eurlex_get_document', () => {
       content_format: 'html',
     };
     const text = (eurlex_get_document.format!(output)[0] as { text: string }).text;
-    for (const s of subjects) expect(text).toContain(s);
+    for (const s of subjects) expect(text).toContain(s.concept_uri);
     // No "(+N more)" truncation notice, and the 6th subject (first one the old cut
     // dropped) is present.
     expect(text).not.toContain('more)');

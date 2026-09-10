@@ -215,13 +215,45 @@ export const eurlex_get_document = tool('eurlex_get_document', {
         'All originating EU institutions, for co-legislated acts adopted by more than one body (e.g. ["European Parliament", "Council of the EU"]). Absent when none recorded.',
       ),
     legal_basis: z
-      .array(z.string().describe('CELEX number or URI of a legal basis act.'))
+      .array(
+        z
+          .object({
+            work_uri: z
+              .string()
+              .describe(
+                'CELLAR work URI of the legal basis act. When celex_number is present, pass either as work_uri or celex_number to eurlex_get_document to fetch that act; a basis with no CELEX is a CELLAR reference that may not resolve to a fetchable work.',
+              ),
+            celex_number: z
+              .string()
+              .optional()
+              .describe(
+                'CELEX number of the legal basis act (e.g. 12012E016 for TFEU Article 16). Absent when CELLAR records no CELEX for the work.',
+              ),
+          })
+          .describe('A legal basis act: its CELLAR work URI plus its CELEX number when recorded.'),
+      )
       .optional()
-      .describe('Legal basis acts for this work.'),
+      .describe('Legal basis acts for this work. Absent when none are recorded.'),
     eurovoc_subjects: z
-      .array(z.string().describe('EuroVoc concept URI.'))
+      .array(
+        z
+          .object({
+            concept_uri: z
+              .string()
+              .describe(
+                'EuroVoc concept URI (http://eurovoc.europa.eu/{id}), the exact value the eurovoc_concept filter of eurlex_search_documents accepts.',
+              ),
+            label: z
+              .string()
+              .optional()
+              .describe(
+                'EuroVoc preferred label in the requested language. Absent when the concept has no label in that language.',
+              ),
+          })
+          .describe('An EuroVoc subject: its concept URI plus its preferred label when available.'),
+      )
       .optional()
-      .describe('EuroVoc subject classifications.'),
+      .describe('EuroVoc subject classifications. Absent when none are recorded.'),
     in_force: z.boolean().optional().describe('Whether the act is currently in force.'),
     is_superseded: z
       .boolean()
@@ -487,16 +519,34 @@ SELECT ?${variable} WHERE {
   FILTER(STR(?c) = "${safe}")
   ?work ${predicate} ?${variable} .
 } LIMIT ${META_DIMENSION_LIMIT}`;
+      // Legal bases and EuroVoc subjects resolve inline (#67): each dimension
+      // query joins the identifying literal (CELEX / language-filtered
+      // skos:prefLabel) as an OPTIONAL and groups per URI, so the label rides the
+      // same round trip and a URI with no label still yields its row.
+      const legalBasisQuery = `
+SELECT ?legalBasis (SAMPLE(?celexValue) AS ?celex) WHERE {
+  ?work cdm:resource_legal_id_celex ?c .
+  FILTER(STR(?c) = "${safe}")
+  ?work cdm:resource_legal_based_on_resource_legal ?legalBasis .
+  OPTIONAL { ?legalBasis cdm:resource_legal_id_celex ?celexValue . }
+} GROUP BY ?legalBasis LIMIT ${META_DIMENSION_LIMIT}`;
+      const eurovocQuery = `
+SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
+  ?work cdm:resource_legal_id_celex ?c .
+  FILTER(STR(?c) = "${safe}")
+  ?work cdm:work_is_about_concept_eurovoc ?eurovoc .
+  OPTIONAL {
+    ?eurovoc skos:prefLabel ?labelValue .
+    FILTER(LANG(?labelValue) = "${language.toLowerCase()}")
+  }
+} GROUP BY ?eurovoc LIMIT ${META_DIMENSION_LIMIT}`;
 
       const [coreBindings, authorBindings, legalBasisBindings, eurovocBindings] = await Promise.all(
         [
           sparqlSvc.query(coreQuery, ctx),
           sparqlSvc.query(dimensionQuery('cdm:work_created_by_agent', 'author'), ctx),
-          sparqlSvc.query(
-            dimensionQuery('cdm:resource_legal_based_on_resource_legal', 'legalBasis'),
-            ctx,
-          ),
-          sparqlSvc.query(dimensionQuery('cdm:work_is_about_concept_eurovoc', 'eurovoc'), ctx),
+          sparqlSvc.query(legalBasisQuery, ctx),
+          sparqlSvc.query(eurovocQuery, ctx),
         ],
       );
 
@@ -507,6 +557,21 @@ SELECT ?${variable} WHERE {
           if (v) set.add(v);
         }
         return [...set];
+      };
+      /** One entry per distinct URI, carrying the companion literal when bound. */
+      const collectResolved = (
+        bindings: SparqlBinding[],
+        uriVariable: string,
+        literalVariable: string,
+      ): { uri: string; literal?: string }[] => {
+        const byUri = new Map<string, string | undefined>();
+        for (const b of bindings) {
+          const uri = CellarSparqlService.bindingValue(b, uriVariable);
+          if (!uri) continue;
+          const literal = CellarSparqlService.bindingValue(b, literalVariable);
+          if (!byUri.has(uri) || (literal && !byUri.get(uri))) byUri.set(uri, literal);
+        }
+        return [...byUri].map(([uri, literal]) => ({ uri, ...(literal ? { literal } : {}) }));
       };
 
       const first = coreBindings[0];
@@ -521,8 +586,13 @@ SELECT ?${variable} WHERE {
           CellarSparqlService.bindingValue(first, 'inForce'),
         ),
         authorUris: collect(authorBindings, 'author'),
-        legalBases: collect(legalBasisBindings, 'legalBasis'),
-        eurovoc: collect(eurovocBindings, 'eurovoc'),
+        legalBases: collectResolved(legalBasisBindings, 'legalBasis', 'celex').map(
+          ({ uri, literal }) => ({ work_uri: uri, ...(literal ? { celex_number: literal } : {}) }),
+        ),
+        eurovoc: collectResolved(eurovocBindings, 'eurovoc', 'label').map(({ uri, literal }) => ({
+          concept_uri: uri,
+          ...(literal ? { label: literal } : {}),
+        })),
       };
     };
 
@@ -583,8 +653,8 @@ SELECT ?${variable} WHERE {
       resource_type?: string;
       author_institution?: string;
       author_institutions?: string[];
-      legal_basis?: string[];
-      eurovoc_subjects?: string[];
+      legal_basis?: { work_uri: string; celex_number?: string }[];
+      eurovoc_subjects?: { concept_uri: string; label?: string }[];
       in_force?: boolean;
       is_superseded?: boolean;
       current_consolidated_celex?: string;
@@ -754,13 +824,21 @@ SELECT ?${variable} WHERE {
     }
     if (result.work_uri) lines.push(`**Work URI:** ${result.work_uri}`);
     if (result.legal_basis && result.legal_basis.length > 0) {
-      lines.push(`**Legal Basis:** ${result.legal_basis.join(', ')}`);
+      lines.push(
+        `**Legal Basis:** ${result.legal_basis
+          .map((lb) => (lb.celex_number ? `${lb.celex_number} (${lb.work_uri})` : lb.work_uri))
+          .join('; ')}`,
+      );
     }
     if (result.eurovoc_subjects && result.eurovoc_subjects.length > 0) {
       // Render the full list for format parity with structuredContent — the set is
       // bounded at META_DIMENSION_LIMIT (100) and real acts carry ~a dozen, so
       // there is no length reason to cut it (previously truncated to 5).
-      lines.push(`**EuroVoc Subjects:** ${result.eurovoc_subjects.join(', ')}`);
+      lines.push(
+        `**EuroVoc Subjects:** ${result.eurovoc_subjects
+          .map((s) => (s.label ? `${s.label} (${s.concept_uri})` : s.concept_uri))
+          .join('; ')}`,
+      );
     }
     lines.push(`**Language:** ${result.language} | **Format:** ${result.content_format}`);
     if (result.requested_language) {

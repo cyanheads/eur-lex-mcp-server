@@ -49,7 +49,9 @@ function makeMetaBinding(opts: {
 }
 
 describe('eurlex_document_resource', () => {
-  beforeEach(() => mockQuery.mockReset());
+  beforeEach(() => {
+    mockQuery.mockReset();
+  });
 
   // --- Happy path ---
 
@@ -76,6 +78,60 @@ describe('eurlex_document_resource', () => {
       // #35: the raw resource-type URI resolves to a human-readable label.
       resource_type: 'Regulation',
     });
+  });
+
+  // --- #67: legal basis and EuroVoc subjects resolve inline ---
+
+  it('returns legal_basis with CELEX and eurovoc_subjects with English labels', async () => {
+    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    const LB = 'http://publications.europa.eu/resource/cellar/fc797fa2-af0e-4cbd-8e74-5ed41139e4dc';
+    mockQuery.mockImplementation(async (sparql: string) => {
+      if (sparql.includes('cdm:resource_legal_based_on_resource_legal')) {
+        return [
+          {
+            legalBasis: { type: 'uri', value: LB },
+            celex: { type: 'literal', value: '12012E016' },
+          },
+        ];
+      }
+      if (sparql.includes('cdm:work_is_about_concept_eurovoc')) {
+        return [
+          {
+            eurovoc: { type: 'uri', value: 'http://eurovoc.europa.eu/5181' },
+            label: { type: 'literal', value: 'data protection' },
+          },
+          { eurovoc: { type: 'uri', value: 'http://eurovoc.europa.eu/9999' } },
+        ];
+      }
+      return [makeMetaBinding({ celex: '32016R0679' })];
+    });
+
+    const params = eurlex_document_resource.params!.parse({ celexNumber: '32016R0679' });
+    const result = (await eurlex_document_resource.handler(params, ctx)) as Record<string, unknown>;
+
+    expect(result.legal_basis).toEqual([{ work_uri: LB, celex_number: '12012E016' }]);
+    expect(result.eurovoc_subjects).toEqual([
+      { concept_uri: 'http://eurovoc.europa.eu/5181', label: 'data protection' },
+      { concept_uri: 'http://eurovoc.europa.eu/9999' },
+    ]);
+    const eurovocQuery = mockQuery.mock.calls
+      .map((c) => c[0] as string)
+      .find((q) => q.includes('cdm:work_is_about_concept_eurovoc'));
+    expect(eurovocQuery).toContain('FILTER(LANG(?labelValue) = "en")');
+    expect(eurovocQuery).toContain('GROUP BY ?eurovoc');
+  });
+
+  it('omits legal_basis and eurovoc_subjects when the work records neither', async () => {
+    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    mockQuery.mockImplementation(async (sparql: string) =>
+      sparql.includes('SELECT ?work ') ? [makeMetaBinding({ celex: '12012E016' })] : [],
+    );
+
+    const params = eurlex_document_resource.params!.parse({ celexNumber: '12012E016' });
+    const result = await eurlex_document_resource.handler(params, ctx);
+
+    expect(result).not.toHaveProperty('legal_basis');
+    expect(result).not.toHaveProperty('eurovoc_subjects');
   });
 
   // --- #35: metadata authorities resolve to human-readable labels ---
