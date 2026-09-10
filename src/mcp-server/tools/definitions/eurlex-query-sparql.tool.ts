@@ -170,9 +170,9 @@ export const eurlex_query_sparql = tool('eurlex_query_sparql', {
     {
       reason: 'sparql_timeout',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'Query exceeded the 60-second Virtuoso hard limit.',
+      when: 'The query exceeded the client-side timeout (timeout_hint, default 55 s) or the 60-second Virtuoso execution limit. Neither is retried: the call fails inside the configured bound.',
       recovery:
-        'Add more specific FILTER conditions, reduce the scope, or use LIMIT with a smaller value.',
+        'Narrow the query with more specific FILTER conditions or a smaller LIMIT, or raise timeout_hint.',
     },
   ],
 

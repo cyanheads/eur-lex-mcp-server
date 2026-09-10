@@ -14,6 +14,7 @@ import { eurlex_query_sparql } from '@/mcp-server/tools/definitions/eurlex-query
 import {
   CellarSparqlService,
   SPARQL_ERROR_RECOVERY_HINT,
+  SPARQL_TIMEOUT_RECOVERY_HINT,
 } from '@/services/cellar-sparql/cellar-sparql-service.js';
 
 function makeService(): CellarSparqlService {
@@ -390,6 +391,45 @@ describe('CellarSparqlService sparql_error recovery (#26)', () => {
       })),
     );
   }
+
+  it('fails fast on a client-side timeout: one attempt, typed reason, recovery hint (#78)', async () => {
+    const fetchMock = vi.fn(async () => {
+      throw new DOMException('The operation timed out.', 'TimeoutError');
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const ctx = createMockContext();
+
+    await expect(
+      makeService().query('SELECT ?work WHERE { ?s ?p ?o }', ctx, 1_000),
+    ).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      data: {
+        reason: 'sparql_timeout',
+        retryable: false,
+        recovery: { hint: SPARQL_TIMEOUT_RECOVERY_HINT },
+      },
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('marks a Virtuoso-side timeout non-retryable with the same recovery hint (#78)', async () => {
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      text: async () =>
+        'Virtuoso 42000 Error SP031: SPARQL compiler: Estimated query execution time exceeds the limit',
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    const ctx = createMockContext();
+
+    await expect(makeService().query('SELECT ?work WHERE { ?s ?p ?o }', ctx)).rejects.toMatchObject(
+      {
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        data: { reason: 'sparql_timeout', retryable: false },
+      },
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
 
   it('attaches the recovery hint to an HTTP 400 malformed-query error', async () => {
     stubFetchRaw({

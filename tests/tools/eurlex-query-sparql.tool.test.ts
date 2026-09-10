@@ -26,7 +26,9 @@ function workRows(n: number) {
 }
 
 describe('eurlex_query_sparql', () => {
-  beforeEach(() => mockQueryWithVars.mockReset());
+  beforeEach(() => {
+    mockQueryWithVars.mockReset();
+  });
 
   // --- Happy paths ---
 

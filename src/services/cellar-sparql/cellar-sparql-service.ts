@@ -36,6 +36,13 @@ export const SPARQL_ERROR_RECOVERY_HINT =
   'Fix the SPARQL query syntax, ensure predicates use the cdm: prefix, and verify variable names.';
 
 /**
+ * Recovery hint attached to both timeout shapes: the client-side abort from
+ * `AbortSignal.timeout` and Virtuoso's own execution-limit error.
+ */
+export const SPARQL_TIMEOUT_RECOVERY_HINT =
+  'Narrow the query with more specific FILTER conditions or a smaller LIMIT, or raise timeout_hint on eurlex_query_sparql.';
+
+/**
  * Locate the outermost (brace-depth 0) `LIMIT` clause — the solution modifier
  * that bounds the top-level query's result, as opposed to a `LIMIT` inside a
  * `{ SELECT … }` subselect. Scans past `#` comments, string literals (both quote
@@ -251,15 +258,33 @@ export class CellarSparqlService {
           query: cappedQuery,
           format: 'application/sparql-results+json',
         });
-        const response = await fetch(this.endpoint, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/x-www-form-urlencoded',
-            Accept: 'application/sparql-results+json',
-          },
-          body: body.toString(),
-          signal: AbortSignal.timeout(effectiveTimeoutMs),
-        });
+        let response: Response;
+        try {
+          response = await fetch(this.endpoint, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/x-www-form-urlencoded',
+              Accept: 'application/sparql-results+json',
+            },
+            body: body.toString(),
+            signal: AbortSignal.timeout(effectiveTimeoutMs),
+          });
+        } catch (error) {
+          // The client-side bound must bound the whole call, not one attempt of
+          // four (#78): a query that could not finish inside the window will not
+          // finish on a retry either, and re-running it hammers a shared endpoint.
+          if (error instanceof DOMException && error.name === 'TimeoutError') {
+            throw serviceUnavailable(
+              `CELLAR SPARQL request exceeded the ${effectiveTimeoutMs} ms client timeout`,
+              {
+                reason: 'sparql_timeout',
+                retryable: false,
+                recovery: { hint: SPARQL_TIMEOUT_RECOVERY_HINT },
+              },
+            );
+          }
+          throw error;
+        }
 
         const text = await response.text();
 
@@ -280,8 +305,12 @@ export class CellarSparqlService {
         /** Virtuoso returns HTTP 200 even for errors — inspect the body. */
         if (VIRTUOSO_ERROR_RE.test(text)) {
           if (VIRTUOSO_TIMEOUT_RE.test(text)) {
+            // Virtuoso's estimated-cost limit is deterministic for the query as
+            // written — a retry re-runs the same estimate and fails the same way.
             throw serviceUnavailable('CELLAR SPARQL query timed out on Virtuoso', {
               reason: 'sparql_timeout',
+              retryable: false,
+              recovery: { hint: SPARQL_TIMEOUT_RECOVERY_HINT },
             });
           }
           // Syntax / semantic error — not transient, fail immediately
