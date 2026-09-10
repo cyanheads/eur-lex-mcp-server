@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.12.0](changelog/0.12.x/0.12.0.md) — 2026-09-09 · ⚠️ Breaking
+
+eurlex_get_document's legal_basis and eurovoc_subjects become labeled objects (breaking), eurlex_lookup_celex resolves resource_type to a label, and a timed-out SPARQL query fails once instead of retrying four times.
+
 ## [0.11.0](changelog/0.11.x/0.11.0.md) — 2026-09-09
 
 Proven pagination continuation across every paged tool, a national_transposition relation type, and calendar-validated date ranges.
