@@ -34,7 +34,9 @@ function makeBinding(
 }
 
 describe('eurlex_lookup_celex', () => {
-  beforeEach(() => mockQuery.mockReset());
+  beforeEach(() => {
+    mockQuery.mockReset();
+  });
 
   // --- Happy paths ---
 
@@ -53,6 +55,52 @@ describe('eurlex_lookup_celex', () => {
     expect(result.found).toBe(true);
     expect(result.celex_number).toBe('32016R0679');
     expect(result.date).toBe('2016-04-27');
+  });
+
+  describe('resource_type label (#58)', () => {
+    it('resolves a mapped CDM resource-type URI to its label on both surfaces', async () => {
+      const ctx = createMockContext({ errors: eurlex_lookup_celex.errors });
+      mockQuery.mockResolvedValue([
+        makeBinding('32016R0679', {
+          type: 'http://publications.europa.eu/resource/authority/resource-type/REG',
+        }),
+      ]);
+
+      const input = eurlex_lookup_celex.input.parse({ identifier: '32016R0679' });
+      const result = await eurlex_lookup_celex.handler(input, ctx);
+
+      expect(result.resource_type).toBe('Regulation');
+      const text = (eurlex_lookup_celex.format!(result)[0] as { text: string }).text;
+      expect(text).toContain('**Type:** Regulation');
+      expect(text).not.toContain('resource-type/REG');
+    });
+
+    it('falls back to the authority code for an unmapped resource-type URI', async () => {
+      const ctx = createMockContext({ errors: eurlex_lookup_celex.errors });
+      mockQuery.mockResolvedValue([
+        makeBinding('02016R0679-20160504', {
+          type: 'http://publications.europa.eu/resource/authority/resource-type/CONS_TEXT',
+        }),
+      ]);
+
+      const input = eurlex_lookup_celex.input.parse({ identifier: '02016R0679-20160504' });
+      const result = await eurlex_lookup_celex.handler(input, ctx);
+
+      expect(result.resource_type).toBe('CONS_TEXT');
+    });
+
+    it('omits resource_type when the work carries none', async () => {
+      const ctx = createMockContext({ errors: eurlex_lookup_celex.errors });
+      mockQuery.mockResolvedValue([makeBinding('32016R0679')]);
+
+      const input = eurlex_lookup_celex.input.parse({ identifier: '32016R0679' });
+      const result = await eurlex_lookup_celex.handler(input, ctx);
+
+      expect(result.resource_type).toBeUndefined();
+      expect((eurlex_lookup_celex.format!(result)[0] as { text: string }).text).not.toContain(
+        '**Type:**',
+      );
+    });
   });
 
   it('auto-detects CELEX format when identifier_type is "auto"', async () => {
@@ -238,7 +286,7 @@ describe('eurlex_lookup_celex', () => {
       found: true,
       work_uri: 'http://publications.europa.eu/resource/cellar/gdpr',
       celex_number: '32016R0679',
-      resource_type: 'http://publications.europa.eu/resource/authority/resource-type/REG',
+      resource_type: 'Regulation',
       date: '2016-04-27',
     };
     const blocks = eurlex_lookup_celex.format!(output);
@@ -246,7 +294,7 @@ describe('eurlex_lookup_celex', () => {
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('32016R0679');
     expect(text).toContain('2016-04-27');
-    expect(text).toContain('REG');
+    expect(text).toContain('Regulation');
   });
 
   it('format renders found flag with sparse output (no optional fields)', () => {

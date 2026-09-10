@@ -5,6 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { resolveResourceTypeLabel } from '@/services/cellar-sparql/cdm-labels.js';
 import {
   CellarSparqlService,
   getCellarSparqlService,
@@ -67,7 +68,7 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
       .string()
       .optional()
       .describe(
-        'CDM resource type URI indicating the document category (e.g. .../resource-type/REG for Regulation). Absent for some works.',
+        'Human-readable document category resolved from the CDM resource type (e.g. "Regulation", "Directive", "Judgment"). An authority value with no known label falls back to its code (e.g. "CONS_TEXT"). Absent for some works.',
       ),
     date: z.string().optional().describe('Document date in ISO 8601 format (YYYY-MM-DD).'),
   }),
@@ -135,11 +136,12 @@ SELECT ?work ?celexNumber ?type ?date WHERE {
       return { found: false };
     }
 
+    const typeUri = CellarSparqlService.bindingValue(binding, 'type');
     return {
       found: true,
       work_uri: CellarSparqlService.bindingValue(binding, 'work'),
       celex_number: CellarSparqlService.bindingValue(binding, 'celexNumber'),
-      resource_type: CellarSparqlService.bindingValue(binding, 'type'),
+      ...(typeUri ? { resource_type: resolveResourceTypeLabel(typeUri) } : {}),
       date: CellarSparqlService.bindingValue(binding, 'date'),
     };
   },
