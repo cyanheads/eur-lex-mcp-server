@@ -99,7 +99,9 @@ function routeQuery(handlers: {
 }
 
 describe('eurlex_document_relations_resource', () => {
-  beforeEach(() => mockQuery.mockReset());
+  beforeEach(() => {
+    mockQuery.mockReset();
+  });
 
   // --- Happy path ---
 
