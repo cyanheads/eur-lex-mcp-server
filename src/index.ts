@@ -19,6 +19,7 @@ await createApp({
   tools: allToolDefinitions,
   resources: allResourceDefinitions,
   prompts: allPromptDefinitions,
+  sessionMode: 'stateless',
   instructions: `EUR-Lex MCP server provides access to the EU CELLAR semantic repository (2.7M+ EU legal works) and the EUR-Lex content API.
 
 Workflow orientation:
