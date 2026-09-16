@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.12.1](changelog/0.12.x/0.12.1.md) — 2026-09-16
+
+Adopts mcp-ts-core 0.13.2 — an explicit stateless session posture published in the server card, unset ${…} env vars falling through to defaults — plus a README restructure and a dependency refresh.
+
 ## [0.12.0](changelog/0.12.x/0.12.0.md) — 2026-09-09 · ⚠️ Breaking
 
 eurlex_get_document's legal_basis and eurovoc_subjects become labeled objects (breaking), eurlex_lookup_celex resolves resource_type to a label, and a timed-out SPARQL query fails once instead of retrying four times.
