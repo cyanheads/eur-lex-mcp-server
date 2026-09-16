@@ -27,136 +27,146 @@
 
 ---
 
-## Tools
+## Overview
 
-Seven tools covering EU legal research — document discovery, content retrieval, citation resolution, case law, relationship graph traversal, EuroVoc thesaurus lookup, and raw SPARQL access:
+EU legislation, CJEU case law, and treaties over the EU Publications Office's CELLAR semantic repository and the EUR-Lex content API. Search documents and case law, fetch full text, resolve citations, traverse the amendment and citation graph, and browse the EuroVoc thesaurus from any MCP client. Runs as a stdio process, a local Streamable HTTP server, or the public hosted endpoint above.
+
+### Tools
 
 | Tool | Description |
 |:-----|:------------|
-| `eurlex_search_documents` | Search EU legislation, treaties, and preparatory acts across the CELLAR corpus. Filters by document category, date range, EuroVoc concept, author institution, and in-force status; consolidated texts can be folded in through the selected basic-act family. |
-| `eurlex_get_document` | Fetch structured metadata and full text (HTML, Markdown, or Formex4 XML) for a work by CELEX number, ELI URI, or CELLAR work URI. |
-| `eurlex_lookup_celex` | Resolve an EU legal citation — a CELEX number or an ELI URI — to the canonical CELLAR work. |
-| `eurlex_get_cases` | Search CJEU and General Court case law — judgments, orders, and Advocate General opinions — by case number, party name, subject, or date range. |
-| `eurlex_get_relations` | Traverse the CELLAR relationship graph: amendment chain, consolidated versions, legal basis, citation network, and national transposition measures. |
-| `eurlex_browse_subjects` | Search the EuroVoc multilingual thesaurus to resolve human-readable terms to EuroVoc concept IDs — required before using the `eurovoc_concept` filter in `eurlex_search_documents`. |
-| `eurlex_query_sparql` | Execute a raw SPARQL SELECT query against the CELLAR Virtuoso endpoint. Results capped at 100; use only when curated tools don't cover the needed CDM ontology traversal. |
+| `eurlex_search_documents` | Search EU legislation, treaties, and preparatory acts by type, date, EuroVoc subject, author institution, and in-force status |
+| `eurlex_get_document` | Fetch metadata and full text (HTML, Markdown, or Formex4 XML) for an act by CELEX, ELI, or work URI |
+| `eurlex_lookup_celex` | Resolve a CELEX number or ELI URI to its canonical CELLAR work |
+| `eurlex_get_cases` | Search CJEU and General Court case law by case number, court, case type, and date range |
+| `eurlex_get_relations` | Traverse the CELLAR relationship graph — amendments, repeals, consolidations, legal basis, citations, transpositions |
+| `eurlex_browse_subjects` | Search the EuroVoc thesaurus to resolve terms to concept URIs |
+| `eurlex_query_sparql` | Run a raw, read-only SPARQL SELECT against the CELLAR endpoint |
 
-### `eurlex_search_documents`
+### Resources
 
-Search EU legislation, treaties, preparatory acts, and more across the 2.7M+ work CELLAR corpus.
+| Resource | Description |
+|:---|:---|
+| `eurlex://document/{celexNumber}` | Metadata snapshot for a CELLAR work |
+| `eurlex://document/{celexNumber}/relations` | One-hop relationship summary for a CELLAR work |
 
-- Keyword search across work titles and CELEX string patterns
-- Filter by document category (`REG`, `DIR`, `DEC`, `TREATY`, and more), with each category expanding to its reviewed CELLAR authority family
-- Optionally include consolidated texts whose basic act belongs to the selected category
-- Date range filtering (`date_from`, `date_to`)
-- EuroVoc concept filtering — use `eurlex_browse_subjects` first to resolve concept IDs
-- Filter to in-force acts only
-- Pagination via `offset` and configurable `limit` (max 100)
-- Returns CELEX numbers, work URIs, document types, and dates for chaining into `eurlex_get_document`
+All resource data is also reachable via tools.
 
----
+### Prompts
 
-### `eurlex_get_document`
-
-Fetch the notice and full text of an EU legal act.
-
-- Accepts CELEX numbers (e.g., `32016R0679`), ELI URIs, or CELLAR work URIs
-- Returns structured metadata: title, date, document type, author institution, legal basis, EuroVoc subjects, in-force flag
-- Full text in HTML (default), Markdown, or Formex4 XML — `format: "markdown"` converts the act body to clean Markdown server-side (recitals and numbered points as readable text, genuine data tables as GFM)
-- Content shaping for large acts: ordinary offset-based `"paged"` windows and `"full"` windows are capped at 100,000 characters; `content_mode` `"paged"` (default) returns the requested character window (`offset` + `limit`), while `"full"` returns the first window from offset zero. Both include `content_chars_total`, `content_offset`, `content_chars_returned`, and `has_more`, so repeated paged calls can reconstruct the complete body without loss; `"metadata_only"` skips the body, while structural outline/selection behavior is unchanged
-- Navigate structure instead of raw offsets: `outline: true` returns the act's chapters, articles, annexes, and recitals as a heading list (each with its character offset), and `select` (e.g. `{ articles: "1,5,17" }`) returns just those sections' text — degrading cleanly to the paging floor for acts with no detectable structure (e.g. case law)
-- Supports the 24 EUR-Lex language codes case-insensitively, normalizes them to uppercase, defaults to English, and automatically falls back to English when a requested translation is unavailable
-- Preserves the exact shaped body in structured output; HTML and XML are shown literally in the text response inside a source-safe tilde fence, while Markdown remains rendered Markdown
-- Older acts and some CJEU judgments may lack English translations
+| Prompt | Description |
+|:---|:---|
+| `eurlex_comparative_analysis` | Frame a comparative EU/US legal analysis for a policy domain |
 
 ---
 
-### `eurlex_lookup_celex`
+## Capability reference
 
-Resolve EU legal identifiers to canonical CELLAR works.
+### `eurlex_search_documents` <sub>tool</sub>
 
-- Accepts CELEX numbers and ELI URIs
-- Auto-detects format with `identifier_type: "auto"` (default); set explicitly when auto-detection fails
-- Returns work URI, confirmed CELEX number, document type, and date — the prerequisite step before `eurlex_get_document` or `eurlex_get_relations`
-
----
-
-### `eurlex_get_cases`
-
-Search CJEU and General Court case law.
-
-- Case-specific search: case number, keyword, court (`CJEU` or `GC`), and case type (`judgment`, `order`, `ag_opinion`)
-- Date range filtering
-- Primary records only by default — derivative information notices, abstracts, and summaries are excluded; set `include_derivative` to include them
-- Returns case identifier, court, date, document type, and parties
-- Distinct from `eurlex_search_documents` — case law (CELEX sector 6) has its own search parameters and practitioner workflows
+- Keyword matches English titles via the full-text index, or CELEX substrings — no full-text body search; at least one filter is required
+- `document_type` (`REG`, `DIR`, `DEC`, `TREATY`, `JUDG`, `OPIN_AG`, `PROP`, `REC`) expands to its full CELLAR authority family; `include_consolidated` folds in consolidated texts of that category
+- Date range (`date_from`/`date_to`), EuroVoc concept URI (from `eurlex_browse_subjects`), author institution, and in-force-only filters
+- Pagination via `offset` and `limit` (max 100); each result flags `is_consolidated`
+- Typed errors: `no_filters`, `invalid_date_range`, `no_results`
 
 ---
 
-### `eurlex_get_relations`
+### `eurlex_get_document` <sub>tool</sub>
 
-Traverse the CELLAR relationship graph for a given work.
-
-- Amendment chain (what amends it, what it amends)
-- Consolidated versions (the current in-force text)
-- Legal basis
-- Citation network (`cdm:work_cites_work` in both directions)
-- National transposition measures
-- Filter to specific relation types or retrieve all at once
-- Returns one-hop relations; multi-hop traversal requires multiple calls or `eurlex_query_sparql`
+- Accepts exactly one of `celex_number`, `eli_uri`, or `work_uri`
+- Body as `html` (default), `markdown` (server-side converted), or `xml` (Formex4); all 24 EUR-Lex language codes, case-insensitive, defaulting to and falling back to English
+- `content_mode` `"paged"` (default, offset/limit window), `"full"` (first window from zero), or `"metadata_only"`; paged and full windows both cap at 100,000 characters, with `content_chars_total`/`has_more` to page the rest
+- `outline: true` returns chapter/article/annex/recital headings with offsets; `select` (e.g. `{ articles: "1,5,17" }`) returns just those sections
+- `resolve: "current_consolidated"` serves the newest consolidated version instead of the requested base act; `is_superseded`/`current_consolidated_celex`/`consolidated_as_of` flag a stale base act either way
+- Typed `content_challenge` error when EUR-Lex returns a WAF bot-challenge instead of text
 
 ---
 
-### `eurlex_browse_subjects`
+### `eurlex_lookup_celex` <sub>tool</sub>
 
-Resolve human-readable terms to EuroVoc concept IDs.
-
-- Full-text search across the multilingual EuroVoc thesaurus, matching both preferred and alternative (non-preferred) labels
-- Returns concept URI, preferred label, concept code, broader/narrower hierarchy hints, and the alternative label that matched when one did
-- Supports all EU official languages; defaults to English
-- Required before using the `eurovoc_concept` filter in `eurlex_search_documents`
+- Accepts a CELEX number or ELI URI; `identifier_type` auto-detects the format or can be set explicitly
+- Returns work URI, confirmed CELEX number, resource type, and date — `found: false` for a well-formed identifier that matches no work
+- `ambiguous_identifier` error when auto-detection can't classify the input
 
 ---
 
-## Resources and prompts
+### `eurlex_get_cases` <sub>tool</sub>
 
-| Type | Name | Description |
-|:-----|:-----|:------------|
-| Resource | `eurlex://document/{celexNumber}` | Metadata snapshot for a CELLAR work — type, date, title, author institution, in-force flag |
-| Resource | `eurlex://document/{celexNumber}/relations` | Relationship summary for a work: amendment chain, consolidations, legal basis, cited-by count |
-| Prompt | `eurlex_comparative_analysis` | Frames a comparative legal analysis across EU and US law for a given policy domain |
+- Filters: `case_number` (`C-131/12` / `T-131/12`), `court` (`CJEU` or `GC`), `case_type` (`judgment`, `order`, `ag_opinion`), keyword, and date range
+- Primary records only by default — judicial information notices, abstracts, summaries, and corrigenda excluded; `include_derivative` includes them
+- Party names, subject matter, and case reference are parsed from the raw CELLAR title into `display_title`, `parties`, `subject_matter`, `case_reference`
+- Pagination via `offset` and `limit` (max 100)
 
-All resource data is also reachable via tools. Resources provide stable-URI injectable context for agents that support MCP resources.
+---
+
+### `eurlex_get_relations` <sub>tool</sub>
+
+- Accepts exactly one of `celex_number` or `work_uri`
+- `relation_types` filters to a subset of `cites`, `amends`, `amended_by`, `repeals`, `repealed_by`, `implicitly_repeals`, `implicitly_repealed_by`, `legal_basis`, `consolidated_version`, `national_transposition`; omit for all
+- One-hop only, paginated per relation type and direction via `offset`/`limit` (max 100, default 100)
+- Each relation carries `relation_type`, `direction` (`outgoing`/`incoming`), `related_work_uri`, and `related_celex_number` when known
+- `empty_relation_types` distinguishes "no edges of this type" from "edges paged out of this window"; `no_relations` fires only when the first page is empty
+
+---
+
+### `eurlex_browse_subjects` <sub>tool</sub>
+
+- Matches both preferred and alternative (non-preferred) EuroVoc labels, so a common synonym resolves to the concept it stands for
+- Returns concept URI, preferred label, code, broader (parent) label, and the alternative label that matched when one did
+- Supports all EU official languages via `language`; defaults to English
+- Pagination via `offset` and `limit` (max 50)
+
+---
+
+### `eurlex_query_sparql` <sub>tool</sub>
+
+- Read-only SELECT only — update forms and ASK/CONSTRUCT/DESCRIBE are rejected before execution
+- `cdm:`, `skos:`, and `xsd:` prefixes are auto-injected; results capped at 100 rows
+- Optional `timeout_hint` (1000–55000 ms); the Virtuoso endpoint enforces a 60-second hard limit
+- Typed errors: `not_read_only`, `sparql_error`, `sparql_timeout`
+
+---
+
+### `eurlex://document/{celexNumber}` <sub>resource</sub>
+
+- Metadata snapshot as `application/json` — resource type, author institution(s), date, title, in-force flag, legal basis, EuroVoc subjects
+- `celexNumber` comes from `eurlex_search_documents`, `eurlex_get_cases`, or `eurlex_lookup_celex`
+
+---
+
+### `eurlex://document/{celexNumber}/relations` <sub>resource</sub>
+
+- One-hop relationship summary — amendment chain, consolidations, national transposition, legal basis, citations — capped at 25 per relation type
+- `truncated` plus a `continuation` pointer to `eurlex_get_relations` when more relations exist
+
+---
+
+### `eurlex_comparative_analysis` <sub>prompt</sub>
+
+- Arguments: `domain` required; `focus` optional, folded into its matching analysis axis or added as its own section
+- Returns a research plan chaining `eurlex_browse_subjects` → `eurlex_search_documents` → `eurlex_get_document` → `eurlex_get_relations` for the EU side and `courtlistener_search_opinions` for the US side, plus a six-axis analysis framework
 
 ---
 
 ## Features
 
-Built on [`@cyanheads/mcp-ts-core`](https://www.npmjs.com/package/@cyanheads/mcp-ts-core):
-
-- Declarative tool, resource, and prompt definitions — single file per primitive, framework handles registration and validation
-- Unified error handling — handlers throw, framework catches, classifies, and formats
-- Pluggable auth: `none`, `jwt`, `oauth`
-- Swappable storage backends: `in-memory`, `filesystem`, `Supabase`, `Cloudflare KV/R2/D1`
-- Structured logging with optional OpenTelemetry tracing
-- STDIO and Streamable HTTP transports
-- MCP 2026-07-28 support, exact tool-input validation, and structured error envelopes clients can act on
+Built on [`@cyanheads/mcp-ts-core`](https://github.com/cyanheads/mcp-ts-core): stdio and Streamable HTTP transports, pluggable auth (`none` / `jwt` / `oauth`), swappable storage (`in-memory`, `filesystem`, `Supabase`, `Cloudflare KV/R2/D1`), structured logging with optional OpenTelemetry tracing.
 
 EUR-Lex-specific:
 
-- No API key required — both CELLAR SPARQL and EUR-Lex REST content endpoints are publicly accessible
-- `CellarSparqlService` POSTs `application/x-www-form-urlencoded` SPARQL with CDM prefix declarations built in; server-side LIMIT enforcement (max 100) prevents Virtuoso timeout abuse
-- `EurLexContentService` fetches act text from the CELLAR content-negotiation resolver (`/resource/celex/{CELEX}` with `Accept` / `Accept-Language` headers); HTML and Formex4 XML pass through, Markdown is converted server-side from the HTML body
-- Virtuoso error classification: HTTP 200 with `Virtuoso 37000 Error` body is parsed and re-raised as `ServiceUnavailable` (transient/timeout) or `InvalidParams` (syntax error)
-- Language fallback on document fetch: if the requested language is unavailable, retries with English and reports requested/effective language parity; ordinary absence after both attempts remains a successful metadata response with `content_status` and a typed unavailability cause, while a WAF challenge remains a typed `content_challenge` error
-- Typed error contracts on every tool — structured `reason` codes let agents branch on outcomes without parsing text
+- No API key required — CELLAR SPARQL and the EUR-Lex REST content endpoints are both publicly accessible
+- SPARQL is POSTed with CDM prefix declarations built in; server-side LIMIT enforcement (max 100) guards against Virtuoso timeouts
+- Act text is fetched via CELLAR content negotiation (`/resource/celex/{CELEX}`); HTML and Formex4 XML pass through, Markdown is converted server-side
+- Virtuoso errors (HTTP 200 with a `Virtuoso 37000 Error` body) are classified and re-raised as `ServiceUnavailable` or `InvalidParams`
+- Automatic English fallback when a requested translation is unavailable, with requested/effective language reported
 
 Agent-friendly output:
 
-- EuroVoc prerequisite guidance in server-level instructions — agents are directed to `eurlex_browse_subjects` before attempting concept-filtered searches
-- `eurlex_lookup_celex` surfaces CELEX confirmation and work existence upfront, preventing downstream errors in document or relation fetches
-- `content_status`, `content_unavailability_reason`, and requested/effective language fields let agents distinguish skipped, available, absent, upstream-failed, and incomplete multipart content without string parsing
-- Relationship graph output carries relation type labels alongside CELLAR URIs and resolved CELEX numbers for human-readable downstream use
+- EuroVoc prerequisite guidance in server-level instructions — agents are directed to `eurlex_browse_subjects` before concept-filtered searches
+- `eurlex_lookup_celex` confirms CELEX/ELI existence upfront, preventing downstream errors in document or relation fetches
+- `content_status`, `content_unavailability_reason`, and requested/effective language fields distinguish skipped, available, absent, upstream-failed, and incomplete content without string parsing
+- Typed `reason` codes on every tool's error contract let agents branch on outcomes programmatically
 
 ---
 
@@ -359,7 +369,7 @@ See [`CLAUDE.md`](./CLAUDE.md) for development guidelines and architectural rule
 
 ## Contributing
 
-Issues and pull requests are welcome. Run checks and tests before submitting:
+Issues are welcome. Run checks and tests before submitting:
 
 ```sh
 bun run devcheck
