@@ -1,13 +1,35 @@
 {
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "eur-lex-mcp-server",
   "version": "0.12.0",
   "description": "Search EU legislation, CJEU case law, and treaties; traverse the CELLAR relationship graph; resolve EuroVoc concepts via MCP. STDIO or Streamable HTTP.",
   "author": {
-    "name": "cyanheads"
+    "name": "cyanheads",
+    "email": "casey@caseyjhand.com",
+    "url": "https://github.com/cyanheads"
   },
   "homepage": "https://github.com/cyanheads/eur-lex-mcp-server#readme",
   "repository": "git+https://github.com/cyanheads/eur-lex-mcp-server.git",
   "license": "Apache-2.0",
+  "keywords": [
+    "eur-lex",
+    "eu-law",
+    "european-union",
+    "cellar",
+    "sparql",
+    "cjeu",
+    "eurovoc",
+    "legislation",
+    "legal",
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "typescript",
+    "bun",
+    "stdio",
+    "streamable-http",
+    "ai-agent"
+  ],
   "mcpServers": {
     "eur-lex-mcp-server": {
       "command": "npx",
