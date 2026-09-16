@@ -4,7 +4,7 @@ All notable changes to this project. Each entry links to its full per-version fi
 
 ## [0.12.1](changelog/0.12.x/0.12.1.md) — 2026-09-16
 
-Adopts mcp-ts-core 0.13.2 — an explicit stateless session posture published in the server card, unset ${…} env vars falling through to defaults — plus a README restructure and a dependency refresh.
+Adopts mcp-ts-core 0.13.2 — an explicit stateless session posture published in the server card, empty or unsubstituted ${…} env vars falling through to defaults — plus a README restructure and a dependency refresh.
 
 ## [0.12.0](changelog/0.12.x/0.12.0.md) — 2026-09-09 · ⚠️ Breaking
 
