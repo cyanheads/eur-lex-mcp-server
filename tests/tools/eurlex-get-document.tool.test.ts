@@ -1174,6 +1174,204 @@ describe('eurlex_get_document', () => {
       expect(text).toContain('Article 1');
     });
 
+    // --- #80: a selection is a set of disjoint slices, so it needs its own bound
+    // and its own navigation. The cap matches paged/full (#74); has_more stays
+    // false because its contiguous-continuation recipe cannot resume across
+    // disjoint slices; each matched section carries its own source address so
+    // every section remains individually reachable through the paging floor (#12).
+
+    /** A structured act whose two articles together exceed the body cap. */
+    const OVERSIZED_BODY = [
+      '<p class="oj-ti-grseq">CHAPTER I</p>',
+      '<p class="oj-ti-grseq">General provisions</p>',
+      '<p class="oj-ti-art">Article 1</p>',
+      '<p class="oj-sti-art">Subject-matter</p>',
+      `<p class="oj-normal">${'x'.repeat(60_000)}</p>`,
+      '<p class="oj-ti-art">Article 2</p>',
+      '<p class="oj-sti-art">Scope</p>',
+      `<p class="oj-normal">${'y'.repeat(60_000)}</p>`,
+    ].join('\n');
+
+    const mockBody = (content: string) => {
+      mockSparqlQuery.mockResolvedValue([makeMetaBinding({ celex: '32016R0679' })]);
+      mockFetchContent.mockResolvedValue({
+        content,
+        contentAvailable: true,
+        format: 'html',
+        language: 'EN',
+      });
+    };
+
+    /** Run a select call and return both the result and what it enriched. */
+    const runSelect = async (
+      content: string,
+      select: Record<string, string>,
+      celex = '32016R0679',
+    ) => {
+      mockBody(content);
+      const ctx = createMockContext({ errors: eurlex_get_document.errors });
+      const result = await eurlex_get_document.handler(
+        eurlex_get_document.input.parse({ celex_number: celex, select }),
+        ctx,
+      );
+      return { result, enrichment: getEnrichment(ctx) };
+    };
+
+    it('#80: caps an oversized selection at the body ceiling and keeps has_more false', async () => {
+      const { result } = await runSelect(OVERSIZED_BODY, { articles: '1,2' });
+
+      expect(OVERSIZED_BODY.length).toBeGreaterThan(100_000);
+      expect(result.content!.length).toBe(100_000);
+      expect(result.content_chars_returned).toBe(100_000);
+      expect(result.content_chars_total).toBe(OVERSIZED_BODY.length);
+      // The selection matched both articles; the cap limited the text, not the match.
+      expect(result.selection?.matched).toEqual(['Article 1', 'Article 2']);
+      // has_more's documented recipe (offset = content_offset + content_chars_returned)
+      // describes a contiguous window, so it must not claim resumability here.
+      expect(result.has_more).toBe(false);
+      expect(result.content_offset).toBeUndefined();
+      // The tail of the second article really was cut.
+      expect(result.content).not.toContain(OVERSIZED_BODY.slice(-200));
+    });
+
+    it('#80: discloses the cut through the truncated enrichment even though has_more is false', async () => {
+      const { result, enrichment } = await runSelect(OVERSIZED_BODY, { articles: '1,2' });
+
+      expect(result.has_more).toBe(false);
+      expect(enrichment).toMatchObject({
+        truncated: true,
+        shown: 100_000,
+        cap: 100_000,
+        notice: expect.stringContaining('selected_sections'),
+      });
+    });
+
+    it("#80: carries each matched section's own source offset and length on selected_sections", async () => {
+      const { result } = await runSelect(OVERSIZED_BODY, { articles: '1,2' });
+
+      expect(result.selected_sections?.map((s) => s.label)).toEqual(['Article 1', 'Article 2']);
+      for (const section of result.selected_sections ?? []) {
+        expect(section.chars).toBeGreaterThan(0);
+        // Each address points at its own heading in the source body.
+        expect(OVERSIZED_BODY.slice(section.offset, section.offset + 60)).toContain(section.label);
+      }
+      // Disjoint slices, ascending — not one contiguous span.
+      const [first, second] = result.selected_sections ?? [];
+      expect(second!.offset).toBeGreaterThan(first!.offset + first!.chars - 1);
+    });
+
+    it('#80: a section cut by the cap is still individually reachable through the paging floor (#12)', async () => {
+      const { result } = await runSelect(OVERSIZED_BODY, { articles: '1,2' });
+      const cutSection = result.selected_sections!.at(-1)!;
+
+      mockBody(OVERSIZED_BODY);
+      const reread = await eurlex_get_document.handler(
+        eurlex_get_document.input.parse({
+          celex_number: '32016R0679',
+          content_mode: 'paged',
+          offset: cutSection.offset,
+          limit: cutSection.chars,
+        }),
+        createMockContext({ errors: eurlex_get_document.errors }),
+      );
+
+      // The advertised address reproduces the section's source span exactly.
+      expect(reread.content).toBe(
+        OVERSIZED_BODY.slice(cutSection.offset, cutSection.offset + cutSection.chars),
+      );
+      expect(reread.content).toContain('Article 2');
+      expect(reread.content).toContain(OVERSIZED_BODY.slice(-200));
+    });
+
+    it('#80: a selection exactly at the ceiling is returned whole with no truncation notice', async () => {
+      const prefix = '<p class="oj-doc-ti">REGULATION</p>\n';
+      const head =
+        '<p class="oj-ti-art">Article 1</p>\n<p class="oj-sti-art">Subject-matter</p>\n<p class="oj-normal">';
+      const tail = '</p>';
+      const atCapBody = `${prefix}${head}${'x'.repeat(100_000 - head.length - tail.length)}${tail}`;
+
+      const { result, enrichment } = await runSelect(atCapBody, { articles: '1' });
+
+      expect(result.content!.length).toBe(100_000);
+      expect(result.content_chars_returned).toBe(100_000);
+      expect(result.selected_sections).toEqual([
+        { label: 'Article 1', offset: prefix.length, chars: 100_000 },
+      ]);
+      expect(enrichment.truncated).toBeUndefined();
+    });
+
+    it('#80: an under-cap selection reports no truncation and addresses every distinct slice', async () => {
+      mockStructured();
+      const ctx = createMockContext({ errors: eurlex_get_document.errors });
+      const result = await eurlex_get_document.handler(
+        eurlex_get_document.input.parse({
+          celex_number: '32016R0679',
+          select: { chapters: 'I', articles: '2,2' },
+        }),
+        ctx,
+      );
+
+      expect(getEnrichment(ctx).truncated).toBeUndefined();
+      expect(result.content_chars_returned).toBe(result.content!.length);
+      expect(result.content_chars_returned).toBeLessThan(100_000);
+      expect(result.has_more).toBe(false);
+      // One address per distinct slice, in document order — the twice-requested
+      // article collapses to a single entry, matching the sliced text.
+      expect(result.selected_sections?.map((s) => s.label)).toEqual(['CHAPTER I', 'Article 2']);
+      expect(result.selection?.matched).toEqual(['CHAPTER I', 'Article 2', 'Article 2']);
+    });
+
+    it('#80: a selection that matches nothing addresses no sections and discloses no cut', async () => {
+      const { result, enrichment } = await runSelect(STRUCTURED_BODY, { articles: '99' });
+
+      expect(result.selection?.missed).toEqual(['Article 99']);
+      expect(result.selected_sections).toEqual([]);
+      expect(result.content).toBeUndefined();
+      expect(result.content_chars_returned).toBe(0);
+      expect(enrichment.truncated).toBeUndefined();
+    });
+
+    it('#80: an unstructured act addresses no sections and still degrades to the floor', async () => {
+      const { result } = await runSelect(UNSTRUCTURED_BODY, { articles: '1' }, '62024CJ0629');
+
+      expect(result.structure_detected).toBe(false);
+      expect(result.selected_sections).toEqual([]);
+      expect(result.has_more).toBe(false);
+    });
+
+    it('#80: format renders selection navigation from the per-section addresses, not a contiguous span', async () => {
+      const { result } = await runSelect(OVERSIZED_BODY, { articles: '1,2' });
+      const text = (eurlex_get_document.format!(result)[0] as { text: string }).text;
+
+      // The old rendering claimed a contiguous "characters 0–539833" window over
+      // text assembled from disjoint slices.
+      expect(text).not.toMatch(/characters \d+–\d+/);
+      expect(text).toContain('disjoint');
+      // Each matched section's own address reaches the text channel too.
+      for (const section of result.selected_sections ?? []) {
+        expect(text).toContain(`${section.label} — offset ${section.offset}, ${section.chars}`);
+      }
+      // Both channels carry the same capped body — no second, differently sized cut.
+      expect(text).toContain(result.content!);
+      expect(text).not.toContain(OVERSIZED_BODY.slice(-200));
+    });
+
+    it('#80: format renders an outline as a structure line, never a zero-length body window', async () => {
+      mockStructured();
+      const ctx = createMockContext({ errors: eurlex_get_document.errors });
+      const result = await eurlex_get_document.handler(
+        eurlex_get_document.input.parse({ celex_number: '32016R0679', outline: true }),
+        ctx,
+      );
+      const text = (eurlex_get_document.format!(result)[0] as { text: string }).text;
+
+      expect(result.content_chars_returned).toBe(0);
+      expect(text).not.toContain('characters 0–0');
+      expect(text).not.toMatch(/characters \d+–\d+/);
+      expect(text).toContain('structure only');
+      expect(text).toContain(`${STRUCTURED_BODY.length}-character`);
+    });
+
     it('format renders a selection miss notice pointing at the paging floor', () => {
       const output = {
         celex_number: '32016R0679',

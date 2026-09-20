@@ -82,6 +82,23 @@ const UNSTRUCTURED_HTML = [
   '</body></html>',
 ].join('\n');
 
+/**
+ * Titles carrying character references — both single-encoded (ordinary markup an
+ * act escapes) and double-encoded (`&amp;lt;`, meaning the literal characters
+ * `&lt;`). Only the heading-classification path decodes these; the body text the
+ * selectors slice is read from the original string.
+ */
+const ENTITY_HTML = [
+  '<html><body>',
+  '<p class="oj-ti-art">Article&nbsp;1</p>',
+  '<p class="oj-sti-art">Markup &amp;lt;b&amp;gt; and &amp;#60; stay escaped</p>',
+  '<p class="oj-normal">Body of Article 1.</p>',
+  '<p class="oj-ti-art">Article 2</p>',
+  '<p class="oj-sti-art">Rights &amp; freedoms, &lt;scope&gt;, &#8217;quoted&#8217;</p>',
+  '<p class="oj-normal">Body of Article 2.</p>',
+  '</body></html>',
+].join('\n');
+
 /** `(N)` markers both before AND after the enacting terms begin. */
 const GATING_HTML = [
   '<html><body>',
@@ -149,6 +166,52 @@ describe('parseActStructure', () => {
       expect(headings.find((h) => h.kind === 'article' && h.number === '1')?.title).toBe(
         'Subject-matter and objectives',
       );
+    });
+  });
+
+  describe('character references in heading text (#79)', () => {
+    /** Title of the article numbered `n` in ENTITY_HTML. */
+    const titleOf = (n: string, content = ENTITY_HTML, format: 'html' | 'xml' = 'html') =>
+      parseActStructure(content, format).find((h) => h.kind === 'article' && h.number === n)?.title;
+
+    it('decodes each reference exactly once, leaving a double-encoded one escaped', () => {
+      // `&amp;lt;b&amp;gt;` is the act writing the literal characters `&lt;b&gt;`.
+      // Decoding `&amp;` first and `&lt;` after collapses it to real markup.
+      expect(titleOf('1')).toBe('Markup &lt;b&gt; and &#60; stay escaped');
+    });
+
+    it('still decodes ordinary single-encoded references', () => {
+      expect(titleOf('2')).toBe('Rights & freedoms, <scope>, ’quoted’');
+    });
+
+    it('decodes a hexadecimal character reference', () => {
+      const html = [
+        '<p class="oj-ti-art">Article 3</p>',
+        '<p class="oj-sti-art">Angle &#x3C;bracket&#x3E; and &#X41;</p>',
+      ].join('\n');
+      expect(titleOf('3', html)).toBe('Angle <bracket> and A');
+    });
+
+    it('leaves an out-of-range numeric reference verbatim instead of throwing', () => {
+      const html = [
+        '<p class="oj-ti-art">Article 4</p>',
+        '<p class="oj-sti-art">Overflow &#99999999; and &#xFFFFFFFF; survive</p>',
+      ].join('\n');
+      expect(() => parseActStructure(html, 'html')).not.toThrow();
+      expect(titleOf('4', html)).toBe('Overflow &#99999999; and &#xFFFFFFFF; survive');
+    });
+
+    it('decodes a non-breaking space inside the heading itself so the pattern still matches', () => {
+      expect(parseActStructure(ENTITY_HTML, 'html').map((h) => h.label)).toEqual([
+        'Article 1',
+        'Article 2',
+      ]);
+    });
+
+    it('applies the same single decoding on the Formex subtitle path', () => {
+      const formex =
+        '<ARTICLE><TI.ART>Article 1</TI.ART><STI.ART>Scope of &amp;lt;TAG&amp;gt;</STI.ART></ARTICLE>';
+      expect(titleOf('1', formex, 'xml')).toBe('Scope of &lt;TAG&gt;');
     });
   });
 
@@ -234,10 +297,40 @@ describe('extractSections', () => {
     expect(result.matched).toEqual(['Article 1', 'Article 1']);
     const occurrences = result.text.split('Subject-matter and objectives').length - 1;
     expect(occurrences).toBe(1);
+    // One address per slice that fed the text, not per request (#80).
+    expect(result.sections).toHaveLength(1);
+  });
+
+  it('addresses each sliced section by its own source span (#80)', () => {
+    const result = extractSections(html, headings, { articles: '5', chapters: 'I' });
+
+    expect(result.sections.map((s) => s.label)).toEqual(['CHAPTER I', 'Article 5']);
+
+    // Each address re-cuts its own slice out of the source string, which is what
+    // lets a caller re-read one section through the paging floor.
+    const spans = result.sections.map((s) => html.slice(s.offset, s.offset + s.chars));
+    expect(spans[0]).toContain('CHAPTER I');
+    expect(spans[0]).toContain('Article 2'); // nested inside the chapter
+    expect(spans[0]).not.toContain('Article 5');
+    expect(spans[1]).toContain('Article 5');
+    expect(result.text).toBe(spans.map((s) => s.trim()).join('\n\n'));
+
+    // Disjoint and ascending — the chapter ends before the article's own slice.
+    const [chapter, article] = result.sections;
+    expect(chapter!.offset + chapter!.chars).toBeLessThanOrEqual(article!.offset);
   });
 
   it('tolerates selector tokens that carry the kind word (e.g. "Article 1")', () => {
     const result = extractSections(html, headings, { articles: 'Article 1' });
     expect(result.matched).toEqual(['Article 1']);
+  });
+
+  it('slices the original body, so character references reach the caller undecoded (#79)', () => {
+    // Decoding happens only on the classification path; the returned text is a
+    // slice of the source string, so the act's own escaping survives verbatim.
+    const entityHeadings = parseActStructure(ENTITY_HTML, 'html');
+    const result = extractSections(ENTITY_HTML, entityHeadings, { articles: '1' });
+    expect(result.text).toContain('&amp;lt;b&amp;gt;');
+    expect(result.text).not.toContain('<b>');
   });
 });

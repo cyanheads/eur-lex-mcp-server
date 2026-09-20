@@ -30,6 +30,7 @@ import {
   extractSections,
   parseActStructure,
   type SectionSelectors,
+  type SelectedSection,
 } from '@/services/eurlex-content/act-structure.js';
 import {
   type ContentFormat,
@@ -82,7 +83,7 @@ const META_DIMENSION_LIMIT = 100;
 export const eurlex_get_document = tool('eurlex_get_document', {
   title: 'Get EU Document',
   description:
-    'Fetch the metadata and full text of an EU act by CELEX number, ELI URI, or work URI. Returns structured metadata (title, date, type, author institution, legal basis, EuroVoc subjects, in-force status) plus the act body as HTML, Markdown, or Formex4 XML, defaulting to English with automatic fallback. Ordinary offset-based paged windows and full-mode windows are capped at 100,000 characters; page with offset/limit to reconstruct larger acts, or use outline: true for a heading map and select to pull specific articles, chapters, recitals, or annexes.',
+    'Fetch the metadata and full text of an EU act by CELEX number, ELI URI, or work URI. Returns structured metadata (title, date, type, author institution, legal basis, EuroVoc subjects, in-force status) plus the act body as HTML, Markdown, or Formex4 XML, defaulting to English with automatic fallback. Every body returned in one call is capped at 100,000 characters — paged and full windows page onward with offset/limit; use outline: true for a heading map and select to pull specific articles, chapters, recitals, or annexes, reading a selected section on its own from the offset and chars in selected_sections.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     celex_number: z
@@ -283,7 +284,7 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .string()
       .optional()
       .describe(
-        `Body content of the act in the requested format and language. In "paged" mode this is the requested window; in "full" mode it starts at zero and is capped at ${MAX_CONTENT_LIMIT} characters. Omitted in "metadata_only" mode, when the window is empty, or when content is unavailable.`,
+        `Body content of the act in the requested format and language. In "paged" mode this is the requested window; in "full" mode it starts at zero; under select it is the matched sections joined in document order. Every one is capped at ${MAX_CONTENT_LIMIT} characters. Omitted in "metadata_only" mode, when the window is empty, or when content is unavailable.`,
       ),
     content_mode: z
       .string()
@@ -309,7 +310,7 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .int()
       .optional()
       .describe(
-        'Character offset where the returned content window begins. Present when a body was fetched and available.',
+        'Character offset where the returned contiguous window begins. Present in "paged" and "full" modes. Absent for outline and select responses, whose content is not a contiguous span — read selected_sections for each matched section\'s own offset.',
       ),
     content_chars_returned: z
       .number()
@@ -328,7 +329,7 @@ export const eurlex_get_document = tool('eurlex_get_document', {
     has_more: z
       .boolean()
       .describe(
-        'True when body content exists beyond the returned window. Continue in "paged" mode with offset = content_offset + content_chars_returned until false. Always false in "metadata_only" mode.',
+        'True when body content exists beyond the returned contiguous window. Continue in "paged" mode with offset = content_offset + content_chars_returned until false. Always false in "metadata_only" mode, and always false for outline and select responses, where that recipe cannot resume across disjoint slices — a cut selection is disclosed through the truncated enrichment instead.',
       ),
     language: z.string().describe('Language code of the returned content.'),
     requested_language: z
@@ -382,14 +383,38 @@ export const eurlex_get_document = tool('eurlex_get_document', {
           .describe('Section descriptors requested, e.g. ["Article 17", "CHAPTER IV"].'),
         matched: z
           .array(z.string())
-          .describe('Section descriptors found and returned in content, in document order.'),
+          .describe('Section descriptors located in the body, in document order.'),
         missed: z
           .array(z.string())
           .describe('Requested section descriptors that could not be located.'),
       })
       .optional()
       .describe(
-        'Outcome of a structural selection. Present only when select was used; content holds the matched sections joined in document order.',
+        `Outcome of a structural selection. Present only when select was used; content holds the matched sections joined in document order, capped at ${MAX_CONTENT_LIMIT} characters. When the cap cuts the join, a trailing matched section may be partly or wholly absent from content — read selected_sections for each one's own address.`,
+      ),
+    selected_sections: z
+      .array(
+        z
+          .object({
+            label: z.string().describe('Section descriptor, e.g. "Article 17".'),
+            offset: z
+              .number()
+              .int()
+              .describe(
+                'Character offset of the section in the full body of the requested format — pass as offset in a paged call to read it.',
+              ),
+            chars: z
+              .number()
+              .int()
+              .describe(
+                'Characters the section spans in the source body — pass as limit alongside offset to read exactly this section. A section longer than the maximum window is read by paging forward from offset instead.',
+              ),
+          })
+          .describe('One selected section, addressable on its own through the paging floor.'),
+      )
+      .optional()
+      .describe(
+        'Source address of each section the selection sliced, in document order. Present only when select was used. A selection is a set of disjoint slices, not a contiguous window, so these addresses — not content_offset — are how a caller navigates one; every section stays individually reachable even when the cap cut its text.',
       ),
     structure_detected: z
       .boolean()
@@ -426,6 +451,7 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       when: 'The primary content response is an AWS WAF bot-challenge interstitial rather than legal text.',
       recovery:
         'Retry shortly, or use content_mode "metadata_only" while the content host challenge persists.',
+      thrownBy: 'service',
     },
   ],
 
@@ -674,6 +700,7 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
       content_format: string;
       outline?: ActHeading[];
       selection?: { requested: string[]; matched: string[]; missed: string[] };
+      selected_sections?: SelectedSection[];
       structure_detected?: boolean;
     } = {
       celex_number: metaResult.confirmedCelex,
@@ -718,6 +745,9 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
       result.requested_celex = requestedCelex;
     }
 
+    /** Uncapped size of a structural selection, set only when the cap cut it. */
+    let selectedCharsBeforeCap: number | undefined;
+
     if (body) {
       result.content_available = body.contentAvailable;
       result.content_status = body.contentAvailable ? 'available' : 'unavailable';
@@ -751,6 +781,14 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
           // (bad number, or no structure at all) is reported in selection.missed
           // with no body returned — never the wrong section — and the paging floor
           // stays available. Applies on top of the requested format.
+          //
+          // #80: the join is a set of disjoint slices, so it takes the same
+          // per-call ceiling as paged/full but NOT their continuation protocol —
+          // has_more's recipe (offset + chars_returned) describes a contiguous
+          // window and cannot resume here. The cut is disclosed through the
+          // truncated enrichment, and selected_sections carries each section's own
+          // source address so every one stays individually reachable through the
+          // paging floor (#12).
           const headings = parseActStructure(full, format);
           result.structure_detected = headings.length > 0;
           const selection = extractSections(full, headings, input.select as SectionSelectors);
@@ -759,9 +797,14 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
             matched: selection.matched,
             missed: selection.missed,
           };
+          result.selected_sections = selection.sections;
           result.has_more = false;
-          result.content_chars_returned = selection.text.length;
-          if (selection.text.length > 0) result.content = selection.text;
+          const windowText = selection.text.slice(0, MAX_CONTENT_LIMIT);
+          if (windowText.length < selection.text.length) {
+            selectedCharsBeforeCap = selection.text.length;
+          }
+          result.content_chars_returned = windowText.length;
+          if (windowText.length > 0) result.content = windowText;
         } else if (input.content_mode === 'full') {
           const windowText = full.slice(0, MAX_CONTENT_LIMIT);
           result.content = windowText;
@@ -782,6 +825,10 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
       }
     }
 
+    // Truncation disclosure. A contiguous window discloses through has_more plus a
+    // continuation offset; a capped selection has no resumable offset, so it
+    // discloses through this enrichment alone and points at the per-section
+    // addresses instead (#80).
     if (result.has_more) {
       const nextOffset = (result.content_offset ?? 0) + (result.content_chars_returned ?? 0);
       const cap = input.content_mode === 'full' ? MAX_CONTENT_LIMIT : input.limit;
@@ -789,6 +836,12 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
         shown: result.content_chars_returned ?? 0,
         cap,
         guidance: `More document content is available. Continue with content_mode="paged" and offset=${nextOffset}.`,
+      });
+    } else if (selectedCharsBeforeCap !== undefined) {
+      ctx.enrich.truncated({
+        shown: result.content_chars_returned ?? 0,
+        cap: MAX_CONTENT_LIMIT,
+        guidance: `The selected sections total ${selectedCharsBeforeCap} characters and were cut at the ${MAX_CONTENT_LIMIT}-character body cap. Read a section on its own with content_mode="paged", passing its offset and chars from selected_sections, or select fewer sections.`,
       });
     }
 
@@ -865,25 +918,46 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
       const returned = result.content_chars_returned ?? result.content?.length ?? 0;
       const end = start + returned;
 
-      // Navigation status — always rendered so every navigation field (content_mode,
-      // content_offset, content_chars_returned/total, has_more) reaches the text
-      // channel too, whichever view (window / outline / selection) shaped the body.
-      if (result.content_mode === 'full' && result.has_more) {
+      // Navigation status — one line per view that shaped the body, so every
+      // navigation field (content_mode, content_offset, content_chars_returned /
+      // total, has_more) reaches the text channel too. Outline and selection each
+      // get their own line and the contiguous-window line is gated on
+      // content_offset: neither returns a contiguous span, so describing either as
+      // a character range would report a window that does not exist (#80).
+      if (result.outline) {
         lines.push(
-          `**Body** (full request, capped): characters ${start}–${end} of ${total} (${returned} returned). ` +
-            `Continue with content_mode="paged" and offset=${end}.`,
+          `**Body** (${result.content_mode}, outline): structure only — ${result.outline.length} heading${result.outline.length === 1 ? '' : 's'} indexed over a ${total}-character body, ${returned} body characters returned. Read a section by paging with its offset.`,
         );
-      } else if (result.content_mode === 'full') {
+      }
+      if (result.selection) {
+        const sections = result.selected_sections ?? [];
         lines.push(
-          `**Body** (full): full body — ${returned} of ${total} characters from offset ${start}.`,
+          `**Body** (${result.content_mode}, selection): ${returned} characters from ${sections.length} disjoint section${sections.length === 1 ? '' : 's'} of a ${total}-character body — not a contiguous window, so there is no continuation offset (has_more ${result.has_more}).`,
         );
-      } else {
-        lines.push(
-          `**Body** (${result.content_mode}): characters ${start}–${end} of ${total} (${returned} returned).` +
-            (result.has_more
-              ? ` More available — continue with content_mode="paged" and offset=${end}.`
-              : ''),
-        );
+        if (returned >= MAX_CONTENT_LIMIT) {
+          lines.push(
+            `Capped at ${MAX_CONTENT_LIMIT} characters — a trailing section may be cut. Read one on its own with content_mode="paged" at its offset and chars below.`,
+          );
+        }
+      }
+      if (result.content_offset !== undefined) {
+        if (result.content_mode === 'full' && result.has_more) {
+          lines.push(
+            `**Body** (full request, capped): characters ${start}–${end} of ${total} (${returned} returned). ` +
+              `Continue with content_mode="paged" and offset=${end}.`,
+          );
+        } else if (result.content_mode === 'full') {
+          lines.push(
+            `**Body** (full): full body — ${returned} of ${total} characters from offset ${start}.`,
+          );
+        } else {
+          lines.push(
+            `**Body** (${result.content_mode}): characters ${start}–${end} of ${total} (${returned} returned).` +
+              (result.has_more
+                ? ` More available — continue with content_mode="paged" and offset=${end}.`
+                : ''),
+          );
+        }
       }
 
       if (result.outline) {
@@ -920,6 +994,16 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
               'Use offset/limit or content_mode "full" to read the act.',
           );
         }
+      }
+
+      // Per-section addresses: the navigation a disjoint selection actually has.
+      // Each doubles as the paged call that re-reads that section alone (#12).
+      if (result.selected_sections && result.selected_sections.length > 0) {
+        lines.push(
+          `Section addresses (content_mode "paged", offset/limit): ${result.selected_sections
+            .map((s) => `${s.label} — offset ${s.offset}, ${s.chars} chars`)
+            .join('; ')}.`,
+        );
       }
 
       if (result.content) {

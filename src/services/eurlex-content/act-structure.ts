@@ -50,6 +50,21 @@ export interface SectionSelectors {
   recitals?: string;
 }
 
+/**
+ * One sliced section's own address in the source body. A selection is a set of
+ * disjoint slices rather than a contiguous window, so each section carries its
+ * own span — which is also what keeps it individually reachable through the
+ * paging floor after a capped response drops its text (#12, #80).
+ */
+export interface SelectedSection {
+  /** Source characters the section spans — `offset + chars` is its end. */
+  chars: number;
+  /** Section descriptor, e.g. "Article 17". */
+  label: string;
+  /** Character offset of the section's heading in the content string. */
+  offset: number;
+}
+
 /** Outcome of a structural selection — the sliced text plus hit/miss bookkeeping. */
 export interface SelectionResult {
   /** Descriptors of the sections that were found and sliced. */
@@ -58,6 +73,8 @@ export interface SelectionResult {
   missed: string[];
   /** Human descriptors of every requested section, e.g. ["Article 17", "CHAPTER IV"]. */
   requested: string[];
+  /** Source address of each distinct slice that fed `text`, in document order. */
+  sections: SelectedSection[];
   /** Concatenated text of the matched sections, in document order. Empty when nothing matched. */
   text: string;
 }
@@ -126,13 +143,32 @@ function visibleText(line: string): string {
     .trim();
 }
 
+/** Named references worth resolving in OJ heading text. */
+const NAMED_ENTITIES: Record<string, string> = {
+  amp: '&',
+  gt: '>',
+  lt: '<',
+  nbsp: ' ',
+};
+
+/** Highest Unicode code point `String.fromCodePoint` accepts. */
+const MAX_CODE_POINT = 0x10ffff;
+
+/**
+ * Decode every character reference in ONE pass, so each is decoded exactly once
+ * (#79). A sequential replace chain decodes `&amp;` into an `&` that the later
+ * passes read as the start of a fresh reference, turning the act's own escaped
+ * `&amp;lt;b&amp;gt;` into real `<b>` markup. Scanning once leaves the `&` this
+ * replacement produced untouched. An unknown name or an out-of-range code point
+ * is left verbatim rather than dropped or thrown on.
+ */
 function decodeEntities(text: string): string {
-  return text
-    .replace(/&nbsp;/gi, ' ')
-    .replace(/&amp;/gi, '&')
-    .replace(/&lt;/gi, '<')
-    .replace(/&gt;/gi, '>')
-    .replace(/&#(\d+);/g, (_, code) => String.fromCodePoint(Number(code)));
+  return text.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (reference, body: string) => {
+    if (body[0] !== '#') return NAMED_ENTITIES[body.toLowerCase()] ?? reference;
+    const hex = body[1] === 'x' || body[1] === 'X';
+    const code = Number.parseInt(hex ? body.slice(2) : body.slice(1), hex ? 16 : 10);
+    return code <= MAX_CODE_POINT ? String.fromCodePoint(code) : reference;
+  });
 }
 
 /**
@@ -395,19 +431,21 @@ export function extractSections(
   // request and an article request inside it could overlap — keep each once).
   matched.sort((a, b) => a.offset - b.offset);
   const seen = new Set<number>();
-  const text = matched
-    .filter((s) => {
-      if (seen.has(s.offset)) return false;
-      seen.add(s.offset);
-      return true;
-    })
-    .map((s) => content.slice(s.offset, s.end).trim())
-    .join('\n\n');
+  const distinct = matched.filter((s) => {
+    if (seen.has(s.offset)) return false;
+    seen.add(s.offset);
+    return true;
+  });
 
   return {
-    text,
+    text: distinct.map((s) => content.slice(s.offset, s.end).trim()).join('\n\n'),
     requested: requests.map((r) => r.descriptor),
     matched: matched.map((s) => s.descriptor),
     missed,
+    sections: distinct.map((s) => ({
+      label: s.descriptor,
+      offset: s.offset,
+      chars: s.end - s.offset,
+    })),
   };
 }
