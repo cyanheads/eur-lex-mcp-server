@@ -166,6 +166,7 @@ export const eurlex_query_sparql = tool('eurlex_query_sparql', {
       when: 'Virtuoso returned a syntax or semantic error — the query is malformed.',
       recovery:
         'Fix the SPARQL query syntax, ensure predicates use the cdm: prefix, and verify variable names.',
+      thrownBy: 'service',
     },
     {
       reason: 'sparql_timeout',
@@ -173,6 +174,7 @@ export const eurlex_query_sparql = tool('eurlex_query_sparql', {
       when: 'The query exceeded the client-side timeout (timeout_hint, default 55 s) or the 60-second Virtuoso execution limit. Neither is retried: the call fails inside the configured bound.',
       recovery:
         'Narrow the query with more specific FILTER conditions or a smaller LIMIT, or raise timeout_hint.',
+      thrownBy: 'service',
     },
   ],
 

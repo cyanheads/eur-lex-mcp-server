@@ -277,6 +277,7 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'Virtuoso returned HTTP 200 with an error body — query malformed or timed out.',
       recovery: 'Simplify the query or reduce the date range and retry.',
+      thrownBy: 'service',
     },
   ],
 
