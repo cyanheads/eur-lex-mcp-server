@@ -143,13 +143,18 @@ function visibleText(line: string): string {
     .trim();
 }
 
-/** Named references worth resolving in OJ heading text. */
-const NAMED_ENTITIES: Record<string, string> = {
-  amp: '&',
-  gt: '>',
-  lt: '<',
-  nbsp: ' ',
-};
+/**
+ * Named references worth resolving in OJ heading text. A Map, not an object
+ * literal: the reference name comes from the document, and an object lookup
+ * walks the prototype chain, so `&constructor;` would resolve to `Object` and
+ * stringify into the heading. A Map resolves these four names and nothing else.
+ */
+const NAMED_ENTITIES = new Map<string, string>([
+  ['amp', '&'],
+  ['gt', '>'],
+  ['lt', '<'],
+  ['nbsp', ' '],
+]);
 
 /** Highest Unicode code point `String.fromCodePoint` accepts. */
 const MAX_CODE_POINT = 0x10ffff;
@@ -164,7 +169,7 @@ const MAX_CODE_POINT = 0x10ffff;
  */
 function decodeEntities(text: string): string {
   return text.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (reference, body: string) => {
-    if (body[0] !== '#') return NAMED_ENTITIES[body.toLowerCase()] ?? reference;
+    if (body[0] !== '#') return NAMED_ENTITIES.get(body.toLowerCase()) ?? reference;
     const hex = body[1] === 'x' || body[1] === 'X';
     const code = Number.parseInt(hex ? body.slice(2) : body.slice(1), hex ? 16 : 10);
     return code <= MAX_CODE_POINT ? String.fromCodePoint(code) : reference;

@@ -213,6 +213,17 @@ describe('parseActStructure', () => {
         '<ARTICLE><TI.ART>Article 1</TI.ART><STI.ART>Scope of &amp;lt;TAG&amp;gt;</STI.ART></ARTICLE>';
       expect(titleOf('1', formex, 'xml')).toBe('Scope of &lt;TAG&gt;');
     });
+
+    it('leaves a reference named after an Object prototype member verbatim', () => {
+      // `&constructor;` matches the named-reference pattern, so a lookup that
+      // walks the prototype chain answers with Object itself and stringifies it
+      // into the title. Only the four mapped names may ever resolve.
+      const html = [
+        '<p class="oj-ti-art">Article 5</p>',
+        '<p class="oj-sti-art">Escape &constructor; and &valueof; unchanged</p>',
+      ].join('\n');
+      expect(titleOf('5', html)).toBe('Escape &constructor; and &valueof; unchanged');
+    });
   });
 
   describe('Formex XML path', () => {
