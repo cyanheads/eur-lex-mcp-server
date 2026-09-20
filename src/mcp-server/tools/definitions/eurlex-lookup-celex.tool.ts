@@ -68,7 +68,7 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
       .string()
       .optional()
       .describe(
-        'Human-readable document category resolved from the CDM resource type (e.g. "Regulation", "Directive", "Judgment"). An authority value with no known label falls back to its code (e.g. "CONS_TEXT"). Absent for some works.',
+        'Human-readable document category resolved from the CDM resource type (e.g. "Regulation", "Directive", "Judgment"). An authority value with no known label falls back to its code (e.g. "BUDGET"). Absent for some works.',
       ),
     date: z.string().optional().describe('Document date in ISO 8601 format (YYYY-MM-DD).'),
   }),

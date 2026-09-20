@@ -420,9 +420,9 @@ describe('eurlex_get_cases', () => {
 
     expect(result.total).toBe(1);
     expect(result.cases).toHaveLength(1);
-    // Both types resolve, de-duplicate, sort, and join. JUDG maps to "Judgment";
-    // CORRIGENDUM is unmapped and falls back to its raw code, sorting first (ASCII).
-    expect(result.cases[0]?.resource_type).toBe('CORRIGENDUM, Judgment');
+    // Both types resolve, de-duplicate, sort, and join: JUDG maps to "Judgment"
+    // and CORRIGENDUM to "Corrigendum" (#86), which still sorts first.
+    expect(result.cases[0]?.resource_type).toBe('Corrigendum, Judgment');
   });
 
   it('the limit bounds distinct cases (cap applied after GROUP BY CELEX)', async () => {
@@ -765,10 +765,10 @@ describe('eurlex_get_cases', () => {
 
     const sparql = mockQuery.mock.calls[0]?.[0] as string;
     // Opting in skips the exclusion entirely, so the corrigendum is returned with both
-    // type labels resolved (CORRIGENDUM falls back to its raw code, sorting first).
+    // type labels resolved — CORRIGENDUM among them since #86 (it still sorts first).
     expect(sparql).not.toContain('FILTER NOT EXISTS');
     expect(result.cases[0]?.celex_number).toBe('62026TN0267R(01)');
-    expect(result.cases[0]?.resource_type).toBe('CORRIGENDUM, Judicial Information Notice');
+    expect(result.cases[0]?.resource_type).toBe('Corrigendum, Judicial Information Notice');
   });
 
   // --- #57: include_derivative echoed in query_echo after the default is applied ---

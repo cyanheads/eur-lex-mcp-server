@@ -162,6 +162,17 @@ const INFO_JUR_URI = `${RESOURCE_TYPE_BASE}INFO_JUR`;
 const ABSTRACT_JUR_URI = `${RESOURCE_TYPE_BASE}ABSTRACT_JUR`;
 const SUM_JUR_URI = `${RESOURCE_TYPE_BASE}SUM_JUR`;
 
+/**
+ * Resource-types the server's own headline flows return by default, each confirmed
+ * live against the authority register: `resolve: "current_consolidated"` yields
+ * CONS_TEXT (75,560 works), a national_transposition CELEX yields MEAS_NATION_IMPL
+ * (200,789), and CORRIGENDUM (29,417) co-types roughly half the rows of a document
+ * search page. None had a map entry before #86, so all three surfaced as raw codes.
+ */
+const CONS_TEXT_URI = `${RESOURCE_TYPE_BASE}CONS_TEXT`;
+const MEAS_NATION_IMPL_URI = `${RESOURCE_TYPE_BASE}MEAS_NATION_IMPL`;
+const CORRIGENDUM_URI = `${RESOURCE_TYPE_BASE}CORRIGENDUM`;
+
 describe('resolveResourceTypeLabel', () => {
   it('resolves a Commission Implementing Regulation to its label, not the raw REG_IMPL code (issue #43)', () => {
     expect(resolveResourceTypeLabel(REG_IMPL_URI)).toBe('Implementing Regulation');
@@ -192,6 +203,26 @@ describe('resolveResourceTypeLabel', () => {
     expect(resolveResourceTypeLabel(RECO_URI)).toBe('Recommendation');
   });
 
+  it('resolves the consolidation, transposition, and corrigendum types (#86)', () => {
+    expect(resolveResourceTypeLabel(CONS_TEXT_URI)).toBe('Consolidated Text');
+    expect(resolveResourceTypeLabel(MEAS_NATION_IMPL_URI)).toBe('National Implementing Measure');
+    expect(resolveResourceTypeLabel(CORRIGENDUM_URI)).toBe('Corrigendum');
+    // Regression guard: none may fall through to the raw authority code.
+    expect(resolveResourceTypeLabel(CONS_TEXT_URI)).not.toBe('CONS_TEXT');
+    expect(resolveResourceTypeLabel(MEAS_NATION_IMPL_URI)).not.toBe('MEAS_NATION_IMPL');
+    expect(resolveResourceTypeLabel(CORRIGENDUM_URI)).not.toBe('CORRIGENDUM');
+  });
+
+  it('labels the new types in Title Case, like every other map entry (#86)', () => {
+    // Every word past the first is capitalised across the map, so "Consolidated
+    // text" / "National implementing measure" would read as drift, not variety.
+    for (const uri of [CONS_TEXT_URI, MEAS_NATION_IMPL_URI, CORRIGENDUM_URI]) {
+      for (const word of resolveResourceTypeLabel(uri).split(' ')) {
+        expect(word[0]).toBe(word[0]?.toUpperCase());
+      }
+    }
+  });
+
   it('falls back to the last path segment for an unmapped resource-type URI', () => {
     expect(resolveResourceTypeLabel(`${RESOURCE_TYPE_BASE}UNKNOWN_TYPE`)).toBe('UNKNOWN_TYPE');
   });
@@ -216,5 +247,25 @@ describe('resolveResourceTypeLabels', () => {
     expect(resolveResourceTypeLabels(SUM_JUR_URI)).toBe('Case Summary');
     expect(resolveResourceTypeLabels(INFO_JUDICIAL_URI)).toBe('Judicial Information Notice');
     expect(resolveResourceTypeLabels(INFO_JUR_URI)).toBe('Information Notice');
+  });
+
+  it('resolves a co-typed corrigendum alongside each base type it carries (#86)', () => {
+    // Corrigenda are genuinely co-typed — a correction work carries CORRIGENDUM
+    // plus the base type of the act it corrects — so the multi-type path is where
+    // the label is actually read, and every observed base type must resolve too.
+    expect(resolveResourceTypeLabels(`${CORRIGENDUM_URI} ${REG_IMPL_URI}`)).toBe(
+      'Corrigendum, Implementing Regulation',
+    );
+    expect(resolveResourceTypeLabels(`${CORRIGENDUM_URI} ${RESOURCE_TYPE_BASE}DEC_ENTSCHEID`)).toBe(
+      'Corrigendum, Decision',
+    );
+    expect(resolveResourceTypeLabels(`${REG_URI} ${CORRIGENDUM_URI}`)).toBe(
+      'Corrigendum, Regulation',
+    );
+  });
+
+  it('resolves a lone CONS_TEXT and MEAS_NATION_IMPL through the multi-type path (#86)', () => {
+    expect(resolveResourceTypeLabels(CONS_TEXT_URI)).toBe('Consolidated Text');
+    expect(resolveResourceTypeLabels(MEAS_NATION_IMPL_URI)).toBe('National Implementing Measure');
   });
 });

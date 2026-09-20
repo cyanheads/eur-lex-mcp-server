@@ -75,7 +75,7 @@ describe('eurlex_lookup_celex', () => {
       expect(text).not.toContain('resource-type/REG');
     });
 
-    it('falls back to the authority code for an unmapped resource-type URI', async () => {
+    it('labels a consolidated text rather than exposing its authority code (#86)', async () => {
       const ctx = createMockContext({ errors: eurlex_lookup_celex.errors });
       mockQuery.mockResolvedValue([
         makeBinding('02016R0679-20160504', {
@@ -86,7 +86,26 @@ describe('eurlex_lookup_celex', () => {
       const input = eurlex_lookup_celex.input.parse({ identifier: '02016R0679-20160504' });
       const result = await eurlex_lookup_celex.handler(input, ctx);
 
-      expect(result.resource_type).toBe('CONS_TEXT');
+      // CONS_TEXT is what every consolidated CELEX resolves to, so the raw code was
+      // the common answer here, not a long-tail one.
+      expect(result.resource_type).toBe('Consolidated Text');
+      expect(result.resource_type).not.toBe('CONS_TEXT');
+    });
+
+    it('falls back to the authority code for an unmapped resource-type URI', async () => {
+      const ctx = createMockContext({ errors: eurlex_lookup_celex.errors });
+      // BUDGET is a live CELLAR resource-type with no curated label — the fallback
+      // is deliberately kept, so an uncurated code still resolves to something.
+      mockQuery.mockResolvedValue([
+        makeBinding('32015B0367', {
+          type: 'http://publications.europa.eu/resource/authority/resource-type/BUDGET',
+        }),
+      ]);
+
+      const input = eurlex_lookup_celex.input.parse({ identifier: '32015B0367' });
+      const result = await eurlex_lookup_celex.handler(input, ctx);
+
+      expect(result.resource_type).toBe('BUDGET');
     });
 
     it('omits resource_type when the work carries none', async () => {

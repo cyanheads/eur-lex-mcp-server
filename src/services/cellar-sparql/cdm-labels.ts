@@ -96,6 +96,16 @@ export const RESOURCE_TYPE_LABELS: Record<string, string> = {
   'http://publications.europa.eu/resource/authority/resource-type/INFO_JUR': 'Information Notice',
   'http://publications.europa.eu/resource/authority/resource-type/ABSTRACT_JUR': 'Case Abstract',
   'http://publications.europa.eu/resource/authority/resource-type/SUM_JUR': 'Case Summary',
+  // Types the server's own headline flows return by default, so the raw-code
+  // fallback was the common case rather than a long-tail one: CONS_TEXT is what
+  // every `resolve: "current_consolidated"` call yields, MEAS_NATION_IMPL what
+  // every national-transposition CELEX resolves to, and CORRIGENDUM co-types a
+  // large share of a document-search page (the same raw-code gap #43 closed for
+  // REG_IMPL / REG_DEL).
+  'http://publications.europa.eu/resource/authority/resource-type/CONS_TEXT': 'Consolidated Text',
+  'http://publications.europa.eu/resource/authority/resource-type/MEAS_NATION_IMPL':
+    'National Implementing Measure',
+  'http://publications.europa.eu/resource/authority/resource-type/CORRIGENDUM': 'Corrigendum',
 };
 
 /** Resolve a CDM resource-type URI to a human-readable label. Falls back to last path segment. */
