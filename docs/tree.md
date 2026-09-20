@@ -1,6 +1,6 @@
 # eur-lex-mcp-server - Directory Structure
 
-Generated on: 2026-09-16 09:09:15
+Generated on: 2026-09-20 22:11:02
 
 ```text
 eur-lex-mcp-server/
@@ -14,6 +14,8 @@ eur-lex-mcp-server/
 │   │   ├── bug_report.yml
 │   │   ├── config.yml
 │   │   └── feature_request.yml
+│   ├── workflows/
+│   │   └── codeql.yml
 │   ├── CODE_OF_CONDUCT.md
 │   ├── CONTRIBUTING.md
 │   ├── FUNDING.yml

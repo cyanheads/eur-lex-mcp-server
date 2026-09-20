@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.12.2](changelog/0.12.x/0.12.2.md) — 2026-09-20
+
+Fixes single-pass entity decoding, bounded and individually addressable section selection, the in_force filter's negative polarity, and default corrigenda exclusion in search; adds three resource-type labels and syncs to mcp-ts-core 0.13.6.
+
 ## [0.12.1](changelog/0.12.x/0.12.1.md) — 2026-09-16
 
 Adopts mcp-ts-core 0.13.2 — an explicit stateless session posture published in the server card, empty or unsubstituted ${…} env vars falling through to defaults — plus a README restructure and a dependency refresh.
