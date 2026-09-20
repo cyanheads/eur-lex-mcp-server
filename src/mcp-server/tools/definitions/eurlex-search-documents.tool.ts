@@ -71,10 +71,22 @@ const DOCUMENT_TYPE_FAMILIES = {
  */
 const CONS_TEXT_URI = `${RESOURCE_TYPE_BASE}CONS_TEXT`;
 
+/**
+ * CDM resource-type URI for corrigenda. A corrigendum is a separate CELLAR work
+ * with its own `…R(nn)` CELEX, its own — usually recent — `work_date_document`,
+ * and no English expression title. It is co-typed CORRIGENDUM *plus* the base
+ * type of the act it corrects, so it satisfies every `document_type` family and
+ * sorts ahead of the acts themselves under `ORDER BY DESC(?docDate)`, crowding
+ * primary acts off the page. Excluded by default and re-admitted by
+ * include_corrigenda — the same shape eurlex_get_cases uses for sector-6
+ * derivative records.
+ */
+const CORRIGENDUM_URI = `${RESOURCE_TYPE_BASE}CORRIGENDUM`;
+
 export const eurlex_search_documents = tool('eurlex_search_documents', {
   title: 'Search EU Documents',
   description:
-    'Search EU legislation, treaties, and preparatory acts across the CELLAR corpus by document type, date range, EuroVoc subject, author institution, and in-force status. Keyword matches English titles and CELEX strings only — there is no full-text body search. Returns a page of CELEX numbers, work URIs, type labels, dates, and titles, newest first, each flagged with is_consolidated. At least one filter is required.',
+    'Search EU legislation, treaties, and preparatory acts across the CELLAR corpus by document type, date range, EuroVoc subject, author institution, and in-force status. Keyword matches English titles and CELEX strings only — there is no full-text body search. Corrigenda are excluded by default so primary acts fill the page (set include_corrigenda to include them). Returns a page of CELEX numbers, work URIs, type labels, dates, and titles, newest first, each flagged with is_consolidated and is_corrigendum. At least one filter is required.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
     keyword: z
@@ -101,6 +113,12 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
       .default(false)
       .describe(
         'When true and document_type is set, also match consolidated texts whose basic act belongs to that document category. No effect when document_type is omitted. Consolidated rows are always tagged is_consolidated: true.',
+      ),
+    include_corrigenda: z
+      .boolean()
+      .default(false)
+      .describe(
+        'Include corrigenda — separate correction works, co-typed CORRIGENDUM alongside the base type of the act they correct, carrying a "…R(nn)" CELEX and usually no English title. Default false: they are excluded so primary acts fill the page. Every returned row is tagged is_corrigendum.',
       ),
     date_from: z
       .union([
@@ -157,7 +175,7 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
       .boolean()
       .optional()
       .describe(
-        'If true, restrict to acts currently in force. Omit to return all regardless of in-force status.',
+        'Restrict by in-force status: true returns only acts currently in force, false only acts no longer in force. Either way the act must carry the in-force property, which a minority of works do. Omit to return all regardless of in-force status.',
       ),
     offset: z
       .number()
@@ -184,6 +202,11 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
               .boolean()
               .describe(
                 'True when this CELEX is a consolidated version — a point-in-time text (…-YYYYMMDD) that incorporates amendments — rather than a base or amending act.',
+              ),
+            is_corrigendum: z
+              .boolean()
+              .describe(
+                'True when this work carries the CORRIGENDUM resource-type — a correction to another act rather than a primary act. Only ever true when include_corrigenda is set, since corrigenda are excluded by default.',
               ),
             resource_type: z
               .string()
@@ -221,6 +244,11 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
           .boolean()
           .describe(
             'Effective include_consolidated value after the false default is applied — whether consolidated texts whose basic act belongs to the document_type category were included. Always present, since the default shapes which records can appear; has effect only when document_type is set.',
+          ),
+        include_corrigenda: z
+          .boolean()
+          .describe(
+            'Effective include_corrigenda value after the false default is applied — whether corrigenda were admitted alongside primary acts. Always present, since the default shapes which records can appear.',
           ),
         date_from: z.string().optional().describe('Start date filter applied.'),
         date_to: z.string().optional().describe('End date filter applied.'),
@@ -267,6 +295,7 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'Virtuoso returned HTTP 200 with an error body — query malformed or timed out.',
       recovery: 'Simplify the query or reduce the date range and retry.',
+      thrownBy: 'service',
     },
   ],
 
@@ -330,8 +359,29 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
     if (dateTo) {
       filters.push(`FILTER(?date <= "${dateTo}"^^xsd:date)`);
     }
-    if (input.in_force === true) {
-      filters.push(`FILTER(?inForce = true)`);
+    /**
+     * In-force filter, applied for either polarity. CELLAR expresses the negative:
+     * Virtuoso serialises `cdm:resource_legal_in-force` as an xsd:integer `0`/`1`,
+     * and the comparison against the xsd:boolean coerces, so `FILTER(?inForce =
+     * false)` returns the no-longer-in-force works. Gating on `=== true` built no
+     * clause for `false`, so the negative ran the same query as omitting the filter
+     * while query_echo still reported it as applied (issue #82).
+     */
+    if (input.in_force !== undefined) {
+      filters.push(`FILTER(?inForce = ${input.in_force})`);
+    }
+
+    /**
+     * Exclude corrigenda by default so primary acts fill the page (issue #83),
+     * mirroring the derivative exclusion eurlex_get_cases applies to sector 6.
+     * A corrigendum is co-typed CORRIGENDUM plus a base type, so it passes every
+     * document_type family; FILTER NOT EXISTS drops the work on the CORRIGENDUM
+     * type alone, which no primary act carries, so nothing else is lost. The
+     * OPTIONAL type projection below is untouched, so a row re-admitted by
+     * include_corrigenda still lists every label it carries.
+     */
+    if (!input.include_corrigenda) {
+      filters.push(`FILTER NOT EXISTS { ?work cdm:work_has_resource-type <${CORRIGENDUM_URI}> . }`);
     }
 
     const eurovocClause = input.eurovoc_concept?.trim()
@@ -409,7 +459,9 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
     }
 
     const inForceClause =
-      input.in_force === true ? `OPTIONAL { ?work cdm:resource_legal_in-force ?inForce . }` : '';
+      input.in_force !== undefined
+        ? `OPTIONAL { ?work cdm:resource_legal_in-force ?inForce . }`
+        : '';
 
     /**
      * Reject a search with no effective narrowing filter. Unlike eurlex_get_cases
@@ -418,7 +470,14 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
      * full 2.7M-work corpus and time out, and a bare {} call has no meaningful result
      * anyway. A whitespace-only keyword trims to empty above, so it correctly counts
      * as no filter here rather than issuing a broad query (issue #25).
-     * include_consolidated broadens rather than narrows, so it is not a filter here.
+     * include_consolidated and include_corrigenda broaden rather than narrow, so
+     * neither is a filter here.
+     *
+     * in_force counts for either polarity (issue #82). Only a minority of works
+     * carry cdm:resource_legal_in-force at all, so both polarities bound the scan
+     * to a small slice of the corpus rather than opening it. The test is
+     * `!== undefined`, never truthiness: `false` is a supplied filter, while an
+     * omitted optional boolean is undefined and must leave the gate closed.
      */
     const hasEffectiveFilter =
       !!keywordInput ||
@@ -427,7 +486,7 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
       !!dateTo ||
       !!input.eurovoc_concept?.trim() ||
       !!authorInput ||
-      input.in_force === true;
+      input.in_force !== undefined;
     if (!hasEffectiveFilter) {
       throw ctx.fail(
         'no_filters',
@@ -488,9 +547,10 @@ SELECT
     const queryEcho = {
       ...(keywordInput ? { keyword: keywordInput } : {}),
       ...(input.document_type ? { document_type: input.document_type } : {}),
-      // Echo the effective flag (Zod applies the false default, so it is always a
-      // boolean) — a defaulted false still describes the search semantics (#57).
+      // Echo the effective flags (Zod applies the false default, so each is always
+      // a boolean) — a defaulted false still describes the search semantics (#57).
       include_consolidated: input.include_consolidated,
+      include_corrigenda: input.include_corrigenda,
       ...(input.date_from ? { date_from: input.date_from } : {}),
       ...(input.date_to ? { date_to: input.date_to } : {}),
       ...(input.eurovoc_concept ? { eurovoc_concept: input.eurovoc_concept } : {}),
@@ -520,10 +580,16 @@ SELECT
     const hasMore = bindings.length > pageLimit;
     const documents = bindings.slice(0, pageLimit).map((b) => {
       const celexNumber = CellarSparqlService.bindingValue(b, 'celex') ?? '';
+      // GROUP_CONCAT delivers every resource-type of the work as one space-separated
+      // string, so membership is tested against the split list — a substring test
+      // would also match a longer code sharing the prefix. Unbound for older works
+      // that carry no type, which makes the tag a definite false rather than absent.
+      const types = CellarSparqlService.bindingValue(b, 'types');
       const doc: {
         work_uri: string;
         celex_number: string;
         is_consolidated: boolean;
+        is_corrigendum: boolean;
         resource_type?: string;
         date?: string;
         title?: string;
@@ -534,8 +600,9 @@ SELECT
           '',
         celex_number: celexNumber,
         is_consolidated: isConsolidatedCelex(celexNumber),
+        is_corrigendum: types?.split(/\s+/).includes(CORRIGENDUM_URI) ?? false,
       };
-      const resourceType = resolveResourceTypeLabels(CellarSparqlService.bindingValue(b, 'types'));
+      const resourceType = resolveResourceTypeLabels(types);
       if (resourceType) doc.resource_type = resourceType;
       const date = CellarSparqlService.bindingValue(b, 'docDate');
       if (date) doc.date = date;
@@ -576,6 +643,7 @@ SELECT
       if (doc.date) lines.push(`**Date:** ${doc.date}`);
       if (doc.resource_type) lines.push(`**Type:** ${doc.resource_type}`);
       lines.push(`**Consolidated:** ${doc.is_consolidated}`);
+      lines.push(`**Corrigendum:** ${doc.is_corrigendum}`);
       lines.push(`**Work URI:** ${doc.work_uri}`);
       lines.push('');
     }

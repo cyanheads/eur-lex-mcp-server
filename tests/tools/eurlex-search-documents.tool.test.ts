@@ -508,9 +508,9 @@ describe('eurlex_search_documents', () => {
     expect(result.total).toBe(1);
     expect(result.documents).toHaveLength(1);
     // Both types resolve, de-duplicate, sort, and join — neither is silently dropped.
-    // BUDGET and CORRIGENDUM aren't in the curated label map, so each falls back to
-    // its raw authority code (the pre-existing single-type behavior).
-    expect(result.documents[0]?.resource_type).toBe('BUDGET, CORRIGENDUM');
+    // CORRIGENDUM carries a curated label (#86); BUDGET has none, so it still falls
+    // back to its raw authority code, and the two forms coexist on one row.
+    expect(result.documents[0]?.resource_type).toBe('BUDGET, Corrigendum');
   });
 
   it('the limit bounds distinct documents (cap applied after GROUP BY CELEX)', async () => {
@@ -728,6 +728,336 @@ describe('eurlex_search_documents', () => {
     expect(result.query_echo.keyword).toBe('data protection');
   });
 
+  // --- in_force filter (#82) ---
+
+  describe('in_force filter (#82)', () => {
+    it('in_force:true binds the in-force property and filters on it', async () => {
+      const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+      mockQuery.mockResolvedValue([makeDocBinding('32016R0679')]);
+
+      const input = eurlex_search_documents.input.parse({
+        document_type: 'REG',
+        in_force: true,
+      });
+      const result = await eurlex_search_documents.handler(input, ctx);
+
+      const sparql = mockQuery.mock.calls[0]?.[0] as string;
+      // The property is OPTIONAL-bound, so a work that never carries it leaves
+      // ?inForce unbound and the FILTER drops it — the positive filter's semantics.
+      expect(sparql).toContain('OPTIONAL { ?work cdm:resource_legal_in-force ?inForce . }');
+      expect(sparql).toContain('FILTER(?inForce = true)');
+      expect(result.query_echo.in_force).toBe(true);
+    });
+
+    it('in_force:true alone is an effective filter and reaches CELLAR', async () => {
+      const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+      mockQuery.mockResolvedValue([makeDocBinding('32016R0679')]);
+
+      const input = eurlex_search_documents.input.parse({ in_force: true });
+      await eurlex_search_documents.handler(input, ctx);
+
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+    });
+
+    it('omitting in_force builds neither the binding nor the filter', async () => {
+      const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+      mockQuery.mockResolvedValue([makeDocBinding('32016R0679')]);
+
+      const input = eurlex_search_documents.input.parse({ document_type: 'REG' });
+      const result = await eurlex_search_documents.handler(input, ctx);
+
+      const sparql = mockQuery.mock.calls[0]?.[0] as string;
+      expect(sparql).not.toContain('cdm:resource_legal_in-force');
+      expect(sparql).not.toContain('?inForce');
+      expect(result.query_echo.in_force).toBeUndefined();
+    });
+
+    it('in_force:false applies the negative filter, mirroring the positive one', async () => {
+      const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+      mockQuery.mockResolvedValue([makeDocBinding('32016R0679')]);
+
+      const input = eurlex_search_documents.input.parse({
+        document_type: 'REG',
+        in_force: false,
+      });
+      const result = await eurlex_search_documents.handler(input, ctx);
+
+      const sparql = mockQuery.mock.calls[0]?.[0] as string;
+      // CELLAR can express the negative — the bound value serialises as an
+      // xsd:integer 0/1 and the comparison coerces — so `false` must build the
+      // same binding-plus-FILTER pair `true` does, not an empty clause.
+      expect(sparql).toContain('OPTIONAL { ?work cdm:resource_legal_in-force ?inForce . }');
+      expect(sparql).toContain('FILTER(?inForce = false)');
+      expect(result.query_echo.in_force).toBe(false);
+    });
+
+    /**
+     * The discriminating assertion for #82. The echo alone proves nothing: it
+     * copied any defined value whether or not the value shaped the query, so a
+     * `query_echo.in_force === false` assertion passed against the unfixed code.
+     * Comparing the two generated queries is what catches a filter that is
+     * accepted, echoed, and then silently dropped — pre-fix the two strings are
+     * byte-identical.
+     */
+    it('in_force:false builds a different query than omitting in_force (#82)', async () => {
+      const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+      mockQuery.mockResolvedValue([makeDocBinding('32016R0679')]);
+
+      const base = { document_type: 'REG', date_from: '2024-06-01', date_to: '2024-12-31' };
+      await eurlex_search_documents.handler(eurlex_search_documents.input.parse(base), ctx);
+      await eurlex_search_documents.handler(
+        eurlex_search_documents.input.parse({ ...base, in_force: false }),
+        ctx,
+      );
+
+      const withoutFlag = mockQuery.mock.calls[0]?.[0] as string;
+      const withFalse = mockQuery.mock.calls[1]?.[0] as string;
+      expect(withFalse).not.toBe(withoutFlag);
+      expect(withoutFlag).not.toContain('?inForce');
+      expect(withFalse).toContain('FILTER(?inForce = false)');
+    });
+
+    it('in_force:false alone is an effective filter, not a no_filters rejection (#82)', async () => {
+      const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+      mockQuery.mockResolvedValue([makeDocBinding('31995L0046')]);
+
+      const input = eurlex_search_documents.input.parse({ in_force: false });
+      const result = await eurlex_search_documents.handler(input, ctx);
+
+      // A standalone in-force filter is bounded — the property is carried by a
+      // small slice of the corpus, not by all 2.7M works — so it narrows enough
+      // to stand on its own, exactly as `in_force: true` already does.
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+      expect(mockQuery.mock.calls[0]?.[0] as string).toContain('FILTER(?inForce = false)');
+      expect(result.query_echo.in_force).toBe(false);
+    });
+
+    it('carries in_force:false onto content[] as well as structuredContent (#82)', async () => {
+      const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+      mockQuery.mockResolvedValue([makeDocBinding('31995L0046', { date: '1995-10-24' })]);
+
+      const input = eurlex_search_documents.input.parse({
+        document_type: 'DIR',
+        in_force: false,
+      });
+      const result = await eurlex_search_documents.handler(input, ctx);
+
+      const text = (eurlex_search_documents.format!(result)[0] as { text: string }).text;
+      expect(text).toContain('in_force=false');
+    });
+
+    /**
+     * Widening the effective-filter gate from `=== true` to `!== undefined` is
+     * exactly the change that can accidentally unlock the unbounded corpus scan,
+     * because an omitted optional boolean is `undefined` rather than absent from
+     * the parsed input. These pin the other side of the gate.
+     */
+    it('leaves the no-filter path closed after the gate is widened (#82)', async () => {
+      const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+
+      const input = eurlex_search_documents.input.parse({});
+      expect(input.in_force).toBeUndefined();
+      await expect(eurlex_search_documents.handler(input, ctx)).rejects.toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        data: { reason: 'no_filters' },
+      });
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    it('still rejects a broadening-flags-only request after the gate is widened (#82)', async () => {
+      const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+
+      const input = eurlex_search_documents.input.parse({
+        include_consolidated: true,
+        include_corrigenda: true,
+      });
+      await expect(eurlex_search_documents.handler(input, ctx)).rejects.toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        data: { reason: 'no_filters' },
+      });
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+  });
+
+  // --- Corrigenda excluded by default behind include_corrigenda (#83) ---
+
+  describe('corrigenda exclusion (#83)', () => {
+    const CORRIGENDUM_URI = `${RESOURCE_TYPE_BASE}CORRIGENDUM`;
+
+    it('excludes CORRIGENDUM works from the default result set', async () => {
+      const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+      mockQuery.mockResolvedValue([makeDocBinding('32024R1689')]);
+
+      const input = eurlex_search_documents.input.parse({
+        document_type: 'REG',
+        date_from: '2024-06-01',
+        date_to: '2024-12-31',
+      });
+      const result = await eurlex_search_documents.handler(input, ctx);
+
+      const sparql = mockQuery.mock.calls[0]?.[0] as string;
+      // A corrigendum is co-typed CORRIGENDUM plus a base type, so it satisfies
+      // every document_type family and — carrying a recent work date — sorts
+      // ahead of the acts it corrects. Without the exclusion it crowds primary
+      // acts off the page.
+      expect(sparql).toContain(
+        `FILTER NOT EXISTS { ?work cdm:work_has_resource-type <${CORRIGENDUM_URI}> . }`,
+      );
+      expect(result.query_echo.include_corrigenda).toBe(false);
+    });
+
+    it('include_corrigenda:true drops the exclusion and re-admits the rows', async () => {
+      const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+      mockQuery.mockResolvedValue([
+        makeDocBinding('32024R2764R(01)', {
+          date: '2025-11-19',
+          types: `${RESOURCE_TYPE_BASE}REG_IMPL ${CORRIGENDUM_URI}`,
+        }),
+      ]);
+
+      const input = eurlex_search_documents.input.parse({
+        document_type: 'REG',
+        include_corrigenda: true,
+      });
+      const result = await eurlex_search_documents.handler(input, ctx);
+
+      const sparql = mockQuery.mock.calls[0]?.[0] as string;
+      expect(sparql).not.toContain('FILTER NOT EXISTS');
+      expect(result.documents[0]?.celex_number).toBe('32024R2764R(01)');
+      expect(result.query_echo.include_corrigenda).toBe(true);
+    });
+
+    /**
+     * Depth past the first level: a corrigendum is a genuinely co-typed work, so
+     * the tag must come from membership in the GROUP_CONCAT type list rather than
+     * from a single-valued type, and the row must still render every label it
+     * carries (#86 governs which strings those are).
+     */
+    it('tags a co-typed corrigendum row is_corrigendum:true and keeps both labels', async () => {
+      const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+      mockQuery.mockResolvedValue([
+        makeDocBinding('32024R2764R(01)', {
+          date: '2025-11-19',
+          types: `${RESOURCE_TYPE_BASE}REG_IMPL ${CORRIGENDUM_URI}`,
+        }),
+      ]);
+
+      const input = eurlex_search_documents.input.parse({
+        document_type: 'REG',
+        include_corrigenda: true,
+      });
+      const result = await eurlex_search_documents.handler(input, ctx);
+
+      expect(result.documents[0]?.is_corrigendum).toBe(true);
+      expect(result.documents[0]?.resource_type).toBe('Corrigendum, Implementing Regulation');
+      const text = (eurlex_search_documents.format!(result)[0] as { text: string }).text;
+      expect(text).toContain('**Corrigendum:** true');
+      expect(text).toContain('**Type:** Corrigendum, Implementing Regulation');
+    });
+
+    it('tags a primary act is_corrigendum:false on both surfaces', async () => {
+      const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+      mockQuery.mockResolvedValue([
+        makeDocBinding('32016R0679', {
+          date: '2016-04-27',
+          types: `${RESOURCE_TYPE_BASE}REG`,
+        }),
+      ]);
+
+      const input = eurlex_search_documents.input.parse({ document_type: 'REG' });
+      const result = await eurlex_search_documents.handler(input, ctx);
+
+      expect(result.documents[0]?.is_corrigendum).toBe(false);
+      const text = (eurlex_search_documents.format!(result)[0] as { text: string }).text;
+      expect(text).toContain('**Corrigendum:** false');
+    });
+
+    it('tags a row carrying no resource-type at all is_corrigendum:false', async () => {
+      const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+      // Older works reach the projection with ?types unbound — the tag must be a
+      // definite false, never undefined, so the boolean is always on the wire.
+      mockQuery.mockResolvedValue([makeDocBinding('31958R0001')]);
+
+      const input = eurlex_search_documents.input.parse({ document_type: 'REG' });
+      const result = await eurlex_search_documents.handler(input, ctx);
+
+      expect(result.documents[0]?.is_corrigendum).toBe(false);
+      expect(result.documents[0]?.resource_type).toBeUndefined();
+    });
+
+    it('matches the corrigendum type exactly, not as a URI substring', async () => {
+      const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+      // Guards the tag against a `String.includes` implementation: a longer code
+      // that merely starts with the corrigendum code is a different type.
+      mockQuery.mockResolvedValue([
+        makeDocBinding('32024R1689', { types: `${CORRIGENDUM_URI}_UNRELATED` }),
+      ]);
+
+      const input = eurlex_search_documents.input.parse({ document_type: 'REG' });
+      const result = await eurlex_search_documents.handler(input, ctx);
+
+      expect(result.documents[0]?.is_corrigendum).toBe(false);
+    });
+
+    it('echoes include_corrigenda on content[] as well as structuredContent', async () => {
+      const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+      mockQuery.mockResolvedValue([makeDocBinding('32016R0679')]);
+
+      const input = eurlex_search_documents.input.parse({ document_type: 'REG' });
+      const result = await eurlex_search_documents.handler(input, ctx);
+
+      const text = (eurlex_search_documents.format!(result)[0] as { text: string }).text;
+      expect(text).toContain('include_corrigenda=false');
+    });
+
+    it('does not count include_corrigenda as an effective narrowing filter', async () => {
+      const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+
+      const input = eurlex_search_documents.input.parse({ include_corrigenda: true });
+      await expect(eurlex_search_documents.handler(input, ctx)).rejects.toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        data: { reason: 'no_filters' },
+      });
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    it('keeps the exclusion on an empty page and an offset past the end', async () => {
+      const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+      mockQuery.mockResolvedValue([]);
+
+      const input = eurlex_search_documents.input.parse({
+        document_type: 'REG',
+        offset: 10_000,
+      });
+      const result = await eurlex_search_documents.handler(input, ctx);
+
+      expect(result.documents).toEqual([]);
+      expect(result.query_echo.include_corrigenda).toBe(false);
+      expect(mockQuery.mock.calls[0]?.[0] as string).toContain('FILTER NOT EXISTS');
+    });
+
+    it('bounds the page by distinct documents when corrigenda are re-admitted', async () => {
+      const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+      mockQuery.mockResolvedValue([
+        makeDocBinding('32025R2605R(01)', { types: `${RESOURCE_TYPE_BASE}REG ${CORRIGENDUM_URI}` }),
+        makeDocBinding('32025R2143R(01)', { types: `${RESOURCE_TYPE_BASE}REG ${CORRIGENDUM_URI}` }),
+        makeDocBinding('32025R1900R(01)', { types: `${RESOURCE_TYPE_BASE}REG ${CORRIGENDUM_URI}` }),
+      ]);
+
+      const input = eurlex_search_documents.input.parse({
+        document_type: 'REG',
+        include_corrigenda: true,
+        limit: 2,
+      });
+      const result = await eurlex_search_documents.handler(input, ctx);
+
+      expect(result.documents).toHaveLength(2);
+      expect(result.has_more).toBe(true);
+      expect(result.documents.every((d) => d.is_corrigendum)).toBe(true);
+      expect(getEnrichment(ctx)).toMatchObject({ truncated: true, shown: 2, cap: 2 });
+    });
+  });
+
   // --- Consolidated texts: include_consolidated filter + is_consolidated tag (issue #30) ---
 
   it('the default type-family join stays narrow and excludes CONS_TEXT (issues #30, #65)', async () => {
@@ -926,6 +1256,7 @@ describe('eurlex_search_documents', () => {
           work_uri: 'http://publications.europa.eu/resource/cellar/gdpr',
           celex_number: '32016R0679',
           is_consolidated: false,
+          is_corrigendum: false,
           resource_type: 'Regulation',
           date: '2016-04-27',
           title: 'GDPR',
@@ -934,7 +1265,7 @@ describe('eurlex_search_documents', () => {
       total: 1,
       offset: 0,
       has_more: false,
-      query_echo: { keyword: 'gdpr', include_consolidated: false },
+      query_echo: { keyword: 'gdpr', include_consolidated: false, include_corrigenda: false },
     };
     const blocks = eurlex_search_documents.format!(output);
     expect(blocks[0]?.type).toBe('text');
@@ -956,18 +1287,20 @@ describe('eurlex_search_documents', () => {
           work_uri: 'http://publications.europa.eu/resource/cellar/cons',
           celex_number: '02014R0833-20260424',
           is_consolidated: true,
-          resource_type: 'CONS_TEXT',
+          is_corrigendum: false,
+          resource_type: 'Consolidated Text',
           date: '2026-04-24',
         },
       ],
       total: 1,
       offset: 0,
       has_more: false,
-      query_echo: { include_consolidated: false },
+      query_echo: { include_consolidated: false, include_corrigenda: false },
     };
     const blocks = eurlex_search_documents.format!(output);
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('**Consolidated:** true');
+    expect(text).toContain('**Corrigendum:** false');
   });
 
   it('format handles sparse documents (no type, date, or title)', () => {
@@ -977,12 +1310,13 @@ describe('eurlex_search_documents', () => {
           work_uri: 'http://publications.europa.eu/resource/cellar/sparse',
           celex_number: '12345ABC',
           is_consolidated: false,
+          is_corrigendum: false,
         },
       ],
       total: 1,
       offset: 0,
       has_more: false,
-      query_echo: { include_consolidated: false },
+      query_echo: { include_consolidated: false, include_corrigenda: false },
     };
     const blocks = eurlex_search_documents.format!(output);
     const text = (blocks[0] as { text: string }).text;
