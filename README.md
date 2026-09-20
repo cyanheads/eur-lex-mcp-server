@@ -66,8 +66,9 @@ All resource data is also reachable via tools.
 
 - Keyword matches English titles via the full-text index, or CELEX substrings — no full-text body search; at least one filter is required
 - `document_type` (`REG`, `DIR`, `DEC`, `TREATY`, `JUDG`, `OPIN_AG`, `PROP`, `REC`) expands to its full CELLAR authority family; `include_consolidated` folds in consolidated texts of that category
-- Date range (`date_from`/`date_to`), EuroVoc concept URI (from `eurlex_browse_subjects`), author institution, and in-force-only filters
-- Pagination via `offset` and `limit` (max 100); each result flags `is_consolidated`
+- Date range (`date_from`/`date_to`), EuroVoc concept URI (from `eurlex_browse_subjects`), and author institution filters; `in_force` restricts to acts in force (`true`) or no longer in force (`false`)
+- Corrigenda are excluded by default so primary acts fill the page; `include_corrigenda` re-admits them
+- Pagination via `offset` and `limit` (max 100); each result flags `is_consolidated` and `is_corrigendum`
 - Typed errors: `no_filters`, `invalid_date_range`, `no_results`
 
 ---
@@ -76,8 +77,8 @@ All resource data is also reachable via tools.
 
 - Accepts exactly one of `celex_number`, `eli_uri`, or `work_uri`
 - Body as `html` (default), `markdown` (server-side converted), or `xml` (Formex4); all 24 EUR-Lex language codes, case-insensitive, defaulting to and falling back to English
-- `content_mode` `"paged"` (default, offset/limit window), `"full"` (first window from zero), or `"metadata_only"`; paged and full windows both cap at 100,000 characters, with `content_chars_total`/`has_more` to page the rest
-- `outline: true` returns chapter/article/annex/recital headings with offsets; `select` (e.g. `{ articles: "1,5,17" }`) returns just those sections
+- `content_mode` `"paged"` (default, offset/limit window), `"full"` (first window from zero), or `"metadata_only"`; every body returned in one call caps at 100,000 characters, with `content_chars_total`/`has_more` to page the rest
+- `outline: true` returns chapter/article/annex/recital headings with offsets; `select` (e.g. `{ articles: "1,5,17" }`) returns just those sections, under the same cap. A selection is a set of disjoint slices rather than a contiguous window, so `has_more` stays false and `selected_sections` carries each matched section's own `offset`/`chars` — read one on its own with a `paged` call, including when the cap cut its text
 - `resolve: "current_consolidated"` serves the newest consolidated version instead of the requested base act; `is_superseded`/`current_consolidated_celex`/`consolidated_as_of` flag a stale base act either way
 - Typed `content_challenge` error when EUR-Lex returns a WAF bot-challenge instead of text
 
