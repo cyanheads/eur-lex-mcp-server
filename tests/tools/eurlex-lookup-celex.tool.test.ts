@@ -4,9 +4,10 @@
  */
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_lookup_celex } from '@/mcp-server/tools/definitions/eurlex-lookup-celex.tool.js';
+import { escapeSparqlLiteral } from '@/services/cellar-sparql/eli-resolution.js';
 
 // --- Service mock ---
 const mockQuery = vi.fn();
@@ -20,7 +21,7 @@ vi.mock('@/services/cellar-sparql/cellar-sparql-service.js', () => ({
 
 function makeBinding(
   celex: string,
-  opts: { workUri?: string; type?: string; date?: string } = {},
+  opts: { workUri?: string; type?: string; date?: string; ecli?: string } = {},
 ): Record<string, { type: string; value: string }> {
   return {
     celexNumber: { type: 'literal', value: celex },
@@ -30,8 +31,11 @@ function makeBinding(
     },
     ...(opts.type ? { type: { type: 'uri', value: opts.type } } : {}),
     ...(opts.date ? { date: { type: 'literal', value: opts.date } } : {}),
+    ...(opts.ecli ? { ecli: { type: 'literal', value: opts.ecli } } : {}),
   };
 }
+
+const RESOURCE_TYPE = 'http://publications.europa.eu/resource/authority/resource-type/';
 
 describe('eurlex_lookup_celex', () => {
   beforeEach(() => {
@@ -329,6 +333,77 @@ describe('eurlex_lookup_celex', () => {
     expect(text).toContain('**Found:** false');
   });
 
+  // --- #93: case-law and national-decision types carry labels ---
+
+  it('labels a national-court decision rather than exposing its DEC_NC code (#93)', async () => {
+    const ctx = createMockContext({ errors: eurlex_lookup_celex.errors });
+    mockQuery.mockResolvedValue([
+      makeBinding('81987NL1021(01)', { type: `${RESOURCE_TYPE}DEC_NC` }),
+    ]);
+
+    const input = eurlex_lookup_celex.input.parse({ identifier: '81987NL1021(01)' });
+    const result = await eurlex_lookup_celex.handler(input, ctx);
+
+    expect(result.resource_type).toBe(
+      'Decision by National Courts in the Field of European Union Law',
+    );
+    expect((eurlex_lookup_celex.format!(result)[0] as { text: string }).text).toContain(
+      '**Type:** Decision by National Courts in the Field of European Union Law',
+    );
+  });
+
+  // --- #92: typed exact CELEX triple ---
+
+  describe('typed CELEX triple (#92)', () => {
+    it('binds the CELEX as a typed exact triple and projects it back as celexNumber', async () => {
+      const ctx = createMockContext({ errors: eurlex_lookup_celex.errors });
+      mockQuery.mockResolvedValue([makeBinding('32016R0679')]);
+
+      const input = eurlex_lookup_celex.input.parse({ identifier: '32016R0679' });
+      const result = await eurlex_lookup_celex.handler(input, ctx);
+
+      const sparql = mockQuery.mock.calls[0]?.[0] as string;
+      expect(sparql).toContain('?work cdm:resource_legal_id_celex "32016R0679"^^xsd:string .');
+      expect(sparql).toContain('BIND("32016R0679"^^xsd:string AS ?celexNumber)');
+      expect(sparql).not.toMatch(/STR\(\?\w+\)\s*=/);
+      expect(result.celex_number).toBe('32016R0679');
+    });
+
+    it('returns the first of several works sharing one CELEX, as before', async () => {
+      const ctx = createMockContext({ errors: eurlex_lookup_celex.errors });
+      // 62012CJ0131 is held by two CELLAR works (live).
+      const judgmentWork =
+        'http://publications.europa.eu/resource/cellar/09eb0861-da7a-11e3-8cd4-01aa75ed71a1';
+      mockQuery.mockResolvedValue([
+        makeBinding('62012CJ0131', { workUri: judgmentWork, type: `${RESOURCE_TYPE}JUDG` }),
+        makeBinding('62012CJ0131', {
+          workUri:
+            'http://publications.europa.eu/resource/cellar/57f6959c-51b3-4ab5-9164-ce6ca914c502',
+          type: `${RESOURCE_TYPE}JUDG_EXTRACT`,
+        }),
+      ]);
+
+      const input = eurlex_lookup_celex.input.parse({ identifier: '62012CJ0131' });
+      const result = await eurlex_lookup_celex.handler(input, ctx);
+
+      expect(result.work_uri).toBe(judgmentWork);
+      expect(result.resource_type).toBe('Judgment');
+    });
+
+    it('carries a parenthesized corrigendum CELEX through the typed literal unchanged', async () => {
+      const ctx = createMockContext({ errors: eurlex_lookup_celex.errors });
+      mockQuery.mockResolvedValue([]);
+
+      const input = eurlex_lookup_celex.input.parse({ identifier: '32016R0679R(02)' });
+      const result = await eurlex_lookup_celex.handler(input, ctx);
+
+      expect(mockQuery.mock.calls[0]?.[0] as string).toContain(
+        'cdm:resource_legal_id_celex "32016R0679R(02)"^^xsd:string .',
+      );
+      expect(result).toEqual({ found: false });
+    });
+  });
+
   // --- #69: auto-detection reuses the shared CELEX shape ---
 
   describe('sector coverage in auto-detection (#69)', () => {
@@ -346,7 +421,7 @@ describe('eurlex_lookup_celex', () => {
       expect(result.celex_number).toBe('02016R0679-20160504');
       // The CELEX branch ran: an exact-match on the CELEX literal, not an ELI lookup.
       const sparql = mockQuery.mock.calls[0]?.[0] as string;
-      expect(sparql).toContain('FILTER(STR(?celexNumber) = "02016R0679-20160504")');
+      expect(sparql).toContain('cdm:resource_legal_id_celex "02016R0679-20160504"^^xsd:string .');
     });
 
     it.each([
@@ -400,6 +475,212 @@ describe('eurlex_lookup_celex', () => {
         data: { reason: 'ambiguous_identifier' },
       });
       expect(mockQuery).not.toHaveBeenCalled();
+    });
+  });
+
+  // --- #84: ECLI resolution and the ecli output field ---
+
+  describe('ECLI identifiers (#84)', () => {
+    async function lookup(
+      identifier: string,
+      identifierType: 'auto' | 'ecli' | 'celex' = 'auto',
+    ): Promise<{
+      result: Awaited<ReturnType<typeof eurlex_lookup_celex.handler>>;
+      sparql: string;
+    }> {
+      const ctx = createMockContext({ errors: eurlex_lookup_celex.errors });
+      const input = eurlex_lookup_celex.input.parse({
+        identifier,
+        identifier_type: identifierType,
+      });
+      const result = await eurlex_lookup_celex.handler(input, ctx);
+      return { result, sparql: mockQuery.mock.calls[0]?.[0] as string };
+    }
+
+    it.each([
+      ['auto', 'auto'],
+      ['explicit ecli', 'ecli'],
+    ] as const)(
+      'resolves ECLI:EU:C:2014:317 to 62012CJ0131 under %s with a typed exact match',
+      async (_label, type) => {
+        // Live shape: the ECLI binds two work URIs that share one CELEX.
+        mockQuery.mockResolvedValue([
+          makeBinding('62012CJ0131', {
+            workUri: 'http://publications.europa.eu/resource/cellar/09eb0861-titled',
+            type: `${RESOURCE_TYPE}JUDG`,
+            date: '2014-05-13',
+            ecli: 'ECLI:EU:C:2014:317',
+          }),
+          makeBinding('62012CJ0131', {
+            workUri: 'http://publications.europa.eu/resource/cellar/57f6959c-member',
+            type: `${RESOURCE_TYPE}JUDG`,
+            ecli: 'ECLI:EU:C:2014:317',
+          }),
+        ]);
+
+        const { result, sparql } = await lookup('ECLI:EU:C:2014:317', type);
+
+        expect(result).toEqual({
+          found: true,
+          work_uri: 'http://publications.europa.eu/resource/cellar/09eb0861-titled',
+          celex_number: '62012CJ0131',
+          resource_type: 'Judgment',
+          date: '2014-05-13',
+          ecli: 'ECLI:EU:C:2014:317',
+        });
+        expect(mockQuery).toHaveBeenCalledTimes(1);
+        expect(sparql).toContain('?work cdm:case-law_ecli ?ecli .');
+        expect(sparql).toContain('"ECLI:EU:C:2014:317"^^xsd:string');
+        expect(sparql).not.toContain('STR(?ecli)');
+      },
+    );
+
+    it('resolves a shared ECLI to the primary judgment, not its extract or abstract', async () => {
+      // ECLI:EU:T:2022:186 (live): the abstract sorts first as served here, and the
+      // judgment CELEX is held by two works (JUDG and JUDG_EXTRACT).
+      mockQuery.mockResolvedValue([
+        makeBinding('62017TJ0350_RES', {
+          type: `${RESOURCE_TYPE}ABSTRACT_JUR`,
+          ecli: 'ECLI:EU:T:2022:186',
+        }),
+        makeBinding('62017TJ0350_EXT', {
+          type: `${RESOURCE_TYPE}JUDG_EXTRACT`,
+          ecli: 'ECLI:EU:T:2022:186',
+        }),
+        makeBinding('62017TJ0350', { type: `${RESOURCE_TYPE}JUDG`, ecli: 'ECLI:EU:T:2022:186' }),
+        makeBinding('62017TJ0350', {
+          workUri: 'http://publications.europa.eu/resource/cellar/extract-work',
+          type: `${RESOURCE_TYPE}JUDG_EXTRACT`,
+          ecli: 'ECLI:EU:T:2022:186',
+        }),
+      ]);
+
+      const { result } = await lookup('ECLI:EU:T:2022:186');
+
+      expect(result.celex_number).toBe('62017TJ0350');
+      expect(result.resource_type).toBe('Judgment');
+    });
+
+    it('resolves a joined AG opinion ECLI to the lowest CELEX', async () => {
+      mockQuery.mockResolvedValue([
+        makeBinding('62013CC0613', { type: `${RESOURCE_TYPE}OPIN_AG`, ecli: 'ECLI:EU:C:2015:785' }),
+        makeBinding('62013CC0609', { type: `${RESOURCE_TYPE}OPIN_AG`, ecli: 'ECLI:EU:C:2015:785' }),
+      ]);
+
+      const { result } = await lookup('ECLI:EU:C:2015:785');
+      expect(result.celex_number).toBe('62013CC0609');
+    });
+
+    it('falls back to a derivative record when the ECLI reaches nothing else', async () => {
+      mockQuery.mockResolvedValue([
+        makeBinding('62020CJ0001_SUM', {
+          type: `${RESOURCE_TYPE}SUM_JUR`,
+          ecli: 'ECLI:EU:C:2021:1',
+        }),
+      ]);
+
+      const { result } = await lookup('ECLI:EU:C:2021:1');
+      expect(result.found).toBe(true);
+      expect(result.celex_number).toBe('62020CJ0001_SUM');
+    });
+
+    it('trims the ECLI and escapes it into the literal', async () => {
+      mockQuery.mockResolvedValue([]);
+
+      const raw = 'ECLI:EU:C:2014:317"\\';
+      const { sparql } = await lookup(`  ${raw}\t`, 'ecli');
+
+      expect(sparql).toContain(`"${escapeSparqlLiteral(raw)}"^^xsd:string`);
+      expect(sparql).not.toContain(`"${raw}"`);
+    });
+
+    it('resolves a lowercase EU ECLI through its uppercase form, detected under auto', async () => {
+      mockQuery.mockResolvedValue([
+        makeBinding('62012CJ0131', { type: `${RESOURCE_TYPE}JUDG`, ecli: 'ECLI:EU:C:2014:317' }),
+      ]);
+
+      const { result, sparql } = await lookup('  ecli:eu:c:2014:317 ');
+
+      expect(result.celex_number).toBe('62012CJ0131');
+      // The stored form is returned, not the caller's spelling.
+      expect(result.ecli).toBe('ECLI:EU:C:2014:317');
+      expect(sparql).toContain('"ecli:eu:c:2014:317"^^xsd:string');
+      expect(sparql).toContain('"ECLI:EU:C:2014:317"^^xsd:string');
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+    });
+
+    it('prefers an exact-case match over its uppercase form for a mixed-case national ECLI', async () => {
+      // Hypothetical collision: the uppercase spelling names a different, lower CELEX.
+      mockQuery.mockResolvedValue([
+        makeBinding('72015FI0001', { ecli: 'ECLI:FI:HELHO:2015:1766' }),
+        makeBinding('82015FI1209(51)', { ecli: 'ECLI:FI:HelHO:2015:1766' }),
+      ]);
+
+      const { result, sparql } = await lookup('ECLI:FI:HelHO:2015:1766');
+
+      expect(result.celex_number).toBe('82015FI1209(51)');
+      expect(result.ecli).toBe('ECLI:FI:HelHO:2015:1766');
+      expect(sparql).toContain('"ECLI:FI:HelHO:2015:1766"^^xsd:string');
+    });
+
+    it('sends a single literal when the ECLI is already uppercase', async () => {
+      mockQuery.mockResolvedValue([]);
+      const { sparql } = await lookup('ECLI:EU:C:2014:317');
+      expect(sparql.match(/\^\^xsd:string/g)).toHaveLength(1);
+    });
+
+    it('returns found: false for a well-formed ECLI that matches no work', async () => {
+      mockQuery.mockResolvedValue([]);
+
+      const { result } = await lookup('ECLI:EU:C:2099:1');
+      expect(result).toEqual({ found: false });
+    });
+
+    it('returns the ECLI of a case resolved by CELEX, and omits it where the work has none', async () => {
+      mockQuery.mockResolvedValue([
+        makeBinding('62012CJ0131', { type: `${RESOURCE_TYPE}JUDG`, ecli: 'ECLI:EU:C:2014:317' }),
+      ]);
+      const { result, sparql } = await lookup('62012CJ0131');
+      expect(result.ecli).toBe('ECLI:EU:C:2014:317');
+      expect(sparql).toContain('OPTIONAL { ?work cdm:case-law_ecli ?ecli . }');
+
+      mockQuery.mockReset();
+      mockQuery.mockResolvedValue([makeBinding('32016R0679', { type: `${RESOURCE_TYPE}REG` })]);
+      const { result: act } = await lookup('32016R0679');
+      expect(act.found).toBe(true);
+      expect('ecli' in act).toBe(false);
+    });
+
+    it('carries the ECLI on both structuredContent and content[]', async () => {
+      mockQuery.mockResolvedValue([
+        makeBinding('62012CJ0131', { type: `${RESOURCE_TYPE}JUDG`, ecli: 'ECLI:EU:C:2014:317' }),
+      ]);
+
+      const result = await runToolContract(eurlex_lookup_celex, {
+        identifier: 'ECLI:EU:C:2014:317',
+      });
+
+      expect(result.isError).toBeFalsy();
+      const structured = eurlex_lookup_celex.output.parse(result.structuredContent);
+      expect(structured.ecli).toBe('ECLI:EU:C:2014:317');
+      expect(structured.celex_number).toBe('62012CJ0131');
+      const text = result.content
+        .map((block) => (block as { text?: string }).text ?? '')
+        .join('\n');
+      expect(text).toContain('**ECLI:** ECLI:EU:C:2014:317');
+      expect(text).toContain('**CELEX:** 62012CJ0131');
+    });
+
+    it('names ecli in the ambiguous_identifier recovery', async () => {
+      const result = await runToolContract(eurlex_lookup_celex, {
+        identifier: 'not an identifier',
+        identifier_type: 'auto',
+      });
+      const structured = result.structuredContent as {
+        error?: { data?: { reason?: string; recovery?: { hint?: string } } };
+      };
+      expect(structured.error?.data?.reason).toBe('ambiguous_identifier');
+      expect(structured.error?.data?.recovery?.hint).toContain('"ecli"');
     });
   });
 });
