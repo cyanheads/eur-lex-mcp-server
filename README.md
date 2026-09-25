@@ -64,7 +64,7 @@ All resource data is also reachable via tools.
 
 ### `eurlex_search_documents` <sub>tool</sub>
 
-- At least one filter: `keyword` (English titles, plus CELEX numbers when it holds a digit: a whole CELEX with its `(01)`–`(20)` siblings and `R(01)`–`R(20)` corrigenda by exact lookup, a partial one by substring; no body search), `document_type` (`REG`, `DIR`, `DEC`, `TREATY`, `JUDG`, `OPIN_AG`, `PROP`, `REC`, each its full CELLAR authority family), `date_from`/`date_to`, `eurovoc_concept` (from `eurlex_browse_subjects`), `author_institution`, or `in_force` (`true`/`false`)
+- At least one filter: `keyword` (English titles, plus CELEX numbers when it holds a digit: a whole CELEX with its `(01)`–`(20)` siblings and `R(01)`–`R(20)` corrigenda by exact lookup, a partial one by substring; no body search), `document_type` (`REG`, `DIR`, `DEC`, `TREATY`, `JUDG`, `OPIN_AG`, `PROP`, `REC`, each its full CELLAR authority family), `date_from`/`date_to`, `eurovoc_concept` (from `eurlex_browse_subjects`), `author_institution`, or `in_force` (`true`/`false`; `false` covers repealed, expired, and not-yet-in-force acts)
 - Pages of up to 100 via `offset`/`limit`, newest first with the CELEX breaking date ties, so a page is the same on every call; each row flags `is_consolidated` and `is_corrigendum`, and corrigenda join only under `include_corrigenda`, consolidated texts of a `document_type` only under `include_consolidated`
 - No match returns an empty page with a `notice` naming the filters and how to broaden them; typed errors: `no_filters`, `invalid_date_range`, `invalid_author_institution` and `invalid_keyword` (no letters or digits)
 
@@ -72,9 +72,11 @@ All resource data is also reachable via tools.
 
 ### `eurlex_get_document` <sub>tool</sub>
 
-- Exactly one of `celex_number`, `eli_uri`, or `work_uri`, served as the work the CELEX resolves to (see `eurlex_lookup_celex`); body as `html` (default), `markdown`, or `xml` (Formex4) in any of the 24 EUR-Lex languages, falling back to English; metadata names `author_institution(s)` and, for case law, `advocates_general`
+- Exactly one of `celex_number`, `eli_uri`, or `work_uri`, served as the work the CELEX resolves to (see `eurlex_lookup_celex`); a `work_uri` carrying several CELEX numbers (a national implementing measure) serves its lowest, with a `notice` giving the count; body as `html` (default), `markdown`, or `xml` (Formex4) in any of the 24 EUR-Lex languages, falling back to English; metadata names `author_institution(s)` and, for case law, `advocates_general`
 - `content_mode` `"paged"` (default), `"full"`, or `"metadata_only"`, every body capped at 100,000 characters per call with `content_chars_total`/`has_more` to page on; `outline: true` lists chapter/section/article/annex/recital headings with offsets, and `select` (e.g. `{ articles: "1,5,17" }`) returns just those sections, each source character once, with `selected_sections` giving each one's own `offset`/`chars` for a `paged` read
-- `resolve: "current_consolidated"` serves the newest consolidated version, and `is_superseded`/`current_consolidated_celex`/`consolidated_as_of` flag a stale base act; typed errors: `invalid_identifier_args`, `not_found`, `content_challenge` (a WAF bot-challenge in place of text)
+- `is_superseded` says whether a newer consolidated version than the text served is in effect (`false` on the newest one, and on a consolidated version dated after it that does not apply yet), with `current_consolidated_celex`/`consolidated_as_of` naming that version; `resolve: "current_consolidated"` serves it, for a base act or any of its consolidated texts; when no consolidated version is in effect yet, a `notice` says a future-dated consolidated text does not apply yet, or that `resolve` served the base act
+- `in_force: false` comes with its reason where CELLAR records one: `repealed_by` (CELEX of the explicitly repealing acts), `end_of_validity` (omitted when open-ended; a future date on an act not yet in force), or `entry_into_force` (the earliest date, when still ahead)
+- A consolidated text keeps its own title, date, and type and reports its base act as `base_act_celex`, with that act's authors, `in_force` and its reason, legal basis, and EuroVoc subjects; typed errors: `invalid_identifier_args`, `not_found`, `content_challenge` (a WAF bot-challenge in place of text)
 
 ---
 
@@ -119,7 +121,7 @@ All resource data is also reachable via tools.
 
 ### `eurlex://document/{celexNumber}` <sub>resource</sub>
 
-- Metadata snapshot as `application/json` — resource type, author institution(s), Advocates General, date, title, in-force flag, legal basis, EuroVoc subjects
+- Metadata snapshot as `application/json` — resource type, author institution(s), Advocates General, date, title, in-force flag, legal basis, EuroVoc subjects; a consolidated text adds `base_act_celex` and reads authors, in-force flag, legal basis, and subjects from that act
 - `celexNumber` comes from `eurlex_search_documents`, `eurlex_get_cases`, or `eurlex_lookup_celex`
 
 ---
