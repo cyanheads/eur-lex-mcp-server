@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.15.0](changelog/0.15.x/0.15.0.md) — 2026-09-25 · ⚠️ Breaking
+
+Consolidations are found through their based-on link and is_superseded describes the text served; a consolidated text reports its base act's metadata, and an act not in force names why.
+
 ## [0.14.0](changelog/0.14.x/0.14.0.md) — 2026-09-25 · ⚠️ Breaking
 
 An empty first page from the four paged tools is a result with a notice rather than an error, date-bounded document searches and whole-CELEX keywords no longer reach the client timeout, and a cancelled call aborts its SPARQL request.
