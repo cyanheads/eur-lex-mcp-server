@@ -19,6 +19,7 @@ import {
   isValidCalendarDate,
 } from '@/services/cellar-sparql/eli-resolution.js';
 import { isConsolidatedCelex } from '@/services/cellar-sparql/relation-traversal.js';
+import { resolveCelexWorks } from '@/services/cellar-sparql/work-resolution.js';
 
 const RESOURCE_TYPE_BASE = 'http://publications.europa.eu/resource/authority/resource-type/';
 
@@ -224,7 +225,9 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
           })
           .describe('A single EU legislative work with its CELEX number, type, and date.'),
       )
-      .describe('Matching EU documents ordered by date descending.'),
+      .describe(
+        'Matching EU documents ordered by date descending, then by CELEX number ascending among documents sharing a date, so pages are stable across calls.',
+      ),
     total: z
       .number()
       .describe('Number of documents returned in this page (not a corpus-wide count).'),
@@ -512,12 +515,19 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
      * survives over a bare duplicate's absent one; MAX(?titledWork) likewise prefers
      * the work URI that carries a title — ?titledWork binds to ?work only inside the
      * title OPTIONAL — and the handler falls back to SAMPLE(?work) when no work in the
-     * group is titled. ?docDate uses SAMPLE, NOT MAX: under ORDER BY DESC(?docDate) a
-     * MAX over the ordered column lets Virtuoso pick a date-index TOP-k plan that
-     * bypasses the date-range upper-bound FILTER whenever no selective graph pattern
-     * is present (a bare date/type search), returning the globally-latest documents
+     * group is titled. Both are fallbacks: the row's work_uri is the CELEX's canonical
+     * work, resolved for the whole page after this query (#97). ?docDate uses SAMPLE,
+     * NOT MAX: under ORDER BY DESC(?docDate) a MAX over the ordered column lets
+     * Virtuoso pick a date-index TOP-k plan that bypasses the date-range upper-bound
+     * FILTER whenever no selective graph pattern is present (a bare date/type search), returning the globally-latest documents
      * instead of the in-range ones. Date is single-valued per CELEX, so SAMPLE shows
      * the same value without triggering that plan.
+     *
+     * The CELEX breaks date ties, so the order is total: identical calls return
+     * identical pages, and consecutive offsets neither repeat nor skip a document
+     * that shares its date with others (#102). The tiebreak is the GROUP BY key
+     * ?celexNumber, not the projected ?celex — Virtuoso does not sort on a SAMPLE
+     * alias of a string.
      */
     const sparql = `
 SELECT
@@ -542,7 +552,7 @@ SELECT
   ${keywordClause}
   ${inForceClause}
   ${filters.join('\n  ')}
-} GROUP BY ?celexNumber ORDER BY DESC(?docDate) LIMIT ${pageLimit + 1} OFFSET ${input.offset}`;
+} GROUP BY ?celexNumber ORDER BY DESC(?docDate) ?celexNumber LIMIT ${pageLimit + 1} OFFSET ${input.offset}`;
 
     const queryEcho = {
       ...(keywordInput ? { keyword: keywordInput } : {}),
@@ -578,7 +588,16 @@ SELECT
     }
 
     const hasMore = bindings.length > pageLimit;
-    const documents = bindings.slice(0, pageLimit).map((b) => {
+    const page = bindings.slice(0, pageLimit);
+    // A CELEX held by several works resolves to its canonical work (#97), in one
+    // follow-up query for the page — the alias match never binds inside the
+    // grouped query above.
+    const resolvedWorks = await resolveCelexWorks(
+      svc,
+      page.map((b) => CellarSparqlService.bindingValue(b, 'celex') ?? ''),
+      ctx,
+    );
+    const documents = page.map((b) => {
       const celexNumber = CellarSparqlService.bindingValue(b, 'celex') ?? '';
       // GROUP_CONCAT delivers every resource-type of the work as one space-separated
       // string, so membership is tested against the split list — a substring test
@@ -595,6 +614,7 @@ SELECT
         title?: string;
       } = {
         work_uri:
+          resolvedWorks.get(celexNumber) ??
           CellarSparqlService.bindingValue(b, 'titledWork') ??
           CellarSparqlService.bindingValue(b, 'work') ??
           '',

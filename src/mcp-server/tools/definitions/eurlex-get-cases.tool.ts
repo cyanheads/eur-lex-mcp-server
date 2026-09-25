@@ -19,6 +19,7 @@ import {
   escapeSparqlLiteral,
   isValidCalendarDate,
 } from '@/services/cellar-sparql/eli-resolution.js';
+import { resolveCelexWorks } from '@/services/cellar-sparql/work-resolution.js';
 
 /**
  * Case type → CDM resource-type authority URI. A case_type filter tests the
@@ -282,7 +283,9 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
           })
           .describe('A single CJEU or General Court case law record.'),
       )
-      .describe('Matching case law records ordered by date descending.'),
+      .describe(
+        'Matching case law records ordered by date descending, then by CELEX number ascending among records sharing a date, so pages are stable across calls.',
+      ),
     total: z.number().describe('Number of cases returned in this page (not a corpus-wide count).'),
     offset: z.number().describe('Pagination offset used for this response.'),
     has_more: z
@@ -527,25 +530,32 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
      * survives over a bare duplicate's absent one; MAX(?titledWork) likewise prefers
      * the work URI that carries a title — ?titledWork binds to ?work only inside the
      * title OPTIONAL — and the handler falls back to SAMPLE(?work) when no work in the
-     * group is titled. ?docDate uses SAMPLE, NOT MAX: under ORDER BY DESC(?docDate) a
-     * MAX over the ordered column lets Virtuoso pick a date-index TOP-k plan that
-     * bypasses the date-range upper-bound FILTER whenever no selective graph pattern
-     * is present (a bare date/court/type search), returning the globally-latest cases
+     * group is titled. Both are fallbacks: the row's work_uri is the CELEX's canonical
+     * work, resolved for the whole page after this query (#97). ?docDate uses SAMPLE,
+     * NOT MAX: under ORDER BY DESC(?docDate) a MAX over the ordered column lets
+     * Virtuoso pick a date-index TOP-k plan that bypasses the date-range upper-bound
+     * FILTER whenever no selective graph pattern is present (a bare date/court/type
+     * search), returning the globally-latest cases
      * instead of the in-range ones. Date is single-valued per CELEX, so SAMPLE shows
      * the same value without triggering that plan. The ECLI is single-valued per
      * CELEX too, but only some member works of a group carry it, so MAX keeps a
      * bound value the way it does for the title (issue #84).
+     *
+     * The CELEX breaks date ties, so the order is total: identical calls return
+     * identical pages, and consecutive offsets neither repeat nor skip a case that
+     * shares its date with others (#102). The tiebreak is the GROUP BY key
+     * ?celexNumber, not the projected ?celex — Virtuoso does not sort on a SAMPLE
+     * alias of a string.
      */
-    const sparql = `
-SELECT
+    const projection = (dateVar: string) => `SELECT
   (SAMPLE(?celexNumber) AS ?celex)
   (MAX(?titledWork) AS ?titledWork)
   (SAMPLE(?work) AS ?work)
   (GROUP_CONCAT(DISTINCT STR(?type); SEPARATOR=" ") AS ?types)
-  (SAMPLE(?date) AS ?docDate)
+  (SAMPLE(${dateVar}) AS ?docDate)
   (MAX(?caseEcli) AS ?ecli)
-  (MAX(?title) AS ?docTitle) WHERE {
-  ?work cdm:resource_legal_id_celex ?celexNumber .
+  (MAX(?title) AS ?docTitle)`;
+    const rowPattern = (keywordPart: string) => `?work cdm:resource_legal_id_celex ?celexNumber .
   ${typeConstraint}
   OPTIONAL { ?work cdm:work_has_resource-type ?type . }
   OPTIONAL { ?work cdm:work_date_document ?date . }
@@ -556,9 +566,53 @@ SELECT
     ?expr cdm:expression_title ?title .
     BIND(?work AS ?titledWork)
   }
-  ${keywordClause}
-  ${filters.join('\n  ')}
-} GROUP BY ?celexNumber ORDER BY DESC(?docDate) LIMIT ${pageLimit + 1} OFFSET ${input.offset}`;
+  ${keywordPart}
+  ${filters.join('\n  ')}`;
+    const paging = `LIMIT ${pageLimit + 1} OFFSET ${input.offset}`;
+
+    /**
+     * Page-first form for a search with any date bound (#98). The flat query groups
+     * and aggregates every matching case before ORDER BY and LIMIT pick the page;
+     * with a date bound, selecting the page's CELEX keys first and aggregating only
+     * those is far cheaper. The subquery holds the match pattern alone — the CELEX,
+     * the required type, the date, the keyword, and every filter — and pages in the
+     * same total order the outer query uses. The outer query repeats the whole row
+     * pattern, so each CELEX groups the same works, types, ECLI, and titles as the
+     * flat form, and takes the row date from the subquery's ?pageDate so a case sorts
+     * where it was paged. ?pageDate is a SAMPLE for the same reason ?docDate is. The
+     * page LIMIT sits inside the subquery, below the outer level the service's LIMIT
+     * ceiling rewrites, so pageLimit stays the only clamp.
+     *
+     * The outer query tests the keyword as FILTER EXISTS rather than joining it
+     * again: the grouped works are the same (a work stays in its CELEX group only
+     * when it matches the keyword either way), but a join re-drives the full-text
+     * and CELEX-substring arms over the whole corpus, which made a keyword search over
+     * a wide date range slower than the flat form. With ?work already bound, EXISTS
+     * checks the page's works alone.
+     *
+     * A date-less search keeps the flat form: finding a broad browse's page keys
+     * costs about as much as the whole query, and a court-only browse measured the
+     * two forms at parity.
+     */
+    const sparql =
+      dateFrom || dateTo
+        ? `
+${projection('?pageDate')} WHERE {
+  {
+    SELECT ?celexNumber (SAMPLE(?date) AS ?pageDate) WHERE {
+      ?work cdm:resource_legal_id_celex ?celexNumber .
+      ${typeConstraint}
+      OPTIONAL { ?work cdm:work_date_document ?date . }
+      ${keywordClause}
+      ${filters.join('\n      ')}
+    } GROUP BY ?celexNumber ORDER BY DESC(?pageDate) ?celexNumber ${paging}
+  }
+  ${rowPattern(keywordClause && `FILTER EXISTS {\n    ${keywordClause}\n  }`)}
+} GROUP BY ?celexNumber ORDER BY DESC(?docDate) ?celexNumber`
+        : `
+${projection('?date')} WHERE {
+  ${rowPattern(keywordClause)}
+} GROUP BY ?celexNumber ORDER BY DESC(?docDate) ?celexNumber ${paging}`;
 
     const queryEcho = {
       ...(input.case_number ? { case_number: input.case_number } : {}),
@@ -595,7 +649,17 @@ SELECT
     }
 
     const hasMore = bindings.length > pageLimit;
-    const cases = bindings.slice(0, pageLimit).map((b) => {
+    const page = bindings.slice(0, pageLimit);
+    // A CELEX held by several works resolves to its canonical work (#97), in one
+    // follow-up query for the page — the alias match never binds inside the
+    // grouped query above.
+    const resolvedWorks = await resolveCelexWorks(
+      svc,
+      page.map((b) => CellarSparqlService.bindingValue(b, 'celex') ?? ''),
+      ctx,
+    );
+    const cases = page.map((b) => {
+      const celexNumber = CellarSparqlService.bindingValue(b, 'celex') ?? '';
       const c: {
         work_uri: string;
         celex_number: string;
@@ -609,10 +673,11 @@ SELECT
         case_reference?: string;
       } = {
         work_uri:
+          resolvedWorks.get(celexNumber) ??
           CellarSparqlService.bindingValue(b, 'titledWork') ??
           CellarSparqlService.bindingValue(b, 'work') ??
           '',
-        celex_number: CellarSparqlService.bindingValue(b, 'celex') ?? '',
+        celex_number: celexNumber,
       };
       const ecli = CellarSparqlService.bindingValue(b, 'ecli');
       if (ecli) c.ecli = ecli;

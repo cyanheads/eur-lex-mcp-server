@@ -8,6 +8,7 @@ import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mc
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_search_documents } from '@/mcp-server/tools/definitions/eurlex-search-documents.tool.js';
 import { escapeSparqlLiteral } from '@/services/cellar-sparql/eli-resolution.js';
+import { canonicalWork, celexWorkRows, fixtureWork } from '../fixtures/cellar-works.js';
 
 const RESOURCE_TYPE_BASE = 'http://publications.europa.eu/resource/authority/resource-type/';
 
@@ -86,6 +87,13 @@ function makeDocBinding(
   if (opts.date) b.docDate = { type: 'literal', value: opts.date };
   if (opts.title) b.docTitle = { type: 'literal', value: opts.title };
   return b;
+}
+
+/** The grouped search queries issued, without the page's follow-up work resolution. */
+function searchQueries(): string[] {
+  return mockQuery.mock.calls
+    .map((c) => c[0] as string)
+    .filter((q) => q.includes('GROUP BY ?celexNumber'));
 }
 
 describe('eurlex_search_documents', () => {
@@ -541,6 +549,28 @@ describe('eurlex_search_documents', () => {
     expect(new Set(uris).size).toBe(2);
   });
 
+  it('orders the page by date, then CELEX, so documents sharing a date keep one order (#102)', async () => {
+    const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+    mockQuery.mockResolvedValue([makeDocBinding('32024R0900', { date: '2024-03-29' })]);
+
+    await eurlex_search_documents.handler(
+      eurlex_search_documents.input.parse({
+        date_from: '2024-03-01',
+        date_to: '2024-03-31',
+        offset: 20,
+      }),
+      ctx,
+    );
+
+    const [sparql] = searchQueries();
+    // The tiebreak is the GROUP BY key: Virtuoso does not sort on the projected
+    // SAMPLE alias ?celex, so ordering by it leaves same-date rows unordered.
+    expect(sparql).toMatch(
+      /\} GROUP BY \?celexNumber ORDER BY DESC\(\?docDate\) \?celexNumber LIMIT 21 OFFSET 20$/,
+    );
+    expect(sparql).not.toMatch(/ORDER BY[^\n]*\?celex\b/);
+  });
+
   // --- Dedup of same-CELEX duplicate works (issue #24) ---
 
   it('groups by CELEX (not work) so N distinct documents fill a page of N (issue #24)', async () => {
@@ -756,7 +786,8 @@ describe('eurlex_search_documents', () => {
       const input = eurlex_search_documents.input.parse({ in_force: true });
       await eurlex_search_documents.handler(input, ctx);
 
-      expect(mockQuery).toHaveBeenCalledTimes(1);
+      // The search itself, then the page's work resolution (#97).
+      expect(searchQueries()).toHaveLength(1);
     });
 
     it('omitting in_force builds neither the binding nor the filter', async () => {
@@ -810,8 +841,7 @@ describe('eurlex_search_documents', () => {
         ctx,
       );
 
-      const withoutFlag = mockQuery.mock.calls[0]?.[0] as string;
-      const withFalse = mockQuery.mock.calls[1]?.[0] as string;
+      const [withoutFlag, withFalse] = searchQueries();
       expect(withFalse).not.toBe(withoutFlag);
       expect(withoutFlag).not.toContain('?inForce');
       expect(withFalse).toContain('FILTER(?inForce = false)');
@@ -827,8 +857,8 @@ describe('eurlex_search_documents', () => {
       // A standalone in-force filter is bounded — the property is carried by a
       // small slice of the corpus, not by all 2.7M works — so it narrows enough
       // to stand on its own, exactly as `in_force: true` already does.
-      expect(mockQuery).toHaveBeenCalledTimes(1);
-      expect(mockQuery.mock.calls[0]?.[0] as string).toContain('FILTER(?inForce = false)');
+      expect(searchQueries()).toHaveLength(1);
+      expect(searchQueries()[0]).toContain('FILTER(?inForce = false)');
       expect(result.query_echo.in_force).toBe(false);
     });
 
@@ -1536,6 +1566,57 @@ describe('eurlex_search_documents', () => {
         .join('\n');
       expect(text).toContain('2026-99-99');
       expect(text).toContain(structured.error?.data?.recovery?.hint as string);
+    });
+  });
+
+  // --- #97: a row's work_uri is its CELEX's canonical work ---
+
+  describe('row work_uri for a CELEX held by several works (#97)', () => {
+    const DC713_TWIN = fixtureWork('51988DC0713', 0);
+
+    it('resolves the 51988DC0713 row to its canonical work through one VALUES query', async () => {
+      mockQuery.mockImplementation(async (q: string) =>
+        q.includes('GROUP BY ?celexNumber')
+          ? [
+              makeDocBinding('51988DC0713', { workUri: DC713_TWIN, titledWork: DC713_TWIN }),
+              makeDocBinding('32016R0679'),
+            ]
+          : celexWorkRows(q),
+      );
+
+      const result = await runToolContract(eurlex_search_documents, {
+        document_type: 'PROP',
+        limit: 2,
+      });
+
+      const structured = eurlex_search_documents.output.parse(result.structuredContent);
+      expect(structured.documents.map((d) => d.work_uri)).toEqual([
+        canonicalWork('51988DC0713'),
+        canonicalWork('32016R0679'),
+      ]);
+      const text = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+      expect(text).toContain(`**Work URI:** ${canonicalWork('51988DC0713')}`);
+      expect(text).not.toContain(DC713_TWIN);
+      const resolution = mockQuery.mock.calls
+        .map((c) => c[0] as string)
+        .filter((q) => q.includes('owl#sameAs'));
+      expect(resolution).toHaveLength(1);
+      expect(resolution[0]).toContain(
+        'VALUES ?celexNumber { "51988DC0713"^^xsd:string "32016R0679"^^xsd:string }',
+      );
+    });
+
+    it('sends no resolution query for an empty page past the end', async () => {
+      mockQuery.mockResolvedValue([]);
+
+      const input = eurlex_search_documents.input.parse({ keyword: 'data', offset: 500 });
+      const result = await eurlex_search_documents.handler(
+        input,
+        createMockContext({ errors: eurlex_search_documents.errors }),
+      );
+
+      expect(result.documents).toEqual([]);
+      expect(mockQuery).toHaveBeenCalledTimes(1);
     });
   });
 });
