@@ -1,6 +1,6 @@
 # eur-lex-mcp-server - Directory Structure
 
-Generated on: 2026-09-25 13:21:42
+Generated on: 2026-09-25 21:36:29
 
 ```text
 eur-lex-mcp-server/
@@ -29,6 +29,7 @@ eur-lex-mcp-server/
 │   ├── 0.11.x/
 │   ├── 0.12.x/
 │   ├── 0.13.x/
+│   ├── 0.14.x/
 │   ├── 0.2.x/
 │   ├── 0.3.x/
 │   ├── 0.4.x/
@@ -158,20 +159,22 @@ eur-lex-mcp-server/
 │   │   │       ├── eurlex-document.resource.ts
 │   │   │       └── index.ts
 │   │   └── tools/
-│   │       └── definitions/
-│   │           ├── eurlex-browse-subjects.tool.ts
-│   │           ├── eurlex-get-cases.tool.ts
-│   │           ├── eurlex-get-document.tool.ts
-│   │           ├── eurlex-get-relations.tool.ts
-│   │           ├── eurlex-lookup-celex.tool.ts
-│   │           ├── eurlex-query-sparql.tool.ts
-│   │           ├── eurlex-search-documents.tool.ts
-│   │           └── index.ts
+│   │       ├── definitions/
+│   │       │   ├── eurlex-browse-subjects.tool.ts
+│   │       │   ├── eurlex-get-cases.tool.ts
+│   │       │   ├── eurlex-get-document.tool.ts
+│   │       │   ├── eurlex-get-relations.tool.ts
+│   │       │   ├── eurlex-lookup-celex.tool.ts
+│   │       │   ├── eurlex-query-sparql.tool.ts
+│   │       │   ├── eurlex-search-documents.tool.ts
+│   │       │   └── index.ts
+│   │       └── echo-value.ts
 │   ├── services/
 │   │   ├── cellar-sparql/
 │   │   │   ├── cdm-labels.ts
 │   │   │   ├── cellar-sparql-service.ts
 │   │   │   ├── eli-resolution.ts
+│   │   │   ├── keyword-match.ts
 │   │   │   ├── relation-traversal.ts
 │   │   │   ├── types.ts
 │   │   │   ├── work-agents.ts

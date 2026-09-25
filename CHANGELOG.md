@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.14.0](changelog/0.14.x/0.14.0.md) — 2026-09-25 · ⚠️ Breaking
+
+An empty first page from the four paged tools is a result with a notice rather than an error, date-bounded document searches and whole-CELEX keywords no longer reach the client timeout, and a cancelled call aborts its SPARQL request.
+
 ## [0.13.1](changelog/0.13.x/0.13.1.md) — 2026-09-25
 
 A CELEX held by several CELLAR works resolves to its canonical work on every tool and resource, Advocates General move out of author_institution(s) into advocates_general, search and relation pages are stable across calls, date-bounded case searches page first, and Formex headings keep their quotation marks.
