@@ -261,6 +261,7 @@ describe('eurlex_document_relations_resource', () => {
       direction: 'incoming',
       related_work_uri: CZECH_MEASURE_WORK_URI,
       related_celex_number: '72016L0680CZE_225030',
+      related_member_state: 'CZE',
     });
     const sparql = mockQuery.mock.calls
       .map((call) => call[0] as string)
@@ -268,6 +269,76 @@ describe('eurlex_document_relations_resource', () => {
         query.includes('cdm:measure_national_implementing_implements_resource_legal'),
       )!;
     expect(sparql).toContain('REGEX(STR(?relatedCelex), "^72016L0680[A-Z]{3}")');
+  });
+
+  // --- #85: national_transposition rows carry the member state ---
+
+  it('carries related_member_state on national_transposition rows and on no other type (#85)', async () => {
+    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    mockQuery.mockImplementation(
+      routeQuery({
+        resolve: [makeResolveBinding(DIRECTIVE_680_WORK_URI)],
+        nationalTransposition: [
+          makeRelationBinding({
+            relatedWork: CZECH_MEASURE_WORK_URI,
+            direction: 'incoming',
+            relatedCelex: '72016L0680CZE_202505539',
+          }),
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/uk-measure',
+            direction: 'incoming',
+            relatedCelex: '72016L0680GBR_201812345',
+          }),
+        ],
+        // A citing work that is itself a sector-7 measure: still no member state.
+        cites: [
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/citing-measure',
+            direction: 'incoming',
+            relatedCelex: '72016L0680DEU_000001',
+          }),
+        ],
+      }),
+    );
+
+    const params = eurlex_document_relations_resource.params!.parse({ celexNumber: '32016L0680' });
+    const result = (await eurlex_document_relations_resource.handler(params, ctx)) as Record<
+      string,
+      unknown
+    >;
+    const relations = result.relations as Array<Record<string, unknown>>;
+
+    expect(relations).toContainEqual({
+      relation_type: 'national_transposition',
+      direction: 'incoming',
+      related_work_uri: CZECH_MEASURE_WORK_URI,
+      related_celex_number: '72016L0680CZE_202505539',
+      related_member_state: 'CZE',
+    });
+    expect(
+      relations.find((r) => r.related_celex_number === '72016L0680GBR_201812345')
+        ?.related_member_state,
+    ).toBe('GBR');
+    const cite = relations.find((r) => r.relation_type === 'cites');
+    expect(cite).toBeDefined();
+    expect(cite).not.toHaveProperty('related_member_state');
+  });
+
+  // --- #92: typed exact CELEX triple ---
+
+  it('resolves the CELEX through a typed exact triple, not a STR() scan (#92)', async () => {
+    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    mockQuery.mockImplementation(routeQuery({ resolve: [makeResolveBinding(GDPR_WORK_URI)] }));
+
+    const params = eurlex_document_relations_resource.params!.parse({ celexNumber: '32016R0679' });
+    await eurlex_document_relations_resource.handler(params, ctx);
+
+    const resolve = mockQuery.mock.calls
+      .map((c) => c[0] as string)
+      .filter((q) => q.includes('"32016R0679"'));
+    expect(resolve).toHaveLength(1);
+    expect(resolve[0]).toContain('?work cdm:resource_legal_id_celex "32016R0679"^^xsd:string .');
+    expect(resolve[0]).not.toMatch(/STR\(\?\w+\)\s*=/);
   });
 
   // --- #31: repeal relations surface through the resource's shared traversal ---
@@ -453,9 +524,11 @@ describe('eurlex_document_relations_resource', () => {
     );
 
     const sparql = mockQuery.mock.calls[0]?.[0] as string;
-    expect(sparql).toContain(`FILTER(STR(?celex) = "${escapeSparqlLiteral(celexNumber)}")`);
+    expect(sparql).toContain(
+      `cdm:resource_legal_id_celex "${escapeSparqlLiteral(celexNumber)}"^^xsd:string .`,
+    );
     // The unterminated form the quote-only pass produced is gone.
-    expect(sparql).not.toContain(String.raw`= "32016R0679\")`);
+    expect(sparql).not.toContain(String.raw`"32016R0679\"^^`);
   });
 
   it('leaves an ordinary CELEX byte-identical through the shared helper (#61)', async () => {
@@ -467,7 +540,7 @@ describe('eurlex_document_relations_resource', () => {
 
     const sparql = mockQuery.mock.calls[0]?.[0] as string;
     // No regression for the overwhelmingly common input: escaping is a no-op.
-    expect(sparql).toContain('FILTER(STR(?celex) = "32016R0679")');
+    expect(sparql).toContain('cdm:resource_legal_id_celex "32016R0679"^^xsd:string .');
   });
 
   // --- #69: CELEX shape gate on the path parameter ---
@@ -539,7 +612,7 @@ describe('eurlex_document_relations_resource', () => {
       const result = await eurlex_document_relations_resource.handler(params, ctx);
 
       expect(mockQuery.mock.calls[0]?.[0] as string).toContain(
-        'FILTER(STR(?celex) = "32016R0679")',
+        'cdm:resource_legal_id_celex "32016R0679"^^xsd:string .',
       );
       expect(result).toMatchObject({ celex_number: '32016R0679' });
     });

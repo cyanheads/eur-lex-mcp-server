@@ -8,7 +8,7 @@
 
 import type { Context } from '@cyanheads/mcp-ts-core';
 import { CellarSparqlService } from './cellar-sparql-service.js';
-import { escapeSparqlLiteral } from './eli-resolution.js';
+import { celexLiteral } from './eli-resolution.js';
 import type { SparqlBinding, WorkRelation } from './types.js';
 
 /** The relation types this server exposes over the CDM graph. */
@@ -237,9 +237,10 @@ export interface CurrentConsolidated {
  * `cdm:act_consolidated_consolidates_resource_legal`, CELEX-bearing, same act
  * core — so a base act (sector `3`) resolves to its sector-`0` consolidations.
  *
- * Self-contained: resolves the base work by CELEX inline (rather than taking a
- * work URI like `traverseRelations`), so the caller can run it concurrently with
- * the metadata/content fetch. `ORDER BY DESC(?consolidatedCelex)` puts the newest
+ * Self-contained: resolves the base work by CELEX inline — a typed exact triple,
+ * never a STR() scan (#92) — rather than taking a work URI like
+ * `traverseRelations`, so the caller can run it concurrently with the
+ * metadata/content fetch. `ORDER BY DESC(?consolidatedCelex)` puts the newest
  * same-act consolidation first — the date suffix sorts chronologically within an
  * act core — so the first row whose core matches is the current version, robust
  * to a truncating LIMIT. CELLAR also asserts the `consolidates` edge for
@@ -258,8 +259,7 @@ export async function findCurrentConsolidated(
 
   const query = `
 SELECT ?consolidatedCelex WHERE {
-  ?work cdm:resource_legal_id_celex ?c .
-  FILTER(STR(?c) = "${escapeSparqlLiteral(celex)}")
+  ?work cdm:resource_legal_id_celex ${celexLiteral(celex)} .
   ?consolidated cdm:act_consolidated_consolidates_resource_legal ?work .
   ?consolidated cdm:resource_legal_id_celex ?consolidatedCelex .
 }
@@ -299,7 +299,8 @@ LIMIT 100`;
  * too. `national_transposition` similarly requires a sector-`7` CELEX carrying
  * the source directive's act core followed by a member-state code, selecting the
  * matching identifier before grouping when one national measure has several CELEX
- * values. Every other relation type is returned unfiltered.
+ * values, and reports that code as the row's `relatedMemberState` — the only
+ * relation type that carries one. Every other relation type is returned unfiltered.
  *
  * An absent `sourceCelex` — an addressed work with no CELEX, or one whose CELEX
  * identity is ambiguous because the work carries several — stands the act-core
@@ -351,13 +352,13 @@ export async function traverseRelations(
     }),
   );
 
+  const nationalMeasureRe = sourceActCore
+    ? new RegExp(nationalMeasureCelexPattern(sourceActCore))
+    : undefined;
   const relations: WorkRelation[] = [];
   let hasMore = false;
   for (const { type, bindings } of perType) {
-    const rowsByDirection = new Map<
-      'outgoing' | 'incoming',
-      Array<{ relatedWorkUri: string; relatedCelex?: string }>
-    >();
+    const rowsByDirection = new Map<'outgoing' | 'incoming', Omit<WorkRelation, 'direction'>[]>();
     const seenForType = new Set<string>();
     for (const b of bindings) {
       const relatedWorkUri = CellarSparqlService.bindingValue(b, 'relatedWork') ?? '';
@@ -371,13 +372,13 @@ export async function traverseRelations(
         if (!relatedCelex) continue;
         if (sourceActCore && celexActCore(relatedCelex) !== sourceActCore) continue;
       }
-      if (
-        type === 'national_transposition' &&
-        (!relatedCelex ||
-          !sourceActCore ||
-          !new RegExp(nationalMeasureCelexPattern(sourceActCore)).test(relatedCelex))
-      ) {
-        continue;
+      let relatedMemberState: string | undefined;
+      if (type === 'national_transposition') {
+        const match = relatedCelex ? nationalMeasureRe?.exec(relatedCelex) : undefined;
+        if (!match) continue;
+        // The anchored pattern ends on the member-state code, so the match's last
+        // three characters are that code (#85).
+        relatedMemberState = match[0].slice(-3);
       }
 
       // Redundant since the query groups by ?relatedWork ?direction, which already
@@ -387,17 +388,18 @@ export async function traverseRelations(
       if (seenForType.has(typeKey)) continue;
       seenForType.add(typeKey);
       const rows = rowsByDirection.get(direction) ?? [];
-      rows.push({ relatedWorkUri, ...(relatedCelex ? { relatedCelex } : {}) });
+      rows.push({
+        relationType: type,
+        relatedWorkUri,
+        ...(relatedCelex ? { relatedCelexNumber: relatedCelex } : {}),
+        ...(relatedMemberState ? { relatedMemberState } : {}),
+      });
       rowsByDirection.set(direction, rows);
     }
 
     for (const [direction, rows] of rowsByDirection) {
       if (rows.length > perTypeLimit) hasMore = true;
-      for (const { relatedWorkUri, relatedCelex } of rows.slice(0, perTypeLimit)) {
-        const relation: WorkRelation = { relationType: type, direction, relatedWorkUri };
-        if (relatedCelex) relation.relatedCelexNumber = relatedCelex;
-        relations.push(relation);
-      }
+      for (const row of rows.slice(0, perTypeLimit)) relations.push({ ...row, direction });
     }
   }
   return { relations, hasMore };

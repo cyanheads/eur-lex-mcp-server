@@ -9,7 +9,7 @@ import {
   CellarSparqlService,
   getCellarSparqlService,
 } from '@/services/cellar-sparql/cellar-sparql-service.js';
-import { CELEX_PATTERN, escapeSparqlLiteral } from '@/services/cellar-sparql/eli-resolution.js';
+import { CELEX_PATTERN, celexLiteral } from '@/services/cellar-sparql/eli-resolution.js';
 import { RELATION_TYPES, traverseRelations } from '@/services/cellar-sparql/relation-traversal.js';
 
 /**
@@ -42,17 +42,16 @@ export const eurlex_document_relations_resource = resource(
     async handler(params, ctx) {
       const svc = getCellarSparqlService();
       const celexNumber = params.celexNumber.trim();
-      // The shared helper, not a local quote-only pass: a hand-rolled escape without
-      // a backslash pass lets a trailing `\` escape the closing quote, so the literal
-      // never terminates and Virtuoso's raw compiler error — internal query text
-      // attached — reaches the client in place of this resource's not_found (#61).
-      const safeCelexNumber = escapeSparqlLiteral(celexNumber);
 
-      // Resolve to work URI first
+      // Resolve to work URI first, through the typed exact triple (#92) — CELLAR
+      // types the CELEX literal xsd:string, so it resolves from the index where a
+      // STR() equality filter scans. The shared helper escapes the value, never a
+      // local quote-only pass: without a backslash pass a trailing `\` escapes the
+      // closing quote and Virtuoso's raw compiler error — internal query text
+      // attached — reaches the client in place of this resource's not_found (#61).
       const resolveSparql = `
 SELECT ?work WHERE {
-  ?work cdm:resource_legal_id_celex ?celex .
-  FILTER(STR(?celex) = "${safeCelexNumber}")
+  ?work cdm:resource_legal_id_celex ${celexLiteral(celexNumber)} .
 } LIMIT 1`;
 
       const resolveBindings = await svc.query(resolveSparql, ctx);
@@ -84,6 +83,7 @@ SELECT ?work WHERE {
         direction: r.direction,
         related_work_uri: r.relatedWorkUri,
         ...(r.relatedCelexNumber ? { related_celex_number: r.relatedCelexNumber } : {}),
+        ...(r.relatedMemberState ? { related_member_state: r.relatedMemberState } : {}),
       }));
 
       return {

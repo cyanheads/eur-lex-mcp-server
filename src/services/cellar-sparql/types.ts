@@ -60,6 +60,11 @@ export interface CaseResult {
 export interface WorkRelation {
   direction: 'outgoing' | 'incoming';
   relatedCelexNumber?: string;
+  /**
+   * ISO 3166-1 alpha-3 member-state code of a national implementing measure, read
+   * from its sector-7 CELEX. Set on `national_transposition` relations only.
+   */
+  relatedMemberState?: string;
   relatedWorkUri: string;
   relationType: string;
 }

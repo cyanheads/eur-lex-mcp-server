@@ -11,7 +11,7 @@ import {
 } from '@/services/cellar-sparql/cellar-sparql-service.js';
 import {
   CELEX_PATTERN,
-  escapeSparqlLiteral,
+  celexLiteral,
   isSafeSparqlIri,
 } from '@/services/cellar-sparql/eli-resolution.js';
 import {
@@ -106,6 +106,12 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
               .string()
               .optional()
               .describe('CELEX number of the related work, if available.'),
+            related_member_state: z
+              .string()
+              .optional()
+              .describe(
+                'ISO 3166-1 alpha-3 code of the member state whose national measure this is (e.g. "CZE"), read from the three letters after the directive number in related_celex_number. Present on national_transposition rows only. The codes are the 27 member states plus "GBR" (the United Kingdom).',
+              ),
           })
           .describe('A single CDM relation between the source work and a related work.'),
       )
@@ -240,10 +246,10 @@ SELECT ?sourceCelex WHERE {
         }
       }
     } else if (celexNumber && !workUriInput) {
+      // Typed exact triple (#92): resolves from the index, where STR() equality scans.
       const resolveSparql = `
 SELECT ?work WHERE {
-  ?work cdm:resource_legal_id_celex ?celex .
-  FILTER(STR(?celex) = "${escapeSparqlLiteral(celexNumber)}")
+  ?work cdm:resource_legal_id_celex ${celexLiteral(celexNumber)} .
 } LIMIT 1`;
 
       const resolveBindings = await svc.query(resolveSparql, ctx);
@@ -306,6 +312,7 @@ SELECT ?work WHERE {
       direction: r.direction,
       related_work_uri: r.relatedWorkUri,
       ...(r.relatedCelexNumber ? { related_celex_number: r.relatedCelexNumber } : {}),
+      ...(r.relatedMemberState ? { related_member_state: r.relatedMemberState } : {}),
     }));
 
     if (hasMore) {
@@ -374,7 +381,10 @@ SELECT ?work WHERE {
         const label = item.related_celex_number
           ? `${item.related_celex_number} (${item.related_work_uri})`
           : item.related_work_uri;
-        lines.push(`- ${label}`);
+        const memberState = item.related_member_state
+          ? ` — member state ${item.related_member_state}`
+          : '';
+        lines.push(`- ${label}${memberState}`);
       }
       lines.push('');
     }

@@ -4,7 +4,7 @@
  */
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_get_relations } from '@/mcp-server/tools/definitions/eurlex-get-relations.tool.js';
 import { RELATION_TYPES } from '@/services/cellar-sparql/relation-traversal.js';
@@ -571,6 +571,7 @@ describe('eurlex_get_relations', () => {
         direction: 'incoming',
         related_work_uri: CZECH_MEASURE_WORK_URI,
         related_celex_number: '72016L0680CZE_225030',
+        related_member_state: 'CZE',
       },
     ]);
     expect(result.requested_relation_types).toEqual(['national_transposition']);
@@ -674,6 +675,7 @@ describe('eurlex_get_relations', () => {
         direction: 'incoming',
         related_work_uri: HUNGARIAN_MEASURE_WORK_URI,
         related_celex_number: '72016L0680HUN_194829',
+        related_member_state: 'HUN',
       },
     ]);
     const sparql = mockQuery.mock.calls
@@ -1881,7 +1883,7 @@ describe('eurlex_get_relations', () => {
 
       expect(result.celex_number).toBe('32016R0679');
       expect(mockQuery.mock.calls[0]?.[0] as string).toContain(
-        'FILTER(STR(?celex) = "32016R0679")',
+        'cdm:resource_legal_id_celex "32016R0679"^^xsd:string .',
       );
     });
   });
@@ -2092,6 +2094,169 @@ describe('eurlex_get_relations', () => {
       expect(result.relations.map((r) => r.related_celex_number)).toEqual(['72016L0680CZE_225030']);
       expect(result.relations.map((r) => r.related_work_uri)).not.toContain(
         'http://publications.europa.eu/resource/cellar/other-act-measure',
+      );
+    });
+  });
+
+  // --- #85: the member state of a national_transposition row ---
+
+  describe('member state on national_transposition rows (#85)', () => {
+    /** Measures of 2016/680 from several member states, as the traversal returns them. */
+    const MEASURES = [
+      { work: CZECH_MEASURE_WORK_URI, celex: '72016L0680CZE_202505539', state: 'CZE' },
+      {
+        work: 'http://publications.europa.eu/resource/cellar/fi-measure',
+        celex: '72016L0680FIN_240353',
+        state: 'FIN',
+      },
+      {
+        work: 'http://publications.europa.eu/resource/cellar/uk-measure',
+        celex: '72016L0680GBR_201812345',
+        state: 'GBR',
+      },
+    ];
+    const measureRows = MEASURES.map((m) =>
+      makeRelationBinding({ relatedWork: m.work, direction: 'incoming', relatedCelex: m.celex }),
+    );
+
+    it('carries the alpha-3 segment after the act core on every row, in both channels', async () => {
+      mockQuery.mockImplementation(
+        routeQuery({
+          resolve: [makeResolveBinding(DIRECTIVE_680_WORK_URI)],
+          nationalTransposition: measureRows,
+        }),
+      );
+
+      const result = await runToolContract(eurlex_get_relations, {
+        celex_number: '32016L0680',
+        relation_types: ['national_transposition'],
+      });
+
+      expect(result.isError).toBeFalsy();
+      const structured = eurlex_get_relations.output.parse(result.structuredContent);
+      expect(structured.relations).toEqual(
+        MEASURES.map((m) => ({
+          relation_type: 'national_transposition',
+          direction: 'incoming',
+          related_work_uri: m.work,
+          related_celex_number: m.celex,
+          related_member_state: m.state,
+        })),
+      );
+      for (const r of structured.relations) {
+        // The code is exactly the three letters after `2016L0680` in the row's CELEX.
+        expect(r.related_member_state).toBe(r.related_celex_number?.slice(10, 13));
+      }
+
+      const text = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+      for (const m of MEASURES) {
+        expect(text).toContain(`- ${m.celex} (${m.work}) — member state ${m.state}`);
+      }
+    });
+
+    it('returns identical member states for the CELEX and work_uri inputs', async () => {
+      const ctx = createMockContext({ errors: eurlex_get_relations.errors });
+      mockQuery.mockImplementation(
+        routeQuery({
+          resolve: [makeResolveBinding(DIRECTIVE_680_WORK_URI)],
+          sourceCelex: [makeSourceCelexBinding('32016L0680')],
+          nationalTransposition: measureRows,
+        }),
+      );
+
+      const byCelex = await eurlex_get_relations.handler(
+        eurlex_get_relations.input.parse({
+          celex_number: '32016L0680',
+          relation_types: ['national_transposition'],
+        }),
+        ctx,
+      );
+      const byWorkUri = await eurlex_get_relations.handler(
+        eurlex_get_relations.input.parse({
+          work_uri: DIRECTIVE_680_WORK_URI,
+          relation_types: ['national_transposition'],
+        }),
+        ctx,
+      );
+
+      expect(byWorkUri.relations.map((r) => r.related_member_state)).toEqual(['CZE', 'FIN', 'GBR']);
+      expect(byWorkUri.relations).toEqual(byCelex.relations);
+    });
+
+    it('never attaches a member state to another relation type, even a sector-7 cites row', async () => {
+      mockQuery.mockImplementation(
+        routeQuery({
+          resolve: [makeResolveBinding(DIRECTIVE_680_WORK_URI)],
+          nationalTransposition: [measureRows[0]!],
+          cites: [
+            makeRelationBinding({
+              relatedWork: 'http://publications.europa.eu/resource/cellar/citing-measure',
+              direction: 'incoming',
+              relatedCelex: '72016L0680DEU_000001',
+            }),
+          ],
+          amendedBy: [
+            makeRelationBinding({
+              relatedWork: 'http://publications.europa.eu/resource/cellar/amender',
+              direction: 'incoming',
+              relatedCelex: '32022L0000',
+            }),
+          ],
+        }),
+      );
+
+      const result = await runToolContract(eurlex_get_relations, {
+        celex_number: '32016L0680',
+        relation_types: ['national_transposition', 'cites', 'amended_by'],
+      });
+      const structured = eurlex_get_relations.output.parse(result.structuredContent);
+
+      const others = structured.relations.filter(
+        (r) => r.relation_type !== 'national_transposition',
+      );
+      expect(others.map((r) => r.relation_type).sort()).toEqual(['amended_by', 'cites']);
+      for (const r of others) expect(r).not.toHaveProperty('related_member_state');
+
+      const text = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+      expect(text.match(/member state/g)).toHaveLength(1);
+      expect(text).toContain(
+        '- 72016L0680DEU_000001 (http://publications.europa.eu/resource/cellar/citing-measure)\n',
+      );
+    });
+  });
+
+  // --- #92: typed exact CELEX triple ---
+
+  describe('typed CELEX triple (#92)', () => {
+    it('resolves the CELEX through a typed exact triple, not a STR() scan', async () => {
+      const ctx = createMockContext({ errors: eurlex_get_relations.errors });
+      mockQuery.mockImplementation(
+        routeQuery({
+          resolve: [makeResolveBinding(GDPR_WORK_URI)],
+          consolidated: [
+            makeRelationBinding({
+              relatedWork: 'http://publications.europa.eu/resource/cellar/genuine',
+              direction: 'incoming',
+              relatedCelex: '02016R0679-20160504',
+            }),
+          ],
+        }),
+      );
+
+      await eurlex_get_relations.handler(
+        eurlex_get_relations.input.parse({
+          celex_number: '32016R0679',
+          relation_types: ['consolidated_version'],
+        }),
+        ctx,
+      );
+
+      const resolve = mockQuery.mock.calls
+        .map((c) => c[0] as string)
+        .find((q) => q.includes('SELECT ?work WHERE'))!;
+      expect(resolve).toContain('?work cdm:resource_legal_id_celex "32016R0679"^^xsd:string .');
+      expect(mockQuery.mock.calls.map((c) => c[0] as string).join('\n')).not.toMatch(
+        /STR\(\?\w+\)\s*=/,
       );
     });
   });
