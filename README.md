@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.13.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/eur-lex-mcp-server) [![MCP Server](https://img.shields.io/badge/MCP%20Server-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/eur-lex-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/eur-lex-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.13.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/eur-lex-mcp-server) [![MCP Server](https://img.shields.io/badge/MCP%20Server-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/eur-lex-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/eur-lex-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.2-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -64,85 +64,69 @@ All resource data is also reachable via tools.
 
 ### `eurlex_search_documents` <sub>tool</sub>
 
-- Keyword matches English titles via the full-text index, or CELEX substrings — no full-text body search; at least one filter is required
-- `document_type` (`REG`, `DIR`, `DEC`, `TREATY`, `JUDG`, `OPIN_AG`, `PROP`, `REC`) expands to its full CELLAR authority family; `include_consolidated` folds in consolidated texts of that category
-- Date range (`date_from`/`date_to`), EuroVoc concept URI (from `eurlex_browse_subjects`), and author institution filters; `in_force` restricts to acts in force (`true`) or no longer in force (`false`)
-- Corrigenda are excluded by default so primary acts fill the page; `include_corrigenda` re-admits them
-- Pagination via `offset` and `limit` (max 100); each result flags `is_consolidated` and `is_corrigendum`
+- At least one filter: `keyword` (English titles and CELEX substrings, no body search), `document_type` (`REG`, `DIR`, `DEC`, `TREATY`, `JUDG`, `OPIN_AG`, `PROP`, `REC`, each its full CELLAR authority family), `date_from`/`date_to`, `eurovoc_concept` (from `eurlex_browse_subjects`), `author_institution`, or `in_force` (`true`/`false`)
+- Pages of up to 100 via `offset`/`limit`, newest first with the CELEX breaking date ties, so a page is the same on every call; each row flags `is_consolidated` and `is_corrigendum`, and corrigenda join only under `include_corrigenda`, consolidated texts of a `document_type` only under `include_consolidated`
 - Typed errors: `no_filters`, `invalid_date_range`, `no_results`
 
 ---
 
 ### `eurlex_get_document` <sub>tool</sub>
 
-- Accepts exactly one of `celex_number`, `eli_uri`, or `work_uri`
-- Body as `html` (default), `markdown` (server-side converted), or `xml` (Formex4); all 24 EUR-Lex language codes, case-insensitive, defaulting to and falling back to English
-- `content_mode` `"paged"` (default, offset/limit window), `"full"` (first window from zero), or `"metadata_only"`; every body returned in one call caps at 100,000 characters, with `content_chars_total`/`has_more` to page the rest
-- `outline: true` returns chapter/section/article/annex/recital headings with offsets, in Formex XML as well as HTML and Markdown; `select` (e.g. `{ articles: "1,5,17" }`) returns just those sections, under the same cap. Each source character appears once: an article selected alongside the chapter holding it rides inside the chapter's text and adds nothing to the cap. A selection is a set of slices rather than a contiguous window, so `has_more` stays false and `selected_sections` carries each matched section's own `offset`/`chars`, nested ones included — read one on its own with a `paged` call, including when the cap cut its text
-- `resolve: "current_consolidated"` serves the newest consolidated version instead of the requested base act; `is_superseded`/`current_consolidated_celex`/`consolidated_as_of` flag a stale base act either way
-- Typed `content_challenge` error when EUR-Lex returns a WAF bot-challenge instead of text
+- Exactly one of `celex_number`, `eli_uri`, or `work_uri`, served as the work the CELEX resolves to (see `eurlex_lookup_celex`); body as `html` (default), `markdown`, or `xml` (Formex4) in any of the 24 EUR-Lex languages, falling back to English; metadata names `author_institution(s)` and, for case law, `advocates_general`
+- `content_mode` `"paged"` (default), `"full"`, or `"metadata_only"`, every body capped at 100,000 characters per call with `content_chars_total`/`has_more` to page on; `outline: true` lists chapter/section/article/annex/recital headings with offsets, and `select` (e.g. `{ articles: "1,5,17" }`) returns just those sections, each source character once, with `selected_sections` giving each one's own `offset`/`chars` for a `paged` read
+- `resolve: "current_consolidated"` serves the newest consolidated version, and `is_superseded`/`current_consolidated_celex`/`consolidated_as_of` flag a stale base act; typed errors: `invalid_identifier_args`, `not_found`, `content_challenge` (a WAF bot-challenge in place of text)
 
 ---
 
 ### `eurlex_lookup_celex` <sub>tool</sub>
 
-- Accepts a CELEX number, ELI URI, or ECLI; `identifier_type` auto-detects the format or can be set explicitly
-- Returns work URI, confirmed CELEX number, resource type, date, and the ECLI of a case — `found: false` for a well-formed identifier that matches no work
-- An ECLI shared by several records (a judgment and its abstract or extract, a joined AG opinion) resolves to the primary record with the lowest CELEX
-- `ambiguous_identifier` error when auto-detection can't classify the input
+- A CELEX number, ELI URI, or ECLI; `identifier_type` auto-detects the format or sets it, and `ambiguous_identifier` fires when auto-detection can't classify the input
+- Returns work URI, confirmed CELEX number, resource type, date, and the case's ECLI (recorded on any work holding the CELEX); `found: false` for a well-formed identifier that matches no work
+- A CELEX held by several works resolves to the one `owl:sameAs` its `http://publications.europa.eu/resource/celex/{CELEX}` IRI, which EUR-Lex serves the text from, else the lowest work URI, and every CELEX-taking tool and resource resolves the same way; an ECLI shared by several records resolves to the primary record with the lowest CELEX
 
 ---
 
 ### `eurlex_get_cases` <sub>tool</sub>
 
-- Filters: `case_number`, `court` (`CJEU` or `GC`), `case_type` (`judgment`, `order`, `ag_opinion`), keyword, and date range
-- `case_number` takes `C-131/12`, `T-22/20`, or `F-12/05`, the `Case C-97/23 P.` reference form with any procedural suffix, and pre-1989 numbers like `26/62`; it reaches every judgment, order, and AG opinion filed under the number. One case per value: a joined list like `C-131/12 and C-132/12` is rejected
-- `court` selects by the CELEX court letter, so every primary record a court filed is reachable, whatever its document letter
-- Primary records only by default — judicial information notices, abstracts, summaries, and corrigenda excluded; `include_derivative` includes them
-- Each case carries its ECLI (`ECLI:EU:C:2014:317`) where CELLAR records one; party names, subject matter, and case reference are parsed from the raw CELLAR title into `display_title`, `parties`, `subject_matter`, `case_reference`
-- Pagination via `offset` and `limit` (max 100)
+- Filters: `case_number` (one case per value — `C-131/12`, `T-22/20`, `F-12/05`, or a pre-1989 `26/62` — reaching every judgment, order, and AG opinion filed under it), `court` (`CJEU` or `GC`, by CELEX court letter), `case_type` (`judgment`, `order`, `ag_opinion`), `keyword`, and `date_from`/`date_to`; primary records only unless `include_derivative` adds notices, abstracts, summaries, and corrigenda
+- Pages of up to 100 via `offset`/`limit`, newest first with the CELEX breaking date ties, so a page is the same on every call; each case carries its ECLI where CELLAR records one, plus `display_title`, `parties`, `subject_matter`, and `case_reference` parsed from the CELLAR title
 - Typed errors: `invalid_case_number`, `invalid_date_range`, `no_results`
 
 ---
 
 ### `eurlex_get_relations` <sub>tool</sub>
 
-- Accepts exactly one of `celex_number` or `work_uri`
-- `relation_types` filters to a subset of `cites`, `amends`, `amended_by`, `repeals`, `repealed_by`, `implicitly_repeals`, `implicitly_repealed_by`, `legal_basis`, `consolidated_version`, `national_transposition`; omit for all
-- One-hop only, paginated per relation type and direction via `offset`/`limit` (max 100, default 100)
-- Each relation carries `relation_type`, `direction` (`outgoing`/`incoming`), `related_work_uri`, and `related_celex_number` when known; `national_transposition` rows add `related_member_state`, the ISO 3166-1 alpha-3 code of the member state behind the measure (`GBR` for the United Kingdom)
-- `empty_relation_types` distinguishes "no edges of this type" from "edges paged out of this window"; `no_relations` fires only when the first page is empty
+- Exactly one of `celex_number` or `work_uri`; `relation_types` narrows to any of `cites`, `amends`, `amended_by`, `repeals`, `repealed_by`, `implicitly_repeals`, `implicitly_repealed_by`, `legal_basis`, `consolidated_version`, `national_transposition` (omit for all)
+- One hop, paged per relation type and direction via `offset`/`limit` (max 100, default 100), newest first with the work URI breaking ties, so a page is the same on every call; undated works come last
+- Each relation carries `relation_type`, `direction` (`outgoing`/`incoming`), `related_work_uri`, `related_celex_number` when known, and on `national_transposition` rows `related_member_state` (ISO 3166-1 alpha-3, `GBR` for the United Kingdom); `empty_relation_types` separates "no edges of this type" from "paged out", and typed errors are `invalid_identifier_args`, `not_found`, and `no_relations` (an empty first page)
 
 ---
 
 ### `eurlex_browse_subjects` <sub>tool</sub>
 
-- Matches both preferred and alternative (non-preferred) EuroVoc labels, so a common synonym resolves to the concept it stands for
-- Returns concept URI, preferred label, code, broader (parent) label, and the alternative label that matched when one did
-- Supports all EU official languages via `language`; defaults to English
-- Pagination via `offset` and `limit` (max 50)
+- Matches preferred and alternative EuroVoc labels, so a common synonym resolves to its concept, in any EU official `language` (default English); `offset`/`limit` pagination (max 50)
+- Returns concept URI, preferred label, code, broader (parent) label, and the alternative label that matched when one did; `no_concepts` when nothing matches
 
 ---
 
 ### `eurlex_query_sparql` <sub>tool</sub>
 
-- Read-only SELECT only — update forms and ASK/CONSTRUCT/DESCRIBE are rejected before execution
-- `cdm:`, `skos:`, and `xsd:` prefixes are auto-injected; results capped at 100 rows
-- Optional `timeout_hint` (1000–55000 ms); the Virtuoso endpoint enforces a 60-second hard limit
+- Read-only SELECT only — update forms and ASK/CONSTRUCT/DESCRIBE are rejected before execution; `cdm:`, `skos:`, and `xsd:` prefixes are auto-injected
+- Results capped at 100 rows; optional `timeout_hint` (1000–55000 ms) under the endpoint's 60-second hard limit
 - Typed errors: `not_read_only`, `sparql_error`, `sparql_timeout`
 
 ---
 
 ### `eurlex://document/{celexNumber}` <sub>resource</sub>
 
-- Metadata snapshot as `application/json` — resource type, author institution(s), date, title, in-force flag, legal basis, EuroVoc subjects
+- Metadata snapshot as `application/json` — resource type, author institution(s), Advocates General, date, title, in-force flag, legal basis, EuroVoc subjects
 - `celexNumber` comes from `eurlex_search_documents`, `eurlex_get_cases`, or `eurlex_lookup_celex`
 
 ---
 
 ### `eurlex://document/{celexNumber}/relations` <sub>resource</sub>
 
-- One-hop relationship summary — amendment chain, consolidations, national transposition (each measure's `related_member_state` included), legal basis, citations — capped at 25 per relation type
+- One-hop relationship summary — amendment chain, consolidations, national transposition (each measure's `related_member_state` included), legal basis, citations — capped at 25 per relation type and direction, keeping the newest
 - `truncated` plus a `continuation` pointer to `eurlex_get_relations` when more relations exist
 
 ---
@@ -163,7 +147,7 @@ EUR-Lex-specific:
 - No API key required — CELLAR SPARQL and the EUR-Lex REST content endpoints are both publicly accessible
 - SPARQL is POSTed with CDM prefix declarations built in; server-side LIMIT enforcement (max 100) guards against Virtuoso timeouts
 - Act text is fetched via CELLAR content negotiation (`/resource/celex/{CELEX}`); HTML and Formex4 XML pass through, Markdown is converted server-side
-- Virtuoso errors (HTTP 200 with a `Virtuoso 37000 Error` body) are classified and re-raised as `ServiceUnavailable` or `InvalidParams`
+- Virtuoso errors (HTTP 200 with a `Virtuoso 37000 Error` body) are classified and re-raised as `ServiceUnavailable` or `ValidationError`
 - Automatic English fallback when a requested translation is unavailable, with requested/effective language reported
 
 Agent-friendly output:

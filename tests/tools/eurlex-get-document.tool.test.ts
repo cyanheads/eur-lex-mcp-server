@@ -9,6 +9,16 @@ import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mc
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_get_document } from '@/mcp-server/tools/definitions/eurlex-get-document.tool.js';
 import { EURLEX_LANGUAGES } from '@/services/eurlex-content/eurlex-content-service.js';
+import {
+  addressedWorks,
+  agentRows,
+  CELLAR,
+  canonicalWork,
+  celexWorkRows,
+  fixtureWork,
+  isResolutionQuery,
+  resolutionRows,
+} from '../fixtures/cellar-works.js';
 
 // --- Service mocks ---
 const mockSparqlQuery = vi.fn();
@@ -148,6 +158,7 @@ describe('eurlex_get_document', () => {
       eurovoc?: Record<string, { type: string; value: string }>[];
     }) =>
       mockSparqlQuery.mockImplementation(async (sparql: string) => {
+        if (isResolutionQuery(sparql)) return resolutionRows(sparql);
         if (sparql.includes('cdm:resource_legal_based_on_resource_legal'))
           return rows.legalBasis ?? [];
         if (sparql.includes('cdm:work_is_about_concept_eurovoc')) return rows.eurovoc ?? [];
@@ -413,7 +424,9 @@ describe('eurlex_get_document', () => {
 
     // Title from the English expression is surfaced.
     expect(result.title).toBe('General Data Protection Regulation');
-    const sparql = mockSparqlQuery.mock.calls[0]?.[0] as string;
+    const sparql = mockSparqlQuery.mock.calls
+      .map((c) => c[0] as string)
+      .find((q) => q.includes('cdm:expression_title')) as string;
     expect(sparql).toContain('cdm:expression_belongs_to_work');
     expect(sparql).toContain('cdm:expression_title');
     // Obsolete work-level pattern must be gone.
@@ -1193,7 +1206,10 @@ describe('eurlex_get_document', () => {
     ].join('\n');
 
     const mockBody = (content: string) => {
-      mockSparqlQuery.mockResolvedValue([makeMetaBinding({ celex: '32016R0679' })]);
+      // Every requested CELEX resolves to one work; the metadata rows are shared.
+      mockSparqlQuery.mockImplementation(async (q: string) =>
+        isResolutionQuery(q) ? resolutionRows(q) : [makeMetaBinding({ celex: '32016R0679' })],
+      );
       mockFetchContent.mockResolvedValue({
         content,
         contentAvailable: true,
@@ -1517,12 +1533,17 @@ describe('eurlex_get_document', () => {
     const row = (field: string, value: string): SparqlRows[number] => ({
       [field]: { type: 'uri', value },
     });
+    /** An agent-query row for a `cdm:work_created_by_agent` value. */
+    const creator = (value: string): SparqlRows[number] => ({
+      agent: { type: 'uri', value },
+      role: { type: 'literal', value: 'creator' },
+    });
 
     /**
-     * Route the shared SPARQL mock by query content. The handler now issues a core
-     * metadata query plus one query per multi-valued dimension (#33), a work_uri
-     * deref (#34), and a consolidation probe (#29), so a single blanket return can't
-     * exercise them independently.
+     * Route the shared SPARQL mock by query content. The handler issues a CELEX
+     * resolution (#97), a core metadata query plus one query per multi-valued
+     * dimension (#33), a work_uri deref (#34), and a consolidation probe (#29), so a
+     * single blanket return can't exercise them independently.
      */
     const routeSparql = (routes: {
       eli?: SparqlRows;
@@ -1534,6 +1555,7 @@ describe('eurlex_get_document', () => {
       consolidation?: SparqlRows;
     }) => {
       mockSparqlQuery.mockImplementation((query: string) => {
+        if (isResolutionQuery(query)) return Promise.resolve(resolutionRows(query));
         if (query.includes('cdm:resource_legal_eli')) return Promise.resolve(routes.eli ?? []);
         if (query.includes('cdm:act_consolidated_consolidates_resource_legal'))
           return Promise.resolve(routes.consolidation ?? []);
@@ -1555,7 +1577,7 @@ describe('eurlex_get_document', () => {
       const ctx = createMockContext({ errors: eurlex_get_document.errors });
       routeSparql({
         core: [makeMetaBinding({ celex: '32016R0679', title: 'GDPR' })],
-        author: [row('author', `${CB}/EP`), row('author', `${CB}/CONSIL`)],
+        author: [creator(`${CB}/EP`), creator(`${CB}/CONSIL`)],
       });
 
       const input = eurlex_get_document.input.parse({
@@ -1587,7 +1609,7 @@ describe('eurlex_get_document', () => {
     ])('#95: %s names its author %s as "%s" in both channels', async (celex, code, name) => {
       routeSparql({
         core: [makeMetaBinding({ celex, title: 'Case-law work' })],
-        author: [row('author', `${CB}/${code}`)],
+        author: [creator(`${CB}/${code}`)],
       });
 
       const result = await runToolContract(eurlex_get_document, {
@@ -1612,7 +1634,7 @@ describe('eurlex_get_document', () => {
       const eurovoc = Array.from({ length: 8 }, (_, i) => row('eurovoc', `http://eurovoc/${i}`));
       routeSparql({
         core: [makeMetaBinding({ celex: '32006R1907', title: 'REACH' })],
-        author: [row('author', `${CB}/EP`), row('author', `${CB}/CONSIL`)],
+        author: [creator(`${CB}/EP`), creator(`${CB}/CONSIL`)],
         legalBasis: [row('legalBasis', 'http://lb/1'), row('legalBasis', 'http://lb/2')],
         eurovoc,
       });
@@ -1772,11 +1794,8 @@ describe('eurlex_get_document', () => {
             { consolidatedCelex: { type: 'literal', value: '02014R0833-20260424' } },
           ]);
         }
-        if (query.includes('cdm:expression_belongs_to_work')) {
-          // Core metadata keys off the served CELEX (the FILTER literal).
-          const celex = /"([^"]+)"/.exec(query)?.[1] ?? '';
-          return Promise.resolve([makeMetaBinding({ celex })]);
-        }
+        // Metadata keys off the served CELEX, resolved to its work.
+        if (isResolutionQuery(query)) return Promise.resolve(resolutionRows(query));
         return Promise.resolve([]);
       });
       mockFetchContent.mockResolvedValue({
@@ -1793,6 +1812,7 @@ describe('eurlex_get_document', () => {
       const result = await eurlex_get_document.handler(input, ctx);
 
       expect(result.celex_number).toBe('02014R0833-20260424'); // served consolidated
+      expect(result.work_uri).toBe(`${CELLAR}02014R0833-20260424`); // its resolved work
       expect(result.requested_celex).toBe('32014R0833'); // original echoed
       expect(result.is_superseded).toBe(true);
       expect(result.current_consolidated_celex).toBe('02014R0833-20260424');
@@ -1946,13 +1966,16 @@ describe('eurlex_get_document', () => {
   describe('typed CELEX triple (#92)', () => {
     /**
      * CELLAR types every `cdm:resource_legal_id_celex` literal as `xsd:string`, so
-     * the typed exact triple resolves from the index while `FILTER(STR(?c) = "…")`
-     * scans. Every query keyed on the caller's CELEX — the metadata core, the three
-     * dimension queries, and the consolidation-staleness lookup — takes the typed form.
+     * the typed literal resolves from the index while `FILTER(STR(?c) = "…")` scans.
+     * The CELEX reaches CELLAR typed in the two queries keyed on it — the resolution
+     * to its work (#97) and the consolidation-staleness lookup — and every metadata
+     * query keys on the resolved work's IRI instead.
      */
-    it('binds the CELEX as a typed exact triple in every CELEX-keyed query', async () => {
+    it('types the CELEX where it is the key and keys the metadata on the resolved work', async () => {
       const ctx = createMockContext({ errors: eurlex_get_document.errors });
-      mockSparqlQuery.mockResolvedValue([makeMetaBinding({ celex: '32016R0679' })]);
+      mockSparqlQuery.mockImplementation(async (q: string) =>
+        isResolutionQuery(q) ? resolutionRows(q) : [makeMetaBinding({ celex: '32016R0679' })],
+      );
 
       const input = eurlex_get_document.input.parse({
         celex_number: '32016R0679',
@@ -1962,26 +1985,28 @@ describe('eurlex_get_document', () => {
 
       const queries = mockSparqlQuery.mock.calls.map((c) => c[0] as string);
       const keyed = queries.filter((q) => q.includes('"32016R0679"'));
-      expect(keyed).toHaveLength(5);
-      for (const q of keyed) {
-        expect(q).toContain('cdm:resource_legal_id_celex "32016R0679"^^xsd:string .');
-        expect(q).not.toMatch(/STR\(\?\w+\)\s*=/);
-      }
-      expect(keyed.some((q) => q.includes('act_consolidated_consolidates'))).toBe(true);
-      // The confirmed CELEX is still projected by the core query.
-      expect(keyed.some((q) => q.includes('BIND("32016R0679"^^xsd:string AS ?celexNumber)'))).toBe(
-        true,
+      expect(keyed).toHaveLength(2);
+      expect(keyed.find(isResolutionQuery)).toContain(
+        'VALUES ?celexNumber { "32016R0679"^^xsd:string }',
       );
+      expect(keyed.find((q) => q.includes('act_consolidated_consolidates'))).toContain(
+        'cdm:resource_legal_id_celex "32016R0679"^^xsd:string .',
+      );
+      const byWork = queries.filter((q) => q.includes(`<${CELLAR}32016R0679>`));
+      expect(byWork).toHaveLength(4);
+      expect(queries.join('\n')).not.toMatch(/STR\(\?\w+\)\s*=/);
       expect(result.celex_number).toBe('32016R0679');
+      expect(result.work_uri).toBe(`${CELLAR}32016R0679`);
     });
 
     it('types both the requested and the served CELEX on the resolve "current_consolidated" path', async () => {
       const ctx = createMockContext({ errors: eurlex_get_document.errors });
-      mockSparqlQuery.mockImplementation(async (q: string) =>
-        q.includes('act_consolidated_consolidates')
-          ? [{ consolidatedCelex: { type: 'literal', value: '02016R0679-20160504' } }]
-          : [makeMetaBinding({ celex: '02016R0679-20160504' })],
-      );
+      mockSparqlQuery.mockImplementation(async (q: string) => {
+        if (q.includes('act_consolidated_consolidates')) {
+          return [{ consolidatedCelex: { type: 'literal', value: '02016R0679-20160504' } }];
+        }
+        return isResolutionQuery(q) ? resolutionRows(q) : [];
+      });
 
       const input = eurlex_get_document.input.parse({
         celex_number: '32016R0679',
@@ -1992,11 +2017,10 @@ describe('eurlex_get_document', () => {
 
       const queries = mockSparqlQuery.mock.calls.map((c) => c[0] as string);
       expect(queries[0]).toContain('cdm:resource_legal_id_celex "32016R0679"^^xsd:string .');
-      const served = queries.filter((q) => q.includes('"02016R0679-20160504"'));
-      expect(served).toHaveLength(4);
-      for (const q of served) {
-        expect(q).toContain('cdm:resource_legal_id_celex "02016R0679-20160504"^^xsd:string .');
-      }
+      expect(queries.find(isResolutionQuery)).toContain(
+        'VALUES ?celexNumber { "02016R0679-20160504"^^xsd:string }',
+      );
+      expect(queries.filter((q) => q.includes(`<${CELLAR}02016R0679-20160504>`))).toHaveLength(4);
       expect(queries.join('\n')).not.toMatch(/STR\(\?\w+\)\s*=/);
     });
   });
@@ -2086,8 +2110,146 @@ describe('eurlex_get_document', () => {
 
       expect(result.celex_number).toBe('32016R0679');
       expect(mockSparqlQuery.mock.calls[0]?.[0] as string).toContain(
-        'cdm:resource_legal_id_celex "32016R0679"^^xsd:string .',
+        'VALUES ?celexNumber { "32016R0679"^^xsd:string }',
       );
+    });
+  });
+
+  // --- #97 / #96: resolved work and its agents, against a CELLAR-shaped fake ---
+
+  describe('fixture works (#97, #96)', () => {
+    type Row = Record<string, { type: string; value: string }>;
+    const uri = (value: string) => ({ type: 'uri', value });
+    const literal = (value: string) => ({ type: 'literal', value });
+    const T181_COPY = fixtureWork('62022TJ0181', 0);
+
+    /** Per-work dimension values: only the canonical work's belong in the output. */
+    const SUBJECTS: Record<string, string> = {
+      [canonicalWork('62022TJ0181')]: 'http://eurovoc.europa.eu/canonical',
+      [T181_COPY]: 'http://eurovoc.europa.eu/copy-only',
+      [fixtureWork('62022TJ0181', 2)]: 'http://eurovoc.europa.eu/alias-only',
+    };
+    const BASES: Record<string, string> = {
+      [canonicalWork('62022TJ0181')]: `${CELLAR}basis-of-canonical`,
+      [T181_COPY]: `${CELLAR}basis-of-copy`,
+    };
+
+    /** Answer every query the handler issues from the fixture works it addresses. */
+    const fakeCellar = async (q: string): Promise<Row[]> => {
+      const works = addressedWorks(q);
+      if (q.includes('SELECT ?celex WHERE')) {
+        return works.map(({ celex }) => ({ celex: literal(celex) }));
+      }
+      if (q.includes('cdm:act_consolidated_consolidates_resource_legal')) return [];
+      if (q.includes('cdm:work_created_by_agent')) return agentRows(q);
+      if (q.includes('cdm:resource_legal_based_on_resource_legal')) {
+        return works.flatMap(({ work }) =>
+          BASES[work.uri] ? [{ legalBasis: uri(BASES[work.uri] as string) }] : [],
+        );
+      }
+      if (q.includes('cdm:work_is_about_concept_eurovoc')) {
+        return works.flatMap(({ work }) =>
+          SUBJECTS[work.uri] ? [{ eurovoc: uri(SUBJECTS[work.uri] as string) }] : [],
+        );
+      }
+      if (q.includes('cdm:expression_belongs_to_work')) {
+        return works.map(({ celex, work }) => ({
+          work: uri(work.uri),
+          celexNumber: literal(celex),
+          title: literal(`${celex} title`),
+        }));
+      }
+      return celexWorkRows(q);
+    };
+
+    const getDocument = (args: Record<string, unknown>) => {
+      mockSparqlQuery.mockImplementation(fakeCellar);
+      return runToolContract(eurlex_get_document, { content_mode: 'metadata_only', ...args });
+    };
+    const textOf = (result: Awaited<ReturnType<typeof getDocument>>) =>
+      result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+
+    it('#97: resolves 62022TJ0181 to its canonical work and reads metadata from that work alone', async () => {
+      const result = await getDocument({ celex_number: '62022TJ0181' });
+
+      const structured = eurlex_get_document.output.parse(result.structuredContent);
+      expect(structured.work_uri).toBe(canonicalWork('62022TJ0181'));
+      expect(structured.eurovoc_subjects).toEqual([
+        { concept_uri: 'http://eurovoc.europa.eu/canonical' },
+      ]);
+      expect(structured.legal_basis).toEqual([{ work_uri: `${CELLAR}basis-of-canonical` }]);
+      expect(textOf(result)).toContain(`**Work URI:** ${canonicalWork('62022TJ0181')}`);
+      expect(textOf(result)).not.toContain('copy-only');
+    });
+
+    it('#97: a work_uri naming a copy serves the canonical work of its CELEX', async () => {
+      const result = await getDocument({ work_uri: T181_COPY });
+
+      const structured = eurlex_get_document.output.parse(result.structuredContent);
+      expect(structured.celex_number).toBe('62022TJ0181');
+      expect(structured.work_uri).toBe(canonicalWork('62022TJ0181'));
+    });
+
+    it('#97: 51988DC0713 resolves to its canonical work, not its sector-5 twin', async () => {
+      const result = await getDocument({ celex_number: '51988DC0713' });
+      expect(eurlex_get_document.output.parse(result.structuredContent).work_uri).toBe(
+        canonicalWork('51988DC0713'),
+      );
+    });
+
+    it('#96: 62012CJ0131 names the court as author and its Advocate General separately', async () => {
+      const result = await getDocument({ celex_number: '62012CJ0131' });
+
+      const structured = eurlex_get_document.output.parse(result.structuredContent);
+      expect(structured.author_institution).toBe('Court of Justice');
+      expect(structured.author_institutions).toEqual(['Court of Justice']);
+      expect(structured.advocates_general).toEqual(['Jääskinen']);
+      const text = textOf(result);
+      expect(text).toContain('**Authors:** Court of Justice');
+      expect(text).toContain('**Advocates General:** Jääskinen');
+      expect(text).not.toContain('233d79cc');
+    });
+
+    it('#96: an AG opinion whose only author is its AG carries no author_institution', async () => {
+      const result = await getDocument({ celex_number: '62024CC0505' });
+
+      const structured = eurlex_get_document.output.parse(result.structuredContent);
+      expect(structured.author_institution).toBeUndefined();
+      expect(structured.author_institutions).toBeUndefined();
+      expect(structured.advocates_general).toEqual(['Biondi']);
+      const text = textOf(result);
+      expect(text).not.toContain('**Author:**');
+      expect(text).toContain('**Advocates General:** Biondi');
+      expect(text).not.toContain('76d5fb73');
+    });
+
+    it('#96: a national-court decision names the court by cdm:court_national_name', async () => {
+      const result = await getDocument({ celex_number: '82003PT1111(51)' });
+
+      const structured = eurlex_get_document.output.parse(result.structuredContent);
+      expect(structured.author_institutions).toEqual(['Supremo Tribunal de Justiça']);
+      expect(structured.author_institution).toBe('Supremo Tribunal de Justiça');
+      expect(structured.advocates_general).toBeUndefined();
+      expect(textOf(result)).not.toContain('06234cad');
+    });
+
+    it('#96: lists every Advocate General of a work with several, in a stable order', async () => {
+      const result = await getDocument({ celex_number: '61983CJ0271' });
+
+      const structured = eurlex_get_document.output.parse(result.structuredContent);
+      expect(structured.advocates_general).toEqual(['Mischo', 'VerLoren van Themaat']);
+      expect(structured.author_institutions).toEqual(['Court of Justice']);
+      expect(textOf(result)).toContain('**Advocates General:** Mischo, VerLoren van Themaat');
+    });
+
+    it('#96: leaves a co-legislated act unchanged and without advocates_general', async () => {
+      const result = await getDocument({ celex_number: '32016R0679' });
+
+      const structured = eurlex_get_document.output.parse(result.structuredContent);
+      expect(structured.author_institution).toBe('Council of the EU');
+      expect(structured.author_institutions).toEqual(['Council of the EU', 'European Parliament']);
+      expect(structured).not.toHaveProperty('advocates_general');
+      expect(textOf(result)).not.toContain('Advocates General');
     });
   });
 });

@@ -7,6 +7,16 @@ import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_document_resource } from '@/mcp-server/resources/definitions/eurlex-document.resource.js';
 import { escapeSparqlLiteral } from '@/services/cellar-sparql/eli-resolution.js';
+import {
+  addressedWorks,
+  agentRows,
+  CELLAR,
+  canonicalWork,
+  celexWorkRows,
+  fixtureWork,
+  isResolutionQuery,
+  resolutionRows,
+} from '../fixtures/cellar-works.js';
 
 // --- Service mock ---
 const mockQuery = vi.fn();
@@ -31,7 +41,6 @@ function makeMetaBinding(opts: {
   date?: string;
   title?: string;
   inForce?: string;
-  author?: string;
 }): Record<string, { type: string; value: string }> {
   const b: Record<string, { type: string; value: string }> = {
     celexNumber: { type: 'literal', value: opts.celex },
@@ -44,8 +53,29 @@ function makeMetaBinding(opts: {
   if (opts.date) b.date = { type: 'literal', value: opts.date };
   if (opts.title) b.title = { type: 'literal', value: opts.title };
   if (opts.inForce !== undefined) b.inForce = { type: 'literal', value: opts.inForce };
-  if (opts.author) b.author = { type: 'uri', value: opts.author };
   return b;
+}
+
+/**
+ * Resolve every CELEX to one work, return `creators` from the agent query, and a
+ * Regulation-typed row from every other query.
+ */
+function mockAgents(creators: string[]): void {
+  mockQuery.mockImplementation(async (sparql: string) => {
+    if (isResolutionQuery(sparql)) return resolutionRows(sparql);
+    if (sparql.includes('cdm:work_created_by_agent')) {
+      return creators.map((value) => ({
+        agent: { type: 'uri', value },
+        role: { type: 'literal', value: 'creator' },
+      }));
+    }
+    return [
+      makeMetaBinding({
+        celex: 'unused',
+        type: 'http://publications.europa.eu/resource/authority/resource-type/REG',
+      }),
+    ];
+  });
 }
 
 describe('eurlex_document_resource', () => {
@@ -124,7 +154,7 @@ describe('eurlex_document_resource', () => {
   it('omits legal_basis and eurovoc_subjects when the work records neither', async () => {
     const ctx = createMockContext({ tenantId: 'test-tenant' });
     mockQuery.mockImplementation(async (sparql: string) =>
-      sparql.includes('SELECT ?work ') ? [makeMetaBinding({ celex: '12012E016' })] : [],
+      isResolutionQuery(sparql) ? resolutionRows(sparql) : [],
     );
 
     const params = eurlex_document_resource.params!.parse({ celexNumber: '12012E016' });
@@ -139,20 +169,9 @@ describe('eurlex_document_resource', () => {
   it('resolves resource_type and author URIs to labels, matching eurlex_get_document', async () => {
     const ctx = createMockContext({ tenantId: 'test-tenant' });
     const CB = 'http://publications.europa.eu/resource/authority/corporate-body';
-    // A co-legislated act: the metadata query returns one row per author. CONSIL
-    // is first, so it is the primary — matching the tool's output for GDPR.
-    mockQuery.mockResolvedValue([
-      makeMetaBinding({
-        celex: '32016R0679',
-        type: 'http://publications.europa.eu/resource/authority/resource-type/REG',
-        author: `${CB}/CONSIL`,
-      }),
-      makeMetaBinding({
-        celex: '32016R0679',
-        type: 'http://publications.europa.eu/resource/authority/resource-type/REG',
-        author: `${CB}/EP`,
-      }),
-    ]);
+    // A co-legislated act: the agent query returns one row per author. CONSIL is
+    // first, so it is the primary — matching the tool's output for GDPR.
+    mockAgents([`${CB}/CONSIL`, `${CB}/EP`]);
 
     const params = eurlex_document_resource.params!.parse({ celexNumber: '32016R0679' });
     const result = (await eurlex_document_resource.handler(params, ctx)) as Record<string, unknown>;
@@ -169,13 +188,7 @@ describe('eurlex_document_resource', () => {
   it('surfaces a single author as both the primary and the one-element institutions list', async () => {
     const ctx = createMockContext({ tenantId: 'test-tenant' });
     const CB = 'http://publications.europa.eu/resource/authority/corporate-body';
-    mockQuery.mockResolvedValue([
-      makeMetaBinding({
-        celex: '32024R2822',
-        type: 'http://publications.europa.eu/resource/authority/resource-type/REG',
-        author: `${CB}/COM`,
-      }),
-    ]);
+    mockAgents([`${CB}/COM`]);
 
     const params = eurlex_document_resource.params!.parse({ celexNumber: '32024R2822' });
     const result = (await eurlex_document_resource.handler(params, ctx)) as Record<string, unknown>;
@@ -231,7 +244,9 @@ describe('eurlex_document_resource', () => {
     const result = await eurlex_document_resource.handler(params, ctx);
 
     expect((result as Record<string, unknown>).title).toBe('General Data Protection Regulation');
-    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    const sparql = mockQuery.mock.calls
+      .map((c) => c[0] as string)
+      .find((q) => q.includes('cdm:expression_title')) as string;
     expect(sparql).toContain('cdm:expression_belongs_to_work');
     expect(sparql).toContain('cdm:expression_title');
     expect(sparql).not.toContain('cdm:work_title');
@@ -271,7 +286,7 @@ describe('eurlex_document_resource', () => {
     const sparql = mockQuery.mock.calls[0]?.[0] as string;
     // The literal carries exactly what the shared helper produces.
     expect(sparql).toContain(
-      `cdm:resource_legal_id_celex "${escapeSparqlLiteral(celexNumber)}"^^xsd:string .`,
+      `VALUES ?celexNumber { "${escapeSparqlLiteral(celexNumber)}"^^xsd:string }`,
     );
     // The unterminated form the quote-only pass produced is gone.
     expect(sparql).not.toContain(String.raw`"32016R0679\"^^`);
@@ -289,7 +304,7 @@ describe('eurlex_document_resource', () => {
 
     const sparql = mockQuery.mock.calls[0]?.[0] as string;
     expect(sparql).toContain(
-      `cdm:resource_legal_id_celex "${escapeSparqlLiteral(celexNumber)}"^^xsd:string .`,
+      `VALUES ?celexNumber { "${escapeSparqlLiteral(celexNumber)}"^^xsd:string }`,
     );
     // Every backslash and quote from the input is escaped, so the only unescaped
     // double quotes in the literal are its own delimiters.
@@ -305,26 +320,31 @@ describe('eurlex_document_resource', () => {
 
     const sparql = mockQuery.mock.calls[0]?.[0] as string;
     // No regression for the overwhelmingly common input: escaping is a no-op.
-    expect(sparql).toContain('cdm:resource_legal_id_celex "32016R0679"^^xsd:string .');
+    expect(sparql).toContain('VALUES ?celexNumber { "32016R0679"^^xsd:string }');
   });
 
-  // --- #92: typed exact CELEX triple ---
+  // --- #92 / #97: the typed CELEX resolves once; metadata keys on the work ---
 
-  it('binds the CELEX as a typed exact triple in the metadata and both dimension queries (#92)', async () => {
+  it('types the CELEX in the resolution and keys all four metadata queries on the resolved work', async () => {
     const ctx = createMockContext({ tenantId: 'test-tenant' });
-    mockQuery.mockResolvedValue([makeMetaBinding({ celex: '62012CJ0131' })]);
+    mockQuery.mockImplementation(async (q: string) =>
+      isResolutionQuery(q) ? resolutionRows(q) : [makeMetaBinding({ celex: '62012CJ0131' })],
+    );
 
     const params = eurlex_document_resource.params!.parse({ celexNumber: '62012CJ0131' });
     const result = (await eurlex_document_resource.handler(params, ctx)) as Record<string, unknown>;
 
     const queries = mockQuery.mock.calls.map((c) => c[0] as string);
-    expect(queries).toHaveLength(3);
-    for (const q of queries) {
-      expect(q).toContain('cdm:resource_legal_id_celex "62012CJ0131"^^xsd:string .');
-      expect(q).not.toMatch(/STR\(\?\w+\)\s*=/);
+    expect(queries).toHaveLength(5);
+    expect(queries[0]).toContain('VALUES ?celexNumber { "62012CJ0131"^^xsd:string }');
+    const work = `<${CELLAR}62012CJ0131>`;
+    for (const q of queries.slice(1)) {
+      expect(q).toContain(work);
+      expect(q).not.toContain('"62012CJ0131"');
     }
-    expect(queries[0]).toContain('BIND("62012CJ0131"^^xsd:string AS ?celexNumber)');
+    expect(queries.join('\n')).not.toMatch(/STR\(\?\w+\)\s*=/);
     expect(result.celex_number).toBe('62012CJ0131');
+    expect(result.work_uri).toBe(`${CELLAR}62012CJ0131`);
   });
 
   // --- #69: CELEX shape gate on the path parameter ---
@@ -387,8 +407,100 @@ describe('eurlex_document_resource', () => {
       await eurlex_document_resource.handler(params, ctx);
 
       expect(mockQuery.mock.calls[0]?.[0] as string).toContain(
-        'cdm:resource_legal_id_celex "32016R0679"^^xsd:string .',
+        'VALUES ?celexNumber { "32016R0679"^^xsd:string }',
       );
+    });
+  });
+
+  // --- #97 / #96: resolved work and its agents, against a CELLAR-shaped fake ---
+
+  describe('fixture works (#97, #96)', () => {
+    type Row = Record<string, { type: string; value: string }>;
+    const T181_COPY = fixtureWork('62022TJ0181', 0);
+
+    /** Answer every query the handler issues from the fixture works it addresses. */
+    const fakeCellar = async (q: string): Promise<Row[]> => {
+      const works = addressedWorks(q);
+      if (q.includes('cdm:case-law_delivered_by_advocate-general')) return agentRows(q);
+      if (q.includes('cdm:resource_legal_based_on_resource_legal')) return [];
+      if (q.includes('cdm:work_is_about_concept_eurovoc')) {
+        return works.map(({ work }) => ({
+          eurovoc: {
+            type: 'uri',
+            value: work.canonical
+              ? 'http://eurovoc.europa.eu/canonical'
+              : 'http://eurovoc.europa.eu/copy-only',
+          },
+        }));
+      }
+      if (q.includes('cdm:expression_belongs_to_work')) {
+        const authors = q.includes('cdm:work_created_by_agent') ? agentRows(q) : [{}];
+        return works.flatMap(({ celex, work }) =>
+          authors.map((author) => ({
+            work: { type: 'uri', value: work.uri },
+            celexNumber: { type: 'literal', value: celex },
+            ...author,
+          })),
+        );
+      }
+      return celexWorkRows(q);
+    };
+
+    const read = async (celexNumber: string) => {
+      mockQuery.mockImplementation(fakeCellar);
+      const params = eurlex_document_resource.params!.parse({ celexNumber });
+      return (await eurlex_document_resource.handler(
+        params,
+        createMockContext({ tenantId: 'test-tenant' }),
+      )) as Record<string, unknown>;
+    };
+
+    it('#97: resolves 62022TJ0181 to its canonical work and reads its subjects alone', async () => {
+      const result = await read('62022TJ0181');
+
+      expect(result.work_uri).toBe(canonicalWork('62022TJ0181'));
+      expect(result.work_uri).not.toBe(T181_COPY);
+      expect(result.eurovoc_subjects).toEqual([
+        { concept_uri: 'http://eurovoc.europa.eu/canonical' },
+      ]);
+    });
+
+    it('#96: 62012CJ0131 names the court as author and its Advocate General separately', async () => {
+      const result = await read('62012CJ0131');
+
+      expect(result.work_uri).toBe(canonicalWork('62012CJ0131'));
+      expect(result.author_institution).toBe('Court of Justice');
+      expect(result.author_institutions).toEqual(['Court of Justice']);
+      expect(result.advocates_general).toEqual(['Jääskinen']);
+      expect(JSON.stringify(result)).not.toContain('233d79cc');
+    });
+
+    it('#96: an AG-only author leaves no author_institution; the AG is listed', async () => {
+      const result = await read('62024CC0505');
+
+      expect(result).not.toHaveProperty('author_institution');
+      expect(result).not.toHaveProperty('author_institutions');
+      expect(result.advocates_general).toEqual(['Biondi']);
+    });
+
+    it('#96: a national-court decision names the court', async () => {
+      const result = await read('82003PT1111(51)');
+
+      expect(result.author_institutions).toEqual(['Supremo Tribunal de Justiça']);
+      expect(result).not.toHaveProperty('advocates_general');
+    });
+
+    it('#96: lists every Advocate General of a work with several', async () => {
+      const result = await read('61983CJ0271');
+      expect(result.advocates_general).toEqual(['Mischo', 'VerLoren van Themaat']);
+    });
+
+    it('#96: leaves a co-legislated act unchanged and without advocates_general', async () => {
+      const result = await read('32016R0679');
+
+      expect(result.author_institution).toBe('Council of the EU');
+      expect(result.author_institutions).toEqual(['Council of the EU', 'European Parliament']);
+      expect(result).not.toHaveProperty('advocates_general');
     });
   });
 });

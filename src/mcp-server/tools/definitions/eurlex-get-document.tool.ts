@@ -5,18 +5,13 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import {
-  ENG_LANGUAGE_URI,
-  resolveCorporateBodyLabel,
-  resolveResourceTypeLabel,
-} from '@/services/cellar-sparql/cdm-labels.js';
+import { ENG_LANGUAGE_URI, resolveResourceTypeLabel } from '@/services/cellar-sparql/cdm-labels.js';
 import {
   CellarSparqlService,
   getCellarSparqlService,
 } from '@/services/cellar-sparql/cellar-sparql-service.js';
 import {
   CELEX_PATTERN,
-  celexLiteral,
   isSafeSparqlIri,
   resolveEliToWork,
 } from '@/services/cellar-sparql/eli-resolution.js';
@@ -25,6 +20,8 @@ import {
   findCurrentConsolidated,
 } from '@/services/cellar-sparql/relation-traversal.js';
 import type { SparqlBinding } from '@/services/cellar-sparql/types.js';
+import { fetchWorkAgents } from '@/services/cellar-sparql/work-agents.js';
+import { resolveCelexWorks } from '@/services/cellar-sparql/work-resolution.js';
 import {
   type ActHeading,
   extractSections,
@@ -84,7 +81,7 @@ const META_DIMENSION_LIMIT = 100;
 export const eurlex_get_document = tool('eurlex_get_document', {
   title: 'Get EU Document',
   description:
-    'Fetch the metadata and full text of an EU act by CELEX number, ELI URI, or work URI. Returns structured metadata (title, date, type, author institution, legal basis, EuroVoc subjects, in-force status) plus the act body as HTML, Markdown, or Formex4 XML, defaulting to English with automatic fallback. Every body returned in one call is capped at 100,000 characters — paged and full windows page onward with offset/limit; use outline: true for a heading map and select to pull specific articles, chapters, recitals, or annexes, reading a selected section on its own from the offset and chars in selected_sections.',
+    'Fetch the metadata and full text of an EU act by CELEX number, ELI URI, or work URI. Returns structured metadata (title, date, type, author institution, Advocates General, legal basis, EuroVoc subjects, in-force status) plus the act body as HTML, Markdown, or Formex4 XML, defaulting to English with automatic fallback. Every body returned in one call is capped at 100,000 characters — paged and full windows page onward with offset/limit; use outline: true for a heading map and select to pull specific articles, chapters, recitals, or annexes, reading a selected section on its own from the offset and chars in selected_sections.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     celex_number: z
@@ -208,13 +205,19 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .string()
       .optional()
       .describe(
-        'Human-readable name of the primary (first) originating EU institution (e.g. "European Parliament", "Council of the EU"). For co-legislated acts, prefer author_institutions for the complete set. Absent when not recorded.',
+        'Human-readable name of the primary (first) originating institution — an EU institution (e.g. "European Parliament", "Court of Justice"), or for a national-court decision the deciding court (e.g. "Supremo Tribunal de Justiça"). For co-legislated acts, prefer author_institutions for the complete set. Absent when not recorded, and for an AG opinion whose only recorded author is the Advocate General.',
       ),
     author_institutions: z
-      .array(z.string().describe('Human-readable EU institution name.'))
+      .array(z.string().describe('Human-readable institution name.'))
       .optional()
       .describe(
-        'All originating EU institutions, for co-legislated acts adopted by more than one body (e.g. ["European Parliament", "Council of the EU"]). Absent when none recorded.',
+        'All originating institutions, for acts adopted by more than one body (e.g. ["European Parliament", "Council of the EU"]). Institutions only: an Advocate General appears in advocates_general. Absent when none recorded.',
+      ),
+    advocates_general: z
+      .array(z.string().describe('Advocate General surname, as CELLAR records it.'))
+      .optional()
+      .describe(
+        'Advocates General who delivered this case-law record, by surname as CELLAR records it (e.g. ["Jääskinen"]), sorted. A few Opinions of the Court list several. Absent for legislation and for case law with none recorded.',
       ),
     legal_basis: z
       .array(
@@ -467,7 +470,9 @@ export const eurlex_get_document = tool('eurlex_get_document', {
     // the shared #5 resolution (cdm:resource_legal_eli exact-match + bare-work /oj
     // retry); a work_uri (the form eurlex_lookup_celex / get_relations / search
     // emit) is dereferenced by cdm:resource_legal_id_celex. Every path lands on a
-    // CELEX, which keys the rest of the flow.
+    // CELEX, which keys the rest of the flow: the metadata comes from the work that
+    // CELEX resolves to, so a work_uri naming a copy is served as the CELEX's
+    // canonical work, the same work the body is fetched from (#97).
     const celexInput = input.celex_number?.trim();
     const eliInput = input.eli_uri?.trim();
     const workUriInput = input.work_uri?.trim();
@@ -526,66 +531,48 @@ export const eurlex_get_document = tool('eurlex_get_document', {
     // relation-traversal.ts runs one per relation type); the core query carries the
     // single-valued fields. No dimension can truncate another.
     //
-    // Every query binds the CELEX as a typed exact triple (#92): CELLAR types the
-    // literal xsd:string, so the triple resolves from the index where a STR()
-    // equality filter scans.
+    // The CELEX resolves to one work first (#97): CELLAR holds some CELEX numbers
+    // under several works, and a CELEX-keyed join would read the union of all of
+    // them. Every metadata query then keys on the resolved work's IRI.
     const fetchMetadata = async (celex: string) => {
-      const typedCelex = celexLiteral(celex);
+      const workUri = (await resolveCelexWorks(sparqlSvc, [celex], ctx)).get(celex);
+      if (!workUri) return null;
       const coreQuery = `
-SELECT ?work ?celexNumber ?type ?date ?title ?inForce WHERE {
-  ?work cdm:resource_legal_id_celex ${typedCelex} .
-  BIND(${typedCelex} AS ?celexNumber)
-  OPTIONAL { ?work cdm:work_has_resource-type ?type . }
-  OPTIONAL { ?work cdm:work_date_document ?date . }
+SELECT ?type ?date ?title ?inForce WHERE {
+  OPTIONAL { <${workUri}> cdm:work_has_resource-type ?type . }
+  OPTIONAL { <${workUri}> cdm:work_date_document ?date . }
   OPTIONAL {
-    ?expr cdm:expression_belongs_to_work ?work .
+    ?expr cdm:expression_belongs_to_work <${workUri}> .
     ?expr cdm:expression_uses_language <${ENG_LANGUAGE_URI}> .
     ?expr cdm:expression_title ?title .
   }
-  OPTIONAL { ?work cdm:resource_legal_in-force ?inForce . }
+  OPTIONAL { <${workUri}> cdm:resource_legal_in-force ?inForce . }
 } LIMIT 5`;
-      const dimensionQuery = (predicate: string, variable: string) => `
-SELECT ?${variable} WHERE {
-  ?work cdm:resource_legal_id_celex ${typedCelex} .
-  ?work ${predicate} ?${variable} .
-} LIMIT ${META_DIMENSION_LIMIT}`;
       // Legal bases and EuroVoc subjects resolve inline (#67): each dimension
       // query joins the identifying literal (CELEX / language-filtered
       // skos:prefLabel) as an OPTIONAL and groups per URI, so the label rides the
       // same round trip and a URI with no label still yields its row.
       const legalBasisQuery = `
 SELECT ?legalBasis (SAMPLE(?celexValue) AS ?celex) WHERE {
-  ?work cdm:resource_legal_id_celex ${typedCelex} .
-  ?work cdm:resource_legal_based_on_resource_legal ?legalBasis .
+  <${workUri}> cdm:resource_legal_based_on_resource_legal ?legalBasis .
   OPTIONAL { ?legalBasis cdm:resource_legal_id_celex ?celexValue . }
 } GROUP BY ?legalBasis LIMIT ${META_DIMENSION_LIMIT}`;
       const eurovocQuery = `
 SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
-  ?work cdm:resource_legal_id_celex ${typedCelex} .
-  ?work cdm:work_is_about_concept_eurovoc ?eurovoc .
+  <${workUri}> cdm:work_is_about_concept_eurovoc ?eurovoc .
   OPTIONAL {
     ?eurovoc skos:prefLabel ?labelValue .
     FILTER(LANG(?labelValue) = "${language.toLowerCase()}")
   }
 } GROUP BY ?eurovoc LIMIT ${META_DIMENSION_LIMIT}`;
 
-      const [coreBindings, authorBindings, legalBasisBindings, eurovocBindings] = await Promise.all(
-        [
-          sparqlSvc.query(coreQuery, ctx),
-          sparqlSvc.query(dimensionQuery('cdm:work_created_by_agent', 'author'), ctx),
-          sparqlSvc.query(legalBasisQuery, ctx),
-          sparqlSvc.query(eurovocQuery, ctx),
-        ],
-      );
+      const [coreBindings, agents, legalBasisBindings, eurovocBindings] = await Promise.all([
+        sparqlSvc.query(coreQuery, ctx),
+        fetchWorkAgents(sparqlSvc, workUri, ctx),
+        sparqlSvc.query(legalBasisQuery, ctx),
+        sparqlSvc.query(eurovocQuery, ctx),
+      ]);
 
-      const collect = (bindings: SparqlBinding[], variable: string): string[] => {
-        const set = new Set<string>();
-        for (const b of bindings) {
-          const v = CellarSparqlService.bindingValue(b, variable);
-          if (v) set.add(v);
-        }
-        return [...set];
-      };
       /** One entry per distinct URI, carrying the companion literal when bound. */
       const collectResolved = (
         bindings: SparqlBinding[],
@@ -604,16 +591,14 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
 
       const first = coreBindings[0];
       return {
-        found: Boolean(first),
-        workUri: CellarSparqlService.bindingValue(first, 'work'),
-        confirmedCelex: CellarSparqlService.bindingValue(first, 'celexNumber') ?? celex,
+        workUri,
         resourceType: CellarSparqlService.bindingValue(first, 'type'),
         date: CellarSparqlService.bindingValue(first, 'date'),
         title: CellarSparqlService.bindingValue(first, 'title'),
         inForce: CellarSparqlService.parseBoolean(
           CellarSparqlService.bindingValue(first, 'inForce'),
         ),
-        authorUris: collect(authorBindings, 'author'),
+        agents,
         legalBases: collectResolved(legalBasisBindings, 'legalBasis', 'celex').map(
           ({ uri, literal }) => ({ work_uri: uri, ...(literal ? { celex_number: literal } : {}) }),
         ),
@@ -659,7 +644,7 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
       superseded: Boolean(staleness),
     });
 
-    if (!metaResult.found) {
+    if (!metaResult) {
       throw ctx.fail('not_found', `No CELLAR work found for CELEX: ${servedCelex}`, {
         ...ctx.recoveryFor('not_found'),
       });
@@ -681,6 +666,7 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
       resource_type?: string;
       author_institution?: string;
       author_institutions?: string[];
+      advocates_general?: string[];
       legal_basis?: { work_uri: string; celex_number?: string }[];
       eurovoc_subjects?: { concept_uri: string; label?: string }[];
       in_force?: boolean;
@@ -705,7 +691,7 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
       selected_sections?: SelectedSection[];
       structure_detected?: boolean;
     } = {
-      celex_number: metaResult.confirmedCelex,
+      celex_number: servedCelex,
       content_mode: input.content_mode,
       content_available: false,
       content_status: input.content_mode === 'metadata_only' ? 'not_requested' : 'unavailable',
@@ -714,22 +700,22 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
       content_format: format,
     };
 
-    if (metaResult.workUri) result.work_uri = metaResult.workUri;
+    result.work_uri = metaResult.workUri;
     if (metaResult.title) result.title = metaResult.title;
     if (metaResult.date) result.date = metaResult.date;
     if (metaResult.resourceType) {
       result.resource_type = resolveResourceTypeLabel(metaResult.resourceType);
     }
     // #33: surface every author. author_institution stays the primary (first) for
-    // back-compat; author_institutions carries the full set (labels deduped, since
-    // distinct URIs like EMA/EMEA share a label).
-    if (metaResult.authorUris.length > 0) {
-      const institutions = [...new Set(metaResult.authorUris.map(resolveCorporateBodyLabel))];
-      const [primary] = institutions;
-      if (primary) {
-        result.author_institution = primary;
-        result.author_institutions = institutions;
-      }
+    // back-compat; author_institutions carries the full set. Advocates General are
+    // people, not institutions, so they get their own field (#96).
+    const [primaryInstitution] = metaResult.agents.institutions;
+    if (primaryInstitution) {
+      result.author_institution = primaryInstitution;
+      result.author_institutions = metaResult.agents.institutions;
+    }
+    if (metaResult.agents.advocatesGeneral.length > 0) {
+      result.advocates_general = metaResult.agents.advocatesGeneral;
     }
     if (metaResult.legalBases.length > 0) result.legal_basis = metaResult.legalBases;
     if (metaResult.eurovoc.length > 0) result.eurovoc_subjects = metaResult.eurovoc;
@@ -859,6 +845,9 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
     if (result.author_institution) lines.push(`**Author:** ${result.author_institution}`);
     if (result.author_institutions && result.author_institutions.length > 0) {
       lines.push(`**Authors:** ${result.author_institutions.join(', ')}`);
+    }
+    if (result.advocates_general && result.advocates_general.length > 0) {
+      lines.push(`**Advocates General:** ${result.advocates_general.join(', ')}`);
     }
     if (typeof result.in_force === 'boolean') lines.push(`**In Force:** ${result.in_force}`);
     // #29 staleness — each field renders in its own block so the format-parity

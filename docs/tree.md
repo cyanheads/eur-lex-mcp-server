@@ -173,7 +173,9 @@ eur-lex-mcp-server/
 │   │   │   ├── cellar-sparql-service.ts
 │   │   │   ├── eli-resolution.ts
 │   │   │   ├── relation-traversal.ts
-│   │   │   └── types.ts
+│   │   │   ├── types.ts
+│   │   │   ├── work-agents.ts
+│   │   │   └── work-resolution.ts
 │   │   └── eurlex-content/
 │   │       ├── act-structure.ts
 │   │       ├── eurlex-content-service.ts
@@ -182,6 +184,7 @@ eur-lex-mcp-server/
 ├── tests/
 │   ├── fixtures/
 │   │   ├── aws-waf-challenge.ts
+│   │   ├── cellar-works.ts
 │   │   ├── eurlex-act-html.ts
 │   │   └── eurlex-formex-multipart.ts
 │   ├── prompts/
@@ -195,7 +198,9 @@ eur-lex-mcp-server/
 │   │   ├── cellar-sparql-service.test.ts
 │   │   ├── eli-resolution.test.ts
 │   │   ├── eurlex-content-service.test.ts
-│   │   └── html-to-markdown.test.ts
+│   │   ├── html-to-markdown.test.ts
+│   │   ├── work-agents.test.ts
+│   │   └── work-resolution.test.ts
 │   └── tools/
 │       ├── eurlex-browse-subjects.tool.test.ts
 │       ├── eurlex-get-cases.tool.test.ts

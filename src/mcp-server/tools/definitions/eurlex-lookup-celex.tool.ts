@@ -21,6 +21,11 @@ import {
   resolveEliToWork,
 } from '@/services/cellar-sparql/eli-resolution.js';
 import type { SparqlBinding } from '@/services/cellar-sparql/types.js';
+import {
+  canonicalAliasPattern,
+  isCanonicalRow,
+  resolvedWorkRow,
+} from '@/services/cellar-sparql/work-resolution.js';
 
 /**
  * Detect CELEX number format, using the same structural floor the CELEX-typed
@@ -51,32 +56,54 @@ function detectIdentifierType(identifier: string): IdentifierType | null {
  * ECLI lookup query. CELLAR stores `cdm:case-law_ecli` as an `xsd:string`-typed
  * literal, so the match is a typed exact join — an untyped literal matches nothing,
  * and a `STR()` comparison scans. `literals` must be pre-escaped; each becomes one
- * typed candidate, and `?ecli` reports which one a row matched.
+ * typed candidate, and `?ecli` reports which one a row matched. `?canonicalAlias`
+ * marks each row's work that carries its CELEX alias (#97).
  */
 function buildEcliQuery(literals: readonly string[]): string {
   const values = literals.map((literal) => `"${literal}"^^xsd:string`).join(' ');
   return `
-SELECT ?work ?celexNumber ?type ?date ?ecli WHERE {
+SELECT ?work ?celexNumber ?type ?date ?ecli ?canonicalAlias WHERE {
   VALUES ?ecli { ${values} }
   ?work cdm:case-law_ecli ?ecli .
   ?work cdm:resource_legal_id_celex ?celexNumber .
+  ${canonicalAliasPattern('?celexNumber')}
   OPTIONAL { ?work cdm:work_has_resource-type ?type . }
   OPTIONAL { ?work cdm:work_date_document ?date . }
+} LIMIT 100`;
+}
+
+/**
+ * CELEX lookup query: every work holding the CELEX, bound back to ?celexNumber so
+ * every branch projects the same row shape, with `?canonicalAlias` on the work the
+ * CELEX resolves to (#97). The `LIMIT` covers every row of every work — a few types
+ * each, and no CELEX has been seen with more than four works — so no work's rows are
+ * cut before the resolved one is picked.
+ */
+function buildCelexQuery(celex: string): string {
+  const literal = celexLiteral(celex);
+  return `
+SELECT ?work ?celexNumber ?type ?date ?ecli ?canonicalAlias WHERE {
+  ?work cdm:resource_legal_id_celex ${literal} .
+  BIND(${literal} AS ?celexNumber)
+  ${canonicalAliasPattern(literal)}
+  OPTIONAL { ?work cdm:work_has_resource-type ?type . }
+  OPTIONAL { ?work cdm:work_date_document ?date . }
+  OPTIONAL { ?work cdm:case-law_ecli ?ecli . }
 } LIMIT 100`;
 }
 
 const DERIVATIVE_TYPES: ReadonlySet<string> = new Set(DERIVATIVE_RESOURCE_TYPES);
 
 /**
- * Pick the binding an ECLI resolves to. One ECLI can reach several works: two work
- * URIs sharing one CELEX, `_RES`/`_SUM` siblings that repeat their parent's ECLI, an
- * `_EXT` extract, or the separate CELEX of a joined AG opinion. Rows matching the
- * caller's exact spelling win over rows reached only through the uppercase form;
- * CELEX numbers carrying a derivative type are then set aside, and the lowest CELEX
- * left wins, taking its first row. A derivative record is returned only when the
- * ECLI reaches nothing else, so an ECLI CELLAR holds never reads as absent.
+ * Pick the CELEX an ECLI resolves to, returning that CELEX's rows. One ECLI can reach
+ * several works: works sharing one CELEX, `_RES`/`_SUM` siblings that repeat their
+ * parent's ECLI, an `_EXT` extract, or the separate CELEX of a joined AG opinion. Rows
+ * matching the caller's exact spelling win over rows reached only through the
+ * uppercase form; CELEX numbers carrying a derivative type are then set aside, and the
+ * lowest CELEX left wins (#84). A derivative record is chosen only when the ECLI
+ * reaches nothing else, so an ECLI CELLAR holds never reads as absent.
  */
-function selectEcliBinding(bindings: SparqlBinding[], exactEcli: string): SparqlBinding | null {
+function selectEcliCelexRows(bindings: SparqlBinding[], exactEcli: string): SparqlBinding[] {
   const value = (b: SparqlBinding, field: string) => CellarSparqlService.bindingValue(b, field);
   const exact = bindings.filter((b) => value(b, 'ecli') === exactEcli);
   const pool = exact.length > 0 ? exact : bindings;
@@ -88,16 +115,14 @@ function selectEcliBinding(bindings: SparqlBinding[], exactEcli: string): Sparql
   const primary = pool.filter((b) => !derivativeCelex.has(value(b, 'celexNumber')));
   const candidates = primary.length > 0 ? primary : pool;
   const celex = (b: SparqlBinding) => value(b, 'celexNumber') ?? '';
-  return candidates.reduce<SparqlBinding | null>(
-    (best, b) => (best && celex(best) <= celex(b) ? best : b),
-    null,
-  );
+  const [lowest] = candidates.map(celex).sort();
+  return candidates.filter((b) => celex(b) === lowest);
 }
 
 export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
   title: 'Resolve EU Legal Citation',
   description:
-    'Resolve an EU legal citation — a CELEX number, ELI URI, or ECLI — to its canonical CELLAR work, confirming it exists before you fetch or traverse it. Returns the work URI, confirmed CELEX number, document type, date, and the ECLI of a case that carries one. An ECLI shared by several records (a judgment and its abstract or extract, or a joined AG opinion) resolves to the primary record with the lowest CELEX.',
+    'Resolve an EU legal citation — a CELEX number, ELI URI, or ECLI — to its canonical CELLAR work, confirming it exists before you fetch or traverse it. Returns the work URI, confirmed CELEX number, document type, date, and the ECLI of a case that carries one. A CELEX that CELLAR holds under several works resolves to the one the EUR-Lex content resolver serves. An ECLI shared by several records (a judgment and its abstract or extract, or a joined AG opinion) resolves to the primary record with the lowest CELEX.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     identifier: z
@@ -125,7 +150,7 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
       .string()
       .optional()
       .describe(
-        'European Case Law Identifier of the resolved work (e.g. "ECLI:EU:C:2014:317"), as CELLAR stores it. Present for case law that carries one; absent for legislation and judicial notices.',
+        'European Case Law Identifier of the case (e.g. "ECLI:EU:C:2014:317"), as CELLAR stores it — the resolved work\'s own, or the one another work holding the same CELEX records. Present for case law that carries one; absent for legislation and judicial notices.',
       ),
     resource_type: z
       .string()
@@ -170,33 +195,47 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
     // ELI resolution (exact-match on cdm:resource_legal_eli, with the bare
     // work-level /oj retry) is shared with eurlex_get_document — see
     // services/cellar-sparql/eli-resolution.ts. The CELEX branch stays here: a
-    // typed exact triple on the CELEX literal (#92), bound back to ?celexNumber so
-    // every branch projects the same row shape. No work carrying an ELI carries an
-    // ECLI (legislation is cited by ELI, case law by ECLI), so only the CELEX and
-    // ECLI branches bind one.
+    // typed exact triple on the CELEX literal (#92), resolved to one work by the
+    // shared canonical-work rule (#97). No work carrying an ELI carries an ECLI
+    // (legislation is cited by ELI, case law by ECLI), so only the CELEX and ECLI
+    // branches bind one.
     let binding: SparqlBinding | null;
     if (effectiveType === 'celex') {
-      const celex = celexLiteral(identifier);
-      const celexQuery = `
-SELECT ?work ?celexNumber ?type ?date ?ecli WHERE {
-  ?work cdm:resource_legal_id_celex ${celex} .
-  BIND(${celex} AS ?celexNumber)
-  OPTIONAL { ?work cdm:work_has_resource-type ?type . }
-  OPTIONAL { ?work cdm:work_date_document ?date . }
-  OPTIONAL { ?work cdm:case-law_ecli ?ecli . }
-} LIMIT 5`;
-      const bindings = await svc.query(celexQuery, ctx);
-      binding = bindings[0] ?? null;
+      /**
+       * An ECLI names the case, not one copy of it: the canonical work can carry none
+       * while its `do_not_index` copies do. The query already returns a row per work,
+       * each with its own ECLI, so the resolved work's ECLI is kept when it has one
+       * and otherwise the lowest ECLI any work of the CELEX records is reported.
+       */
+      const rows = await svc.query(buildCelexQuery(identifier), ctx);
+      const resolved = resolvedWorkRow(rows);
+      const [caseEcli] = rows
+        .flatMap((b) => b.ecli ?? [])
+        .sort((a, b) => (a.value < b.value ? -1 : 1));
+      binding = resolved && !resolved.ecli && caseEcli ? { ...resolved, ecli: caseEcli } : resolved;
     } else if (effectiveType === 'ecli') {
       /**
        * Every EU ECLI in CELLAR is uppercase, so a lowercase EU ECLI resolves
        * through its uppercase form. National ECLIs keep mixed case
        * (`ECLI:FI:HelHO:2015:1766`), so the caller's exact spelling is also sent and
        * preferred — both candidates go in one query.
+       *
+       * #84 picks the CELEX; the canonical-work rule then picks the work within it
+       * (#97). When none of that CELEX's ECLI rows is its canonical work — the
+       * canonical work can carry no ECLI while its copies do — the CELEX is resolved
+       * on its own works, keeping the ECLI the lookup matched.
        */
       const candidates = [...new Set([identifier, identifier.toUpperCase()])];
       const bindings = await svc.query(buildEcliQuery(candidates.map(escapeSparqlLiteral)), ctx);
-      binding = selectEcliBinding(bindings, identifier);
+      const celexRows = selectEcliCelexRows(bindings, identifier);
+      const [first] = celexRows;
+      if (!first || celexRows.some(isCanonicalRow)) {
+        binding = resolvedWorkRow(celexRows);
+      } else {
+        const celex = CellarSparqlService.bindingValue(first, 'celexNumber') ?? '';
+        const resolved = resolvedWorkRow(await svc.query(buildCelexQuery(celex), ctx));
+        binding = resolved && { ...resolved, ...(first.ecli ? { ecli: first.ecli } : {}) };
+      }
     } else {
       binding = await resolveEliToWork(svc, identifier, ctx);
     }
