@@ -49,7 +49,7 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
       })
       .optional()
       .describe(
-        'CELLAR work resource URI to traverse (e.g. http://publications.europa.eu/resource/cellar/3e485e15-11bd-11e6-ba9a-01aa75ed71a1). Used directly as the addressed work; its CELEX identity is resolved for relation-specific act matching, and act-matched relation types stand down when the work carries several CELEX numbers — address such a work by celex_number to name the act you mean. Provide exactly one of celex_number or work_uri.',
+        'CELLAR work resource URI to traverse (e.g. http://publications.europa.eu/resource/cellar/3e485e15-11bd-11e6-ba9a-01aa75ed71a1). Used directly as the addressed work; its CELEX identity is resolved for the national_transposition act match, which stands down when the work carries several CELEX numbers — address such a work by celex_number to name the act you mean. Provide exactly one of celex_number or work_uri.',
       ),
     relation_types: z
       .array(z.enum([...RELATION_TYPES]))
@@ -202,25 +202,20 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
       workUri = workUriInput;
       /**
        * Establish the addressed work's CELEX identity, which gates the
-       * relation-specific act-core constraints. Two rows are requested rather than
-       * one so an ambiguous identity is detectable: a CELLAR work can carry many
-       * CELEX values — a national implementing measure holds one per directive it
-       * transposes, dozens in practice — and there is no principled basis for
-       * choosing among them. Picking the first would silently constrain the
-       * traversal to an arbitrary act, so an ambiguous work supplies no source
-       * CELEX at all and the act-core constraints stand down: `consolidated_version`
-       * falls back to requiring a CELEX without an act match, and
-       * `national_transposition` returns nothing rather than measures selected
-       * against an act the caller never named.
+       * `national_transposition` act-core constraint. Two rows are requested
+       * rather than one so an ambiguous identity is detectable: a CELLAR work can
+       * carry many CELEX values — a national implementing measure holds one per
+       * directive it transposes, dozens in practice — and there is no principled
+       * basis for choosing among them. Picking the first would silently constrain
+       * the traversal to an arbitrary act, so an ambiguous work supplies no source
+       * CELEX at all and `national_transposition` returns nothing rather than
+       * measures selected against an act the caller never named.
        *
-       * Only `consolidated_version` and `national_transposition` consume that
-       * identity, so the lookup runs only when one of them was requested — a
-       * traversal of the other eight types spends no CELLAR round-trip on it.
+       * Only `national_transposition` consumes that identity, so the lookup runs
+       * only when it was requested — a traversal of the other nine types spends no
+       * CELLAR round-trip on it.
        */
-      if (
-        requestedTypes.includes('consolidated_version') ||
-        requestedTypes.includes('national_transposition')
-      ) {
+      if (requestedTypes.includes('national_transposition')) {
         const sourceIdentitySparql = `
 SELECT ?sourceCelex WHERE {
   <${workUri}> cdm:resource_legal_id_celex ?sourceCelex .
@@ -236,7 +231,7 @@ SELECT ?sourceCelex WHERE {
         ];
         sourceCelexNumber = sourceCelexValues.length === 1 ? sourceCelexValues[0] : undefined;
         if (sourceCelexValues.length > 1) {
-          ctx.log.info('Work carries several CELEX identifiers; act-core constraints stand down', {
+          ctx.log.info('Work carries several CELEX identifiers; act-core constraint stands down', {
             workUri,
             sourceCelexValues,
           });

@@ -104,7 +104,7 @@ function routeQuery(handlers: {
     if (isResolutionQuery(q)) return resolveRowsFor(q, handlers.resolve);
     if (q.includes('SELECT ?sourceCelex WHERE')) return handlers.sourceCelex ?? [];
     if (q.includes('cdm:work_cites_work')) return handlers.cites ?? [];
-    if (q.includes('cdm:act_consolidated_consolidates_resource_legal'))
+    if (q.includes('cdm:act_consolidated_based_on_resource_legal'))
       return handlers.consolidated ?? [];
     if (q.includes('cdm:measure_national_implementing_implements_resource_legal'))
       return handlers.nationalTransposition ?? [];
@@ -266,9 +266,9 @@ describe('eurlex_get_relations', () => {
     );
   });
 
-  // --- #19: consolidated_version is the INCOMING side of the consolidates predicate ---
+  // --- #19/#109: consolidated_version is the INCOMING side of the based-on link ---
 
-  it('consolidated_version queries incoming cdm:act_consolidated_consolidates_resource_legal', async () => {
+  it('consolidated_version queries incoming cdm:act_consolidated_based_on_resource_legal', async () => {
     const ctx = createMockContext({ errors: eurlex_get_relations.errors });
     mockQuery.mockImplementation(
       routeQuery({
@@ -297,9 +297,10 @@ describe('eurlex_get_relations', () => {
       .map((c) => c[0] as string)
       .find((q) => !isResolutionQuery(q))!;
     expect(relSparql).toContain(
-      `?relatedWork cdm:act_consolidated_consolidates_resource_legal <${GDPR_WORK_URI}>`,
+      `?relatedWork cdm:act_consolidated_based_on_resource_legal <${GDPR_WORK_URI}>`,
     );
     expect(relSparql).not.toContain('cdm:resource_legal_has_consolidated_version');
+    expect(relSparql).not.toContain('act_consolidated_consolidates');
   });
 
   // --- #31: repeal relations (explicit + implicit, both directions) ---
@@ -438,26 +439,19 @@ describe('eurlex_get_relations', () => {
     );
   });
 
-  // --- #32: consolidated_version is filtered to genuine consolidations of the source act ---
+  // --- #32: consolidated_version keeps only fetchable (CELEX-bearing) consolidations ---
 
-  it('consolidated_version drops CELEX-less and cross-act rows when the source CELEX is known', async () => {
+  it('consolidated_version drops CELEX-less rows', async () => {
     const ctx = createMockContext({ errors: eurlex_get_relations.errors });
     mockQuery.mockImplementation(
       routeQuery({
         resolve: [makeResolveBinding(GDPR_WORK_URI)],
-        // Mirrors the live CELLAR shape for GDPR: one genuine consolidation, one
-        // cross-act consolidation of the repealed 1995 directive, one CELEX-less
-        // CONS_TEXT member work.
+        // One consolidation and one CELEX-less CONS_TEXT member work.
         consolidated: [
           makeRelationBinding({
             relatedWork: 'http://publications.europa.eu/resource/cellar/genuine',
             direction: 'incoming',
             relatedCelex: '02016R0679-20160504',
-          }),
-          makeRelationBinding({
-            relatedWork: 'http://publications.europa.eu/resource/cellar/cross-act',
-            direction: 'incoming',
-            relatedCelex: '01995L0046-20180525',
           }),
           makeRelationBinding({
             relatedWork:
@@ -476,9 +470,6 @@ describe('eurlex_get_relations', () => {
 
     expect(result.total).toBe(1);
     expect(result.relations[0]?.related_celex_number).toBe('02016R0679-20160504');
-    expect(result.relations.map((r) => r.related_celex_number)).not.toContain(
-      '01995L0046-20180525',
-    );
   });
 
   it('consolidated_version keeps every genuine same-act consolidation', async () => {
@@ -514,7 +505,7 @@ describe('eurlex_get_relations', () => {
     ]);
   });
 
-  it('resolves source identity on the work_uri path and excludes cross-act consolidations (#73)', async () => {
+  it('follows the based-on link on the work_uri path without resolving source identity (#73, #109)', async () => {
     const ctx = createMockContext({ errors: eurlex_get_relations.errors });
     mockQuery.mockImplementation(
       routeQuery({
@@ -524,11 +515,6 @@ describe('eurlex_get_relations', () => {
             relatedWork: 'http://publications.europa.eu/resource/cellar/genuine',
             direction: 'incoming',
             relatedCelex: '02016R0679-20160504',
-          }),
-          makeRelationBinding({
-            relatedWork: 'http://publications.europa.eu/resource/cellar/cross-act',
-            direction: 'incoming',
-            relatedCelex: '01995L0046-20180525',
           }),
           makeRelationBinding({
             relatedWork:
@@ -548,16 +534,16 @@ describe('eurlex_get_relations', () => {
     expect(result.total).toBe(1);
     expect(result.relations.map((r) => r.related_celex_number)).toEqual(['02016R0679-20160504']);
 
-    const sourceIdentitySparql = mockQuery.mock.calls
-      .map((call) => call[0] as string)
-      .find((query) => query.includes('SELECT ?sourceCelex WHERE'))!;
-    expect(sourceIdentitySparql).toContain(
-      `<${GDPR_WORK_URI}> cdm:resource_legal_id_celex ?sourceCelex`,
+    const queries = mockQuery.mock.calls.map((call) => call[0] as string);
+    // The link is specific to this act, so no CELEX identity is needed to filter it.
+    expect(queries).not.toContainEqual(expect.stringContaining('SELECT ?sourceCelex WHERE'));
+    const traversalSparql = queries.find((query) =>
+      query.includes('cdm:act_consolidated_based_on_resource_legal'),
+    )!;
+    expect(traversalSparql).toContain(
+      `?relatedWork cdm:act_consolidated_based_on_resource_legal <${GDPR_WORK_URI}>`,
     );
-    const traversalSparql = mockQuery.mock.calls
-      .map((call) => call[0] as string)
-      .find((query) => query.includes('cdm:act_consolidated_consolidates_resource_legal'))!;
-    expect(traversalSparql).toContain('REGEX(STR(?relatedCelex), "^02016R0679-[0-9]{8}$")');
+    expect(traversalSparql).not.toContain('REGEX');
   });
 
   // --- #56: national transposition measures ---
@@ -831,7 +817,7 @@ describe('eurlex_get_relations', () => {
 
   // --- #45: consolidated_version truncation reflects post-filter rows; filter pushed to SPARQL ---
 
-  it('pushes the consolidated_version validity filter into SPARQL — required CELEX + act-core REGEX (issue #45)', async () => {
+  it('pushes the consolidated_version validity filter into SPARQL — required CELEX, no act-core REGEX (#45, #109)', async () => {
     const ctx = createMockContext({ errors: eurlex_get_relations.errors });
     mockQuery.mockImplementation(
       routeQuery({
@@ -854,18 +840,18 @@ describe('eurlex_get_relations', () => {
 
     const relSparql = mockQuery.mock.calls
       .map((c) => c[0] as string)
-      .find((q) => q.includes('cdm:act_consolidated_consolidates_resource_legal'))!;
+      .find((q) => q.includes('cdm:act_consolidated_based_on_resource_legal'))!;
     // The related CELEX is required (not OPTIONAL), so CELEX-less artifacts never
     // enter the page or the truncation count.
     expect(relSparql).toContain('?relatedWork cdm:resource_legal_id_celex ?relatedCelex .');
     expect(relSparql).not.toContain(
       'OPTIONAL { ?relatedWork cdm:resource_legal_id_celex ?relatedCelex . }',
     );
-    // The act-core REGEX keeps only genuine consolidations of THIS act (32016R0679 → 2016R0679).
-    expect(relSparql).toContain('REGEX(STR(?relatedCelex), "^02016R0679-[0-9]{8}$")');
+    // The based-on link reaches this act's consolidations alone, however numbered.
+    expect(relSparql).not.toContain('REGEX');
   });
 
-  it('requires the related CELEX and pushes the resolved act-core REGEX on the work_uri path (#45, #73)', async () => {
+  it('requires the related CELEX with no act-core REGEX on the work_uri path (#45, #73, #109)', async () => {
     const ctx = createMockContext({ errors: eurlex_get_relations.errors });
     mockQuery.mockImplementation(
       routeQuery({
@@ -888,9 +874,9 @@ describe('eurlex_get_relations', () => {
 
     const relSparql = mockQuery.mock.calls
       .map((call) => call[0] as string)
-      .find((query) => query.includes('cdm:act_consolidated_consolidates_resource_legal'))!;
+      .find((query) => query.includes('cdm:act_consolidated_based_on_resource_legal'))!;
     expect(relSparql).toContain('?relatedWork cdm:resource_legal_id_celex ?relatedCelex .');
-    expect(relSparql).toContain('REGEX(STR(?relatedCelex), "^02016R0679-[0-9]{8}$")');
+    expect(relSparql).not.toContain('REGEX');
   });
 
   it('leaves the CELEX OPTIONAL and adds no REGEX for non-consolidated relation types (issue #45)', async () => {
@@ -925,10 +911,9 @@ describe('eurlex_get_relations', () => {
 
   it('does not set truncated when filtered consolidated_version artifacts fill the raw cap but valid rows are under it (issue #45)', async () => {
     const ctx = createMockContext({ errors: eurlex_get_relations.errors });
-    // Mirrors the live GDPR shape at limit 3: one genuine same-act consolidation, one
-    // cross-act consolidation of the repealed 1995 directive, one CELEX-less CONS_TEXT
-    // member. The raw page fills the cap of 3, but only the genuine row survives the
-    // filter — so no additional valid rows exist beyond this page.
+    // One consolidation and one CELEX-less CONS_TEXT member at limit 2. The raw page
+    // fills the cap of 2, but only the CELEX-bearing row survives the filter — so no
+    // additional valid rows exist beyond this page.
     mockQuery.mockImplementation(
       routeQuery({
         resolve: [makeResolveBinding(GDPR_WORK_URI)],
@@ -937,11 +922,6 @@ describe('eurlex_get_relations', () => {
             relatedWork: 'http://publications.europa.eu/resource/cellar/genuine',
             direction: 'incoming',
             relatedCelex: '02016R0679-20160504',
-          }),
-          makeRelationBinding({
-            relatedWork: 'http://publications.europa.eu/resource/cellar/cross-act',
-            direction: 'incoming',
-            relatedCelex: '01995L0046-20180525',
           }),
           makeRelationBinding({
             relatedWork:
@@ -955,13 +935,13 @@ describe('eurlex_get_relations', () => {
     const input = eurlex_get_relations.input.parse({
       celex_number: '32016R0679',
       relation_types: ['consolidated_version'],
-      limit: 3,
+      limit: 2,
     });
     const result = await eurlex_get_relations.handler(input, ctx);
 
     expect(result.total).toBe(1);
     expect(result.relations[0]?.related_celex_number).toBe('02016R0679-20160504');
-    // The three filtered-out artifacts must not raise a false truncation hint.
+    // The filtered-out artifact must not raise a false truncation hint.
     expect(getEnrichment(ctx).truncated).toBeUndefined();
   });
 
@@ -1578,20 +1558,20 @@ describe('eurlex_get_relations', () => {
     const ctx = createMockContext({ errors: eurlex_get_relations.errors });
     mockQuery.mockImplementation(
       routeQuery({
-        sourceCelex: [makeSourceCelexBinding('32016R0679')],
-        consolidated: [
+        sourceCelex: [makeSourceCelexBinding('32016L0680')],
+        nationalTransposition: [
           makeRelationBinding({
-            relatedWork: 'http://publications.europa.eu/resource/cellar/genuine',
+            relatedWork: CZECH_MEASURE_WORK_URI,
             direction: 'incoming',
-            relatedCelex: '02016R0679-20160504',
+            relatedCelex: '72016L0680CZE_225030',
           }),
         ],
       }),
     );
 
     const input = eurlex_get_relations.input.parse({
-      work_uri: GDPR_WORK_URI,
-      relation_types: ['consolidated_version'],
+      work_uri: DIRECTIVE_680_WORK_URI,
+      relation_types: ['national_transposition'],
     });
     const result = await eurlex_get_relations.handler(input, ctx);
 
@@ -1601,11 +1581,11 @@ describe('eurlex_get_relations', () => {
       expect.stringContaining('SELECT ?sourceCelex WHERE'),
     );
     // The resolved identity reaches structuredContent…
-    expect(result.celex_number).toBe('32016R0679');
-    expect(result.work_uri).toBe(GDPR_WORK_URI);
+    expect(result.celex_number).toBe('32016L0680');
+    expect(result.work_uri).toBe(DIRECTIVE_680_WORK_URI);
     // …and the text channel, so both surfaces name the act the traversal matched.
     const text = (eurlex_get_relations.format!(result)[0] as { text: string }).text;
-    expect(text).toContain('Relations for 32016R0679');
+    expect(text).toContain('Relations for 32016L0680');
   });
 
   // --- Input guard: exactly one identifier (issue #8) ---
@@ -1944,20 +1924,20 @@ describe('eurlex_get_relations', () => {
       const ctx = createMockContext({ errors: eurlex_get_relations.errors });
       mockQuery.mockImplementation(
         routeQuery({
-          sourceCelex: [makeSourceCelexBinding('32016R0679')],
-          consolidated: [
+          sourceCelex: [makeSourceCelexBinding('32016L0680')],
+          nationalTransposition: [
             makeRelationBinding({
-              relatedWork: 'http://publications.europa.eu/resource/cellar/genuine',
+              relatedWork: CZECH_MEASURE_WORK_URI,
               direction: 'incoming',
-              relatedCelex: '02016R0679-20160504',
+              relatedCelex: '72016L0680CZE_225030',
             }),
           ],
         }),
       );
 
       const input = eurlex_get_relations.input.parse({
-        work_uri: GDPR_WORK_URI,
-        relation_types: ['consolidated_version'],
+        work_uri: DIRECTIVE_680_WORK_URI,
+        relation_types: ['national_transposition'],
       });
       await eurlex_get_relations.handler(input, ctx);
 
@@ -1967,7 +1947,7 @@ describe('eurlex_get_relations', () => {
       expect(sourceIdentitySparql).toContain('LIMIT 2');
     });
 
-    it('stands the consolidated_version act-core constraint down for an ambiguous work', async () => {
+    it('follows consolidated_version for an ambiguous work without resolving its identity (#109)', async () => {
       const ctx = createMockContext({ errors: eurlex_get_relations.errors });
       // A national implementing measure carries one CELEX per directive it
       // transposes; there is no principled basis for picking one of them.
@@ -1997,11 +1977,13 @@ describe('eurlex_get_relations', () => {
       });
       const result = await eurlex_get_relations.handler(input, ctx);
 
-      const traversalSparql = mockQuery.mock.calls
-        .map((call) => call[0] as string)
-        .find((query) => query.includes('cdm:act_consolidated_consolidates_resource_legal'))!;
-      // No act-core REGEX is pushed — picking one of the work's CELEX values to
-      // build it would constrain the traversal to an arbitrary act.
+      const queries = mockQuery.mock.calls.map((call) => call[0] as string);
+      // The based-on link needs no act identity, so the work's several CELEX values
+      // are never read.
+      expect(queries).not.toContainEqual(expect.stringContaining('SELECT ?sourceCelex WHERE'));
+      const traversalSparql = queries.find((query) =>
+        query.includes('cdm:act_consolidated_based_on_resource_legal'),
+      )!;
       expect(traversalSparql).not.toContain('REGEX(STR(?relatedCelex)');
       // The related CELEX stays required, so CELEX-less consolidation artifacts
       // are still dropped.
@@ -2054,27 +2036,29 @@ describe('eurlex_get_relations', () => {
       // The same CELEX repeated across rows is one identity, not an ambiguity.
       mockQuery.mockImplementation(
         routeQuery({
-          sourceCelex: [makeSourceCelexBinding('32016R0679'), makeSourceCelexBinding('32016R0679')],
-          consolidated: [
+          sourceCelex: [makeSourceCelexBinding('32016L0680'), makeSourceCelexBinding('32016L0680')],
+          nationalTransposition: [
             makeRelationBinding({
-              relatedWork: 'http://publications.europa.eu/resource/cellar/genuine',
+              relatedWork: CZECH_MEASURE_WORK_URI,
               direction: 'incoming',
-              relatedCelex: '02016R0679-20160504',
+              relatedCelex: '72016L0680CZE_225030',
             }),
           ],
         }),
       );
 
       const input = eurlex_get_relations.input.parse({
-        work_uri: GDPR_WORK_URI,
-        relation_types: ['consolidated_version'],
+        work_uri: DIRECTIVE_680_WORK_URI,
+        relation_types: ['national_transposition'],
       });
       const result = await eurlex_get_relations.handler(input, ctx);
 
       const traversalSparql = mockQuery.mock.calls
         .map((call) => call[0] as string)
-        .find((query) => query.includes('cdm:act_consolidated_consolidates_resource_legal'))!;
-      expect(traversalSparql).toContain('REGEX(STR(?relatedCelex), "^02016R0679-[0-9]{8}$")');
+        .find((query) =>
+          query.includes('cdm:measure_national_implementing_implements_resource_legal'),
+        )!;
+      expect(traversalSparql).toContain('REGEX(STR(?relatedCelex), "^72016L0680[A-Z]{3}")');
       expect(result.total).toBe(1);
     });
   });
@@ -2523,6 +2507,54 @@ describe('eurlex_get_relations', () => {
       expect(structured).toMatchObject({ has_more: true, next_offset: 2, truncated: true });
       expect(structured.notice).toContain('offset=2');
       expect(contentText(result)).toContain(`> ${structured.notice as string}`);
+    });
+  });
+
+  // --- #109: consolidated_version follows the based-on link ---
+
+  describe('consolidated_version via the based-on link (#109)', () => {
+    it.each([
+      ['22006A0901(01)', '02006A0901(01)-20090301'],
+      // Numbered differently from its act: the based-on link is the only tie.
+      ['32000O0007', '02000X0776-20110201'],
+    ])('%s lists its consolidated version %s', async (celex, consolidated) => {
+      const sourceWork = `${CELLAR}source-${celex}`;
+      mockQuery.mockImplementation(async (q: string) => {
+        if (isResolutionQuery(q)) return resolveRowsFor(q, [makeResolveBinding(sourceWork)]);
+        if (
+          q.includes(`?relatedWork cdm:act_consolidated_based_on_resource_legal <${sourceWork}>`)
+        ) {
+          return [
+            makeRelationBinding({
+              relatedWork: `${CELLAR}consolidation`,
+              direction: 'incoming',
+              relatedCelex: consolidated,
+            }),
+          ];
+        }
+        return [];
+      });
+
+      const result = await runToolContract(eurlex_get_relations, {
+        celex_number: celex,
+        relation_types: ['consolidated_version'],
+      });
+
+      const structured = result.structuredContent as {
+        relations: { relation_type: string; related_celex_number?: string }[];
+      };
+      expect(structured.relations).toEqual([
+        expect.objectContaining({
+          relation_type: 'consolidated_version',
+          related_celex_number: consolidated,
+        }),
+      ]);
+      expect(contentText(result)).toContain(consolidated);
+      const relSparql = mockQuery.mock.calls
+        .map((c) => c[0] as string)
+        .find((q) => q.includes('?relatedWork cdm:act_consolidated')) as string;
+      expect(relSparql).not.toContain('act_consolidated_consolidates');
+      expect(relSparql).not.toContain('REGEX');
     });
   });
 });

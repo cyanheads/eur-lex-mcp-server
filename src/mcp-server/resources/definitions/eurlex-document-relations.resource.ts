@@ -51,11 +51,11 @@ export const eurlex_document_relations_resource = resource(
       // Summarize all relation types via the shared traversal — one query per
       // type so amendment and consolidation relations (modeled one-directionally
       // in CELLAR) actually surface. Passing the CELEX lets the traversal apply
-      // relation-specific act-number filters for consolidations and national
-      // transposition measures. Incoming edges come ordered newest-first, so
-      // this lightweight summary keeps the most recent within its per-direction
-      // cap. See relation-traversal.ts. The cap is clamped to the service ceiling
-      // so both sides of a symmetric query stay capped consistently.
+      // the act-number filter for national transposition measures. Incoming
+      // edges come ordered newest-first, so this lightweight summary keeps the
+      // most recent within its per-direction cap. See relation-traversal.ts. The
+      // cap is clamped to the service ceiling so both sides of a symmetric query
+      // stay capped consistently.
       const { relations: workRelations, hasMore } = await traverseRelations(
         svc,
         workUri,

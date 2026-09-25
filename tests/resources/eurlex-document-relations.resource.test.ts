@@ -85,7 +85,7 @@ function routeQuery(handlers: {
     if (typeof q !== 'string') return [];
     if (isResolutionQuery(q)) return resolveRowsFor(q, handlers.resolve);
     if (q.includes('cdm:work_cites_work')) return handlers.cites ?? [];
-    if (q.includes('cdm:act_consolidated_consolidates_resource_legal'))
+    if (q.includes('cdm:act_consolidated_based_on_resource_legal'))
       return handlers.consolidated ?? [];
     if (q.includes('cdm:measure_national_implementing_implements_resource_legal'))
       return handlers.nationalTransposition ?? [];
@@ -392,9 +392,9 @@ describe('eurlex_document_relations_resource', () => {
     expect(implicit?.related_celex_number).toBe('32003R1882');
   });
 
-  // --- #32: the resource inherits the consolidated_version act-number filter ---
+  // --- #32/#109: the resource inherits the consolidated_version CELEX requirement ---
 
-  it('filters consolidated_version to the genuine same-act consolidation (drops cross-act + CELEX-less)', async () => {
+  it('keeps CELEX-bearing consolidated_version rows and drops CELEX-less ones', async () => {
     const ctx = createMockContext({ tenantId: 'test-tenant' });
     mockQuery.mockImplementation(
       routeQuery({
@@ -404,11 +404,6 @@ describe('eurlex_document_relations_resource', () => {
             relatedWork: 'http://publications.europa.eu/resource/cellar/genuine',
             direction: 'incoming',
             relatedCelex: '02016R0679-20160504',
-          }),
-          makeRelationBinding({
-            relatedWork: 'http://publications.europa.eu/resource/cellar/cross-act',
-            direction: 'incoming',
-            relatedCelex: '01995L0046-20180525',
           }),
           makeRelationBinding({
             relatedWork:
@@ -434,7 +429,7 @@ describe('eurlex_document_relations_resource', () => {
 
   it('does not set truncated when filtered consolidated_version artifacts fill the summary cap but valid rows are under it (issue #45)', async () => {
     const ctx = createMockContext({ tenantId: 'test-tenant' });
-    // 25 raw consolidated rows = the SUMMARY_PER_TYPE_LIMIT: one genuine same-act
+    // 25 raw consolidated rows = the SUMMARY_PER_TYPE_LIMIT: one CELEX-bearing
     // consolidation plus 24 CELEX-less CONS_TEXT members. The raw page fills the cap,
     // but only the genuine row survives the filter — the resource must not flag truncation.
     const consolidatedRaw = [
