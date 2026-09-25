@@ -6,6 +6,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   parseCaseLawTitle,
+  resolveCorporateBodyLabel,
   resolveResourceTypeLabel,
   resolveResourceTypeLabels,
 } from '@/services/cellar-sparql/cdm-labels.js';
@@ -173,6 +174,51 @@ const CONS_TEXT_URI = `${RESOURCE_TYPE_BASE}CONS_TEXT`;
 const MEAS_NATION_IMPL_URI = `${RESOURCE_TYPE_BASE}MEAS_NATION_IMPL`;
 const CORRIGENDUM_URI = `${RESOURCE_TYPE_BASE}CORRIGENDUM`;
 
+/**
+ * Every resource-type a sector-6 (case-law) work carries that had no map entry
+ * before #93, plus DEC_NC, the national-court decision type (sector 8) reachable
+ * through eurlex_lookup_celex. Expected labels are the English skos:prefLabel of
+ * each authority-register concept, in the map's Title Case: JUDG_EXTRACT "Judgment
+ * (extracts)", ORDER_EXTRACT "Order (extracts)", OPIN_JUR "Opinion of the Court",
+ * DEC_NC "Decision by national courts in the field of European Union law",
+ * DEC_REVIEW "Decision to review", GARNISHEE_ORDER "Attachment order",
+ * THIRDPARTY_PROCEED "Third-party proceedings", DATPRO "Provisional data".
+ */
+const CASE_LAW_LABELS_93: Record<string, string> = {
+  JUDG_EXTRACT: 'Judgment (Extracts)',
+  ORDER_EXTRACT: 'Order (Extracts)',
+  OPIN_JUR: 'Opinion of the Court',
+  DEC_NC: 'Decision by National Courts in the Field of European Union Law',
+  DEC_REVIEW: 'Decision to Review',
+  GARNISHEE_ORDER: 'Attachment Order',
+  THIRDPARTY_PROCEED: 'Third-Party Proceedings',
+  DATPRO: 'Provisional Data',
+};
+
+/**
+ * Every resource-type carried by a sector-6 work, from a live survey of CELLAR
+ * (works whose CELEX starts with "6", grouped by `cdm:work_has_resource-type`).
+ */
+const SECTOR_6_RESOURCE_TYPES = [
+  'INFO_JUDICIAL',
+  'JUDG',
+  'OPIN_AG',
+  'ORDER',
+  'INFO_JUR',
+  'SUM_JUR',
+  'ABSTRACT_JUR',
+  'JUDG_EXTRACT',
+  'CORRIGENDUM',
+  'VIEW_AG',
+  'OPIN_JUR',
+  'ORDER_EXTRACT',
+  'DEC_REVIEW',
+  'GARNISHEE_ORDER',
+  'THIRDPARTY_PROCEED',
+  'DATPRO',
+  'RULING',
+];
+
 describe('resolveResourceTypeLabel', () => {
   it('resolves a Commission Implementing Regulation to its label, not the raw REG_IMPL code (issue #43)', () => {
     expect(resolveResourceTypeLabel(REG_IMPL_URI)).toBe('Implementing Regulation');
@@ -223,6 +269,18 @@ describe('resolveResourceTypeLabel', () => {
     }
   });
 
+  it('labels the case-law extract, opinion, and national-decision types from the authority register (#93)', () => {
+    for (const [code, label] of Object.entries(CASE_LAW_LABELS_93)) {
+      expect(resolveResourceTypeLabel(`${RESOURCE_TYPE_BASE}${code}`)).toBe(label);
+    }
+  });
+
+  it('labels every resource-type a sector-6 work carries — none falls back to its code (#93)', () => {
+    for (const code of SECTOR_6_RESOURCE_TYPES) {
+      expect(resolveResourceTypeLabel(`${RESOURCE_TYPE_BASE}${code}`)).not.toBe(code);
+    }
+  });
+
   it('falls back to the last path segment for an unmapped resource-type URI', () => {
     expect(resolveResourceTypeLabel(`${RESOURCE_TYPE_BASE}UNKNOWN_TYPE`)).toBe('UNKNOWN_TYPE');
   });
@@ -264,8 +322,47 @@ describe('resolveResourceTypeLabels', () => {
     );
   });
 
+  it('resolves an OJ extract co-typed with its base judgment or order (#93)', () => {
+    // A General Court extract carries JUDG_EXTRACT alongside JUDG (e.g. 62020TJ0022),
+    // and the pair reached the caller as "JUDG_EXTRACT, Judgment".
+    expect(
+      resolveResourceTypeLabels(`${RESOURCE_TYPE_BASE}JUDG_EXTRACT ${RESOURCE_TYPE_BASE}JUDG`),
+    ).toBe('Judgment, Judgment (Extracts)');
+    expect(
+      resolveResourceTypeLabels(`${RESOURCE_TYPE_BASE}ORDER ${RESOURCE_TYPE_BASE}ORDER_EXTRACT`),
+    ).toBe('Order, Order (Extracts)');
+    expect(resolveResourceTypeLabels(`${RESOURCE_TYPE_BASE}OPIN_JUR`)).toBe('Opinion of the Court');
+  });
+
   it('resolves a lone CONS_TEXT and MEAS_NATION_IMPL through the multi-type path (#86)', () => {
     expect(resolveResourceTypeLabels(CONS_TEXT_URI)).toBe('Consolidated Text');
     expect(resolveResourceTypeLabels(MEAS_NATION_IMPL_URI)).toBe('National Implementing Measure');
+  });
+});
+
+/**
+ * Every corporate body that authors a sector-6 work, from a live survey of CELLAR
+ * (works whose CELEX starts with "6", grouped by `cdm:work_created_by_agent`), with
+ * the English skos:prefLabel of its corporate-body authority concept. CURIA keeps
+ * its existing shortened label.
+ */
+const CORPORATE_BODY_BASE = 'http://publications.europa.eu/resource/authority/corporate-body/';
+const SECTOR_6_AUTHORS: Record<string, string> = {
+  CJ: 'Court of Justice',
+  GCEU: 'General Court',
+  CST: 'Civil Service Tribunal',
+  CFI: 'Court of First Instance',
+  CURIA: 'Court of Justice of the EU',
+};
+
+describe('resolveCorporateBodyLabel', () => {
+  it('names every court that authors a sector-6 work — none falls back to its code (#95)', () => {
+    for (const [code, label] of Object.entries(SECTOR_6_AUTHORS)) {
+      expect(resolveCorporateBodyLabel(`${CORPORATE_BODY_BASE}${code}`)).toBe(label);
+    }
+  });
+
+  it('falls back to the last path segment for an unmapped corporate body', () => {
+    expect(resolveCorporateBodyLabel(`${CORPORATE_BODY_BASE}UNKNOWN_BODY`)).toBe('UNKNOWN_BODY');
   });
 });

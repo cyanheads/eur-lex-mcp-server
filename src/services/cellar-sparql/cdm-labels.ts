@@ -106,7 +106,55 @@ export const RESOURCE_TYPE_LABELS: Record<string, string> = {
   'http://publications.europa.eu/resource/authority/resource-type/MEAS_NATION_IMPL':
     'National Implementing Measure',
   'http://publications.europa.eu/resource/authority/resource-type/CORRIGENDUM': 'Corrigendum',
+  // The remaining resource-types sector-6 works carry, plus DEC_NC — the national-
+  // court decision type (sector 8) eurlex_lookup_celex resolves. Each label is the
+  // authority register's English skos:prefLabel in the map's Title Case, e.g.
+  // JUDG_EXTRACT "Judgment (extracts)" and DEC_NC "Decision by national courts in
+  // the field of European Union law". JUDG_EXTRACT / ORDER_EXTRACT sit on the default
+  // eurlex_get_cases path, co-typed with the base judgment or order.
+  'http://publications.europa.eu/resource/authority/resource-type/JUDG_EXTRACT':
+    'Judgment (Extracts)',
+  'http://publications.europa.eu/resource/authority/resource-type/ORDER_EXTRACT':
+    'Order (Extracts)',
+  'http://publications.europa.eu/resource/authority/resource-type/OPIN_JUR': 'Opinion of the Court',
+  'http://publications.europa.eu/resource/authority/resource-type/DEC_NC':
+    'Decision by National Courts in the Field of European Union Law',
+  'http://publications.europa.eu/resource/authority/resource-type/DEC_REVIEW': 'Decision to Review',
+  'http://publications.europa.eu/resource/authority/resource-type/GARNISHEE_ORDER':
+    'Attachment Order',
+  'http://publications.europa.eu/resource/authority/resource-type/THIRDPARTY_PROCEED':
+    'Third-Party Proceedings',
+  'http://publications.europa.eu/resource/authority/resource-type/DATPRO': 'Provisional Data',
 };
+
+/**
+ * Derivative sector-6 resource-types: information notices (INFO_JUDICIAL, INFO_JUR),
+ * case-law abstracts (ABSTRACT_JUR), case summaries (SUM_JUR), and standalone
+ * corrigenda (CORRIGENDUM). Each is a separate CELLAR work with its own CELEX
+ * (`…_RES`, `…_SUM`, `…R(nn)`, the `CN`/`CA`/`TN`… notices) that restates or
+ * announces a primary judgment, order, or AG opinion rather than being one.
+ *
+ * eurlex_get_cases excludes them from its default search, where at a page limit they
+ * crowd distinct primary cases off the page (issue #44). eurlex_lookup_celex skips
+ * them when one ECLI reaches several works, since an `_RES`/`_SUM` sibling carries
+ * its parent's ECLI.
+ *
+ * CORRIGENDUM covers the standalone correction works, all carrying the CELEX `…R(nn)`
+ * corrigendum marker (issue #55). No primary judgment/order/AG opinion is typed
+ * CORRIGENDUM, so excluding the type drops only the correction record and never the
+ * corrected case, which is a distinct CELEX. Listing it explicitly also makes the
+ * exclusion robust: sector-6 corrigenda are currently co-typed INFO_JUDICIAL (already
+ * listed), but a corrigendum typed CORRIGENDUM alone would otherwise leak.
+ * JUDG_EXTRACT/ORDER_EXTRACT are deliberately NOT here: an OJ extract can be the sole
+ * published record of an older case, so excluding it would cost recall.
+ */
+export const DERIVATIVE_RESOURCE_TYPES = [
+  'http://publications.europa.eu/resource/authority/resource-type/INFO_JUDICIAL',
+  'http://publications.europa.eu/resource/authority/resource-type/INFO_JUR',
+  'http://publications.europa.eu/resource/authority/resource-type/ABSTRACT_JUR',
+  'http://publications.europa.eu/resource/authority/resource-type/SUM_JUR',
+  'http://publications.europa.eu/resource/authority/resource-type/CORRIGENDUM',
+] as const;
 
 /** Resolve a CDM resource-type URI to a human-readable label. Falls back to last path segment. */
 export function resolveResourceTypeLabel(uri: string): string {
@@ -209,6 +257,13 @@ export const CORPORATE_BODY_LABELS: Record<string, string> = {
   'http://publications.europa.eu/resource/authority/corporate-body/COM': 'European Commission',
   'http://publications.europa.eu/resource/authority/corporate-body/CURIA':
     'Court of Justice of the EU',
+  // The courts that author sector-6 (case-law) works, from a CELLAR survey of their
+  // cdm:work_created_by_agent values; each label is the corporate-body authority
+  // register's English skos:prefLabel.
+  'http://publications.europa.eu/resource/authority/corporate-body/CJ': 'Court of Justice',
+  'http://publications.europa.eu/resource/authority/corporate-body/GCEU': 'General Court',
+  'http://publications.europa.eu/resource/authority/corporate-body/CST': 'Civil Service Tribunal',
+  'http://publications.europa.eu/resource/authority/corporate-body/CFI': 'Court of First Instance',
   'http://publications.europa.eu/resource/authority/corporate-body/ECB': 'European Central Bank',
   'http://publications.europa.eu/resource/authority/corporate-body/EIB': 'European Investment Bank',
   'http://publications.europa.eu/resource/authority/corporate-body/ECA':
