@@ -259,6 +259,9 @@ export class CellarSparqlService {
           format: 'application/sparql-results+json',
         });
         let response: Response;
+        let text: string;
+        // The body read sits inside the try too: the fetch signal still bounds it, so
+        // a timeout or cancellation mid-body is classified here like one before headers.
         try {
           response = await fetch(this.endpoint, {
             method: 'POST',
@@ -271,6 +274,7 @@ export class CellarSparqlService {
             // request in flight; without it a cancelled call ran to completion (#122).
             signal: AbortSignal.any([signal, AbortSignal.timeout(effectiveTimeoutMs)]),
           });
+          text = await response.text();
         } catch (error) {
           // A caller abort propagates as itself, never relabelled as a timeout.
           if (signal.aborted) throw error;
@@ -289,8 +293,6 @@ export class CellarSparqlService {
           }
           throw error;
         }
-
-        const text = await response.text();
 
         if (!response.ok) {
           if (response.status === 400) {

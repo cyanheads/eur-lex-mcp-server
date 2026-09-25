@@ -412,6 +412,28 @@ describe('CellarSparqlService sparql_error recovery (#26)', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it('fails fast when the client timeout fires while the body is still arriving (#78)', async () => {
+    // Headers arrive, then the body stalls until the request signal aborts — as a
+    // real fetch rejects response.text() with the signal's TimeoutError.
+    const fetchMock = vi.fn(async (_url: string, init: { signal: AbortSignal }) => ({
+      ok: true,
+      status: 200,
+      text: () =>
+        new Promise<string>((_resolve, reject) => {
+          init.signal.addEventListener('abort', () => reject(init.signal.reason));
+        }),
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(
+      makeService().query('SELECT ?work WHERE { ?s ?p ?o }', createMockContext(), 30),
+    ).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      data: { reason: 'sparql_timeout', retryable: false },
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it('marks a Virtuoso-side timeout non-retryable with the same recovery hint (#78)', async () => {
     const fetchMock = vi.fn(async () => ({
       ok: true,
