@@ -4,7 +4,7 @@ All notable changes to this project. Each entry links to its full per-version fi
 
 ## [0.13.0](changelog/0.13.x/0.13.0.md) — 2026-09-25
 
-ECLI lookup and output for case law, case_number and court filters that reach every record a court files, member-state codes on transposition rows, and CELEX lookups through a typed exact triple instead of a STR() scan.
+ECLI lookup and output for case law, case_number and court filters that reach every primary record filed under them, member-state codes on transposition rows, and CELEX lookups through a typed exact triple instead of a STR() scan.
 
 ## [0.12.2](changelog/0.12.x/0.12.2.md) — 2026-09-20
 
