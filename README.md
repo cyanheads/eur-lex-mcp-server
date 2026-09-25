@@ -97,7 +97,7 @@ All resource data is also reachable via tools.
 
 - Filters: `case_number`, `court` (`CJEU` or `GC`), `case_type` (`judgment`, `order`, `ag_opinion`), keyword, and date range
 - `case_number` takes `C-131/12`, `T-22/20`, or `F-12/05`, the `Case C-97/23 P.` reference form with any procedural suffix, and pre-1989 numbers like `26/62`; it reaches every judgment, order, and AG opinion filed under the number. One case per value: a joined list like `C-131/12 and C-132/12` is rejected
-- `court` selects by the CELEX court letter, so every record a court filed is reachable
+- `court` selects by the CELEX court letter, so every primary record a court filed is reachable, whatever its document letter
 - Primary records only by default — judicial information notices, abstracts, summaries, and corrigenda excluded; `include_derivative` includes them
 - Each case carries its ECLI (`ECLI:EU:C:2014:317`) where CELLAR records one; party names, subject matter, and case reference are parsed from the raw CELLAR title into `display_title`, `parties`, `subject_matter`, `case_reference`
 - Pagination via `offset` and `limit` (max 100)
