@@ -253,7 +253,7 @@ export class CellarSparqlService {
     );
 
     const parsed = await withRetry(
-      async () => {
+      async ({ signal }) => {
         const body = new URLSearchParams({
           query: cappedQuery,
           format: 'application/sparql-results+json',
@@ -267,9 +267,13 @@ export class CellarSparqlService {
               Accept: 'application/sparql-results+json',
             },
             body: body.toString(),
-            signal: AbortSignal.timeout(effectiveTimeoutMs),
+            // The caller's cancellation (ctx.signal, carried by withRetry) aborts the
+            // request in flight; without it a cancelled call ran to completion (#122).
+            signal: AbortSignal.any([signal, AbortSignal.timeout(effectiveTimeoutMs)]),
           });
         } catch (error) {
+          // A caller abort propagates as itself, never relabelled as a timeout.
+          if (signal.aborted) throw error;
           // The client-side bound must bound the whole call, not one attempt of
           // four (#78): a query that could not finish inside the window will not
           // finish on a retry either, and re-running it hammers a shared endpoint.

@@ -473,3 +473,91 @@ describe('CellarSparqlService sparql_error recovery (#26)', () => {
     expect(SPARQL_ERROR_RECOVERY_HINT).toBe(contractRecovery);
   });
 });
+
+// --- #122: a caller's cancellation reaches the request in flight ---
+
+describe('CellarSparqlService caller cancellation (#122)', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  /** A fetch that answers after `ms` unless the request's signal aborts first, as a real fetch does. */
+  function stubSlowFetch(ms: number): ReturnType<typeof vi.fn> {
+    const fetchMock = vi.fn(
+      (_url: string, init: { signal: AbortSignal }) =>
+        new Promise((resolve, reject) => {
+          if (init.signal.aborted) {
+            reject(init.signal.reason);
+            return;
+          }
+          const timer = setTimeout(
+            () =>
+              resolve({ ok: true, status: 200, text: async () => JSON.stringify(rowsPayload(1)) }),
+            ms,
+          );
+          init.signal.addEventListener('abort', () => {
+            clearTimeout(timer);
+            reject(init.signal.reason);
+          });
+        }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+
+  it('rejects a request the caller cancels mid-flight instead of returning its rows', async () => {
+    const fetchMock = stubSlowFetch(200);
+    const controller = new AbortController();
+    const ctx = createMockContext({ signal: controller.signal });
+
+    const pending = makeService().query('SELECT ?work WHERE { ?s ?p ?o } LIMIT 1', ctx);
+    setTimeout(() => controller.abort(), 20);
+
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('hands fetch an already-aborted signal for a caller that has already cancelled, and rejects', async () => {
+    const fetchMock = stubSlowFetch(200);
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(
+      makeService().query(
+        'SELECT ?work WHERE { ?s ?p ?o } LIMIT 1',
+        createMockContext({ signal: controller.signal }),
+      ),
+    ).rejects.toMatchObject({ name: 'AbortError' });
+    // One attempt, no retry; a real fetch given an aborted signal rejects without sending.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const init = fetchMock.mock.calls[0]?.[1] as { signal: AbortSignal };
+    expect(init.signal.aborted).toBe(true);
+  });
+
+  it('propagates a caller signal aborted with a TimeoutError as itself, not as sparql_timeout', async () => {
+    stubSlowFetch(4_000);
+    // The caller's own deadline, well inside the service's 5 s client timeout.
+    const ctx = createMockContext({ signal: AbortSignal.timeout(10) });
+
+    const rejection = await makeService()
+      .query('SELECT ?work WHERE { ?s ?p ?o } LIMIT 1', ctx)
+      .then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+
+    expect(rejection).toMatchObject({ name: 'TimeoutError' });
+    expect(rejection).not.toHaveProperty('code', JsonRpcErrorCode.ServiceUnavailable);
+    expect((rejection as { data?: { reason?: string } }).data?.reason).not.toBe('sparql_timeout');
+  });
+
+  it('still reports its own client timeout as sparql_timeout, not as a cancellation', async () => {
+    stubSlowFetch(5_000);
+    const ctx = createMockContext();
+
+    await expect(
+      makeService().query('SELECT ?work WHERE { ?s ?p ?o } LIMIT 1', ctx, 30),
+    ).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      data: { reason: 'sparql_timeout', retryable: false },
+    });
+  });
+});
