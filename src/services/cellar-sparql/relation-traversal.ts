@@ -30,6 +30,17 @@ export type RelationType = (typeof RELATION_TYPES)[number];
 type Direction = 'outgoing' | 'incoming' | 'both';
 
 /**
+ * The link from a consolidated text to its base act. Every CELEX-bearing
+ * consolidation carries exactly one, so it names an act's consolidations however
+ * they are numbered (`32000O0007` is consolidated as `02000X0776-…` as well as
+ * `02000O0007-…`). The broader `cdm:act_consolidated_consolidates_resource_legal`
+ * also points at amending acts and at consolidations of other acts, and needed an
+ * act-number match that missed every consolidation outside the `0{act}-YYYYMMDD`
+ * shape.
+ */
+const CONSOLIDATION_BASE_PREDICATE = 'cdm:act_consolidated_based_on_resource_legal';
+
+/**
  * Per-relation-type CDM traversal spec: the predicate to follow and the
  * direction(s) relative to the source work.
  *
@@ -39,8 +50,8 @@ type Direction = 'outgoing' | 'incoming' | 'both';
  * zero triples:
  *  - `amended_by` is the incoming side of `…amends…` (`?amender amends <work>`).
  *  - `consolidated_version` is the incoming side of
- *    `…act_consolidated_consolidates…` (the consolidated act points back to the
- *    base; there is no forward `…has_consolidated_version…` link).
+ *    {@link CONSOLIDATION_BASE_PREDICATE} (each consolidated text points back to
+ *    its one base act; there is no forward `…has_consolidated_version…` link).
  *
  * Repeal carries triples in the natural direction on `…repeals…` and
  * `…implicitly_repeals…`, so each is exposed as a pair of distinct enum values —
@@ -69,10 +80,7 @@ const RELATION_SPECS: Record<RelationType, { predicate: string; direction: Direc
     direction: 'incoming',
   },
   legal_basis: { predicate: 'cdm:resource_legal_based_on_resource_legal', direction: 'outgoing' },
-  consolidated_version: {
-    predicate: 'cdm:act_consolidated_consolidates_resource_legal',
-    direction: 'incoming',
-  },
+  consolidated_version: { predicate: CONSOLIDATION_BASE_PREDICATE, direction: 'incoming' },
   national_transposition: {
     predicate: 'cdm:measure_national_implementing_implements_resource_legal',
     direction: 'incoming',
@@ -91,11 +99,10 @@ export const DEFAULT_PER_TYPE_LIMIT = 100;
 
 /**
  * CELEX constraint pushed into a relation arm before LIMIT/OFFSET and continuation
- * proof. Consolidations require a sector-`0` same-act CELEX; national transposition
- * measures require a sector-`7` CELEX with the source directive's act core. Requiring
- * and filtering the related CELEX before grouping also makes one work with several
- * CELEX values occupy exactly one page row. Client-side checks remain as
- * belt-and-suspenders.
+ * proof. Consolidations require a CELEX; national transposition measures require a
+ * sector-`7` CELEX with the source directive's act core. Requiring and filtering the
+ * related CELEX before grouping also makes one work with several CELEX values occupy
+ * exactly one page row. Client-side checks remain as belt-and-suspenders.
  */
 interface CelexConstraint {
   /** Regular expression applied to the related work's required CELEX identifier. */
@@ -188,23 +195,15 @@ function buildRelationQuery(
 
 /**
  * Extract a CELEX's act-identifying core — the `{year}{type}{number}` that
- * follows the one-character sector — so a consolidated version (sector `0`) can
- * be matched to its base act (legislation is sector `3`). `32016R0679` and its
- * consolidation `02016R0679-20160504` both yield `2016R0679`; a consolidation of
- * a different act (`01995L0046-20180525`) yields `1995L0046`. Returns `undefined`
- * when the string doesn't parse as a CELEX.
+ * follows the one-character sector — so a national implementing measure (sector
+ * `7`) can be matched to the directive it transposes (`32016L0680` and
+ * `72016L0680CZE_225030` both yield `2016L0680`). Returns `undefined` when the
+ * string doesn't parse as a CELEX.
  */
 const CELEX_ACT_CORE_RE = /^[0-9A-Z](\d{4}[A-Z]{1,2}\d+)/;
 function celexActCore(celex: string): string | undefined {
   return CELEX_ACT_CORE_RE.exec(celex)?.[1];
 }
-
-/**
- * A consolidated-version CELEX: sector `0`, the `{year}{type}{number}` act core
- * (group 1), and a `-YYYYMMDD` consolidation-date suffix (groups 2–4). Genuine
- * consolidations of an act carry this shape, e.g. `02014R0833-20260424`.
- */
-const CONSOLIDATED_CELEX_RE = /^0(\d{4}[A-Z]{1,2}\d+)-(\d{4})(\d{2})(\d{2})$/;
 
 /**
  * CELEX pattern for a national implementing measure that transposes the act
@@ -216,8 +215,7 @@ const CONSOLIDATED_CELEX_RE = /^0(\d{4}[A-Z]{1,2}\d+)-(\d{4})(\d{2})(\d{2})$/;
  * has to be there: a left-anchored `^7{core}` alone also matches a longer act
  * number that merely starts with the same digits, so measures transposing a
  * hypothetical `32016L06801` would be returned as transpositions of
- * `32016L0680`. That mirrors the two-ended discipline the `consolidated_version`
- * pattern already applies. The trailing measure number is deliberately left
+ * `32016L0680`. The trailing measure number is deliberately left
  * unanchored — no digit can extend the act core across three letters, so
  * anchoring it would add false-rejection risk without closing anything.
  * Verified against 3,000 sector-7 CELEX values pulled live from CELLAR: all
@@ -227,65 +225,125 @@ function nationalMeasureCelexPattern(sourceActCore: string): string {
   return `^7${sourceActCore}[A-Z]{3}`;
 }
 
-/** True when a CELEX is itself a consolidated version (…-YYYYMMDD), not a base act. */
+/**
+ * True when a CELEX names a consolidated text: sector `0` is the consolidated-text
+ * sector, and every CELEX-bearing consolidation linked to a base act carries it,
+ * including those outside the `0{act}-YYYYMMDD` shape (`02006A0901(01)-20090301`,
+ * `02003T0000-20040501`).
+ */
 export function isConsolidatedCelex(celex: string): boolean {
-  return CONSOLIDATED_CELEX_RE.test(celex);
+  return celex.startsWith('0');
 }
 
-/** The newest consolidated version of a base act. */
-export interface CurrentConsolidated {
-  /** Consolidation date parsed from the CELEX suffix, ISO 8601 (`2026-04-24`). */
-  asOf: string;
-  /** CELEX of the consolidated work, e.g. `02014R0833-20260424`. */
+/** A consolidated text's base act, as its based-on link names it. */
+export interface ConsolidationBase {
+  /** CELEX of the base act. */
   celex: string;
+  workUri: string;
+}
+
+/** Where a CELEX stands among its act's consolidated versions. */
+export interface ConsolidationContext {
+  /**
+   * The base act of the consolidated versions: the linked base of a consolidated
+   * text, or the requested act itself when it has a current consolidated version.
+   * Absent for a consolidated text with no based-on link, or whose base work
+   * carries no CELEX — a base that can't be named, so the text reads as its own.
+   */
+  base?: ConsolidationBase;
+  /** The act's newest consolidated version in effect today. Absent when it has none. */
+  current?: { asOf: string; celex: string };
+  /**
+   * For a base-act CELEX with no consolidated version in effect, one dated after
+   * today (the latest, when there are several), which does not apply yet. Absent
+   * otherwise.
+   */
+  pending?: { asOf: string; celex: string };
+  /** Consolidation date of a consolidated-text CELEX, ISO 8601. */
+  requestedAsOf?: string;
 }
 
 /**
- * Find the newest consolidated version of a base act, or `undefined` when the
- * act has no consolidation (or is itself a consolidated version). Mirrors the
- * `consolidated_version` relation — the incoming side of
- * `cdm:act_consolidated_consolidates_resource_legal`, CELEX-bearing, same act
- * core — so a base act (sector `3`) resolves to its sector-`0` consolidations.
+ * Locate a CELEX among its act's consolidated versions in one query. A base-act
+ * CELEX reads its newest consolidation; a consolidated-text CELEX (sector `0`)
+ * reads its own consolidation date, its base act's work and CELEX, and that base
+ * act's newest consolidation.
  *
- * Self-contained: resolves the base work by CELEX inline — a typed exact triple,
- * never a STR() scan (#92) — rather than taking a work URI like
- * `traverseRelations`, so the caller can run it concurrently with the
- * metadata/content fetch. `ORDER BY DESC(?consolidatedCelex)` puts the newest
- * same-act consolidation first — the date suffix sorts chronologically within an
- * act core — so the first row whose core matches is the current version, robust
- * to a truncating LIMIT. CELLAR also asserts the `consolidates` edge for
- * consolidations of *other* acts (a graph artifact), so the act-core match is
- * required, not incidental.
+ * An act's consolidations are the works whose {@link CONSOLIDATION_BASE_PREDICATE}
+ * is its work. The newest is the latest `cdm:act_consolidated_date` on or before
+ * today, which also supplies its `asOf`: a consolidation dated in the future does
+ * not apply yet and is never the current one. The date orders the versions, not
+ * the CELEX, because one act's consolidations can be numbered differently. Dates
+ * compare as ISO strings, the form `STR()` renders an `xsd:date` in.
+ *
+ * A base act whose consolidations are all dated in the future has no current
+ * version; the same query reads one of those as `pending`, so a caller can say no
+ * consolidated version is in effect yet. Both arms are OPTIONAL, and unbound values
+ * sort last under `DESC`, so a current version always wins the one row returned.
+ *
+ * Self-contained: keys on the typed CELEX literal (#92), so a caller can run it
+ * concurrently with CELEX resolution and the metadata fetch.
  */
-export async function findCurrentConsolidated(
+export async function findConsolidation(
   svc: Pick<CellarSparqlService, 'query'>,
   celex: string,
   ctx: Context,
-): Promise<CurrentConsolidated | undefined> {
-  // A consolidated version has no newer consolidation to resolve to.
-  if (isConsolidatedCelex(celex)) return;
-  const baseCore = celexActCore(celex);
-  if (!baseCore) return;
+): Promise<ConsolidationContext> {
+  const today = new Date().toISOString().slice(0, 10);
+  const currentPattern = `?current ${CONSOLIDATION_BASE_PREDICATE} ?baseWork ;
+      cdm:act_consolidated_date ?currentDate ;
+      cdm:resource_legal_id_celex ?currentCelex .
+    FILTER(STR(?currentDate) <= "${today}")`;
+  const newestFirst = 'ORDER BY DESC(STR(?currentDate)) DESC(?currentCelex)';
 
-  const query = `
-SELECT ?consolidatedCelex WHERE {
-  ?work cdm:resource_legal_id_celex ${celexLiteral(celex)} .
-  ?consolidated cdm:act_consolidated_consolidates_resource_legal ?work .
-  ?consolidated cdm:resource_legal_id_celex ?consolidatedCelex .
-}
-ORDER BY DESC(?consolidatedCelex)
-LIMIT 100`;
-
-  const bindings = await svc.query(query, ctx);
-  for (const b of bindings) {
-    const c = CellarSparqlService.bindingValue(b, 'consolidatedCelex');
-    if (!c) continue;
-    const m = CONSOLIDATED_CELEX_RE.exec(c);
-    if (m && m[1] === baseCore) {
-      return { celex: c, asOf: `${m[2]}-${m[3]}-${m[4]}` };
-    }
+  const query = isConsolidatedCelex(celex)
+    ? `
+SELECT ?requestedDate ?baseWork ?baseCelex ?currentCelex ?currentDate WHERE {
+  ?requested cdm:resource_legal_id_celex ${celexLiteral(celex)} ;
+    ${CONSOLIDATION_BASE_PREDICATE} ?baseWork .
+  OPTIONAL { ?requested cdm:act_consolidated_date ?requestedDate . }
+  OPTIONAL { ?baseWork cdm:resource_legal_id_celex ?baseCelex . }
+  OPTIONAL {
+    ${currentPattern}
   }
-  return;
+} ${newestFirst} LIMIT 1`
+    : `
+SELECT ?baseWork ?currentCelex ?currentDate ?pendingCelex ?pendingDate WHERE {
+  ?baseWork cdm:resource_legal_id_celex ${celexLiteral(celex)} .
+  OPTIONAL {
+    ${currentPattern}
+  }
+  OPTIONAL {
+    ?pending ${CONSOLIDATION_BASE_PREDICATE} ?baseWork ;
+      cdm:act_consolidated_date ?pendingDate ;
+      cdm:resource_legal_id_celex ?pendingCelex .
+    FILTER(STR(?pendingDate) > "${today}")
+  }
+} ${newestFirst} DESC(STR(?pendingDate)) LIMIT 1`;
+
+  const [row] = await svc.query(query, ctx);
+  const baseWork = CellarSparqlService.bindingValue(row, 'baseWork');
+  if (!baseWork) return {};
+
+  const version = (celexVariable: string, dateVariable: string) => {
+    const versionCelex = CellarSparqlService.bindingValue(row, celexVariable);
+    const date = CellarSparqlService.bindingValue(row, dateVariable);
+    return versionCelex && date ? { celex: versionCelex, asOf: date.slice(0, 10) } : undefined;
+  };
+  const current = version('currentCelex', 'currentDate');
+
+  if (!isConsolidatedCelex(celex)) {
+    if (current) return { base: { workUri: baseWork, celex }, current };
+    const pending = version('pendingCelex', 'pendingDate');
+    return pending ? { pending } : {};
+  }
+  const baseCelex = CellarSparqlService.bindingValue(row, 'baseCelex');
+  const requestedAsOf = CellarSparqlService.bindingValue(row, 'requestedDate')?.slice(0, 10);
+  return {
+    ...(baseCelex ? { base: { workUri: baseWork, celex: baseCelex } } : {}),
+    ...(current ? { current } : {}),
+    ...(requestedAsOf ? { requestedAsOf } : {}),
+  };
 }
 
 /**
@@ -295,30 +353,24 @@ LIMIT 100`;
  * the per-type caps are independent.
  *
  * `sourceCelex` is the CELEX identity of the work being traversed, supplied from
- * the CELEX input or resolved from the work URI. It gates the relation-specific
- * act-number filters. For `consolidated_version`,
- * CELLAR asserts the `consolidates` edge for genuine consolidations of this act
- * *and* — as a graph artifact — for consolidations of other acts (e.g. an act
- * this one repealed) plus CELEX-less `CONS_TEXT` member/manifestation works. That
- * filter is pushed into the SPARQL query for `consolidated_version` (see
- * `CelexConstraint`) so LIMIT/OFFSET and the truncation count operate on valid
- * rows only (issue #45); the same test is re-applied client-side below as
- * belt-and-suspenders. `consolidated_version` rows with no related CELEX are
- * always dropped (they can't be fetched via get_document anyway); when
- * `sourceCelex` is known, rows whose CELEX belongs to a different act are dropped
- * too. `national_transposition` similarly requires a sector-`7` CELEX carrying
- * the source directive's act core followed by a member-state code, selecting the
- * matching identifier before grouping when one national measure has several CELEX
- * values, and reports that code as the row's `relatedMemberState` — the only
- * relation type that carries one. Every other relation type is returned unfiltered.
+ * the CELEX input or resolved from the work URI. It gates the act-number filter of
+ * `national_transposition`, which requires a sector-`7` CELEX carrying the source
+ * directive's act core followed by a member-state code, selecting the matching
+ * identifier before grouping when one national measure has several CELEX values,
+ * and reports that code as the row's `relatedMemberState` — the only relation type
+ * that carries one. The filter is pushed into the SPARQL query (see
+ * `CelexConstraint`) so LIMIT/OFFSET and the truncation count operate on valid rows
+ * only (issue #45), and re-applied client-side below as belt-and-suspenders. An
+ * absent `sourceCelex` — an addressed work with no CELEX, or one whose CELEX
+ * identity is ambiguous because the work carries several — returns no
+ * `national_transposition` rows without issuing a query at all, since selecting
+ * measures with no source act is precisely the arbitrary binding the constraint
+ * exists to prevent.
  *
- * An absent `sourceCelex` — an addressed work with no CELEX, or one whose CELEX
- * identity is ambiguous because the work carries several — stands the act-core
- * constraints down rather than binding the traversal to an arbitrary act:
- * `consolidated_version` then requires only that the related work carry some
- * CELEX, and `national_transposition` returns nothing without issuing a query at
- * all, since selecting measures with no source act is precisely the arbitrary
- * binding the constraint exists to prevent.
+ * `consolidated_version` follows the based-on link, which reaches this act's
+ * consolidations alone, and requires only that the related work carry a CELEX:
+ * a CELEX-less `CONS_TEXT` member or manifestation work can't be fetched via
+ * get_document. Every other relation type is returned unfiltered.
  *
  * `perTypeLimit` bounds each direction of each type; `offset` pages within a
  * direction. Each query requests one additional grouped row per direction, then
@@ -339,11 +391,11 @@ export async function traverseRelations(
     types.map(async (type): Promise<{ type: RelationType; bindings: SparqlBinding[] }> => {
       /**
        * Push relation-specific CELEX validity into the query before pagination:
-       * sector-0 same-act consolidations and sector-7 same-act national measures.
+       * CELEX-bearing consolidations and sector-7 same-act national measures.
        */
       let celex: CelexConstraint | undefined;
       if (type === 'consolidated_version') {
-        celex = sourceActCore ? { pattern: `^0${sourceActCore}-[0-9]{8}$` } : {};
+        celex = {};
       } else if (type === 'national_transposition') {
         // With no source act core there is no pattern that selects this act's
         // implementing measures, and every row is dropped either way. Return the
@@ -378,10 +430,7 @@ export async function traverseRelations(
 
       // Keep CELEX-constrained relation lists trustworthy at a glance. These
       // checks mirror the SPARQL filters as client-side belt-and-suspenders.
-      if (type === 'consolidated_version') {
-        if (!relatedCelex) continue;
-        if (sourceActCore && celexActCore(relatedCelex) !== sourceActCore) continue;
-      }
+      if (type === 'consolidated_version' && !relatedCelex) continue;
       let relatedMemberState: string | undefined;
       if (type === 'national_transposition') {
         const match = relatedCelex ? nationalMeasureRe?.exec(relatedCelex) : undefined;

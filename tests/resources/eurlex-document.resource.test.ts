@@ -8,6 +8,12 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_document_resource } from '@/mcp-server/resources/definitions/eurlex-document.resource.js';
 import { escapeSparqlLiteral } from '@/services/cellar-sparql/eli-resolution.js';
 import {
+  ACTS,
+  fakeConsolidationCellar,
+  isConsolidationLookup,
+  WORK,
+} from '../fixtures/cellar-consolidations.js';
+import {
   addressedWorks,
   agentRows,
   CELLAR,
@@ -501,6 +507,80 @@ describe('eurlex_document_resource', () => {
       expect(result.author_institution).toBe('Council of the EU');
       expect(result.author_institutions).toEqual(['Council of the EU', 'European Parliament']);
       expect(result).not.toHaveProperty('advocates_general');
+    });
+  });
+
+  // --- Consolidated texts (#110) ---
+
+  describe('consolidated texts (#110)', () => {
+    const read = async (celex: string) => {
+      mockQuery.mockImplementation(fakeConsolidationCellar);
+      const ctx = createMockContext();
+      const params = eurlex_document_resource.params!.parse({ celexNumber: celex });
+      return (await eurlex_document_resource.handler(params, ctx)) as Record<string, unknown>;
+    };
+
+    it("reads a consolidated text's authors, in-force status, subjects, and legal bases from its base act", async () => {
+      const result = await read('02024R1689-20260727');
+
+      expect(result.base_act_celex).toBe('32024R1689');
+      expect(result.author_institutions).toEqual(
+        expect.arrayContaining(['European Parliament', 'Council of the EU']),
+      );
+      expect(result.author_institutions).toHaveLength(2);
+      expect(result.in_force).toBe(true);
+      expect(result.eurovoc_subjects).toHaveLength(7);
+      expect(result.legal_basis).toHaveLength(2);
+      expect(JSON.stringify(result)).not.toContain('OP_DATPRO');
+    });
+
+    it('leaves a base act unchanged, with no base_act_celex and no lookup', async () => {
+      const result = await read('32024R1689');
+
+      expect(result).not.toHaveProperty('base_act_celex');
+      expect(result.work_uri).toBe(WORK.aiAct);
+      const queries = mockQuery.mock.calls.map((c) => c[0] as string);
+      expect(queries.some(isConsolidationLookup)).toBe(false);
+      expect(queries).toHaveLength(5);
+    });
+
+    it('runs the base lookup concurrently with CELEX resolution for a sector-0 CELEX', async () => {
+      let markLookup!: () => void;
+      const lookupIssued = new Promise<void>((resolve) => {
+        markLookup = resolve;
+      });
+      mockQuery.mockImplementation(async (q: string) => {
+        if (isConsolidationLookup(q)) markLookup();
+        if (isResolutionQuery(q)) {
+          await Promise.race([
+            lookupIssued,
+            new Promise((_, reject) =>
+              setTimeout(
+                () => reject(new Error('lookup was not issued alongside resolution')),
+                200,
+              ),
+            ),
+          ]);
+        }
+        return fakeConsolidationCellar(q);
+      });
+
+      const params = eurlex_document_resource.params!.parse({ celexNumber: '02024R1689-20240712' });
+      const result = (await eurlex_document_resource.handler(
+        params,
+        createMockContext(),
+      )) as Record<string, unknown>;
+      expect(result.base_act_celex).toBe('32024R1689');
+    });
+
+    it('keeps a consolidated text under its own CELEX, work, title, date, and type', async () => {
+      const result = await read('02024R1689-20260727');
+
+      expect(result.celex_number).toBe('02024R1689-20260727');
+      expect(result.work_uri).toBe(ACTS['02024R1689-20260727']?.uri);
+      expect(result.title).toBe('Consolidated text of 2026-07-27');
+      expect(result.date).toBe('2026-07-27');
+      expect(result.resource_type).toBe('Consolidated Text');
     });
   });
 });

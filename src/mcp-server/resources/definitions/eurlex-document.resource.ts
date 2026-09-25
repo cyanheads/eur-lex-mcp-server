@@ -11,6 +11,10 @@ import {
   getCellarSparqlService,
 } from '@/services/cellar-sparql/cellar-sparql-service.js';
 import { CELEX_PATTERN } from '@/services/cellar-sparql/eli-resolution.js';
+import {
+  findConsolidation,
+  isConsolidatedCelex,
+} from '@/services/cellar-sparql/relation-traversal.js';
 import type { SparqlBinding } from '@/services/cellar-sparql/types.js';
 import { fetchWorkAgents } from '@/services/cellar-sparql/work-agents.js';
 import { resolveCelexWorks } from '@/services/cellar-sparql/work-resolution.js';
@@ -37,7 +41,7 @@ function collectResolved(
 export const eurlex_document_resource = resource('eurlex://document/{celexNumber}', {
   name: 'EUR-Lex document metadata',
   description:
-    'Metadata snapshot for a CELLAR work by CELEX number — human-readable document type and author institution labels, Advocates General of a case-law record, date, title, in-force flag, legal basis acts (work URI plus CELEX), and EuroVoc subjects (concept URI plus English label).',
+    "Metadata snapshot for a CELLAR work by CELEX number — human-readable document type and author institution labels, Advocates General of a case-law record, date, title, in-force flag, legal basis acts (work URI plus CELEX), and EuroVoc subjects (concept URI plus English label). A consolidated text keeps its own type, date, and title, and reports its base act (base_act_celex) with that act's authors, in-force flag, legal bases, and subjects.",
   mimeType: 'application/json',
   params: z.object({
     celexNumber: z
@@ -59,10 +63,20 @@ export const eurlex_document_resource = resource('eurlex://document/{celexNumber
     // The CELEX resolves to one work first (#97): CELLAR holds some CELEX numbers
     // under several works, and a CELEX-keyed join would read the union of all of
     // them. Every metadata query then keys on the resolved work's IRI.
-    const workUri = (await resolveCelexWorks(svc, [celexNumber], ctx)).get(celexNumber);
+    //
+    // A consolidated text records none of its act's metadata, so its authors,
+    // in-force flag, legal bases, and subjects come from its linked base act
+    // (#110), found by a lookup that runs alongside the resolution.
+    const [resolved, consolidation] = await Promise.all([
+      resolveCelexWorks(svc, [celexNumber], ctx),
+      isConsolidatedCelex(celexNumber) ? findConsolidation(svc, celexNumber, ctx) : undefined,
+    ]);
+    const workUri = resolved.get(celexNumber);
     if (!workUri) {
       throw notFound(`No CELLAR work found for CELEX: ${celexNumber}`, { celexNumber });
     }
+    const baseAct = consolidation?.base;
+    const actWork = baseAct?.workUri ?? workUri;
 
     const sparql = `
 SELECT ?type ?date ?title ?inForce WHERE {
@@ -73,7 +87,7 @@ SELECT ?type ?date ?title ?inForce WHERE {
     ?expr cdm:expression_uses_language <${ENG_LANGUAGE_URI}> .
     ?expr cdm:expression_title ?title .
   }
-  OPTIONAL { <${workUri}> cdm:resource_legal_in-force ?inForce . }
+  OPTIONAL { <${actWork}> cdm:resource_legal_in-force ?inForce . }
 } LIMIT 5`;
 
     // Legal bases and EuroVoc subjects are fetched per dimension (never a
@@ -82,12 +96,12 @@ SELECT ?type ?date ?title ?inForce WHERE {
     // language input, so labels are English.
     const legalBasisSparql = `
 SELECT ?legalBasis (SAMPLE(?celexValue) AS ?celex) WHERE {
-  <${workUri}> cdm:resource_legal_based_on_resource_legal ?legalBasis .
+  <${actWork}> cdm:resource_legal_based_on_resource_legal ?legalBasis .
   OPTIONAL { ?legalBasis cdm:resource_legal_id_celex ?celexValue . }
 } GROUP BY ?legalBasis LIMIT ${DIMENSION_LIMIT}`;
     const eurovocSparql = `
 SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
-  <${workUri}> cdm:work_is_about_concept_eurovoc ?eurovoc .
+  <${actWork}> cdm:work_is_about_concept_eurovoc ?eurovoc .
   OPTIONAL {
     ?eurovoc skos:prefLabel ?labelValue .
     FILTER(LANG(?labelValue) = "en")
@@ -98,13 +112,14 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
     // never from rows cross-joined with the single-valued fields.
     const [bindings, agents, legalBasisBindings, eurovocBindings] = await Promise.all([
       svc.query(sparql, ctx),
-      fetchWorkAgents(svc, workUri, ctx),
+      fetchWorkAgents(svc, actWork, ctx),
       svc.query(legalBasisSparql, ctx),
       svc.query(eurovocSparql, ctx),
     ]);
 
     const first = bindings[0];
     const result: Record<string, unknown> = { celex_number: celexNumber, work_uri: workUri };
+    if (baseAct) result.base_act_celex = baseAct.celex;
 
     // Resolve the raw CDM authority URI to a human-readable label, matching the
     // eurlex_get_document tool (previously the resource leaked the raw URI).

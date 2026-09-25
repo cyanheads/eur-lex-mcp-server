@@ -16,8 +16,9 @@ import {
   resolveEliToWork,
 } from '@/services/cellar-sparql/eli-resolution.js';
 import {
-  type CurrentConsolidated,
-  findCurrentConsolidated,
+  type ConsolidationBase,
+  findConsolidation,
+  isConsolidatedCelex,
 } from '@/services/cellar-sparql/relation-traversal.js';
 import type { SparqlBinding } from '@/services/cellar-sparql/types.js';
 import { fetchWorkAgents } from '@/services/cellar-sparql/work-agents.js';
@@ -78,10 +79,13 @@ function formatLiteralSource(content: string, format: 'html' | 'xml'): string {
  */
 const META_DIMENSION_LIMIT = 100;
 
+/** CELLAR's end-of-validity value for an act with no end date. */
+const OPEN_ENDED_VALIDITY = '9999-12-31';
+
 export const eurlex_get_document = tool('eurlex_get_document', {
   title: 'Get EU Document',
   description:
-    'Fetch the metadata and full text of an EU act by CELEX number, ELI URI, or work URI. Returns structured metadata (title, date, type, author institution, Advocates General, legal basis, EuroVoc subjects, in-force status) plus the act body as HTML, Markdown, or Formex4 XML, defaulting to English with automatic fallback. Every body returned in one call is capped at 100,000 characters — paged and full windows page onward with offset/limit; use outline: true for a heading map and select to pull specific articles, chapters, recitals, or annexes, reading a selected section on its own from the offset and chars in selected_sections.',
+    'Fetch the metadata and full text of an EU act by CELEX number, ELI URI, or work URI. Returns structured metadata (title, date, type, author institution, Advocates General, legal basis, EuroVoc subjects, in-force status and, for an act not in force, its repealing acts, end of validity, or pending entry into force) plus the act body as HTML, Markdown, or Formex4 XML, defaulting to English with automatic fallback. Every body returned in one call is capped at 100,000 characters — paged and full windows page onward with offset/limit; use outline: true for a heading map and select to pull specific articles, chapters, recitals, or annexes, reading a selected section on its own from the offset and chars in selected_sections.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     celex_number: z
@@ -115,13 +119,13 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       })
       .optional()
       .describe(
-        'CELLAR work resource URI to fetch (e.g. http://publications.europa.eu/resource/cellar/3e485e15-11bd-11e6-ba9a-01aa75ed71a1) — the form returned by eurlex_lookup_celex, eurlex_get_relations, and eurlex_search_documents. Provide exactly one of celex_number, eli_uri, or work_uri.',
+        'CELLAR work resource URI to fetch (e.g. http://publications.europa.eu/resource/cellar/3e485e15-11bd-11e6-ba9a-01aa75ed71a1) — the form returned by eurlex_lookup_celex, eurlex_get_relations, and eurlex_search_documents. A work carrying several CELEX numbers (a national implementing measure, one per directive it was notified against) is served under its lowest, with a notice giving the count; each names the same document, so pass celex_number to serve a specific one. Provide exactly one of celex_number, eli_uri, or work_uri.',
       ),
     resolve: z
       .enum(['as_requested', 'current_consolidated'])
       .default('as_requested')
       .describe(
-        'Which version to serve for a base act with newer consolidated versions. "as_requested" (default) returns the exact CELEX requested; "current_consolidated" serves the newest consolidated version instead (echoing the request in requested_celex), a no-op when none exists. Either way, is_superseded / current_consolidated_celex / consolidated_as_of flag a stale base act.',
+        'Which version to serve. "as_requested" (default) returns the exact CELEX requested; "current_consolidated" serves the newest consolidated version in effect of the requested act — or, for a consolidated CELEX, of its base act — echoing the request in requested_celex, and is a no-op when none exists (with a notice when the act\'s only consolidated versions are dated in the future). Either way, is_superseded / current_consolidated_celex / consolidated_as_of describe the text served.',
       ),
     language: z
       .string()
@@ -205,13 +209,13 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .string()
       .optional()
       .describe(
-        'Human-readable name of the primary (first) originating institution — an EU institution (e.g. "European Parliament", "Court of Justice"), or for a national-court decision the deciding court (e.g. "Supremo Tribunal de Justiça"). For co-legislated acts, prefer author_institutions for the complete set. Absent when not recorded, and for an AG opinion whose only recorded author is the Advocate General.',
+        'Human-readable name of the primary (first) originating institution — an EU institution (e.g. "European Parliament", "Court of Justice"), or for a national-court decision the deciding court (e.g. "Supremo Tribunal de Justiça"). For co-legislated acts, prefer author_institutions for the complete set. For a consolidated text, the base act\'s (see base_act_celex). Absent when not recorded, and for an AG opinion whose only recorded author is the Advocate General.',
       ),
     author_institutions: z
       .array(z.string().describe('Human-readable institution name.'))
       .optional()
       .describe(
-        'All originating institutions, for acts adopted by more than one body (e.g. ["European Parliament", "Council of the EU"]). Institutions only: an Advocate General appears in advocates_general. Absent when none recorded.',
+        'All originating institutions, for acts adopted by more than one body (e.g. ["European Parliament", "Council of the EU"]). Institutions only: an Advocate General appears in advocates_general. For a consolidated text, the base act\'s. Absent when none recorded.',
       ),
     advocates_general: z
       .array(z.string().describe('Advocate General surname, as CELLAR records it.'))
@@ -238,7 +242,9 @@ export const eurlex_get_document = tool('eurlex_get_document', {
           .describe('A legal basis act: its CELLAR work URI plus its CELEX number when recorded.'),
       )
       .optional()
-      .describe('Legal basis acts for this work. Absent when none are recorded.'),
+      .describe(
+        "Legal basis acts for this work — for a consolidated text, its base act's. Absent when none are recorded.",
+      ),
     eurovoc_subjects: z
       .array(
         z
@@ -258,31 +264,62 @@ export const eurlex_get_document = tool('eurlex_get_document', {
           .describe('An EuroVoc subject: its concept URI plus its preferred label when available.'),
       )
       .optional()
-      .describe('EuroVoc subject classifications. Absent when none are recorded.'),
-    in_force: z.boolean().optional().describe('Whether the act is currently in force.'),
+      .describe(
+        "EuroVoc subject classifications — for a consolidated text, its base act's. Absent when none are recorded.",
+      ),
+    in_force: z
+      .boolean()
+      .optional()
+      .describe(
+        'Whether the act is currently in force — for a consolidated text, whether its base act is. When false, repealed_by, entry_into_force, and end_of_validity give the reason where CELLAR records one: an explicit repeal, an entry into force still ahead, or an end of validity — past for an expired act, possibly still ahead for one not yet in force. Some acts not in force carry none of them.',
+      ),
+    repealed_by: z
+      .array(z.string().describe('CELEX number of a repealing act.'))
+      .optional()
+      .describe(
+        "CELEX numbers of the acts that explicitly repeal this one, the relation eurlex_get_relations names repealed_by (implicit repeals are listed there as implicitly_repealed_by). Present only when in_force is false; for a consolidated text, its base act's.",
+      ),
+    entry_into_force: z
+      .string()
+      .optional()
+      .describe(
+        "Earliest entry-into-force date (YYYY-MM-DD) of an act not yet in force. Present only when in_force is false and that date is after today (UTC); for a consolidated text, its base act's.",
+      ),
+    end_of_validity: z
+      .string()
+      .optional()
+      .describe(
+        "Date (YYYY-MM-DD) the act's validity ends or ended: past for an expired act, and possibly in the future for one not yet in force (read it with entry_into_force), so on its own it does not mean the act expired. Present only when in_force is false and CELLAR records an actual date rather than its open-ended 9999-12-31; for a consolidated text, its base act's.",
+      ),
+    base_act_celex: z
+      .string()
+      .optional()
+      .describe(
+        "CELEX of the base act a consolidated text consolidates (e.g. 32024R1689), linked through CELLAR rather than derived from the consolidated CELEX. Its authors, in-force status, legal basis, and EuroVoc subjects are reported here in place of the consolidation's own. Absent for a base act, and for a consolidated text whose base act is unlinked or carries no CELEX.",
+      ),
     is_superseded: z
       .boolean()
       .optional()
       .describe(
-        'True when a newer consolidated version of the requested base act exists (an unofficial reading aid merging later amendments), so the returned text may not include those amendments. Not a repeal/replacement signal — the base act remains the law and may still be in force (see in_force). Absent when the act has no consolidated version, or is itself one.',
+        'Whether a newer consolidated version (an unofficial reading aid merging later amendments) than the text served is in effect, so this text may lack those amendments. False when the text served is the newest consolidated version in effect, or a consolidated version dated after it that does not apply yet. Not a repeal/replacement signal — the base act remains the law and may still be in force (see in_force). Present whenever the act has a consolidated version in effect; absent otherwise.',
       ),
     current_consolidated_celex: z
       .string()
       .optional()
       .describe(
-        'CELEX of the newest consolidated version of the requested base act (e.g. 02014R0833-20260424) — fetch it with eurlex_get_document, or pass resolve "current_consolidated". Present only when is_superseded is true.',
+        'CELEX of the act\'s newest consolidated version in effect (e.g. 02014R0833-20260424) — fetch it with eurlex_get_document, or pass resolve "current_consolidated". A consolidation dated in the future is never this version. Present whenever is_superseded is.',
       ),
     consolidated_as_of: z
       .string()
       .optional()
       .describe(
-        'Consolidation date of current_consolidated_celex in ISO 8601 (YYYY-MM-DD). Present only when is_superseded is true.',
+        'Consolidation date of current_consolidated_celex in ISO 8601 (YYYY-MM-DD). Present whenever is_superseded is.',
       ),
     requested_celex: z
       .string()
       .optional()
       .describe(
-        'The originally requested CELEX, echoed when resolve "current_consolidated" served a different (consolidated) work. celex_number holds the CELEX actually served. Absent when the served work is the one requested.',
+        'The originally requested CELEX, echoed when resolve "current_consolidated" served a different consolidated version. celex_number holds the CELEX actually served. Absent when the served work is the one requested.',
       ),
     content: z
       .string()
@@ -432,7 +469,12 @@ export const eurlex_get_document = tool('eurlex_get_document', {
     truncated: z.boolean().optional().describe('True when the returned body window was capped.'),
     shown: z.number().int().optional().describe('Number of body characters returned.'),
     cap: z.number().int().optional().describe('Maximum body characters allowed in the window.'),
-    notice: z.string().optional().describe('How to retrieve the remaining document content.'),
+    notice: z
+      .string()
+      .optional()
+      .describe(
+        'How to retrieve the remaining document content; when a work_uri carries several CELEX numbers, how many it carries and which one was served; and, when no consolidated version is in effect yet, that the consolidated text served does not apply yet, or that resolve "current_consolidated" served the base act.',
+      ),
   },
 
   errors: [
@@ -479,6 +521,8 @@ export const eurlex_get_document = tool('eurlex_get_document', {
     const providedCount = [celexInput, eliInput, workUriInput].filter(Boolean).length;
 
     let requestedCelex: string;
+    /** Set when a work_uri carries several CELEX numbers and the lowest was served. */
+    let celexNotice: string | undefined;
     if (providedCount !== 1) {
       throw ctx.fail(
         'invalid_identifier_args',
@@ -503,13 +547,17 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       // CELEX (some CONS_TEXT member/manifestation works) can't be fetched by the
       // CELEX-keyed flow — report that honestly, never as a mislabeled ELI. The
       // refine already guaranteed the URI is safe to interpolate inside <...>.
+      //
+      // A national implementing measure carries one CELEX per directive it was
+      // notified against, each an alias of the same work, so none is canonical
+      // (#104). The lowest serves, the order eurlex_get_relations reads a work's
+      // CELEX in, and the count rides the same query for the notice below.
       const safeWorkUri = workUriInput as string;
-      const derefBindings = await sparqlSvc.query(
-        `SELECT ?celex WHERE {\n  <${safeWorkUri}> cdm:resource_legal_id_celex ?celex .\n} LIMIT 1`,
+      const [deref] = await sparqlSvc.query(
+        `SELECT (MIN(STR(?celexValue)) AS ?celex) (COUNT(DISTINCT ?celexValue) AS ?celexCount) WHERE {\n  <${safeWorkUri}> cdm:resource_legal_id_celex ?celexValue .\n}`,
         ctx,
       );
-      const resolvedCelex =
-        derefBindings[0] && CellarSparqlService.bindingValue(derefBindings[0], 'celex');
+      const resolvedCelex = CellarSparqlService.bindingValue(deref, 'celex');
       if (!resolvedCelex) {
         throw ctx.fail(
           'not_found',
@@ -518,6 +566,10 @@ export const eurlex_get_document = tool('eurlex_get_document', {
         );
       }
       requestedCelex = resolvedCelex;
+      const celexCount = Number(CellarSparqlService.bindingValue(deref, 'celexCount'));
+      if (celexCount > 1) {
+        celexNotice = `This work carries ${celexCount} CELEX numbers, each naming the same document; served the lowest, ${resolvedCelex}. Pass celex_number to serve it under a specific one.`;
+      }
     }
 
     const language = input.language as EurLexLanguage;
@@ -534,11 +586,36 @@ export const eurlex_get_document = tool('eurlex_get_document', {
     // The CELEX resolves to one work first (#97): CELLAR holds some CELEX numbers
     // under several works, and a CELEX-keyed join would read the union of all of
     // them. Every metadata query then keys on the resolved work's IRI.
-    const fetchMetadata = async (celex: string) => {
-      const workUri = (await resolveCelexWorks(sparqlSvc, [celex], ctx)).get(celex);
+    //
+    // A consolidated text records none of its act's metadata — its author is the
+    // Publications Office's provisional-data code, with no in-force flag, subjects,
+    // or legal basis — so those come from its linked base act (#110), while its
+    // identity (type, date, title, work) stays its own. `base` arrives from the
+    // consolidation lookup, awaited alongside the resolution so it adds no serial
+    // round trip.
+    const fetchMetadata = async (
+      celex: string,
+      base: Promise<ConsolidationBase | undefined> | undefined,
+    ) => {
+      const [resolved, baseAct] = await Promise.all([
+        resolveCelexWorks(sparqlSvc, [celex], ctx),
+        base,
+      ]);
+      const workUri = resolved.get(celex);
       if (!workUri) return null;
+      const actWork = baseAct?.workUri ?? workUri;
+      // The in-force reasons (#111) ride the core query as aggregates: the earliest
+      // entry into force, the latest end of validity, and the CELEX of every act
+      // explicitly repealing this one. The dates aggregate over STR(): CELLAR
+      // computes a grouped MIN/MAX over an OPTIONAL xsd:date wrongly. The open-ended
+      // placeholder is filtered inside its OPTIONAL, so the MAX sees only real dates
+      // on an act that records one alongside it.
       const coreQuery = `
-SELECT ?type ?date ?title ?inForce WHERE {
+SELECT ?type ?date ?title ?inForce
+  (MIN(STR(?entryIntoForceDate)) AS ?entryIntoForce)
+  (MAX(STR(?endOfValidityDate)) AS ?endOfValidity)
+  (GROUP_CONCAT(DISTINCT STR(?repealerCelex); separator=" ") AS ?repealedBy)
+WHERE {
   OPTIONAL { <${workUri}> cdm:work_has_resource-type ?type . }
   OPTIONAL { <${workUri}> cdm:work_date_document ?date . }
   OPTIONAL {
@@ -546,20 +623,29 @@ SELECT ?type ?date ?title ?inForce WHERE {
     ?expr cdm:expression_uses_language <${ENG_LANGUAGE_URI}> .
     ?expr cdm:expression_title ?title .
   }
-  OPTIONAL { <${workUri}> cdm:resource_legal_in-force ?inForce . }
-} LIMIT 5`;
+  OPTIONAL { <${actWork}> cdm:resource_legal_in-force ?inForce . }
+  OPTIONAL { <${actWork}> cdm:resource_legal_date_entry-into-force ?entryIntoForceDate . }
+  OPTIONAL {
+    <${actWork}> cdm:resource_legal_date_end-of-validity ?endOfValidityDate .
+    FILTER(STR(?endOfValidityDate) != "${OPEN_ENDED_VALIDITY}")
+  }
+  OPTIONAL {
+    ?repealer cdm:resource_legal_repeals_resource_legal <${actWork}> .
+    ?repealer cdm:resource_legal_id_celex ?repealerCelex .
+  }
+} GROUP BY ?type ?date ?title ?inForce LIMIT 5`;
       // Legal bases and EuroVoc subjects resolve inline (#67): each dimension
       // query joins the identifying literal (CELEX / language-filtered
       // skos:prefLabel) as an OPTIONAL and groups per URI, so the label rides the
       // same round trip and a URI with no label still yields its row.
       const legalBasisQuery = `
 SELECT ?legalBasis (SAMPLE(?celexValue) AS ?celex) WHERE {
-  <${workUri}> cdm:resource_legal_based_on_resource_legal ?legalBasis .
+  <${actWork}> cdm:resource_legal_based_on_resource_legal ?legalBasis .
   OPTIONAL { ?legalBasis cdm:resource_legal_id_celex ?celexValue . }
 } GROUP BY ?legalBasis LIMIT ${META_DIMENSION_LIMIT}`;
       const eurovocQuery = `
 SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
-  <${workUri}> cdm:work_is_about_concept_eurovoc ?eurovoc .
+  <${actWork}> cdm:work_is_about_concept_eurovoc ?eurovoc .
   OPTIONAL {
     ?eurovoc skos:prefLabel ?labelValue .
     FILTER(LANG(?labelValue) = "${language.toLowerCase()}")
@@ -568,7 +654,7 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
 
       const [coreBindings, agents, legalBasisBindings, eurovocBindings] = await Promise.all([
         sparqlSvc.query(coreQuery, ctx),
-        fetchWorkAgents(sparqlSvc, workUri, ctx),
+        fetchWorkAgents(sparqlSvc, actWork, ctx),
         sparqlSvc.query(legalBasisQuery, ctx),
         sparqlSvc.query(eurovocQuery, ctx),
       ]);
@@ -592,12 +678,19 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
       const first = coreBindings[0];
       return {
         workUri,
+        baseActCelex: baseAct?.celex,
         resourceType: CellarSparqlService.bindingValue(first, 'type'),
         date: CellarSparqlService.bindingValue(first, 'date'),
         title: CellarSparqlService.bindingValue(first, 'title'),
         inForce: CellarSparqlService.parseBoolean(
           CellarSparqlService.bindingValue(first, 'inForce'),
         ),
+        entryIntoForce: CellarSparqlService.bindingValue(first, 'entryIntoForce')?.slice(0, 10),
+        endOfValidity: CellarSparqlService.bindingValue(first, 'endOfValidity')?.slice(0, 10),
+        repealedBy: (CellarSparqlService.bindingValue(first, 'repealedBy') ?? '')
+          .split(' ')
+          .filter(Boolean)
+          .sort(),
         agents,
         legalBases: collectResolved(legalBasisBindings, 'legalBasis', 'celex').map(
           ({ uri, literal }) => ({ work_uri: uri, ...(literal ? { celex_number: literal } : {}) }),
@@ -614,34 +707,42 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
         ? Promise.resolve(null)
         : contentSvc.fetchContent(celex, language, format, ctx);
 
-    // Staleness detection + opt-in resolution (#29). findCurrentConsolidated is
-    // self-contained (resolves the base work by CELEX), so on the default path it
-    // runs concurrently with the metadata + content fetch and adds no serial
-    // latency. resolve "current_consolidated" must know which work to serve before
-    // fetching, so it awaits detection first — an inherent serial step on the
-    // opt-in path only. The staleness fields always describe the REQUESTED base
-    // act, whichever work is served.
-    let staleness: CurrentConsolidated | undefined;
+    // Consolidation lookup + opt-in resolution (#29, #109). The lookup keys on the
+    // CELEX alone, so it starts at once and runs concurrently with CELEX
+    // resolution, the metadata, and the body. It names the act's current
+    // consolidated version and, for a consolidated text, its base act, which
+    // fetchMetadata awaits alongside the resolution. resolve "current_consolidated"
+    // must know which work to serve before fetching, so it awaits the lookup first
+    // — an inherent serial step on the opt-in path only. Whichever text is served,
+    // the lookup's base act is its base when it is a consolidated text.
+    const consolidation = findConsolidation(sparqlSvc, requestedCelex, ctx);
+    const baseOf = (celex: string) =>
+      isConsolidatedCelex(celex) ? consolidation.then((c) => c.base) : undefined;
+
     let servedCelex = requestedCelex;
     let metaResult: Awaited<ReturnType<typeof fetchMetadata>>;
     let body: Awaited<ReturnType<typeof fetchBody>>;
+    let context: Awaited<typeof consolidation>;
 
     if (input.resolve === 'current_consolidated') {
-      staleness = await findCurrentConsolidated(sparqlSvc, requestedCelex, ctx);
-      servedCelex = staleness?.celex ?? requestedCelex;
-      [metaResult, body] = await Promise.all([fetchMetadata(servedCelex), fetchBody(servedCelex)]);
+      context = await consolidation;
+      servedCelex = context.current?.celex ?? requestedCelex;
+      [metaResult, body] = await Promise.all([
+        fetchMetadata(servedCelex, baseOf(servedCelex)),
+        fetchBody(servedCelex),
+      ]);
     } else {
-      [metaResult, body, staleness] = await Promise.all([
-        fetchMetadata(requestedCelex),
+      [metaResult, body, context] = await Promise.all([
+        fetchMetadata(requestedCelex, baseOf(requestedCelex)),
         fetchBody(requestedCelex),
-        findCurrentConsolidated(sparqlSvc, requestedCelex, ctx),
+        consolidation,
       ]);
     }
 
     ctx.log.info('Document metadata fetch', {
       requestedCelex,
       servedCelex,
-      superseded: Boolean(staleness),
+      currentConsolidated: context.current?.celex,
     });
 
     if (!metaResult) {
@@ -670,6 +771,10 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
       legal_basis?: { work_uri: string; celex_number?: string }[];
       eurovoc_subjects?: { concept_uri: string; label?: string }[];
       in_force?: boolean;
+      repealed_by?: string[];
+      entry_into_force?: string;
+      end_of_validity?: string;
+      base_act_celex?: string;
       is_superseded?: boolean;
       current_consolidated_celex?: string;
       consolidated_as_of?: string;
@@ -701,6 +806,7 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
     };
 
     result.work_uri = metaResult.workUri;
+    if (metaResult.baseActCelex) result.base_act_celex = metaResult.baseActCelex;
     if (metaResult.title) result.title = metaResult.title;
     if (metaResult.date) result.date = metaResult.date;
     if (metaResult.resourceType) {
@@ -721,16 +827,46 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
     if (metaResult.eurovoc.length > 0) result.eurovoc_subjects = metaResult.eurovoc;
     if (typeof metaResult.inForce === 'boolean') result.in_force = metaResult.inForce;
 
-    // #29: staleness describes the requested base act. When resolve served a
-    // different (consolidated) work, echo the original request so the redirect is
-    // visible — celex_number already holds the served CELEX.
-    if (staleness) {
-      result.is_superseded = true;
-      result.current_consolidated_celex = staleness.celex;
-      result.consolidated_as_of = staleness.asOf;
+    // #111: why an act is not in force. Only a false in_force carries a reason — an
+    // act in force can still be the target of a partial repeal — and only the parts
+    // that explain it: an entry into force still ahead (UTC today), and an end of
+    // validity (the query already excludes CELLAR's open-ended placeholder).
+    const today = new Date().toISOString().slice(0, 10);
+    if (metaResult.inForce === false) {
+      if (metaResult.repealedBy.length > 0) result.repealed_by = metaResult.repealedBy;
+      if (metaResult.entryIntoForce && metaResult.entryIntoForce > today) {
+        result.entry_into_force = metaResult.entryIntoForce;
+      }
+      if (metaResult.endOfValidity) result.end_of_validity = metaResult.endOfValidity;
+    }
+
+    // #109: staleness describes the served text. It is current when it is the
+    // newest consolidated version in effect, and not superseded either when it is
+    // a consolidated version dated after that one, which does not apply yet. When
+    // resolve served a different work, echo the original request so the redirect
+    // is visible — celex_number already holds the served CELEX.
+    const { current } = context;
+    if (current) {
+      const servedAsOf = servedCelex === requestedCelex ? context.requestedAsOf : current.asOf;
+      result.is_superseded =
+        servedCelex !== current.celex && !(servedAsOf !== undefined && servedAsOf > current.asOf);
+      result.current_consolidated_celex = current.celex;
+      result.consolidated_as_of = current.asOf;
     }
     if (servedCelex !== requestedCelex) {
       result.requested_celex = requestedCelex;
+    }
+
+    // With no consolidated version in effect (so the requested text is the one
+    // served) there is no staleness to report, but a consolidated text dated after
+    // today, or a resolve that found only such versions, would otherwise pass
+    // silently for a text that applies.
+    let consolidationNotice: string | undefined;
+    if (!current && context.requestedAsOf && context.requestedAsOf > today) {
+      const baseAct = context.base ? `its base act (${context.base.celex})` : 'its act';
+      consolidationNotice = `Consolidated version ${servedCelex} is dated ${context.requestedAsOf} and does not apply yet; no consolidated version of ${baseAct} is in effect.`;
+    } else if (!current && context.pending && input.resolve === 'current_consolidated') {
+      consolidationNotice = `No consolidated version of ${requestedCelex} is in effect yet (${context.pending.celex} applies from ${context.pending.asOf}), so resolve "current_consolidated" served the base act.`;
     }
 
     /** Uncapped size of a structural selection, set only when the cap cut it. */
@@ -817,20 +953,31 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
     // continuation offset; a capped selection has no resumable offset, so it
     // discloses through this enrichment alone and points at the per-section
     // addresses instead (#80).
+    // Both write the one notice field, so the served-CELEX (#104) and consolidation
+    // (#109) notices ride behind it.
+    const trailingNotice = [consolidationNotice, celexNotice].filter(Boolean).join(' ');
+    const withTrailingNotice = (guidance: string) =>
+      trailingNotice ? `${guidance} ${trailingNotice}` : guidance;
     if (result.has_more) {
       const nextOffset = (result.content_offset ?? 0) + (result.content_chars_returned ?? 0);
       const cap = input.content_mode === 'full' ? MAX_CONTENT_LIMIT : input.limit;
       ctx.enrich.truncated({
         shown: result.content_chars_returned ?? 0,
         cap,
-        guidance: `More document content is available. Continue with content_mode="paged" and offset=${nextOffset}.`,
+        guidance: withTrailingNotice(
+          `More document content is available. Continue with content_mode="paged" and offset=${nextOffset}.`,
+        ),
       });
     } else if (selectedCharsBeforeCap !== undefined) {
       ctx.enrich.truncated({
         shown: result.content_chars_returned ?? 0,
         cap: MAX_CONTENT_LIMIT,
-        guidance: `The selected sections total ${selectedCharsBeforeCap} characters and were cut at the ${MAX_CONTENT_LIMIT}-character body cap. Read a section on its own with content_mode="paged", passing its offset and chars from selected_sections, or select fewer sections.`,
+        guidance: withTrailingNotice(
+          `The selected sections total ${selectedCharsBeforeCap} characters and were cut at the ${MAX_CONTENT_LIMIT}-character body cap. Read a section on its own with content_mode="paged", passing its offset and chars from selected_sections, or select fewer sections.`,
+        ),
       });
+    } else if (trailingNotice) {
+      ctx.enrich.notice(trailingNotice);
     }
 
     return result;
@@ -842,6 +989,7 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
     ];
     if (result.date) lines.push(`**Date:** ${result.date}`);
     if (result.resource_type) lines.push(`**Type:** ${result.resource_type}`);
+    if (result.base_act_celex) lines.push(`**Base act:** ${result.base_act_celex}`);
     if (result.author_institution) lines.push(`**Author:** ${result.author_institution}`);
     if (result.author_institutions && result.author_institutions.length > 0) {
       lines.push(`**Authors:** ${result.author_institutions.join(', ')}`);
@@ -850,10 +998,22 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
       lines.push(`**Advocates General:** ${result.advocates_general.join(', ')}`);
     }
     if (typeof result.in_force === 'boolean') lines.push(`**In Force:** ${result.in_force}`);
-    // #29 staleness — each field renders in its own block so the format-parity
-    // sentinel walk sees every one; is_superseded is present only when true.
-    if (result.is_superseded) {
-      lines.push('**Superseded:** true — a newer consolidated version exists.');
+    if (result.repealed_by && result.repealed_by.length > 0) {
+      lines.push(`**Repealed by:** ${result.repealed_by.join(', ')}`);
+    }
+    if (result.end_of_validity) lines.push(`**End of validity:** ${result.end_of_validity}`);
+    if (result.entry_into_force) lines.push(`**Entry into force:** ${result.entry_into_force}`);
+    // #29/#109 staleness — each field renders in its own block so the
+    // format-parity sentinel walk sees every one.
+    if (typeof result.is_superseded === 'boolean') {
+      const current = `${result.current_consolidated_celex} (${result.consolidated_as_of})`;
+      lines.push(
+        result.is_superseded
+          ? `**Superseded:** true — consolidated version ${current} is newer than this text; not a repeal (see In Force).`
+          : result.celex_number === result.current_consolidated_celex
+            ? '**Superseded:** false — this is the newest consolidated version.'
+            : `**Superseded:** false — this consolidated version is dated after the current one, ${current}, and does not apply yet.`,
+      );
     }
     if (result.current_consolidated_celex) {
       lines.push(`**Current consolidated:** ${result.current_consolidated_celex}`);

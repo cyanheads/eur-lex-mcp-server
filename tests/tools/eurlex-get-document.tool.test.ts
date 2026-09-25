@@ -6,9 +6,15 @@
 import { z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_get_document } from '@/mcp-server/tools/definitions/eurlex-get-document.tool.js';
 import { EURLEX_LANGUAGES } from '@/services/eurlex-content/eurlex-content-service.js';
+import {
+  ACTS,
+  fakeConsolidationCellar,
+  isConsolidationLookup,
+  WORK,
+} from '../fixtures/cellar-consolidations.js';
 import {
   addressedWorks,
   agentRows,
@@ -1542,7 +1548,7 @@ describe('eurlex_get_document', () => {
     /**
      * Route the shared SPARQL mock by query content. The handler issues a CELEX
      * resolution (#97), a core metadata query plus one query per multi-valued
-     * dimension (#33), a work_uri deref (#34), and a consolidation probe (#29), so a
+     * dimension (#33), a work_uri deref (#34), and a consolidation lookup (#109), so a
      * single blanket return can't exercise them independently.
      */
     const routeSparql = (routes: {
@@ -1557,7 +1563,7 @@ describe('eurlex_get_document', () => {
       mockSparqlQuery.mockImplementation((query: string) => {
         if (isResolutionQuery(query)) return Promise.resolve(resolutionRows(query));
         if (query.includes('cdm:resource_legal_eli')) return Promise.resolve(routes.eli ?? []);
-        if (query.includes('cdm:act_consolidated_consolidates_resource_legal'))
+        if (query.includes('cdm:act_consolidated_based_on_resource_legal'))
           return Promise.resolve(routes.consolidation ?? []);
         if (query.includes('cdm:work_created_by_agent'))
           return Promise.resolve(routes.author ?? []);
@@ -1717,17 +1723,18 @@ describe('eurlex_get_document', () => {
 
     // --- #29: staleness signal + opt-in resolve ---
 
-    it('#29: flags a superseded base act — newest same-act consolidation wins, other acts filtered out', async () => {
+    /** The consolidation lookup's one row: the newest consolidation in effect. */
+    const currentRow = (baseCelex: string, celex: string, date: string): SparqlRows[number] => ({
+      baseWork: { type: 'uri', value: `${CELLAR}${baseCelex}` },
+      currentCelex: { type: 'literal', value: celex },
+      currentDate: { type: 'literal', value: date },
+    });
+
+    it('#29: flags a superseded base act with its newest consolidated version', async () => {
       const ctx = createMockContext({ errors: eurlex_get_document.errors });
       routeSparql({
         core: [makeMetaBinding({ celex: '32014R0833' })],
-        // Query orders DESC(?consolidatedCelex); newest same-act first, then older,
-        // then a different act's consolidation (a graph artifact to be filtered).
-        consolidation: [
-          row('consolidatedCelex', '02014R0833-20260424'),
-          row('consolidatedCelex', '02014R0833-20220101'),
-          row('consolidatedCelex', '01995L0046-20180525'),
-        ],
+        consolidation: [currentRow('32014R0833', '02014R0833-20260424', '2026-04-24')],
       });
 
       const input = eurlex_get_document.input.parse({
@@ -1744,28 +1751,6 @@ describe('eurlex_get_document', () => {
       expect(text).toContain('Superseded');
       expect(text).toContain('02014R0833-20260424');
       expect(text).toContain('2026-04-24');
-    });
-
-    it('#29: omits staleness when the requested CELEX is itself a consolidated version (no probe issued)', async () => {
-      const ctx = createMockContext({ errors: eurlex_get_document.errors });
-      routeSparql({
-        core: [makeMetaBinding({ celex: '02014R0833-20260424' })],
-        consolidation: [row('consolidatedCelex', '02014R0833-20260424')],
-      });
-
-      const input = eurlex_get_document.input.parse({
-        celex_number: '02014R0833-20260424',
-        content_mode: 'metadata_only',
-      });
-      const result = await eurlex_get_document.handler(input, ctx);
-
-      expect(result.is_superseded).toBeUndefined();
-      expect(result.current_consolidated_celex).toBeUndefined();
-      // Short-circuits before issuing the consolidation query.
-      const probed = mockSparqlQuery.mock.calls
-        .map((c) => c[0] as string)
-        .some((q) => q.includes('act_consolidated_consolidates'));
-      expect(probed).toBe(false);
     });
 
     it('#29: omits staleness for a base act with no consolidated versions', async () => {
@@ -1789,10 +1774,8 @@ describe('eurlex_get_document', () => {
     it('#29: resolve "current_consolidated" serves the consolidated work and reports served + requested CELEX', async () => {
       const ctx = createMockContext({ errors: eurlex_get_document.errors });
       mockSparqlQuery.mockImplementation((query: string) => {
-        if (query.includes('cdm:act_consolidated_consolidates_resource_legal')) {
-          return Promise.resolve([
-            { consolidatedCelex: { type: 'literal', value: '02014R0833-20260424' } },
-          ]);
+        if (query.includes('cdm:act_consolidated_based_on_resource_legal')) {
+          return Promise.resolve([currentRow('32014R0833', '02014R0833-20260424', '2026-04-24')]);
         }
         // Metadata keys off the served CELEX, resolved to its work.
         if (isResolutionQuery(query)) return Promise.resolve(resolutionRows(query));
@@ -1814,7 +1797,7 @@ describe('eurlex_get_document', () => {
       expect(result.celex_number).toBe('02014R0833-20260424'); // served consolidated
       expect(result.work_uri).toBe(`${CELLAR}02014R0833-20260424`); // its resolved work
       expect(result.requested_celex).toBe('32014R0833'); // original echoed
-      expect(result.is_superseded).toBe(true);
+      expect(result.is_superseded).toBe(false); // the served text is the newest (#109)
       expect(result.current_consolidated_celex).toBe('02014R0833-20260424');
       expect(result.content).toBe('<html>consolidated</html>');
       // Content fetched for the CONSOLIDATED celex, not the requested base.
@@ -1968,7 +1951,7 @@ describe('eurlex_get_document', () => {
      * CELLAR types every `cdm:resource_legal_id_celex` literal as `xsd:string`, so
      * the typed literal resolves from the index while `FILTER(STR(?c) = "…")` scans.
      * The CELEX reaches CELLAR typed in the two queries keyed on it — the resolution
-     * to its work (#97) and the consolidation-staleness lookup — and every metadata
+     * to its work (#97) and the consolidation lookup (#109) — and every metadata
      * query keys on the resolved work's IRI instead.
      */
     it('types the CELEX where it is the key and keys the metadata on the resolved work', async () => {
@@ -1989,7 +1972,7 @@ describe('eurlex_get_document', () => {
       expect(keyed.find(isResolutionQuery)).toContain(
         'VALUES ?celexNumber { "32016R0679"^^xsd:string }',
       );
-      expect(keyed.find((q) => q.includes('act_consolidated_consolidates'))).toContain(
+      expect(keyed.find((q) => q.includes('act_consolidated_based_on'))).toContain(
         'cdm:resource_legal_id_celex "32016R0679"^^xsd:string .',
       );
       const byWork = queries.filter((q) => q.includes(`<${CELLAR}32016R0679>`));
@@ -2002,8 +1985,14 @@ describe('eurlex_get_document', () => {
     it('types both the requested and the served CELEX on the resolve "current_consolidated" path', async () => {
       const ctx = createMockContext({ errors: eurlex_get_document.errors });
       mockSparqlQuery.mockImplementation(async (q: string) => {
-        if (q.includes('act_consolidated_consolidates')) {
-          return [{ consolidatedCelex: { type: 'literal', value: '02016R0679-20160504' } }];
+        if (q.includes('act_consolidated_based_on')) {
+          return [
+            {
+              baseWork: { type: 'uri', value: `${CELLAR}32016R0679` },
+              currentCelex: { type: 'literal', value: '02016R0679-20160504' },
+              currentDate: { type: 'literal', value: '2016-05-04' },
+            },
+          ];
         }
         return isResolutionQuery(q) ? resolutionRows(q) : [];
       });
@@ -2020,7 +2009,10 @@ describe('eurlex_get_document', () => {
       expect(queries.find(isResolutionQuery)).toContain(
         'VALUES ?celexNumber { "02016R0679-20160504"^^xsd:string }',
       );
-      expect(queries.filter((q) => q.includes(`<${CELLAR}02016R0679-20160504>`))).toHaveLength(4);
+      // The consolidation's own identity comes from its work; its act metadata from
+      // the base act's work (#110): the core query names both.
+      expect(queries.filter((q) => q.includes(`<${CELLAR}02016R0679-20160504>`))).toHaveLength(1);
+      expect(queries.filter((q) => q.includes(`<${CELLAR}32016R0679>`))).toHaveLength(4);
       expect(queries.join('\n')).not.toMatch(/STR\(\?\w+\)\s*=/);
     });
   });
@@ -2109,9 +2101,9 @@ describe('eurlex_get_document', () => {
       const result = await eurlex_get_document.handler(input, ctx);
 
       expect(result.celex_number).toBe('32016R0679');
-      expect(mockSparqlQuery.mock.calls[0]?.[0] as string).toContain(
-        'VALUES ?celexNumber { "32016R0679"^^xsd:string }',
-      );
+      expect(
+        mockSparqlQuery.mock.calls.map((c) => c[0] as string).find(isResolutionQuery),
+      ).toContain('VALUES ?celexNumber { "32016R0679"^^xsd:string }');
     });
   });
 
@@ -2137,10 +2129,16 @@ describe('eurlex_get_document', () => {
     /** Answer every query the handler issues from the fixture works it addresses. */
     const fakeCellar = async (q: string): Promise<Row[]> => {
       const works = addressedWorks(q);
-      if (q.includes('SELECT ?celex WHERE')) {
-        return works.map(({ celex }) => ({ celex: literal(celex) }));
+      if (q.includes('AS ?celexCount')) {
+        // The work_uri dereference: the lowest CELEX and the count, one row (#104).
+        const [lowest] = works.map(({ celex }) => celex).toSorted();
+        return [
+          {
+            ...(lowest ? { celex: literal(lowest) } : {}),
+            celexCount: literal(String(works.length)),
+          },
+        ];
       }
-      if (q.includes('cdm:act_consolidated_consolidates_resource_legal')) return [];
       if (q.includes('cdm:work_created_by_agent')) return agentRows(q);
       if (q.includes('cdm:resource_legal_based_on_resource_legal')) {
         return works.flatMap(({ work }) =>
@@ -2250,6 +2248,784 @@ describe('eurlex_get_document', () => {
       expect(structured.author_institutions).toEqual(['Council of the EU', 'European Parliament']);
       expect(structured).not.toHaveProperty('advocates_general');
       expect(textOf(result)).not.toContain('Advocates General');
+    });
+  });
+
+  // --- Consolidated texts and their base acts (#109, #110) ---
+
+  describe('consolidated texts (#109, #110)', () => {
+    beforeEach(() => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(new Date('2026-09-25T12:00:00Z'));
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    const getDocument = (args: Record<string, unknown>) => {
+      mockSparqlQuery.mockImplementation(fakeConsolidationCellar);
+      return runToolContract(eurlex_get_document, { content_mode: 'metadata_only', ...args });
+    };
+    const structuredOf = (result: Awaited<ReturnType<typeof getDocument>>) =>
+      eurlex_get_document.output.parse(result.structuredContent);
+    const textOf = (result: Awaited<ReturnType<typeof getDocument>>) =>
+      result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+
+    it('serves a consolidated text under its own CELEX, work, title, date, and type', async () => {
+      const result = await getDocument({ celex_number: '02024R1689-20240712' });
+
+      const structured = structuredOf(result);
+      expect(structured.celex_number).toBe('02024R1689-20240712');
+      expect(structured.work_uri).toBe(ACTS['02024R1689-20240712']?.uri);
+      expect(structured.title).toBe('Consolidated text of 2024-07-12');
+      expect(structured.date).toBe('2024-07-12');
+      expect(structured.resource_type).toBe('Consolidated Text');
+      expect(textOf(result)).toContain('## 02024R1689-20240712 — Consolidated text of 2024-07-12');
+    });
+
+    it('flags a base act with a consolidated version as superseded, in both channels', async () => {
+      const result = await getDocument({ celex_number: '32016R0679' });
+
+      const structured = structuredOf(result);
+      expect(structured.is_superseded).toBe(true);
+      expect(structured.current_consolidated_celex).toBe('02016R0679-20160504');
+      expect(structured.consolidated_as_of).toBe('2016-05-04');
+      expect(textOf(result)).toContain('**Current consolidated:** 02016R0679-20160504');
+      expect(textOf(result)).toContain('**Consolidated as of:** 2016-05-04');
+    });
+
+    // --- #109: is_superseded describes the served text ---
+
+    it('#109: resolve "current_consolidated" serves the newest version and reports it as current', async () => {
+      const result = await getDocument({
+        celex_number: '32024R1689',
+        resolve: 'current_consolidated',
+      });
+
+      const structured = structuredOf(result);
+      expect(structured.celex_number).toBe('02024R1689-20260727');
+      expect(structured.requested_celex).toBe('32024R1689');
+      expect(structured.is_superseded).toBe(false);
+      expect(structured.current_consolidated_celex).toBe('02024R1689-20260727');
+      expect(structured.consolidated_as_of).toBe('2026-07-27');
+      expect(textOf(result)).toContain(
+        '**Superseded:** false — this is the newest consolidated version.',
+      );
+    });
+
+    it('#109: a stale base act names the newer version and says it is not a repeal', async () => {
+      const result = await getDocument({ celex_number: '32016R0679' });
+
+      expect(textOf(result)).toContain(
+        '**Superseded:** true — consolidated version 02016R0679-20160504 (2016-05-04) is newer than this text; not a repeal (see In Force).',
+      );
+    });
+
+    it('#109: an older consolidated text requested directly is superseded by the newest', async () => {
+      const older = structuredOf(await getDocument({ celex_number: '02024R1689-20240712' }));
+      expect(older.is_superseded).toBe(true);
+      expect(older.current_consolidated_celex).toBe('02024R1689-20260727');
+      expect(older.consolidated_as_of).toBe('2026-07-27');
+
+      const newest = await getDocument({ celex_number: '02024R1689-20260727' });
+      expect(structuredOf(newest).is_superseded).toBe(false);
+      expect(structuredOf(newest).current_consolidated_celex).toBe('02024R1689-20260727');
+      expect(textOf(newest)).toContain(
+        '**Superseded:** false — this is the newest consolidated version.',
+      );
+    });
+
+    it.each([
+      ['22006A0901(01)', '02006A0901(01)-20090301', '2009-03-01'],
+      // Numbered differently from the act: ordered by consolidation date, not CELEX.
+      ['32000O0007', '02000O0007-20120101', '2012-01-01'],
+      // 02002L0087-20270130 is dated after today and never the current version.
+      ['32002L0087', '02002L0087-20240109', '2024-01-09'],
+    ])(
+      '#109: %s finds its current consolidated version %s through the based-on link',
+      async (celex, current, asOf) => {
+        const structured = structuredOf(await getDocument({ celex_number: celex }));
+
+        expect(structured.is_superseded).toBe(true);
+        expect(structured.current_consolidated_celex).toBe(current);
+        expect(structured.consolidated_as_of).toBe(asOf);
+      },
+    );
+
+    it('#109: a future-dated consolidated text is not superseded, and names the current version', async () => {
+      const result = await getDocument({ celex_number: '02002L0087-20270130' });
+
+      const structured = structuredOf(result);
+      expect(structured.is_superseded).toBe(false);
+      expect(structured.current_consolidated_celex).toBe('02002L0087-20240109');
+      expect(structured.consolidated_as_of).toBe('2024-01-09');
+      expect(textOf(result)).toContain(
+        '**Superseded:** false — this consolidated version is dated after the current one, 02002L0087-20240109 (2024-01-09), and does not apply yet.',
+      );
+    });
+
+    it('#109: resolve "current_consolidated" on a consolidated CELEX serves its base act\'s newest version', async () => {
+      const structured = structuredOf(
+        await getDocument({ celex_number: '02024R1689-20240712', resolve: 'current_consolidated' }),
+      );
+
+      expect(structured.celex_number).toBe('02024R1689-20260727');
+      expect(structured.requested_celex).toBe('02024R1689-20240712');
+      expect(structured.is_superseded).toBe(false);
+    });
+
+    const noticeOf = (result: Awaited<ReturnType<typeof getDocument>>) =>
+      (result.structuredContent as { notice?: string }).notice;
+
+    it('#109: an act whose only consolidated version is dated in the future carries no staleness fields or notice', async () => {
+      const result = await getDocument({ celex_number: '32021D1442' });
+
+      const structured = structuredOf(result);
+      expect(structured).not.toHaveProperty('is_superseded');
+      expect(structured).not.toHaveProperty('current_consolidated_celex');
+      expect(noticeOf(result)).toBeUndefined();
+    });
+
+    it('#109: a future-dated consolidated text with no version in effect says it does not apply yet, in both channels', async () => {
+      const result = await getDocument({ celex_number: '02021D1442-20261001' });
+
+      const structured = structuredOf(result);
+      expect(structured.celex_number).toBe('02021D1442-20261001');
+      expect(structured.base_act_celex).toBe('32021D1442');
+      expect(structured).not.toHaveProperty('is_superseded');
+      expect(structured).not.toHaveProperty('current_consolidated_celex');
+      const notice = noticeOf(result);
+      expect(notice).toBe(
+        'Consolidated version 02021D1442-20261001 is dated 2026-10-01 and does not apply yet; no consolidated version of its base act (32021D1442) is in effect.',
+      );
+      expect(textOf(result)).toContain(notice as string);
+      expect(textOf(result)).not.toContain('Superseded');
+    });
+
+    it('#109: resolve "current_consolidated" on that future-dated text serves it with the same notice', async () => {
+      const result = await getDocument({
+        celex_number: '02021D1442-20261001',
+        resolve: 'current_consolidated',
+      });
+
+      expect(structuredOf(result).celex_number).toBe('02021D1442-20261001');
+      expect(structuredOf(result)).not.toHaveProperty('requested_celex');
+      expect(noticeOf(result)).toContain('does not apply yet');
+    });
+
+    it('#109: resolve "current_consolidated" with only a future-dated version serves the base act and says so, in both channels', async () => {
+      const result = await getDocument({
+        celex_number: '32021D1442',
+        resolve: 'current_consolidated',
+      });
+
+      const structured = structuredOf(result);
+      expect(structured.celex_number).toBe('32021D1442');
+      expect(structured).not.toHaveProperty('requested_celex');
+      expect(structured).not.toHaveProperty('is_superseded');
+      const notice = noticeOf(result);
+      expect(notice).toBe(
+        'No consolidated version of 32021D1442 is in effect yet (02021D1442-20261001 applies from 2026-10-01), so resolve "current_consolidated" served the base act.',
+      );
+      expect(textOf(result)).toContain(notice as string);
+    });
+
+    it('#109: the resolve notice rides behind the paging guidance when the body is also cut', async () => {
+      mockFetchContent.mockResolvedValue({
+        content: 'x'.repeat(50),
+        contentAvailable: true,
+        format: 'html',
+        language: 'EN',
+      });
+      const result = await getDocument({
+        celex_number: '32021D1442',
+        resolve: 'current_consolidated',
+        content_mode: 'paged',
+        limit: 10,
+      });
+
+      const structured = result.structuredContent as { notice?: string; truncated?: boolean };
+      expect(structured.truncated).toBe(true);
+      expect(structured.notice).toContain('offset=10');
+      expect(structured.notice).toContain('No consolidated version of 32021D1442 is in effect yet');
+      expect(textOf(result)).toContain(structured.notice as string);
+    });
+
+    it('#109: once that version takes effect, resolve serves it with no notice', async () => {
+      vi.setSystemTime(new Date('2026-10-01T00:30:00Z'));
+      const result = await getDocument({
+        celex_number: '32021D1442',
+        resolve: 'current_consolidated',
+      });
+
+      const structured = structuredOf(result);
+      expect(structured.celex_number).toBe('02021D1442-20261001');
+      expect(structured.requested_celex).toBe('32021D1442');
+      expect(structured.is_superseded).toBe(false);
+      expect(noticeOf(result)).toBeUndefined();
+    });
+
+    it('#109: resolve on an act with no consolidated version at all serves it with no notice', async () => {
+      const result = await getDocument({
+        celex_number: '32026R2099',
+        resolve: 'current_consolidated',
+      });
+
+      expect(structuredOf(result).celex_number).toBe('32026R2099');
+      expect(noticeOf(result)).toBeUndefined();
+    });
+
+    it('#109: an act with no consolidated version carries none of the staleness fields', async () => {
+      const result = await getDocument({ celex_number: '32026R2099' });
+
+      const structured = structuredOf(result);
+      expect(structured).not.toHaveProperty('is_superseded');
+      expect(structured).not.toHaveProperty('current_consolidated_celex');
+      expect(structured).not.toHaveProperty('consolidated_as_of');
+      expect(textOf(result)).not.toContain('Superseded');
+    });
+
+    it('#109: the lookup keys on the typed CELEX, follows the based-on link, and excludes future dates', async () => {
+      await getDocument({ celex_number: '32002L0087' });
+
+      const lookup = mockSparqlQuery.mock.calls
+        .map((c) => c[0] as string)
+        .find(isConsolidationLookup) as string;
+      expect(lookup).toContain('?baseWork cdm:resource_legal_id_celex "32002L0087"^^xsd:string .');
+      expect(lookup).toContain('cdm:act_consolidated_based_on_resource_legal ?baseWork');
+      expect(lookup).toContain('FILTER(STR(?currentDate) <= "2026-09-25")');
+      expect(lookup).toContain('ORDER BY DESC(STR(?currentDate)) DESC(?currentCelex)');
+      expect(lookup).not.toContain('act_consolidated_consolidates');
+      // The future-dated arm rides the same query, filtered to dates after today.
+      expect(lookup).toContain('FILTER(STR(?pendingDate) > "2026-09-25")');
+    });
+
+    it('#109: a base-act request issues no added query — the lookup replaces the old probe', async () => {
+      await getDocument({ celex_number: '32024R1689' });
+
+      const queries = mockSparqlQuery.mock.calls.map((c) => c[0] as string);
+      // Resolution, the consolidation lookup, core, agents, legal basis, EuroVoc.
+      expect(queries).toHaveLength(6);
+      expect(queries.filter(isConsolidationLookup)).toHaveLength(1);
+    });
+
+    it('#109: a consolidated-CELEX request runs its lookup concurrently with CELEX resolution', async () => {
+      let markLookup!: () => void;
+      const lookupIssued = new Promise<void>((resolve) => {
+        markLookup = resolve;
+      });
+      mockSparqlQuery.mockImplementation(async (q: string) => {
+        if (isConsolidationLookup(q)) markLookup();
+        if (isResolutionQuery(q)) {
+          // Resolution completes only once the lookup is already in flight.
+          await Promise.race([
+            lookupIssued,
+            new Promise((_, reject) =>
+              setTimeout(
+                () => reject(new Error('lookup was not issued alongside resolution')),
+                200,
+              ),
+            ),
+          ]);
+        }
+        return fakeConsolidationCellar(q);
+      });
+
+      const result = await runToolContract(eurlex_get_document, {
+        celex_number: '02024R1689-20240712',
+        content_mode: 'metadata_only',
+      });
+      expect(result.isError).toBeFalsy();
+      // Resolution, lookup, core, agents, legal basis, EuroVoc: one query added.
+      expect(mockSparqlQuery).toHaveBeenCalledTimes(6);
+    });
+
+    it('#109: propagates a caller cancellation raised by the lookup on a consolidated CELEX', async () => {
+      const ctx = createMockContext({ errors: eurlex_get_document.errors });
+      mockSparqlQuery.mockImplementation((q: string) =>
+        isConsolidationLookup(q)
+          ? Promise.reject(new DOMException('The operation was aborted.', 'AbortError'))
+          : fakeConsolidationCellar(q),
+      );
+
+      const input = eurlex_get_document.input.parse({
+        celex_number: '02024R1689-20240712',
+        content_mode: 'metadata_only',
+      });
+      await expect(eurlex_get_document.handler(input, ctx)).rejects.toThrow(/aborted/);
+    });
+
+    // --- #110: a consolidated text reads its base act's metadata ---
+
+    const expectAiActBase = (result: Awaited<ReturnType<typeof getDocument>>) => {
+      const structured = structuredOf(result);
+      expect(structured.base_act_celex).toBe('32024R1689');
+      expect(structured.author_institutions).toEqual(
+        expect.arrayContaining(['European Parliament', 'Council of the EU']),
+      );
+      expect(structured.author_institutions).toHaveLength(2);
+      expect(structured.in_force).toBe(true);
+      expect(structured.eurovoc_subjects).toHaveLength(7);
+      expect(structured.legal_basis).toHaveLength(2);
+      const text = textOf(result);
+      expect(text).toContain('**Base act:** 32024R1689');
+      expect(text).toContain('**In Force:** true');
+      expect(text).not.toContain('OP_DATPRO');
+      expect(JSON.stringify(structured)).not.toContain('OP_DATPRO');
+    };
+
+    it("#110: a consolidated text reports its base act's authors, in-force status, subjects, and legal bases", async () => {
+      const result = await getDocument({ celex_number: '02024R1689-20260727' });
+
+      expectAiActBase(result);
+      const structured = structuredOf(result);
+      // Its own identity fields stay the consolidation's.
+      expect(structured.celex_number).toBe('02024R1689-20260727');
+      expect(structured.work_uri).toBe(ACTS['02024R1689-20260727']?.uri);
+      expect(structured.resource_type).toBe('Consolidated Text');
+      expect(structured.date).toBe('2026-07-27');
+    });
+
+    it('#110: resolve "current_consolidated" on the base act carries the same base-act fields', async () => {
+      expectAiActBase(
+        await getDocument({ celex_number: '32024R1689', resolve: 'current_consolidated' }),
+      );
+    });
+
+    it('#110: the base act CELEX comes from the link, not the consolidated CELEX', async () => {
+      const structured = structuredOf(await getDocument({ celex_number: '02003T0000-20040501' }));
+      expect(structured.base_act_celex).toBe('12003T/TXT');
+    });
+
+    it("#110: in_force is the base act's, including false", async () => {
+      const result = await getDocument({ celex_number: '01995R1422-20060701' });
+      expect(structuredOf(result).base_act_celex).toBe('31995R1422');
+      expect(structuredOf(result).in_force).toBe(false);
+      expect(textOf(result)).toContain('**In Force:** false');
+      // #111: so is the reason it is not in force.
+      expect(structuredOf(result).repealed_by).toEqual(['32006R0951']);
+      expect(structuredOf(result).end_of_validity).toBe('2006-06-30');
+    });
+
+    it('#110: a base act carries no base_act_celex and keeps its own metadata', async () => {
+      const result = await getDocument({ celex_number: '32024R1689' });
+
+      const structured = structuredOf(result);
+      expect(structured).not.toHaveProperty('base_act_celex');
+      expect(structured.work_uri).toBe(WORK.aiAct);
+      expect(structured.author_institutions).toHaveLength(2);
+      expect(textOf(result)).not.toContain('**Base act:**');
+    });
+
+    it.each([
+      ['no based-on link', '02099R9999-20200101'],
+      ['a base work with no CELEX', '02098R9998-20200101'],
+    ])('#110: a consolidated text with %s reads its own metadata', async (_label, celex) => {
+      const result = await getDocument({ celex_number: celex });
+
+      const structured = structuredOf(result);
+      expect(structured).not.toHaveProperty('base_act_celex');
+      expect(structured.author_institutions).toEqual(['OP_DATPRO']);
+      expect(structured).not.toHaveProperty('in_force');
+    });
+
+    it('propagates a caller cancellation raised by the consolidation lookup on a base act', async () => {
+      const ctx = createMockContext({ errors: eurlex_get_document.errors });
+      mockSparqlQuery.mockImplementation((q: string) =>
+        q.includes('act_consolidated_') && !isResolutionQuery(q)
+          ? Promise.reject(new DOMException('The operation was aborted.', 'AbortError'))
+          : fakeConsolidationCellar(q),
+      );
+
+      const input = eurlex_get_document.input.parse({
+        celex_number: '32016R0679',
+        content_mode: 'metadata_only',
+      });
+      await expect(eurlex_get_document.handler(input, ctx)).rejects.toThrow(/aborted/);
+    });
+  });
+
+  // --- #111: why an act is not in force ---
+
+  describe('why an act is not in force (#111)', () => {
+    beforeEach(() => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(new Date('2026-09-25T12:00:00Z'));
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    const getDocument = (celex: string) => {
+      mockSparqlQuery.mockImplementation(fakeConsolidationCellar);
+      return runToolContract(eurlex_get_document, {
+        celex_number: celex,
+        content_mode: 'metadata_only',
+      });
+    };
+    const structuredOf = (result: Awaited<ReturnType<typeof getDocument>>) =>
+      eurlex_get_document.output.parse(result.structuredContent);
+    const textOf = (result: Awaited<ReturnType<typeof getDocument>>) =>
+      result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+    const REASON_FIELDS = ['repealed_by', 'entry_into_force', 'end_of_validity'] as const;
+    const REASON_LINES = ['**Repealed by:**', '**Entry into force:**', '**End of validity:**'];
+
+    const expectNoReasons = (result: Awaited<ReturnType<typeof getDocument>>) => {
+      const structured = structuredOf(result);
+      for (const field of REASON_FIELDS) expect(structured).not.toHaveProperty(field);
+      for (const line of REASON_LINES) expect(textOf(result)).not.toContain(line);
+    };
+
+    it.each([
+      ['32016R0679', 'in force'],
+      ['32003R1882', 'in force, though the target of three partial repeals'],
+    ])('%s (%s) carries none of the reason fields', async (celex) => {
+      const result = await getDocument(celex);
+      expect(structuredOf(result).in_force).toBe(true);
+      expect(textOf(result)).toContain('**In Force:** true');
+      expectNoReasons(result);
+    });
+
+    it('a base-act request still issues six queries — the reasons ride the core query', async () => {
+      await getDocument('31995L0046');
+      // Resolution, consolidation lookup, core, agents, legal bases, EuroVoc.
+      expect(mockSparqlQuery).toHaveBeenCalledTimes(6);
+    });
+
+    it('propagates a caller cancellation raised by the core metadata query', async () => {
+      const ctx = createMockContext({ errors: eurlex_get_document.errors });
+      mockSparqlQuery.mockImplementation((q: string) =>
+        q.includes('cdm:expression_belongs_to_work')
+          ? Promise.reject(new DOMException('The operation was aborted.', 'AbortError'))
+          : fakeConsolidationCellar(q),
+      );
+      const input = eurlex_get_document.input.parse({
+        celex_number: '31995L0046',
+        content_mode: 'metadata_only',
+      });
+      await expect(eurlex_get_document.handler(input, ctx)).rejects.toThrow(/aborted/);
+    });
+
+    it('31995L0046: names its repealing act and end of validity, in both channels', async () => {
+      const result = await getDocument('31995L0046');
+
+      const structured = structuredOf(result);
+      expect(structured.in_force).toBe(false);
+      expect(structured.repealed_by).toEqual(['32016R0679']);
+      expect(structured.end_of_validity).toBe('2018-05-24');
+      expect(structured).not.toHaveProperty('entry_into_force');
+      const text = textOf(result);
+      expect(text).toContain('**In Force:** false');
+      expect(text).toContain('**Repealed by:** 32016R0679');
+      expect(text).toContain('**End of validity:** 2018-05-24');
+      expect(text).not.toContain('**Entry into force:**');
+    });
+
+    it('32026R2099 before 2026-10-12: names its earliest entry into force, omitting the open-ended validity', async () => {
+      const result = await getDocument('32026R2099');
+
+      const structured = structuredOf(result);
+      expect(structured.in_force).toBe(false);
+      expect(structured.entry_into_force).toBe('2026-10-12');
+      expect(structured).not.toHaveProperty('repealed_by');
+      expect(structured).not.toHaveProperty('end_of_validity');
+      expect(textOf(result)).toContain('**Entry into force:** 2026-10-12');
+      expect(textOf(result)).not.toContain('9999-12-31');
+    });
+
+    it.each([
+      ['on', '2026-10-12T00:30:00Z'],
+      ['after', '2026-11-01T12:00:00Z'],
+    ])(
+      '32026R2099 %s its entry-into-force date (UTC) no longer reports it',
+      async (_label, now) => {
+        vi.setSystemTime(new Date(now));
+        expectNoReasons(await getDocument('32026R2099'));
+      },
+    );
+
+    it('reads "today" as the UTC date, not the local one', async () => {
+      // 23:30 on 2026-10-11 UTC is already 2026-10-12 in UTC+1 and later zones.
+      vi.setSystemTime(new Date('2026-10-11T23:30:00Z'));
+      expect(structuredOf(await getDocument('32026R2099')).entry_into_force).toBe('2026-10-12');
+    });
+
+    it('32026R1975: a pending act reports its entry into force and a future end of validity', async () => {
+      const result = await getDocument('32026R1975');
+
+      const structured = structuredOf(result);
+      expect(structured.in_force).toBe(false);
+      expect(structured.entry_into_force).toBe('2026-09-29');
+      expect(structured.end_of_validity).toBe('2030-12-31');
+      expect(structured).not.toHaveProperty('repealed_by');
+      const text = textOf(result);
+      expect(text).toContain('**Entry into force:** 2026-09-29');
+      expect(text).toContain('**End of validity:** 2030-12-31');
+    });
+
+    it.each([
+      ['32000D0670', '2002-12-31'],
+      ['32020D1531', '2024-03-17'],
+    ])(
+      '%s: a real end of validity recorded beside 9999-12-31 is reported, in both channels',
+      async (celex, date) => {
+        const result = await getDocument(celex);
+
+        const structured = structuredOf(result);
+        expect(structured.in_force).toBe(false);
+        expect(structured.end_of_validity).toBe(date);
+        expect(textOf(result)).toContain(`**End of validity:** ${date}`);
+        expect(textOf(result)).not.toContain('9999-12-31');
+      },
+    );
+
+    it('excludes the open-ended placeholder inside the end-of-validity OPTIONAL', async () => {
+      await getDocument('32000D0670');
+
+      const core = mockSparqlQuery.mock.calls
+        .map((c) => c[0] as string)
+        .find((q) => q.includes('cdm:expression_belongs_to_work')) as string;
+      expect(core).toMatch(
+        /OPTIONAL \{[^{}]*cdm:resource_legal_date_end-of-validity \?(\w+) \.[^{}]*FILTER\(STR\(\?\1\) != "9999-12-31"\)[^{}]*\}/,
+      );
+    });
+
+    it('a repeal edge with no CELEX and an open-ended validity yield no reason fields', async () => {
+      const result = await getDocument('31990R0001');
+      expect(structuredOf(result).in_force).toBe(false);
+      expectNoReasons(result);
+    });
+
+    it("a consolidated text reports its base act's reasons", async () => {
+      const result = await getDocument('01995L0046-20180525');
+
+      const structured = structuredOf(result);
+      expect(structured.base_act_celex).toBe('31995L0046');
+      expect(structured.in_force).toBe(false);
+      expect(structured.repealed_by).toEqual(['32016R0679']);
+      expect(structured.end_of_validity).toBe('2018-05-24');
+      expect(textOf(result)).toContain('**Repealed by:** 32016R0679');
+    });
+
+    it('sorts several repealing acts and reads the dates as string aggregates', async () => {
+      mockSparqlQuery.mockImplementation(async (q: string) => {
+        const rows = await fakeConsolidationCellar(q);
+        if (!q.includes('cdm:expression_belongs_to_work')) return rows;
+        return rows.map((r) => ({
+          ...r,
+          inForce: { type: 'literal', value: '0' },
+          repealedBy: { type: 'literal', value: '32012R0528 32008R1101 32009R0217' },
+        }));
+      });
+      const result = await runToolContract(eurlex_get_document, {
+        celex_number: '32003R1882',
+        content_mode: 'metadata_only',
+      });
+
+      expect(structuredOf(result).repealed_by).toEqual(['32008R1101', '32009R0217', '32012R0528']);
+      expect(textOf(result)).toContain('**Repealed by:** 32008R1101, 32009R0217, 32012R0528');
+      // CELLAR computes a grouped MAX over an OPTIONAL xsd:date wrongly; STR() avoids it.
+      const core = mockSparqlQuery.mock.calls
+        .map((c) => c[0] as string)
+        .find((q) => q.includes('cdm:expression_belongs_to_work'));
+      expect(core).toMatch(/MIN\(STR\(\?\w+\)\) AS \?entryIntoForce/);
+      expect(core).toMatch(/MAX\(STR\(\?\w+\)\) AS \?endOfValidity/);
+    });
+  });
+
+  // --- #104: a work_uri carrying several CELEX ---
+
+  describe('a work_uri carrying several CELEX (#104)', () => {
+    const NIM_WORK = `${CELLAR}002d2e00-f978-11e4-a4c8-01aa75ed71a1`;
+    const GDPR_WORK = `${CELLAR}3e485e15-11bd-11e6-ba9a-01aa75ed71a1`;
+    const TWO_CELEX_WORK = `${CELLAR}fixture-two-celex`;
+    const EMPTY_WORK = `${CELLAR}fixture-celexless`;
+    /** The 30 CELEX the national measure carried on 2026-09-25, lowest first. */
+    const NIM_CELEX = [
+      '71989L0391',
+      '71997L0081',
+      '71999L0070',
+      '72000L0078',
+      '72003L0088',
+      '72004L0113',
+      '72006L0011',
+      '72006L0054',
+      '72009L0071',
+      '72010L0018',
+      '72011L0070',
+      '72013L0053',
+      '72013L0054',
+      '72013L0059',
+      '72014L0028',
+      '72014L0047',
+      '72014L0087',
+      '72014L0090',
+      '72015L0849',
+      '72016L0680',
+      '72016L0797',
+      '72018L0843',
+      '72019L0001',
+      '72019L0633',
+      '72019L0997',
+      '72019L1152',
+      '72019L1158',
+      '72019L1937',
+      '72022L2041',
+      '72024L1346',
+    ].map((core) => `${core}CZE_225030`);
+    const LOWEST = '71989L0391CZE_225030';
+
+    const literal = (value: string) => ({ type: 'literal', value });
+
+    /**
+     * Answer the work_uri dereference the way CELLAR evaluates it: an aggregate reads
+     * every CELEX of the work, while a plain SELECT gets them in endpoint order,
+     * which differs from call to call.
+     */
+    let endpointShift = 0;
+    const derefRows = (query: string, celexes: string[]) => {
+      if (query.includes('MIN(STR(')) {
+        const [lowest] = celexes.toSorted();
+        return [
+          {
+            ...(lowest ? { celex: literal(lowest) } : {}),
+            celexCount: literal(String(celexes.length)),
+          },
+        ];
+      }
+      const shift = celexes.length > 0 ? endpointShift++ % celexes.length : 0;
+      const rows = [...celexes.slice(shift), ...celexes.slice(0, shift)].map((c) => ({
+        celex: literal(c),
+      }));
+      return /LIMIT 1\b/.test(query) ? rows.slice(0, 1) : rows;
+    };
+
+    const WORKS: Record<string, string[]> = {
+      [NIM_WORK]: NIM_CELEX,
+      [TWO_CELEX_WORK]: ['72019L1158DEU_1', '72019L1152DEU_1'],
+      [GDPR_WORK]: ['32016R0679'],
+      [EMPTY_WORK]: [],
+    };
+    const cellar = async (query: string) => {
+      if (isResolutionQuery(query)) return resolutionRows(query);
+      for (const [work, celexes] of Object.entries(WORKS)) {
+        if (query.includes(`<${work}> cdm:resource_legal_id_celex`)) {
+          return derefRows(query, celexes);
+        }
+      }
+      if (query.includes('cdm:expression_belongs_to_work')) {
+        return [makeMetaBinding({ celex: 'n/a', title: 'National measure' })];
+      }
+      return [];
+    };
+
+    beforeEach(() => {
+      endpointShift = 7;
+      mockSparqlQuery.mockImplementation(cellar);
+    });
+
+    const getByWork = (workUri: string, args: Record<string, unknown> = {}) =>
+      runToolContract(eurlex_get_document, {
+        work_uri: workUri,
+        content_mode: 'metadata_only',
+        ...args,
+      });
+    const textOf = (result: Awaited<ReturnType<typeof getByWork>>) =>
+      result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+    const noticeOf = (result: Awaited<ReturnType<typeof getByWork>>) =>
+      (result.structuredContent as { notice?: string }).notice;
+
+    it('a single-CELEX work_uri serves its CELEX with no notice', async () => {
+      const result = await getByWork(GDPR_WORK);
+
+      expect(result.isError).toBeFalsy();
+      const structured = eurlex_get_document.output.parse(result.structuredContent);
+      expect(structured.celex_number).toBe('32016R0679');
+      expect(noticeOf(result)).toBeUndefined();
+      expect(textOf(result)).not.toContain('CELEX numbers');
+    });
+
+    it('a work_uri with no CELEX still fails not_found', async () => {
+      const ctx = createMockContext({ errors: eurlex_get_document.errors });
+      const input = eurlex_get_document.input.parse({ work_uri: EMPTY_WORK });
+      await expect(eurlex_get_document.handler(input, ctx)).rejects.toMatchObject({
+        code: JsonRpcErrorCode.NotFound,
+        data: { reason: 'not_found' },
+      });
+    });
+
+    it('propagates a caller cancellation raised by the dereference', async () => {
+      mockSparqlQuery.mockImplementation((q: string) =>
+        q.includes(`<${NIM_WORK}> cdm:resource_legal_id_celex`)
+          ? Promise.reject(new DOMException('The operation was aborted.', 'AbortError'))
+          : cellar(q),
+      );
+      const ctx = createMockContext({ errors: eurlex_get_document.errors });
+      const input = eurlex_get_document.input.parse({ work_uri: NIM_WORK });
+      await expect(eurlex_get_document.handler(input, ctx)).rejects.toThrow(/aborted/);
+    });
+
+    it('serves the lowest CELEX on every call, whatever the endpoint row order', async () => {
+      const served: string[] = [];
+      for (let call = 0; call < 3; call++) {
+        const result = await getByWork(NIM_WORK);
+        served.push(eurlex_get_document.output.parse(result.structuredContent).celex_number);
+      }
+      expect(served).toEqual([LOWEST, LOWEST, LOWEST]);
+      mockFetchContent.mockResolvedValue({
+        content: 'body',
+        contentAvailable: true,
+        format: 'html',
+        language: 'EN',
+      });
+      await getByWork(NIM_WORK, { content_mode: 'paged' });
+      expect(mockFetchContent).toHaveBeenCalledWith(LOWEST, 'EN', 'html', expect.anything());
+    });
+
+    it('names the count and the served CELEX in a notice, on both channels', async () => {
+      const result = await getByWork(NIM_WORK);
+
+      const notice = noticeOf(result);
+      expect(notice).toContain('30 CELEX numbers');
+      expect(notice).toContain(LOWEST);
+      expect(notice).toContain('celex_number');
+      expect(textOf(result)).toContain(notice as string);
+      expect(textOf(result)).toContain(`## ${LOWEST}`);
+    });
+
+    it('notices a work carrying exactly two CELEX', async () => {
+      const result = await getByWork(TWO_CELEX_WORK);
+      expect(eurlex_get_document.output.parse(result.structuredContent).celex_number).toBe(
+        '72019L1152DEU_1',
+      );
+      expect(noticeOf(result)).toContain('2 CELEX numbers');
+    });
+
+    it('keeps the paging guidance when the body window is also cut', async () => {
+      mockFetchContent.mockResolvedValue({
+        content: 'x'.repeat(50),
+        contentAvailable: true,
+        format: 'html',
+        language: 'EN',
+      });
+      const result = await getByWork(NIM_WORK, { content_mode: 'paged', limit: 10 });
+
+      const structured = result.structuredContent as { notice?: string; truncated?: boolean };
+      expect(structured.truncated).toBe(true);
+      expect(structured.notice).toContain('offset=10');
+      expect(structured.notice).toContain('30 CELEX numbers');
+      expect(textOf(result)).toContain(structured.notice as string);
+    });
+
+    it('a celex_number request carries no notice and never dereferences a work', async () => {
+      const result = await runToolContract(eurlex_get_document, {
+        celex_number: '72019L1152CZE_225030',
+        content_mode: 'metadata_only',
+      });
+      expect(noticeOf(result)).toBeUndefined();
+      expect(mockSparqlQuery.mock.calls.some((c) => (c[0] as string).includes(NIM_WORK))).toBe(
+        false,
+      );
     });
   });
 });
