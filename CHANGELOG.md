@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.13.1](changelog/0.13.x/0.13.1.md) — 2026-09-25
+
+A CELEX held by several CELLAR works resolves to its canonical work on every tool and resource, Advocates General move out of author_institution(s) into advocates_general, search and relation pages are stable across calls, date-bounded case searches page first, and Formex headings keep their quotation marks.
+
 ## [0.13.0](changelog/0.13.x/0.13.0.md) — 2026-09-25
 
 ECLI lookup and output for case law, case_number and court filters that reach every primary record filed under them, member-state codes on transposition rows, and CELEX lookups through a typed exact triple instead of a STR() scan.
