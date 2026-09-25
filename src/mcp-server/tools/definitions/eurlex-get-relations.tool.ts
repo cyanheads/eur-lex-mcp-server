@@ -266,8 +266,9 @@ SELECT ?sourceCelex WHERE {
     // capped consistently — the symmetric UNION has no outer LIMIT and the
     // internal query path passes its per-arm subselect LIMITs through unchanged.
     const perDirectionLimit = Math.min(input.limit, svc.maxResults);
-    // Pass the source CELEX resolved from either identifier path so relation-specific
-    // act-core constraints operate before LIMIT/OFFSET and continuation proof.
+    // Pass the source CELEX resolved from either identifier path so the
+    // national_transposition act-core constraint operates before LIMIT/OFFSET and
+    // continuation proof.
     const { relations: workRelations, hasMore } = await traverseRelations(
       svc,
       workUri,
@@ -328,7 +329,7 @@ SELECT ?sourceCelex WHERE {
     // Echo the CELEX the traversal actually ran against. On the work_uri path that
     // is the identity resolved from the work — reported only when the work carries
     // exactly one, which is also the only case where it gated the act-core
-    // constraints — so the caller can see which act the constrained types matched.
+    // constraint — so the caller can see which act national_transposition matched.
     const resolvedCelexNumber = celexNumber ?? sourceCelexNumber;
 
     return {
