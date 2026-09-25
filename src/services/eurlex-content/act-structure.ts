@@ -145,9 +145,13 @@ function splitLines(content: string): RawLine[] {
   return out;
 }
 
-/** Strip HTML tags and decode common entities to the human-visible text of a line. */
+/**
+ * Strip HTML tags and decode common entities to the human-visible text of a line.
+ * A tag match stops at the next `<`, so a run of `<` with no `>` after it fails
+ * each attempt at once instead of rescanning to the end of the text per opener.
+ */
 function visibleText(line: string): string {
-  return decodeEntities(line.replace(/<[^>]*>/g, ' '))
+  return decodeEntities(line.replace(/<[^<>]*>/g, ' '))
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -287,9 +291,41 @@ function parseTextStructure(content: string): ActHeading[] {
 
 // --- Formex 4 XML: element matching ---
 
-/** Strip tags/entities from a Formex element's inner text. */
+/**
+ * A Formex quotation mark, self-closing (`<QUOT.START CODE="2018" …/>`) or as an
+ * empty start/end pair (`<QUOT.START CODE="2018" …></QUOT.START>`), and likewise
+ * `QUOT.END`. `[^<>]` keeps each match attempt inside one tag, so a run of
+ * unclosed openers costs one pass.
+ */
+const FORMEX_QUOT_RE = /<(QUOT\.(?:START|END))\b([^<>]*?)(?:\/>|><\/\1>)/g;
+
+/**
+ * The character reference for a quotation mark's `CODE` — the mark's code point in
+ * hex — or undefined when the code is missing, not hex, beyond Unicode, or names a
+ * surrogate or control character.
+ */
+function quoteMarkReference(attributes: string): string | undefined {
+  const code = /\bCODE="([0-9A-F]{1,6})"/i.exec(attributes)?.[1];
+  if (!code) return;
+  const point = Number.parseInt(code, 16);
+  if (point > MAX_CODE_POINT || /[\p{Cc}\p{Cs}]/u.test(String.fromCodePoint(point))) return;
+  return `&#x${code};`;
+}
+
+/**
+ * Strip tags/entities from a Formex element's inner text. Formex writes a quotation
+ * mark as an element naming its character by `CODE` (#99); a valid one becomes a
+ * character reference in place, with no padding, so the single decoding pass
+ * renders it and a mark that is itself `&` never starts a second reference (#79).
+ * A mark with an unusable `CODE` is left to the tag stripper, as before.
+ */
 function formexText(inner: string): string {
-  return visibleText(inner);
+  return visibleText(
+    inner.replace(
+      FORMEX_QUOT_RE,
+      (element, _name, attributes: string) => quoteMarkReference(attributes) ?? element,
+    ),
+  );
 }
 
 /** Where a Formex article heading opens. */

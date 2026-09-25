@@ -227,6 +227,91 @@ describe('parseActStructure', () => {
     });
   });
 
+  describe('Formex quotation marks (#99)', () => {
+    /** Formex article with the given subtitle markup. */
+    const article = (label: string, subtitle: string) =>
+      `<ARTICLE><TI.ART>${label}</TI.ART><STI.ART>${subtitle}</STI.ART><ALINEA>Body.</ALINEA></ARTICLE>`;
+    /** Subtitle of the first article in a Formex fragment. */
+    const subtitle = (formex: string) =>
+      parseActStructure(formex, 'xml').find((h) => h.kind === 'article')?.title;
+    const quote = (name: 'START' | 'END', code: string, id: string) =>
+      `<QUOT.${name} CODE="${code}" ID="${id}" REF.${name === 'START' ? 'END' : 'START'}="${id}"/>`;
+
+    it.each([
+      [
+        'English',
+        'Article 17',
+        `Right to erasure (${quote('START', '2018', 'QS0048')}right to be forgotten${quote('END', '2019', 'QE0048')})`,
+        'Right to erasure (‘right to be forgotten’)',
+      ],
+      [
+        'French',
+        'Article 17',
+        `Droit à l'effacement (${quote('START', '00AB', 'QS0046')}droit à l'oubli${quote('END', '00BB', 'QE0046')})`,
+        "Droit à l'effacement («droit à l'oubli»)",
+      ],
+      [
+        'German',
+        'Artikel 17',
+        `Recht auf Löschung (${quote('START', '201E', 'QS0055')}Recht auf Vergessenwerden${quote('END', '201C', 'QE0055')})`,
+        'Recht auf Löschung („Recht auf Vergessenwerden“)',
+      ],
+    ])(
+      'renders GDPR Article 17’s %s marks as the HTML title does',
+      (_lang, label, markup, title) => {
+        // The markup CELLAR serves for 32016R0679 in each language.
+        expect(subtitle(article(label, markup))).toBe(title);
+      },
+    );
+
+    it('renders the paired element form, inside a <P>', () => {
+      // 32018R1725 Article 19 writes each mark as an empty start/end tag pair.
+      const markup =
+        '<P>Right to erasure (<QUOT.START CODE="2018" ID="QS0044" REF.END="QE0044"></QUOT.START>right to be forgotten<QUOT.END CODE="2019" ID="QE0044" REF.START="QS0044"></QUOT.END>)</P>';
+      expect(subtitle(article('Article 19', markup))).toBe(
+        'Right to erasure (‘right to be forgotten’)',
+      );
+    });
+
+    it('adds no padding around a mark', () => {
+      expect(
+        subtitle(article('Article 1', '(<QUOT.START CODE="2018"/>x<QUOT.END CODE="2019"/>)')),
+      ).toBe('(‘x’)');
+    });
+
+    it('renders marks in an article label and a chapter subtitle', () => {
+      const formex = [
+        '<DIVISION><TITLE><TI><P>CHAPTER I</P></TI><STI><P>The <QUOT.START CODE="201C"/>general<QUOT.END CODE="201D"/> part</P></STI></TITLE>',
+        '<ARTICLE><TI.ART>Article <QUOT.START CODE="2018"/>2<QUOT.END CODE="2019"/></TI.ART></ARTICLE></DIVISION>',
+      ].join('');
+      const headings = parseActStructure(formex, 'xml');
+      expect(headings.find((h) => h.kind === 'chapter')?.title).toBe('The “general” part');
+      expect(headings.find((h) => h.kind === 'article')?.label).toBe('Article ‘2’');
+    });
+
+    it.each([
+      ['missing', '<QUOT.START/>x<QUOT.END ID="QE1"></QUOT.END>'],
+      ['non-hex', '<QUOT.START CODE="ZZ18"/>x<QUOT.END CODE="20 19"></QUOT.END>'],
+      ['out-of-range', '<QUOT.START CODE="110000"/>x<QUOT.END CODE="FFFFFFF"></QUOT.END>'],
+      ['surrogate or control', '<QUOT.START CODE="D800"/>x<QUOT.END CODE="0007"></QUOT.END>'],
+    ])('renders a %s CODE as before and keeps detecting structure', (_label, marks) => {
+      const formex = [
+        article('Article 1', `Scope (${marks})`),
+        article('Article 2', 'Definitions'),
+      ].join('');
+      const headings = parseActStructure(formex, 'xml');
+      expect(headings.map((h) => [h.label, h.title])).toEqual([
+        ['Article 1', 'Scope ( x )'],
+        ['Article 2', 'Definitions'],
+      ]);
+    });
+
+    it('decodes a mark once, so the character it names never starts a reference', () => {
+      // CODE 0026 names "&": followed by "lt;" it must stay the four characters "&lt;".
+      expect(subtitle(article('Article 1', 'A <QUOT.START CODE="0026"/>lt; B'))).toBe('A &lt; B');
+    });
+  });
+
   describe('Formex XML path', () => {
     it('detects articles and recitals from Formex elements, with the STI.ART subtitle', () => {
       const headings = parseActStructure(FORMEX_DOC_2, 'xml');
@@ -419,6 +504,10 @@ describe('parseActStructure', () => {
         fill('<TI.ART>Article 1</TI.ART><STI.ART>xx', n),
       'an unclosed <STI.ART> nesting the next <TI.ART>, repeated': (n) =>
         fill('<TI.ART>Article 1</TI.ART><STI.ART><TI.ART>', n),
+      'unclosed <QUOT.START> openers inside a closed heading (#99)': (n) =>
+        `<TI.ART>${fill('<QUOT.START CODE="2018" ', n - 17)}</TI.ART>`,
+      'paired <QUOT.START> openers missing their closer (#99)': (n) =>
+        `<TI.ART>${fill('<QUOT.START CODE="2018">', n - 17)}</TI.ART>`,
     };
 
     it.each(Object.entries(ADVERSARIAL_ARTICLES))('stays linear on %s', (_label, build) =>
