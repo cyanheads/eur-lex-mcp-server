@@ -5,6 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { echoValue } from '@/mcp-server/tools/echo-value.js';
 import {
   ENG_LANGUAGE_URI,
   resolveResourceTypeLabels,
@@ -13,11 +14,8 @@ import {
   CellarSparqlService,
   getCellarSparqlService,
 } from '@/services/cellar-sparql/cellar-sparql-service.js';
-import {
-  escapeSparqlLiteral,
-  isSafeSparqlIri,
-  isValidCalendarDate,
-} from '@/services/cellar-sparql/eli-resolution.js';
+import { isSafeSparqlIri, isValidCalendarDate } from '@/services/cellar-sparql/eli-resolution.js';
+import { keywordMatchPattern, keywordTitlePhrase } from '@/services/cellar-sparql/keyword-match.js';
 import { isConsolidatedCelex } from '@/services/cellar-sparql/relation-traversal.js';
 import { resolveCelexWorks } from '@/services/cellar-sparql/work-resolution.js';
 
@@ -94,7 +92,7 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
       .string()
       .optional()
       .describe(
-        'Keyword matched against English document titles via the full-text index (multi-word input is treated as a phrase), or against CELEX substrings.',
+        'Keyword matched against English document titles via the full-text index (multi-word input is treated as a phrase), and against CELEX numbers. A keyword that is a whole CELEX (e.g. 32016R0679) matches that document, its numbered siblings (…(01) to …(20)), and for case law its _INF, _RES, _SUM, and _EXT records, plus its corrigenda (…R(01) to …R(20), and any work recorded as correcting it) when include_corrigenda is set; a partial CELEX (e.g. 2016R0679) matches every CELEX containing it. A keyword with no digit, or with a character no CELEX holds (a space, a period), matches titles only. A keyword with no letter or digit is rejected.',
       ),
     document_type: z
       .union([
@@ -269,6 +267,12 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
       .describe('True when an additional CELLAR row proves more documents exist beyond this page.'),
     shown: z.number().optional().describe('Number of documents returned in this page.'),
     cap: z.number().optional().describe('The limit that was applied to this page.'),
+    notice: z
+      .string()
+      .optional()
+      .describe(
+        'Guidance for the next call: on an empty first page, the filters that matched nothing and how to broaden them; on a page with more rows, the offset to continue from.',
+      ),
   },
 
   errors: [
@@ -287,11 +291,18 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
         'Supply each date as a real calendar day in YYYY-MM-DD form, with date_from on or before date_to.',
     },
     {
-      reason: 'no_results',
-      code: JsonRpcErrorCode.NotFound,
-      when: 'The first page (offset 0) returned zero bindings — no matching documents in CELLAR. A later page that comes back empty returns an empty success instead.',
+      reason: 'invalid_author_institution',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'author_institution holds no letters or digits, so it can name no institution.',
       recovery:
-        'Broaden the search by removing filters, trying a shorter keyword, or expanding the date range.',
+        'Pass an institution name such as "European Parliament", "Council", or "European Commission", or omit author_institution.',
+    },
+    {
+      reason: 'invalid_keyword',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'keyword holds no letters or digits, so no title and no CELEX can match it.',
+      recovery:
+        'Pass a title word or phrase (e.g. "data protection") or a CELEX number (e.g. 32016R0679), or omit keyword.',
     },
     {
       reason: 'sparql_error',
@@ -311,7 +322,7 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
      * no_filters gate. The schema pins the `YYYY-MM-DD` shape only, so an
      * impossible calendar day or an inverted range still reaches CELLAR as an
      * `xsd:date` comparison that Virtuoso answers with zero bindings — the caller
-     * would see no_results and never learn the input was at fault. Ordering
+     * would see an empty page and never learn the input was at fault. Ordering
      * matters against the no_filters gate too: the caller did supply a filter, it
      * just failed validation, so no_filters would be the wrong diagnosis. Both
      * values are shape- and calendar-valid by the time the range is compared, so
@@ -416,9 +427,11 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
         .replace(/\s+/g, ' ')
         .trim();
       if (!authorPhrase) {
-        throw ctx.fail('no_results', `No EU institution matches author "${authorInput}".`, {
-          ...ctx.recoveryFor('no_results'),
-        });
+        throw ctx.fail(
+          'invalid_author_institution',
+          `author_institution "${echoValue(authorInput)}" holds no letters or digits.`,
+          { ...ctx.recoveryFor('invalid_author_institution') },
+        );
       }
       authorClause = `?work cdm:work_created_by_agent ?agent .
   ?agent skos:prefLabel ?agentLabel .
@@ -427,38 +440,18 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
     }
 
     /**
-     * Keyword match — title via the Virtuoso full-text index, CELEX by substring.
-     * The former `FILTER(CONTAINS(LCASE(?title), …))` scan forced the expression
-     * graph to be joined for every one of the 2.7M works before the term was
-     * tested, so a broad or lightly-filtered keyword scanned every candidate
-     * title and hit the query timeout (issue #17). `bif:contains` drives the
-     * match straight off the full-text index — the same fix the author filter
-     * uses — resolving in well under a second. Exact-substring CELEX matching is
-     * preserved as a UNION arm; a UNION arm evaluates its FILTER over its own
-     * scope, so the CELEX triple is re-bound inside the arm (a bare FILTER on the
-     * outer ?celexNumber binds nothing there). The term is sanitised for the
-     * full-text phrase the same way the author phrase is.
+     * A keyword with no letter or digit can match no title and no CELEX, so answering
+     * it would return an empty page that silently drops every other filter. The input
+     * is at fault, so it is rejected before any CELLAR call, and before the no_filters
+     * gate for the same reason an invalid date is.
      */
-    let keywordClause = '';
     const keywordInput = input.keyword?.trim();
-    if (keywordInput) {
-      const celexTerm = escapeSparqlLiteral(keywordInput.toLowerCase());
-      const ftPhrase = keywordInput
-        .replace(/[^\p{L}\p{N}\s]+/gu, ' ')
-        .replace(/\s+/g, ' ')
-        .trim();
-      const celexArm = `?work cdm:resource_legal_id_celex ?kwCelex .
-    FILTER(CONTAINS(LCASE(STR(?kwCelex)), "${celexTerm}"))`;
-      keywordClause = ftPhrase
-        ? `{
-    ?kwExpr cdm:expression_title ?kwTitle .
-    ?kwTitle bif:contains "'${ftPhrase}'" .
-    ?kwExpr cdm:expression_uses_language <${ENG_LANGUAGE_URI}> .
-    ?kwExpr cdm:expression_belongs_to_work ?work .
-  } UNION {
-    ${celexArm}
-  }`
-        : celexArm;
+    if (keywordInput && !keywordTitlePhrase(keywordInput)) {
+      throw ctx.fail(
+        'invalid_keyword',
+        `keyword "${echoValue(keywordInput)}" holds no letters or digits.`,
+        { ...ctx.recoveryFor('invalid_keyword') },
+      );
     }
 
     const inForceClause =
@@ -516,12 +509,13 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
      * the work URI that carries a title — ?titledWork binds to ?work only inside the
      * title OPTIONAL — and the handler falls back to SAMPLE(?work) when no work in the
      * group is titled. Both are fallbacks: the row's work_uri is the CELEX's canonical
-     * work, resolved for the whole page after this query (#97). ?docDate uses SAMPLE,
-     * NOT MAX: under ORDER BY DESC(?docDate) a MAX over the ordered column lets
-     * Virtuoso pick a date-index TOP-k plan that bypasses the date-range upper-bound
-     * FILTER whenever no selective graph pattern is present (a bare date/type search), returning the globally-latest documents
-     * instead of the in-range ones. Date is single-valued per CELEX, so SAMPLE shows
-     * the same value without triggering that plan.
+     * work, resolved for the whole page after this query (#97). The row date uses
+     * SAMPLE, NOT MAX, at every level: under ORDER BY DESC(?docDate) a MAX over the
+     * ordered column lets Virtuoso pick a date-index TOP-k plan that bypasses the
+     * date-range upper-bound FILTER whenever no selective graph pattern is present (a
+     * bare date/type search), returning the globally-latest documents instead of the
+     * in-range ones. Date is single-valued per CELEX, so SAMPLE shows the same value
+     * without triggering that plan.
      *
      * The CELEX breaks date ties, so the order is total: identical calls return
      * identical pages, and consecutive offsets neither repeat nor skip a document
@@ -529,15 +523,17 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
      * ?celexNumber, not the projected ?celex — Virtuoso does not sort on a SAMPLE
      * alias of a string.
      */
-    const sparql = `
-SELECT
+    const projection = (dateVar: string) => `SELECT
   (SAMPLE(?celexNumber) AS ?celex)
   (MAX(?titledWork) AS ?titledWork)
   (SAMPLE(?work) AS ?work)
   (GROUP_CONCAT(DISTINCT STR(?type); SEPARATOR=" ") AS ?types)
-  (SAMPLE(?date) AS ?docDate)
-  (MAX(?title) AS ?docTitle) WHERE {
-  ?work cdm:resource_legal_id_celex ?celexNumber .
+  (SAMPLE(${dateVar}) AS ?docDate)
+  (MAX(?title) AS ?docTitle)`;
+    const rowPattern = (
+      authorPart: string,
+      keywordPart: string,
+    ) => `?work cdm:resource_legal_id_celex ?celexNumber .
   ${documentTypeClause}
   OPTIONAL { ?work cdm:work_has_resource-type ?type . }
   OPTIONAL { ?work cdm:work_date_document ?date . }
@@ -548,11 +544,60 @@ SELECT
     BIND(?work AS ?titledWork)
   }
   ${eurovocClause}
-  ${authorClause}
-  ${keywordClause}
+  ${authorPart}
+  ${keywordPart}
   ${inForceClause}
-  ${filters.join('\n  ')}
-} GROUP BY ?celexNumber ORDER BY DESC(?docDate) ?celexNumber LIMIT ${pageLimit + 1} OFFSET ${input.offset}`;
+  ${filters.join('\n  ')}`;
+    const paging = `LIMIT ${pageLimit + 1} OFFSET ${input.offset}`;
+    const onPageWorks = (pattern: string) => pattern && `FILTER EXISTS {\n    ${pattern}\n  }`;
+
+    // The keyword's one CELLAR lookup runs only once the input has passed validation.
+    const keywordClause = keywordInput ? await keywordMatchPattern(svc, keywordInput, ctx) : '';
+
+    /**
+     * Page-first form for a search with any date bound — the form #98 gave
+     * eurlex_get_cases, for the same reason (#105). The flat query groups and
+     * aggregates every matching document before ORDER BY and LIMIT pick the page, so
+     * a date range, even a single day, passed the client timeout. The subquery holds
+     * the match pattern alone — the CELEX, the document type, the date, the subject,
+     * the author, the keyword, the in-force flag, and every filter — and pages in the
+     * same total order the outer query uses. The outer query repeats the whole row
+     * pattern, so each CELEX groups the same works, types, and titles as the flat
+     * form, and takes the row date from the subquery's ?pageDate so a document sorts
+     * where it was paged. The page LIMIT sits inside the subquery, below the outer
+     * level the service's LIMIT ceiling rewrites, so pageLimit stays the only clamp.
+     *
+     * The outer query tests the author and the keyword as FILTER EXISTS rather than
+     * joining them again: the grouped works are the same, but a join re-drives their
+     * full-text and CELEX arms over the whole corpus. With ?work already bound,
+     * EXISTS checks the page's works alone.
+     *
+     * A date-less search keeps the flat form: finding a broad browse's page keys
+     * costs about as much as the whole query, and a keyword-only search ran faster
+     * flat than paged first.
+     */
+    const sparql =
+      dateFrom || dateTo
+        ? `
+${projection('?pageDate')} WHERE {
+  {
+    SELECT ?celexNumber (SAMPLE(?date) AS ?pageDate) WHERE {
+      ?work cdm:resource_legal_id_celex ?celexNumber .
+      ${documentTypeClause}
+      OPTIONAL { ?work cdm:work_date_document ?date . }
+      ${eurovocClause}
+      ${authorClause}
+      ${keywordClause}
+      ${inForceClause}
+      ${filters.join('\n      ')}
+    } GROUP BY ?celexNumber ORDER BY DESC(?pageDate) ?celexNumber ${paging}
+  }
+  ${rowPattern(onPageWorks(authorClause), onPageWorks(keywordClause))}
+} GROUP BY ?celexNumber ORDER BY DESC(?docDate) ?celexNumber`
+        : `
+${projection('?date')} WHERE {
+  ${rowPattern(authorClause, keywordClause)}
+} GROUP BY ?celexNumber ORDER BY DESC(?docDate) ?celexNumber ${paging}`;
 
     const queryEcho = {
       ...(keywordInput ? { keyword: keywordInput } : {}),
@@ -576,14 +621,18 @@ SELECT
       offset: input.offset,
     });
 
+    /**
+     * Zero hits is an answer, not a failure (#112): an empty first page returns the
+     * same shape as a page past the end, plus a notice naming the filters and how to
+     * broaden them. A page past the end stays silent — the caller already has rows.
+     * Each echoed value is bounded; query_echo keeps it whole.
+     */
     if (bindings.length === 0 && input.offset === 0) {
       const filterSummary = Object.entries(queryEcho)
-        .map(([k, v]) => `${k}=${String(v)}`)
+        .map(([k, v]) => `${k}=${echoValue(String(v))}`)
         .join(', ');
-      throw ctx.fail(
-        'no_results',
-        `No documents matched the search criteria${filterSummary ? `. Filters: ${filterSummary}` : '.'}`,
-        { ...ctx.recoveryFor('no_results') },
+      ctx.enrich.notice(
+        `No documents matched the search criteria (${filterSummary}). Broaden the search by removing filters, trying a shorter keyword, or expanding the date range.`,
       );
     }
 
@@ -632,7 +681,11 @@ SELECT
     });
 
     if (hasMore) {
-      ctx.enrich.truncated({ shown: documents.length, cap: pageLimit });
+      ctx.enrich.truncated({
+        shown: documents.length,
+        cap: pageLimit,
+        guidance: `More documents match beyond this page; call again with offset=${input.offset + pageLimit}.`,
+      });
     }
 
     return {

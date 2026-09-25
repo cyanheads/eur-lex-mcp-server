@@ -5,6 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { echoValue } from '@/mcp-server/tools/echo-value.js';
 import {
   DERIVATIVE_RESOURCE_TYPES,
   ENG_LANGUAGE_URI,
@@ -19,6 +20,7 @@ import {
   escapeSparqlLiteral,
   isValidCalendarDate,
 } from '@/services/cellar-sparql/eli-resolution.js';
+import { keywordMatchPattern, keywordTitlePhrase } from '@/services/cellar-sparql/keyword-match.js';
 import { resolveCelexWorks } from '@/services/cellar-sparql/work-resolution.js';
 
 /**
@@ -155,7 +157,9 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
     keyword: z
       .string()
       .optional()
-      .describe('Keyword to match against case titles and CELEX strings.'),
+      .describe(
+        'Keyword matched against English case titles via the full-text index (multi-word input is treated as a phrase), and against CELEX numbers. A keyword that is a whole CELEX (e.g. 62023CO0097) matches that record, its numbered siblings (…(01) to …(20)), its _INF, _RES, _SUM, and _EXT records, and its corrigenda, with notices, abstracts, summaries, and corrigenda still joining only under include_derivative; for every record filed under a case, use case_number. A partial CELEX (e.g. 2013CJ0131) matches every CELEX containing it. A keyword with no digit, or with a character no CELEX holds (a space, a period), matches titles only. A keyword with no letter or digit is rejected.',
+      ),
     court: z
       .union([
         z.literal(''),
@@ -325,6 +329,12 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
       .describe('True when an additional CELLAR row proves more cases exist beyond this page.'),
     shown: z.number().optional().describe('Number of cases returned in this page.'),
     cap: z.number().optional().describe('The limit that was applied to this page.'),
+    notice: z
+      .string()
+      .optional()
+      .describe(
+        'Guidance for the next call: on an empty first page, the filters that matched nothing and how to broaden them; on a page with more rows, the offset to continue from.',
+      ),
   },
 
   errors: [
@@ -343,11 +353,11 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
         'Pass one case number per call, written as C-{number}/{year}, T-{number}/{year}, or F-{number}/{year} (e.g. C-131/12); a leading "Case", a trailing procedural suffix, and a pre-1989 Court of Justice number such as 26/62 are also accepted.',
     },
     {
-      reason: 'no_results',
-      code: JsonRpcErrorCode.NotFound,
-      when: 'The first page (offset 0) returned zero bindings — no matching cases in CELLAR sector 6. A later page that comes back empty returns an empty success instead.',
+      reason: 'invalid_keyword',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'keyword holds no letters or digits, so no case title and no CELEX can match it.',
       recovery:
-        'Try a different keyword, broader date range, or remove the court/case_type filter.',
+        'Pass a party name or title phrase (e.g. "Google Spain") or a CELEX number (e.g. 62013CJ0131), or omit keyword.',
     },
     {
       reason: 'sparql_error',
@@ -366,8 +376,8 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
      * Date-range validity, checked before any clause is built. The schema pins the
      * `YYYY-MM-DD` shape only, so an impossible calendar day or an inverted range
      * still reaches CELLAR as an `xsd:date` comparison that Virtuoso answers with
-     * zero bindings — the caller would see no_results and never learn the input was
-     * at fault. Both values are shape- and calendar-valid by the time the range is
+     * zero bindings — the caller would see an empty page and never learn the input
+     * was at fault. Both values are shape- and calendar-valid by the time the range is
      * compared, so a lexicographic comparison of the ISO strings is a chronological
      * one.
      */
@@ -421,50 +431,31 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
         const cn = escapeSparqlLiteral(caseNumberInput);
         filters.push(`FILTER(CONTAINS(LCASE(STR(?celexNumber)), LCASE("${cn}")))`);
       } else {
+        const quoted = echoValue(caseNumberInput);
         throw ctx.fail(
           'invalid_case_number',
           parsed.kind === 'unprefixed_out_of_range'
-            ? `Case number "${caseNumberInput}" has no court prefix, and its year ${parsed.year} falls outside 1953–1988, when unprefixed Court of Justice numbers were issued. Add the C-, T-, or F- prefix.`
+            ? `Case number "${quoted}" has no court prefix, and its year ${parsed.year} falls outside 1953–1988, when unprefixed Court of Justice numbers were issued. Add the C-, T-, or F- prefix.`
             : parsed.kind === 'several'
-              ? `Case number "${caseNumberInput}" names more than one case.`
-              : `Case number "${caseNumberInput}" is not a recognizable case number.`,
+              ? `Case number "${quoted}" names more than one case.`
+              : `Case number "${quoted}" is not a recognizable case number.`,
           { ...ctx.recoveryFor('invalid_case_number') },
         );
       }
     }
 
     /**
-     * Keyword match — title via the Virtuoso full-text index, CELEX by substring.
-     * The former `FILTER(CONTAINS(LCASE(?title), …))` scan forced the expression
-     * graph to be joined for every candidate work before the term was tested, so
-     * a broad keyword scanned every candidate title and risked the query timeout
-     * (issue #17). `bif:contains` drives the match straight off the full-text
-     * index — the same fix the author filter in eurlex_search_documents uses —
-     * resolving in well under a second. Exact-substring CELEX matching is
-     * preserved as a UNION arm; a UNION arm evaluates its FILTER over its own
-     * scope, so the CELEX triple is re-bound inside the arm (a bare FILTER on the
-     * outer ?celexNumber binds nothing there).
+     * A keyword with no letter or digit can match no title and no CELEX, so answering
+     * it would return an empty page that silently drops every other filter. The input
+     * is at fault, so it is rejected before any CELLAR call.
      */
-    let keywordClause = '';
     const keywordInput = input.keyword?.trim();
-    if (keywordInput) {
-      const celexTerm = escapeSparqlLiteral(keywordInput.toLowerCase());
-      const ftPhrase = keywordInput
-        .replace(/[^\p{L}\p{N}\s]+/gu, ' ')
-        .replace(/\s+/g, ' ')
-        .trim();
-      const celexArm = `?work cdm:resource_legal_id_celex ?kwCelex .
-    FILTER(CONTAINS(LCASE(STR(?kwCelex)), "${celexTerm}"))`;
-      keywordClause = ftPhrase
-        ? `{
-    ?kwExpr cdm:expression_title ?kwTitle .
-    ?kwTitle bif:contains "'${ftPhrase}'" .
-    ?kwExpr cdm:expression_uses_language <${ENG_LANGUAGE_URI}> .
-    ?kwExpr cdm:expression_belongs_to_work ?work .
-  } UNION {
-    ${celexArm}
-  }`
-        : celexArm;
+    if (keywordInput && !keywordTitlePhrase(keywordInput)) {
+      throw ctx.fail(
+        'invalid_keyword',
+        `keyword "${echoValue(keywordInput)}" holds no letters or digits.`,
+        { ...ctx.recoveryFor('invalid_keyword') },
+      );
     }
 
     if (input.court) {
@@ -570,6 +561,10 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
   ${filters.join('\n  ')}`;
     const paging = `LIMIT ${pageLimit + 1} OFFSET ${input.offset}`;
 
+    // Title arm on the full-text index, CELEX arm by the keyword's shape (#17, #105).
+    // Its one CELLAR lookup runs only once the input has passed validation.
+    const keywordClause = keywordInput ? await keywordMatchPattern(svc, keywordInput, ctx) : '';
+
     /**
      * Page-first form for a search with any date bound (#98). The flat query groups
      * and aggregates every matching case before ORDER BY and LIMIT pick the page;
@@ -586,7 +581,7 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
      * The outer query tests the keyword as FILTER EXISTS rather than joining it
      * again: the grouped works are the same (a work stays in its CELEX group only
      * when it matches the keyword either way), but a join re-drives the full-text
-     * and CELEX-substring arms over the whole corpus, which made a keyword search over
+     * and CELEX arms over the whole corpus, which made a keyword search over
      * a wide date range slower than the flat form. With ?work already bound, EXISTS
      * checks the page's works alone.
      *
@@ -637,14 +632,18 @@ ${projection('?date')} WHERE {
       resultCount: bindings.length,
     });
 
+    /**
+     * Zero hits is an answer, not a failure (#112): an empty first page returns the
+     * same shape as a page past the end, plus a notice naming the filters and how to
+     * broaden them. A page past the end stays silent — the caller already has rows.
+     * Each echoed value is bounded; query_echo keeps it whole.
+     */
     if (bindings.length === 0 && input.offset === 0) {
       const filterSummary = Object.entries(queryEcho)
-        .map(([k, v]) => `${k}=${String(v)}`)
+        .map(([k, v]) => `${k}=${echoValue(String(v))}`)
         .join(', ');
-      throw ctx.fail(
-        'no_results',
-        `No case law records matched the search criteria${filterSummary ? `. Filters: ${filterSummary}` : '.'}`,
-        { ...ctx.recoveryFor('no_results') },
+      ctx.enrich.notice(
+        `No case law records matched the search criteria (${filterSummary}). Try a different keyword, broader date range, or remove the court/case_type filter.`,
       );
     }
 
@@ -702,7 +701,11 @@ ${projection('?date')} WHERE {
     });
 
     if (hasMore) {
-      ctx.enrich.truncated({ shown: cases.length, cap: pageLimit });
+      ctx.enrich.truncated({
+        shown: cases.length,
+        cap: pageLimit,
+        guidance: `More cases match beyond this page; call again with offset=${input.offset + pageLimit}.`,
+      });
     }
 
     return {
