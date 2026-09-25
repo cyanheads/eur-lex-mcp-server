@@ -1209,6 +1209,24 @@ describe('eurlex_search_documents', () => {
     expect(result.documents[1]?.is_consolidated).toBe(false);
   });
 
+  it('tags a consolidated CELEX outside the -YYYYMMDD act-number shape is_consolidated:true (#109)', async () => {
+    const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+    mockQuery.mockResolvedValue([
+      makeDocBinding('02006A0901(01)-20090301', { date: '2009-03-01' }),
+      makeDocBinding('02003T0000-20040501', { date: '2004-05-01' }),
+      makeDocBinding('22006A0901(01)', { date: '2006-09-01' }),
+    ]);
+
+    const input = eurlex_search_documents.input.parse({ keyword: 'schengen' });
+    const result = await eurlex_search_documents.handler(input, ctx);
+
+    expect(result.documents.map((d) => [d.celex_number, d.is_consolidated])).toEqual([
+      ['02006A0901(01)-20090301', true],
+      ['02003T0000-20040501', true],
+      ['22006A0901(01)', false],
+    ]);
+  });
+
   // --- #57: include_consolidated echoed in query_echo after the default is applied ---
 
   it('echoes the effective include_consolidated:false in query_echo and content[] on a default call (issue #57)', async () => {

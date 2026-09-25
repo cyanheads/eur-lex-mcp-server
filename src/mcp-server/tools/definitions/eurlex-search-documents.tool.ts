@@ -174,7 +174,7 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
       .boolean()
       .optional()
       .describe(
-        'Restrict by in-force status: true returns only acts currently in force, false only acts no longer in force. Either way the act must carry the in-force property, which a minority of works do. Omit to return all regardless of in-force status.',
+        'Restrict by in-force status: true returns only acts currently in force; false returns acts not in force — repealed, expired, or not yet in force (eurlex_get_document names which, where CELLAR records one). Either way the act must carry the in-force property, which a minority of works do. Omit to return all regardless of in-force status.',
       ),
     offset: z
       .number()
@@ -200,7 +200,7 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
             is_consolidated: z
               .boolean()
               .describe(
-                'True when this CELEX is a consolidated version — a point-in-time text (…-YYYYMMDD) that incorporates amendments — rather than a base or amending act.',
+                'True when this CELEX is a consolidated version (sector 0, e.g. 02016R0679-20160504) — a point-in-time text that incorporates amendments — rather than a base or amending act.',
               ),
             is_corrigendum: z
               .boolean()
