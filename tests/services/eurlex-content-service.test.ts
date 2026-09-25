@@ -186,6 +186,24 @@ describe('EurLexContentService', () => {
     expect(result.unavailabilityReason).toBe('upstream_failure');
   });
 
+  it('rethrows a fetch failure after the request is cancelled instead of degrading it', async () => {
+    const controller = new AbortController();
+    mockFetch.mockImplementation(() => {
+      controller.abort();
+      return Promise.reject(new TypeError('fetch failed'));
+    });
+
+    await expect(
+      makeService().fetchContent(
+        '32016R0679',
+        'EN',
+        'html',
+        createMockContext({ signal: controller.signal }),
+      ),
+    ).rejects.toThrow();
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+
   it('retains an upstream failure across the requested-language and English fallback attempts', async () => {
     mockFetch.mockImplementation((_url: string, init: { headers: Record<string, string> }) =>
       Promise.resolve(

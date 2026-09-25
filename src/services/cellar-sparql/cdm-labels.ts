@@ -14,7 +14,7 @@ export const ENG_LANGUAGE_URI = 'http://publications.europa.eu/resource/authorit
  * Covers common legislation types, case law types, and preparatory acts.
  * Falls back to the last URI path segment when not in the map.
  */
-export const RESOURCE_TYPE_LABELS: Record<string, string> = {
+const RESOURCE_TYPE_LABEL_ENTRIES: Record<string, string> = {
   'http://publications.europa.eu/resource/authority/resource-type/REG': 'Regulation',
   'http://publications.europa.eu/resource/authority/resource-type/REG_ADOPT_INTERNATION':
     'Regulation Adopted by International Bodies',
@@ -128,6 +128,15 @@ export const RESOURCE_TYPE_LABELS: Record<string, string> = {
 };
 
 /**
+ * Lookup view of {@link RESOURCE_TYPE_LABEL_ENTRIES}. A `Map`, not the object
+ * literal, so an upstream URI such as `constructor` cannot resolve through the
+ * prototype chain.
+ */
+export const RESOURCE_TYPE_LABELS: ReadonlyMap<string, string> = new Map(
+  Object.entries(RESOURCE_TYPE_LABEL_ENTRIES),
+);
+
+/**
  * Derivative sector-6 resource-types: information notices (INFO_JUDICIAL, INFO_JUR),
  * case-law abstracts (ABSTRACT_JUR), case summaries (SUM_JUR), and standalone
  * corrigenda (CORRIGENDUM). Each is a separate CELLAR work with its own CELEX
@@ -158,7 +167,7 @@ export const DERIVATIVE_RESOURCE_TYPES = [
 
 /** Resolve a CDM resource-type URI to a human-readable label. Falls back to last path segment. */
 export function resolveResourceTypeLabel(uri: string): string {
-  return RESOURCE_TYPE_LABELS[uri] ?? uri.split('/').pop() ?? uri;
+  return RESOURCE_TYPE_LABELS.get(uri) ?? uri.split('/').pop() ?? uri;
 }
 
 /**
@@ -251,7 +260,7 @@ export function parseCaseLawTitle(raw: string | undefined): ParsedCaseTitle {
  * CDM corporate-body URI → human-readable institution name.
  * Falls back to the last URI path segment when not in the map.
  */
-export const CORPORATE_BODY_LABELS: Record<string, string> = {
+const CORPORATE_BODY_LABEL_ENTRIES: Record<string, string> = {
   'http://publications.europa.eu/resource/authority/corporate-body/EP': 'European Parliament',
   'http://publications.europa.eu/resource/authority/corporate-body/CONSIL': 'Council of the EU',
   'http://publications.europa.eu/resource/authority/corporate-body/COM': 'European Commission',
@@ -308,7 +317,12 @@ export const CORPORATE_BODY_LABELS: Record<string, string> = {
   'http://publications.europa.eu/resource/authority/corporate-body/TRADE': 'DG Trade',
 };
 
+/** Lookup view of {@link CORPORATE_BODY_LABEL_ENTRIES}, a `Map` for the same reason as {@link RESOURCE_TYPE_LABELS}. */
+export const CORPORATE_BODY_LABELS: ReadonlyMap<string, string> = new Map(
+  Object.entries(CORPORATE_BODY_LABEL_ENTRIES),
+);
+
 /** Resolve a CDM corporate-body URI to a human-readable institution name. Falls back to last path segment. */
 export function resolveCorporateBodyLabel(uri: string): string {
-  return CORPORATE_BODY_LABELS[uri] ?? uri.split('/').pop() ?? uri;
+  return CORPORATE_BODY_LABELS.get(uri) ?? uri.split('/').pop() ?? uri;
 }

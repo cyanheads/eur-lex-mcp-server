@@ -375,7 +375,8 @@ export class EurLexContentService {
    * `upstream_failure`, so callers can try the next variant or language. A WAF
    * challenge body resolves to `challenge`. The inner function only throws on a
    * `fetch` rejection, so `withRetry` retries transient network errors but never
-   * a 300, 404, or challenge.
+   * a 300, 404, or challenge. A rejection after the request signal aborted is
+   * rethrown rather than degraded, so cancellation surfaces as `RequestCancelled`.
    */
   private fetchUrl(
     url: string,
@@ -406,7 +407,10 @@ export class EurLexContentService {
         maxRetries: 2,
         signal: ctx.signal,
       },
-    ).catch((): FetchOutcome => ({ kind: 'upstream_failure' }));
+    ).catch((error: unknown): FetchOutcome => {
+      if (ctx.signal.aborted) throw error;
+      return { kind: 'upstream_failure' };
+    });
   }
 
   /**

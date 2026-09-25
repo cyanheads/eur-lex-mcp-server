@@ -284,6 +284,12 @@ describe('resolveResourceTypeLabel', () => {
   it('falls back to the last path segment for an unmapped resource-type URI', () => {
     expect(resolveResourceTypeLabel(`${RESOURCE_TYPE_BASE}UNKNOWN_TYPE`)).toBe('UNKNOWN_TYPE');
   });
+
+  it('never resolves a key through the prototype chain', () => {
+    for (const key of ['constructor', 'toString', '__proto__']) {
+      expect(resolveResourceTypeLabel(key)).toBe(key);
+    }
+  });
 });
 
 describe('resolveResourceTypeLabels', () => {
@@ -364,5 +370,11 @@ describe('resolveCorporateBodyLabel', () => {
 
   it('falls back to the last path segment for an unmapped corporate body', () => {
     expect(resolveCorporateBodyLabel(`${CORPORATE_BODY_BASE}UNKNOWN_BODY`)).toBe('UNKNOWN_BODY');
+  });
+
+  it('never resolves a key through the prototype chain', () => {
+    for (const key of ['constructor', 'toString', '__proto__']) {
+      expect(resolveCorporateBodyLabel(key)).toBe(key);
+    }
   });
 });
