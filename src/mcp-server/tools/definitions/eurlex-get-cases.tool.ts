@@ -6,6 +6,7 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import {
+  DERIVATIVE_RESOURCE_TYPES,
   ENG_LANGUAGE_URI,
   parseCaseLawTitle,
   resolveResourceTypeLabels,
@@ -36,66 +37,119 @@ const CASE_TYPE_RESOURCE_TYPE: Record<string, string> = {
 };
 
 /**
- * Derivative sector-6 resource-types excluded from the untyped/default search:
- * information notices (INFO_JUDICIAL, INFO_JUR), case-law abstracts (ABSTRACT_JUR),
- * case summaries (SUM_JUR), and standalone corrigenda (CORRIGENDUM). Each is a
- * separate CELLAR work with its own CELEX, so at a page limit they crowd distinct
- * primary cases off the page — a keyword search for a landmark ruling could drop
- * the ruling itself entirely (issue #44). A case_type filter already excludes them
- * structurally (it requires a primary resource-type); the untyped path excludes
- * them unless include_derivative opts in.
+ * CELEX type letters of sector-6 case law. A case-law CELEX reads
+ * `6{year}{court}{document}{number}` — e.g. 62023CO0097(01) is year 2023, court `C`,
+ * document `O` (order), number 0097 — so position 6 names the court and position 7
+ * the kind of record.
  *
- * CORRIGENDUM covers the standalone correction works, all carrying the CELEX `…R(nn)`
- * corrigendum marker (issue #55). No primary judgment/order/AG opinion is typed
- * CORRIGENDUM, so excluding the type drops only the correction record and never the
- * corrected case, which is a distinct CELEX. Excluding it explicitly also makes the
- * exclusion robust: sector-6 corrigenda are currently co-typed INFO_JUDICIAL (already
- * excluded above), but a corrigendum typed CORRIGENDUM alone would otherwise leak.
- * JUDG_EXTRACT/ORDER_EXTRACT are deliberately NOT here: an OJ extract can be the
- * sole published record of an older case, so excluding it would cost recall.
+ * The court filter keys on the court letter alone, so every record a court filed is
+ * reachable whatever its document letter (issue #91). A case number keys on the court
+ * letter plus the document letters that court files under a case number (issue #81),
+ * from a survey of every sector-6 CELEX: the primary records, and the notices that
+ * only include_derivative admits. Numbered Opinions and Rulings of the Court of
+ * Justice (`CV`, `CU`, `CG`, `CX`) are left out: they are cited as "Opinion 2/13",
+ * not by case number, and their CELEX collides with the `C-n/yy` case of the same
+ * number and year.
  */
-const DERIVATIVE_RESOURCE_TYPES = [
-  'http://publications.europa.eu/resource/authority/resource-type/INFO_JUDICIAL',
-  'http://publications.europa.eu/resource/authority/resource-type/INFO_JUR',
-  'http://publications.europa.eu/resource/authority/resource-type/ABSTRACT_JUR',
-  'http://publications.europa.eu/resource/authority/resource-type/SUM_JUR',
-  'http://publications.europa.eu/resource/authority/resource-type/CORRIGENDUM',
-] as const;
+const COURT_CELEX_LETTER = { CJEU: 'C', GC: 'T' } as const;
+const CASE_NUMBER_DOCUMENT_LETTERS = {
+  C: { primary: 'JOCPSTD', notices: 'ABN' },
+  T: { primary: 'JOCT', notices: 'ABN' },
+  F: { primary: 'JO', notices: 'ABN' },
+} as const;
+
+/** CELEX court letter a case-number prefix names: Court of Justice, General Court, Civil Service Tribunal. */
+type CaseCourtLetter = keyof typeof CASE_NUMBER_DOCUMENT_LETTERS;
 
 /**
- * Convert a standard EU case number (C-131/12 or T-131/12) into a CELEX substring
- * suitable for a CONTAINS filter.
- *
- * CELEX format for case law: 6{year4d}{court}{num4d}
- *   e.g. C-131/12 → 62012CJ0131, T-22/20 → 62020TJ0022
- *
- * 2-digit year heuristic: yy ≤ 60 → 20yy, else → 19yy.
- * Returns null if the input doesn't match the expected pattern.
+ * Case-number grammar. A `C-`/`T-`/`F-` prefix takes any hyphen form a published
+ * reference uses (ASCII, U+2010–U+2015, U+2212 — CELLAR titles often carry U+2011).
+ * A prefix-less number is a pre-1989 Court of Justice case (`26/62`, `133-73`),
+ * where `/` or a hyphen separates number and year. Both accept a leading "Case" and
+ * ignore the text after the year — a procedural suffix (`P`, `R II`, `PPU`, …) or
+ * the trailing "." of a case reference — since CELEX carries no suffix. Trailing
+ * text that holds another case designation (a digit, `/` or a hyphen, a digit — as
+ * in "C-131/12 and C-132/12") names a second case, which a single CELEX match would
+ * silently drop, so it is rejected; no procedural suffix contains a digit. Each
+ * pattern is anchored or fixed-width and backtracks through a single digit run at
+ * most, so cost stays linear in the input length.
  */
-function caseNumberToCelexFragment(caseNumber: string): string | null {
-  const m = /^([CT])-(\d+)\/(\d{2,4})$/.exec(caseNumber.trim().toUpperCase());
-  if (!m) return null;
-  // Groups 1–3 are all present once the pattern matches; the `?? ''` fallbacks
-  // satisfy the type-checker without a non-null assertion and never fire at runtime.
-  const court = m[1] === 'C' ? 'CJ' : 'TJ';
-  const caseNum = (m[2] ?? '').padStart(4, '0');
-  const yearStr = m[3] ?? '';
-  const rawYear = parseInt(yearStr, 10);
-  const year4 = yearStr.length === 2 ? (rawYear <= 60 ? 2000 + rawYear : 1900 + rawYear) : rawYear;
-  return `${year4}${court}${caseNum}`;
+const HYPHEN = '[-\\u2010-\\u2015\\u2212]';
+const PREFIXED_CASE_NUMBER = new RegExp(
+  `^(?:case\\s+)?([CTF])${HYPHEN}(\\d+)/(\\d{2,4})(?!\\d)`,
+  'i',
+);
+const PREFIXLESS_CASE_NUMBER = new RegExp(
+  `^(?:case\\s+)?(\\d+)(?:/|${HYPHEN})(\\d{2,4})(?!\\d)`,
+  'i',
+);
+const ANOTHER_CASE_NUMBER = new RegExp(`\\d(?:/|${HYPHEN})\\d`);
+
+/** Unprefixed Court of Justice case numbers were issued from 1953 until the General Court opened in 1989. */
+const PREFIXLESS_FIRST_YEAR = 1953;
+const PREFIXLESS_LAST_YEAR = 1988;
+
+/**
+ * A value made only of characters a CELEX can hold. Every sector-6 CELEX is made of
+ * these characters alone, so any value a CELEX substring match can reach is one of
+ * these strings; a value that parses as no case number and contains anything else
+ * can never match and is rejected instead of answered with an empty search.
+ */
+const CELEX_CHARACTERS = /^[0-9A-Za-z()_]+$/;
+
+type ParsedCaseNumber =
+  | { kind: 'case'; court: CaseCourtLetter; year: number; number: string }
+  | { kind: 'unprefixed_out_of_range'; year: number }
+  | { kind: 'several' }
+  | { kind: 'unparsed' };
+
+/**
+ * Parse a single case number into the CELEX parts it names.
+ *
+ * Prefixed years keep the historical two-digit heuristic (yy ≤ 60 → 20yy, else
+ * 19yy), so C-25/62 still reads as 1962; a three- or four-digit year is taken as
+ * written. A prefix-less number always reads as the Court of Justice with a 19yy
+ * year, and one dated outside 1953–1988 is reported separately — it cannot be told
+ * apart from a General Court or Court of Justice number that lost its prefix. A value
+ * whose trailing text holds a second case designation is reported as `several`.
+ */
+function parseCaseNumber(value: string): ParsedCaseNumber {
+  const prefixed = PREFIXED_CASE_NUMBER.exec(value);
+  const match = prefixed ?? PREFIXLESS_CASE_NUMBER.exec(value);
+  if (!match) return { kind: 'unparsed' };
+  if (ANOTHER_CASE_NUMBER.test(value.slice(match[0].length))) return { kind: 'several' };
+  if (prefixed) {
+    // Groups 1–3 are all present once the pattern matches; the `?? ''` fallbacks
+    // satisfy the type-checker without a non-null assertion and never fire at runtime.
+    const yearText = prefixed[3] ?? '';
+    const rawYear = parseInt(yearText, 10);
+    return {
+      kind: 'case',
+      court: (prefixed[1] ?? '').toUpperCase() as CaseCourtLetter,
+      year: yearText.length === 2 ? (rawYear <= 60 ? 2000 + rawYear : 1900 + rawYear) : rawYear,
+      number: (prefixed[2] ?? '').padStart(4, '0'),
+    };
+  }
+  const yearText = match[2] ?? '';
+  const rawYear = parseInt(yearText, 10);
+  const year = yearText.length === 2 ? 1900 + rawYear : rawYear;
+  if (year < PREFIXLESS_FIRST_YEAR || year > PREFIXLESS_LAST_YEAR) {
+    return { kind: 'unprefixed_out_of_range', year };
+  }
+  return { kind: 'case', court: 'C', year, number: (match[1] ?? '').padStart(4, '0') };
 }
 
 export const eurlex_get_cases = tool('eurlex_get_cases', {
   title: 'Search CJEU/GC Case Law',
   description:
-    'Search CJEU and General Court case law — judgments, orders, and Advocate General opinions — by case number, court, case type, keyword, and date range. By default only these primary records are returned; derivative judicial information notices, case abstracts, summaries, and corrigenda are excluded so distinct cases fill the page (set include_derivative to include them). Keyword matches English case titles (which carry party names) and CELEX strings; there is no full-text body search. Returns each case with its court, date, and type, plus — parsed from the title where present — the parties, subject matter, and case reference.',
+    'Search CJEU and General Court case law — judgments, orders, and Advocate General opinions — by case number, court, case type, keyword, and date range. A case number reaches every judgment, order, and AG opinion filed under it. By default only these primary records are returned; derivative judicial information notices, case abstracts, summaries, and corrigenda are excluded so distinct cases fill the page (set include_derivative to include them). Keyword matches English case titles (which carry party names) and CELEX strings; there is no full-text body search. Returns each case with its CELEX number (whose sixth character names the court: C, T, or F), work URI, ECLI, date, and type, plus — parsed from the title where present — the parties, subject matter, and case reference.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
     case_number: z
       .string()
       .optional()
       .describe(
-        'Case number in standard format: C-{num}/{year} for CJEU or T-{num}/{year} for General Court (e.g. C-131/12).',
+        'Number of a single case: C-{num}/{year} (Court of Justice), T-{num}/{year} (General Court), or F-{num}/{year} (Civil Service Tribunal), e.g. C-131/12. Also accepts the case_reference form ("Case C-97/23 P."), any procedural suffix after the year (P, R, PPU, …), and a pre-1989 Court of Justice number with no prefix (26/62). A value naming more than one case ("C-131/12 and C-132/12") is rejected; search each separately. Matches the judgments, orders, AG opinions, and other primary records filed under that number; derivative records (notices, abstracts, summaries, corrigenda) join only under include_derivative. Numbered Opinions and Rulings of the Court of Justice ("Opinion 2/13", "Ruling 1/78") are not reached by a case number; look one up by its CELEX (e.g. 62013CV0002). A value made only of CELEX characters (e.g. 2023CJ0097) is matched as a CELEX substring instead.',
       ),
     keyword: z
       .string()
@@ -104,11 +158,13 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
     court: z
       .union([
         z.literal(''),
-        z.enum(['CJEU', 'GC']).describe('CJEU = Court of Justice of the EU, GC = General Court.'),
+        z
+          .enum(['CJEU', 'GC'])
+          .describe('CJEU (C) = Court of Justice of the EU, GC (T) = General Court.'),
       ])
       .optional()
       .describe(
-        'Court filter: CJEU = Court of Justice of the EU, GC = General Court. Omit to search both.',
+        'Court filter, by the court letter at position 6 of the CELEX: CJEU (C) = Court of Justice of the EU, GC (T) = General Court. It does not narrow by record type: every primary record the court filed matches, and its derivative records (notices, abstracts, summaries, corrigenda) join only under include_derivative. Omit to search every court.',
       ),
     case_type: z
       .union([
@@ -180,6 +236,12 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
           .object({
             work_uri: z.string().describe('CELLAR work URI.'),
             celex_number: z.string().describe('CELEX identifier for the case (e.g. 62024CJ0629).'),
+            ecli: z
+              .string()
+              .optional()
+              .describe(
+                'European Case Law Identifier, the citation form of the record (e.g. "ECLI:EU:C:2014:317"); eurlex_lookup_celex resolves one back to its CELEX. Absent for judicial notices and the few records that carry none.',
+              ),
             resource_type: z
               .string()
               .optional()
@@ -233,7 +295,12 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
     query_echo: z
       .object({
         case_number: z.string().optional().describe('Case number filter applied.'),
-        celex_fragment: z.string().optional().describe('CELEX substring derived from case_number.'),
+        celex_fragment: z
+          .string()
+          .optional()
+          .describe(
+            'CELEX pattern matched for case_number: year, court letter, and zero-padded case number, with * standing for any document letter that court files under a case number (e.g. "2023C*0097" reaches 62023CJ0097, 62023CO0097, and 62023CC0097). Absent when case_number was matched as a raw CELEX substring.',
+          ),
         keyword: z.string().optional().describe('Keyword filter applied.'),
         court: z.string().optional().describe('Court filter applied.'),
         case_type: z.string().optional().describe('Case type filter applied.'),
@@ -264,6 +331,13 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
       when: 'date_from or date_to is not a real calendar date, or date_from falls after date_to.',
       recovery:
         'Supply each date as a real calendar day in YYYY-MM-DD form, with date_from on or before date_to.',
+    },
+    {
+      reason: 'invalid_case_number',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'case_number is not a recognizable case number and holds characters no CELEX contains, names more than one case (e.g. "C-131/12 and C-132/12"), or is a prefix-less number dated outside 1953–1988.',
+      recovery:
+        'Pass one case number per call, written as C-{number}/{year}, T-{number}/{year}, or F-{number}/{year} (e.g. C-131/12); a leading "Case", a trailing procedural suffix, and a pre-1989 Court of Justice number such as 26/62 are also accepted.',
     },
     {
       reason: 'no_results',
@@ -317,18 +391,42 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
     // All case law is in CELEX sector 6
     const filters: string[] = [`FILTER(STRSTARTS(STR(?celexNumber), "6"))`];
 
+    /**
+     * Case number → CELEX match. CELEX stores the year before the number
+     * (C-131/12 → 62012CJ0131), and the court files one case under several
+     * document letters (judgment CJ, order CO, AG opinion CC, …), so the match
+     * fixes year, court letter, and number and lets the document letter vary over
+     * the set that court uses. Notice letters join only when derivative records are
+     * admitted. The REGEX is unanchored, as the former CONTAINS was, so every value
+     * that parsed before still reaches what it reached then. A value that parses as
+     * no case number keeps the escaped CELEX-substring match only when it is made
+     * of CELEX characters; anything else could never match and is rejected.
+     */
     let celexFragment: string | undefined;
-    if (input.case_number?.trim()) {
-      // Convert standard case number (C-131/12) to CELEX substring (2012CJ0131).
-      // The old approach — searching for the raw "131/12" string in the CELEX — is
-      // inverted: CELEX stores year before case number, so "131/12" never matches.
-      celexFragment = caseNumberToCelexFragment(input.case_number) ?? undefined;
-      if (celexFragment) {
-        filters.push(`FILTER(CONTAINS(STR(?celexNumber), "${celexFragment}"))`);
-      } else {
-        // Fallback for non-standard formats: substring match on CELEX
-        const cn = escapeSparqlLiteral(input.case_number.trim());
+    const caseNumberInput = input.case_number?.trim();
+    if (caseNumberInput) {
+      const parsed = parseCaseNumber(caseNumberInput);
+      if (parsed.kind === 'case') {
+        const letters = CASE_NUMBER_DOCUMENT_LETTERS[parsed.court];
+        const admitsNotices = !input.case_type && input.include_derivative;
+        const documentLetters = letters.primary + (admitsNotices ? letters.notices : '');
+        celexFragment = `${parsed.year}${parsed.court}*${parsed.number}`;
+        filters.push(
+          `FILTER(REGEX(STR(?celexNumber), "${parsed.year}${parsed.court}[${documentLetters}]${parsed.number}"))`,
+        );
+      } else if (parsed.kind === 'unparsed' && CELEX_CHARACTERS.test(caseNumberInput)) {
+        const cn = escapeSparqlLiteral(caseNumberInput);
         filters.push(`FILTER(CONTAINS(LCASE(STR(?celexNumber)), LCASE("${cn}")))`);
+      } else {
+        throw ctx.fail(
+          'invalid_case_number',
+          parsed.kind === 'unprefixed_out_of_range'
+            ? `Case number "${caseNumberInput}" has no court prefix, and its year ${parsed.year} falls outside 1953–1988, when unprefixed Court of Justice numbers were issued. Add the C-, T-, or F- prefix.`
+            : parsed.kind === 'several'
+              ? `Case number "${caseNumberInput}" names more than one case.`
+              : `Case number "${caseNumberInput}" is not a recognizable case number.`,
+          { ...ctx.recoveryFor('invalid_case_number') },
+        );
       }
     }
 
@@ -366,15 +464,9 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
         : celexArm;
     }
 
-    if (input.court === 'CJEU') {
-      // CJEU cases have CELEX pattern 6{year}CJ or 6{year}CC (AG opinions)
+    if (input.court) {
       filters.push(
-        `FILTER(CONTAINS(STR(?celexNumber), "CJ") || CONTAINS(STR(?celexNumber), "CC") || CONTAINS(STR(?celexNumber), "CO"))`,
-      );
-    } else if (input.court === 'GC') {
-      // General Court cases have pattern 6{year}TJ
-      filters.push(
-        `FILTER(CONTAINS(STR(?celexNumber), "TJ") || CONTAINS(STR(?celexNumber), "TO"))`,
+        `FILTER(SUBSTR(STR(?celexNumber), 6, 1) = "${COURT_CELEX_LETTER[input.court]}")`,
       );
     }
 
@@ -440,7 +532,9 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
      * bypasses the date-range upper-bound FILTER whenever no selective graph pattern
      * is present (a bare date/court/type search), returning the globally-latest cases
      * instead of the in-range ones. Date is single-valued per CELEX, so SAMPLE shows
-     * the same value without triggering that plan.
+     * the same value without triggering that plan. The ECLI is single-valued per
+     * CELEX too, but only some member works of a group carry it, so MAX keeps a
+     * bound value the way it does for the title (issue #84).
      */
     const sparql = `
 SELECT
@@ -449,11 +543,13 @@ SELECT
   (SAMPLE(?work) AS ?work)
   (GROUP_CONCAT(DISTINCT STR(?type); SEPARATOR=" ") AS ?types)
   (SAMPLE(?date) AS ?docDate)
+  (MAX(?caseEcli) AS ?ecli)
   (MAX(?title) AS ?docTitle) WHERE {
   ?work cdm:resource_legal_id_celex ?celexNumber .
   ${typeConstraint}
   OPTIONAL { ?work cdm:work_has_resource-type ?type . }
   OPTIONAL { ?work cdm:work_date_document ?date . }
+  OPTIONAL { ?work cdm:case-law_ecli ?caseEcli . }
   OPTIONAL {
     ?expr cdm:expression_belongs_to_work ?work .
     ?expr cdm:expression_uses_language <${ENG_LANGUAGE_URI}> .
@@ -503,6 +599,7 @@ SELECT
       const c: {
         work_uri: string;
         celex_number: string;
+        ecli?: string;
         resource_type?: string;
         date?: string;
         title?: string;
@@ -517,6 +614,8 @@ SELECT
           '',
         celex_number: CellarSparqlService.bindingValue(b, 'celex') ?? '',
       };
+      const ecli = CellarSparqlService.bindingValue(b, 'ecli');
+      if (ecli) c.ecli = ecli;
       const resourceType = resolveResourceTypeLabels(CellarSparqlService.bindingValue(b, 'types'));
       if (resourceType) c.resource_type = resourceType;
       const date = CellarSparqlService.bindingValue(b, 'docDate');
@@ -570,6 +669,7 @@ SELECT
       const heading = c.display_title ?? c.title;
       lines.push(`### ${c.celex_number}${heading ? ` — ${heading}` : ''}`);
       if (c.date) lines.push(`**Date:** ${c.date}`);
+      if (c.ecli) lines.push(`**ECLI:** ${c.ecli}`);
       if (c.resource_type) lines.push(`**Type:** ${c.resource_type}`);
       if (c.parties) lines.push(`**Parties:** ${c.parties}`);
       if (c.subject_matter) lines.push(`**Subject matter:** ${c.subject_matter}`);

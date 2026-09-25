@@ -38,6 +38,7 @@ function makeCaseBinding(
     types?: string;
     date?: string;
     title?: string;
+    ecli?: string;
   } = {},
 ): Record<string, { type: string; value: string }> {
   const b: Record<string, { type: string; value: string }> = {
@@ -53,8 +54,62 @@ function makeCaseBinding(
   if (opts.types) b.types = { type: 'literal', value: opts.types };
   if (opts.date) b.docDate = { type: 'literal', value: opts.date };
   if (opts.title) b.docTitle = { type: 'literal', value: opts.title };
+  if (opts.ecli) b.ecli = { type: 'literal', value: opts.ecli };
   return b;
 }
+
+/** Evaluate one atom of a generated CELEX filter against a CELEX value. */
+function evaluateCelexAtom(atom: string, celex: string): boolean {
+  const startsWith = /^STRSTARTS\(STR\(\?celexNumber\), "([^"]*)"\)$/.exec(atom);
+  if (startsWith) return celex.startsWith(startsWith[1] ?? '');
+  const contains = /^CONTAINS\(STR\(\?celexNumber\), "([^"]*)"\)$/.exec(atom);
+  if (contains) return celex.includes(contains[1] ?? '');
+  const lcaseContains = /^CONTAINS\(LCASE\(STR\(\?celexNumber\)\), LCASE\("([^"]*)"\)\)$/.exec(
+    atom,
+  );
+  if (lcaseContains) return celex.toLowerCase().includes((lcaseContains[1] ?? '').toLowerCase());
+  const regex = /^REGEX\(STR\(\?celexNumber\), "([^"]*)"\)$/.exec(atom);
+  if (regex) return new RegExp(regex[1] ?? '').test(celex);
+  const substr = /^SUBSTR\(STR\(\?celexNumber\), (\d+), (\d+)\) = "([^"]*)"$/.exec(atom);
+  if (substr) {
+    const start = Number(substr[1]) - 1;
+    return celex.slice(start, start + Number(substr[2])) === substr[3];
+  }
+  throw new Error(`Unrecognized CELEX filter atom: ${atom}`);
+}
+
+/**
+ * Whether a generated query's CELEX-string filters — the sector-6 bound, the
+ * case_number match, and the court filter — admit a real CELEX value. Tests assert
+ * which records a query can reach rather than the text it contains; the atom shapes
+ * are those the tool emits (and emitted before), and any other shape throws, so a
+ * filter this helper cannot read never passes silently. Resource-type filtering
+ * (case_type, the derivative exclusion) is server-side and outside its scope.
+ */
+function admits(sparql: string, celex: string): boolean {
+  const filters = sparql
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith('FILTER(') && line.includes('STR(?celexNumber)'));
+  if (filters.length === 0) throw new Error('No CELEX filter in the generated query');
+  return filters.every((line) =>
+    line
+      .slice('FILTER('.length, -1)
+      .split(' || ')
+      .some((atom) => evaluateCelexAtom(atom, celex)),
+  );
+}
+
+/** Every record CELLAR holds under C-97/23 and T-97/23 (live, 2026-09-25). */
+const C_97_23_PRIMARY = [
+  '62023CJ0097',
+  '62023CC0097',
+  '62023CO0097',
+  '62023CO0097(01)',
+  '62023CO0097(02)',
+];
+const C_97_23_DERIVATIVE = ['62023CJ0097_RES', '62023CA0097', '62023CN0097'];
+const T_97_23_RECORDS = ['62023TJ0097', '62023TJ0097_INF', '62023TA0097', '62023TN0097'];
 
 describe('eurlex_get_cases', () => {
   beforeEach(() => {
@@ -105,7 +160,8 @@ describe('eurlex_get_cases', () => {
     await eurlex_get_cases.handler(input, ctx);
 
     const sparql = mockQuery.mock.calls[0]?.[0] as string;
-    expect(sparql).toContain('"CJ"');
+    expect(admits(sparql, '62013CJ0131')).toBe(true);
+    expect(admits(sparql, '62020TJ0001')).toBe(false);
   });
 
   it('applies court=GC filter', async () => {
@@ -116,7 +172,8 @@ describe('eurlex_get_cases', () => {
     await eurlex_get_cases.handler(input, ctx);
 
     const sparql = mockQuery.mock.calls[0]?.[0] as string;
-    expect(sparql).toContain('"TJ"');
+    expect(admits(sparql, '62020TJ0001')).toBe(true);
+    expect(admits(sparql, '62013CJ0131')).toBe(false);
   });
 
   // --- case_type filters by resource-type, not CELEX substring (issue #38) ---
@@ -191,8 +248,9 @@ describe('eurlex_get_cases', () => {
     await eurlex_get_cases.handler(input, ctx);
 
     const sparql = mockQuery.mock.calls[0]?.[0] as string;
-    // Court stays a CELEX-letter test (CJEU = CJ/CC/CO); case_type is the resource-type triple.
-    expect(sparql).toContain('CONTAINS(STR(?celexNumber), "CJ")');
+    // Court stays a CELEX-letter test (the court letter C); case_type is the resource-type triple.
+    expect(admits(sparql, '62013CJ0131')).toBe(true);
+    expect(admits(sparql, '62020TJ0022')).toBe(false);
     expect(sparql).toContain(
       '?work cdm:work_has_resource-type <http://publications.europa.eu/resource/authority/resource-type/JUDG> .',
     );
@@ -213,7 +271,7 @@ describe('eurlex_get_cases', () => {
 
   // --- case_number conversion ---
 
-  it('converts C-131/12 to CELEX fragment 2012CJ0131 in SPARQL', async () => {
+  it('converts C-131/12 to a CELEX match reaching 62012CJ0131 (#2)', async () => {
     const ctx = createMockContext({ errors: eurlex_get_cases.errors });
     mockQuery.mockResolvedValue([makeCaseBinding('62012CJ0131')]);
 
@@ -221,14 +279,14 @@ describe('eurlex_get_cases', () => {
     const result = await eurlex_get_cases.handler(input, ctx);
 
     const sparql = mockQuery.mock.calls[0]?.[0] as string;
-    // Should search for the CELEX substring, not the raw case number
-    expect(sparql).toContain('2012CJ0131');
+    // Should search the CELEX layout (year first), not the raw case number
+    expect(admits(sparql, '62012CJ0131')).toBe(true);
     expect(sparql).not.toContain('131/12');
-    expect(result.query_echo.celex_fragment).toBe('2012CJ0131');
+    expect(result.query_echo.celex_fragment).toBe('2012C*0131');
     expect(result.query_echo.case_number).toBe('C-131/12');
   });
 
-  it('converts T-22/20 to CELEX fragment 2020TJ0022 in SPARQL', async () => {
+  it('converts T-22/20 to a CELEX match reaching 62020TJ0022 (#2)', async () => {
     const ctx = createMockContext({ errors: eurlex_get_cases.errors });
     mockQuery.mockResolvedValue([makeCaseBinding('62020TJ0022')]);
 
@@ -236,7 +294,18 @@ describe('eurlex_get_cases', () => {
     await eurlex_get_cases.handler(input, ctx);
 
     const sparql = mockQuery.mock.calls[0]?.[0] as string;
-    expect(sparql).toContain('2020TJ0022');
+    expect(admits(sparql, '62020TJ0022')).toBe(true);
+    expect(admits(sparql, '62020CJ0022')).toBe(false);
+  });
+
+  it('converts C-25/62 to a CELEX match reaching 61962CJ0025 (#2)', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+    mockQuery.mockResolvedValue([makeCaseBinding('61962CJ0025')]);
+
+    const input = eurlex_get_cases.input.parse({ case_number: 'C-25/62' });
+    await eurlex_get_cases.handler(input, ctx);
+
+    expect(admits(mockQuery.mock.calls[0]?.[0] as string, '61962CJ0025')).toBe(true);
   });
 
   it('includes query_echo in the response', async () => {
@@ -328,23 +397,22 @@ describe('eurlex_get_cases', () => {
   // unescaped value too (a mocked query returns its fixture whatever it is
   // handed); the built query text is the discriminating part.
 
-  it('escapes a trailing backslash in the case_number fallback (#62)', async () => {
+  /**
+   * A backslash is not a CELEX character, so since #81 a trailing-backslash
+   * case_number is rejected as invalid_case_number before any query is built —
+   * no literal reaches CELLAR at all, which closes the #62 leak more tightly than
+   * escaping did. The CELEX-character fallback that remains still routes its
+   * literal through escapeSparqlLiteral (asserted in the #81 fallback tests).
+   */
+  it('rejects a trailing-backslash case_number before any CELLAR request (#62, #81)', async () => {
     const ctx = createMockContext({ errors: eurlex_get_cases.errors });
-    mockQuery.mockResolvedValue([]);
 
-    // A non-standard format misses caseNumberToCelexFragment and takes the
-    // substring-match fallback — the path that builds the literal.
-    const caseNumber = 'ZZ\\';
-    const input = eurlex_get_cases.input.parse({ case_number: caseNumber });
+    const input = eurlex_get_cases.input.parse({ case_number: 'ZZ\\' });
     await expect(eurlex_get_cases.handler(input, ctx)).rejects.toMatchObject({
-      code: JsonRpcErrorCode.NotFound,
-      data: { reason: 'no_results' },
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'invalid_case_number' },
     });
-
-    const sparql = mockQuery.mock.calls[0]?.[0] as string;
-    expect(sparql).toContain(`LCASE("${escapeSparqlLiteral(caseNumber)}")`);
-    // The unterminated form the quote-only pass produced is gone.
-    expect(sparql).not.toContain(String.raw`LCASE("ZZ\")`);
+    expect(mockQuery).not.toHaveBeenCalled();
   });
 
   it('escapes a trailing backslash in the keyword CELEX arm (#62)', async () => {
@@ -377,15 +445,17 @@ describe('eurlex_get_cases', () => {
     const ctx = createMockContext({ errors: eurlex_get_cases.errors });
     mockQuery.mockResolvedValue([]);
 
-    const input = eurlex_get_cases.input.parse({ case_number: 'ZZ-1\t' });
+    // A CELEX-character value with a trailing tab still takes the substring
+    // fallback (#81), so the trim-then-escape order stays observable there.
+    const input = eurlex_get_cases.input.parse({ case_number: 'ZZ1\t' });
     await expect(eurlex_get_cases.handler(input, ctx)).rejects.toMatchObject({
       data: { reason: 'no_results' },
     });
 
     const sparql = mockQuery.mock.calls[0]?.[0] as string;
-    expect(sparql).toContain('LCASE("ZZ-1")');
+    expect(sparql).toContain('LCASE("ZZ1")');
     // Escaping first would leave an escaped tab the trim could not remove.
-    expect(sparql).not.toContain(String.raw`ZZ-1\t`);
+    expect(sparql).not.toContain(String.raw`ZZ1\t`);
   });
 
   // --- Dedup of multi-resource-type works (issue #14) ---
@@ -1115,6 +1185,432 @@ describe('eurlex_get_cases', () => {
         .join('\n');
       expect(text).toContain('2026-99-99');
       expect(text).toContain(structured.error?.data?.recovery?.hint as string);
+    });
+  });
+
+  // --- #81: case_number reaches every record the court files under that number ---
+
+  describe('case_number matching (#81)', () => {
+    async function queryFor(input: Record<string, unknown>): Promise<{
+      sparql: string;
+      result: Awaited<ReturnType<typeof eurlex_get_cases.handler>>;
+    }> {
+      const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+      mockQuery.mockResolvedValue([makeCaseBinding('62023CJ0097')]);
+      const result = await eurlex_get_cases.handler(eurlex_get_cases.input.parse(input), ctx);
+      return { sparql: mockQuery.mock.calls[0]?.[0] as string, result };
+    }
+
+    it('reaches the judgment, AG opinion, and every order filed under C-97/23', async () => {
+      const { sparql, result } = await queryFor({ case_number: 'C-97/23' });
+
+      for (const celex of C_97_23_PRIMARY) expect(admits(sparql, celex), celex).toBe(true);
+      // The derivative exclusion stays on by default; notice letters are not even
+      // admitted by the CELEX match unless include_derivative opens that path.
+      expect(admits(sparql, '62023CA0097')).toBe(false);
+      expect(admits(sparql, '62023CN0097')).toBe(false);
+      expect(sparql).toContain('FILTER NOT EXISTS');
+      for (const celex of T_97_23_RECORDS) expect(admits(sparql, celex), celex).toBe(false);
+      expect(result.query_echo.celex_fragment).toBe('2023C*0097');
+    });
+
+    it('adds the notices and abstracts under include_derivative', async () => {
+      const { sparql } = await queryFor({ case_number: 'C-97/23', include_derivative: true });
+
+      for (const celex of [...C_97_23_PRIMARY, ...C_97_23_DERIVATIVE]) {
+        expect(admits(sparql, celex), celex).toBe(true);
+      }
+      expect(sparql).not.toContain('FILTER NOT EXISTS');
+      for (const celex of T_97_23_RECORDS) expect(admits(sparql, celex), celex).toBe(false);
+    });
+
+    it.each([
+      ['order', 'ORDER'],
+      ['ag_opinion', 'OPIN_AG'],
+      ['judgment', 'JUDG'],
+    ])(
+      'keeps case_type %s narrowing by resource type alongside the widened match',
+      async (caseType, typeCode) => {
+        const { sparql } = await queryFor({ case_number: 'C-97/23', case_type: caseType });
+
+        // The CELEX match no longer pins the judgment letters, so case_type can reach
+        // the orders and opinions; the resource-type triple does the narrowing.
+        for (const celex of C_97_23_PRIMARY) expect(admits(sparql, celex), celex).toBe(true);
+        expect(sparql).toContain(
+          `?work cdm:work_has_resource-type <http://publications.europa.eu/resource/authority/resource-type/${typeCode}> .`,
+        );
+      },
+    );
+
+    it.each([
+      ['General Court', 'T-97/23', '2023T*0097', ['62023TJ0097', '62023TJ0097_INF']],
+      ['Civil Service Tribunal', 'F-12/05', '2005F*0012', ['62005FJ0012', '62005FO0012']],
+    ])('reaches %s records for %s', async (_label, caseNumber, fragment, reached) => {
+      const { sparql, result } = await queryFor({ case_number: caseNumber });
+
+      for (const celex of reached) expect(admits(sparql, celex), celex).toBe(true);
+      expect(result.query_echo.celex_fragment).toBe(fragment);
+    });
+
+    it('keeps the General Court letter set to the types that court files', async () => {
+      const { sparql } = await queryFor({ case_number: 'T-643/24' });
+
+      expect(admits(sparql, '62024TC0643')).toBe(true);
+      expect(admits(sparql, '62024TT0643')).toBe(true);
+      // CP/CS/CD are Court of Justice letters; the General Court files none of them.
+      expect(admits(sparql, '62024TP0643')).toBe(false);
+      expect(admits(sparql, '62024CJ0643')).toBe(false);
+    });
+
+    it('does not reach numbered Opinions or Rulings whose CELEX collides with a case number', async () => {
+      const { sparql } = await queryFor({ case_number: 'C-2/13' });
+
+      expect(admits(sparql, '62013CJ0002')).toBe(true);
+      // Opinion 2/13 is 62013CV0002 — a different proceeding, numbered "Opinion 2/13".
+      for (const letter of ['V', 'U', 'G', 'X']) {
+        expect(admits(sparql, `62013C${letter}0002`), letter).toBe(false);
+      }
+    });
+
+    it.each([
+      ['a trailing appeal suffix', 'C-97/23 P'],
+      ['the full case_reference form', 'Case C-97/23 P.'],
+      ['a lowercase prefix', 'c-97/23'],
+      ['a four-digit year', 'C-97/2023'],
+      ['a suffix with no space', 'C-97/23P'],
+      ['a non-breaking hyphen (U+2011)', 'Case C‑97/23 P.'],
+      ['a hyphen (U+2010)', 'C‐97/23'],
+      ['a figure dash (U+2012)', 'C‒97/23'],
+      ['an en dash (U+2013)', 'C–97/23'],
+      ['an em dash (U+2014)', 'C—97/23'],
+      ['a horizontal bar (U+2015)', 'C―97/23'],
+      ['a minus sign (U+2212)', 'C−97/23'],
+    ])('parses %s', async (_label, caseNumber) => {
+      const { sparql, result } = await queryFor({ case_number: caseNumber });
+
+      expect(result.query_echo.celex_fragment).toBe('2023C*0097');
+      expect(result.query_echo.case_number).toBe(caseNumber);
+      expect(admits(sparql, '62023CO0097(02)')).toBe(true);
+    });
+
+    it.each([
+      'P',
+      'R',
+      'R II',
+      'PPU',
+      'RENV',
+      'DEP',
+      'P-DEP',
+      'REC',
+      'P-R',
+      'AJ',
+      'REV',
+      'SA',
+      'RX',
+      'OP',
+      'INT',
+      'INTP',
+      'TO',
+    ])('accepts and ignores the procedural suffix %s', async (suffix) => {
+      const { result } = await queryFor({ case_number: `T-125/03 ${suffix}` });
+      expect(result.query_echo.celex_fragment).toBe('2003T*0125');
+    });
+
+    it.each(['P', 'R II', 'P-DEP', 'P-R', 'INTP'])(
+      'accepts the procedural suffix %s followed by a trailing "."',
+      async (suffix) => {
+        const { result } = await queryFor({ case_number: `Case T-125/03 ${suffix}.` });
+        expect(result.query_echo.celex_fragment).toBe('2003T*0125');
+      },
+    );
+
+    it.each([
+      ['Case 26/62.', '1962C*0026', '61962CJ0026'],
+      ['Case 133-73.', '1973C*0133', '61973CJ0133'],
+      ['26/1962', '1962C*0026', '61962CJ0026'],
+      ['53/53', '1953C*0053', '61953CJ0053'],
+      ['1/88', '1988C*0001', '61988CO0001'],
+    ])(
+      'reads the prefix-less %s as a Court of Justice case',
+      async (caseNumber, fragment, celex) => {
+        const { sparql, result } = await queryFor({ case_number: caseNumber });
+
+        expect(result.query_echo.celex_fragment).toBe(fragment);
+        expect(admits(sparql, celex)).toBe(true);
+      },
+    );
+
+    it.each([
+      ['a prefix-less number with a post-1988 year', '97/23'],
+      ['a prefix-less number dated 1989', '1/89'],
+      ['a prefix-less number dated 1952', '1/52'],
+      ['a prefix-less four-digit year outside the range', 'Case 26/1989.'],
+      ['a space in place of the prefix hyphen', 'C 97-23 x/y'],
+      ['a plural joined-case reference', 'Cases T-683/22 to T-688/22'],
+      ['two joined cases', 'C-131/12 and C-132/12'],
+      ['a comma-separated pair', 'C-131/12, C-132/12'],
+      ['a range under one prefix', 'T-683/22 to T-688/22'],
+      ['a second number without its prefix', 'C-131/12 and 132/12'],
+      ['two joined appeals', 'C-97/23 P and C-98/23 P'],
+      ['a joined pre-1989 pair', 'Case 26/62 and 27/62.'],
+      ['a joined pre-1989 pair written with hyphens', 'Case 133-73 and 134-73.'],
+      ['a trailing backslash', 'ZZ\\'],
+      ['a hyphenated non-case string', 'ZZ-1'],
+      ['whitespace inside a CELEX-like string', '2023 CJ 0097'],
+    ])(
+      'rejects %s with invalid_case_number before any CELLAR request',
+      async (_label, caseNumber) => {
+        const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+
+        const input = eurlex_get_cases.input.parse({ case_number: caseNumber });
+        const err = await Promise.resolve(eurlex_get_cases.handler(input, ctx)).catch(
+          (e: unknown) => e,
+        );
+
+        expect(err).toMatchObject({
+          code: JsonRpcErrorCode.ValidationError,
+          data: { reason: 'invalid_case_number' },
+        });
+        expect((err as { message: string }).message).toContain(caseNumber);
+        expect(mockQuery).not.toHaveBeenCalled();
+      },
+    );
+
+    it('asks for the court prefix when an unprefixed year is outside 1953–1988', async () => {
+      const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+
+      const input = eurlex_get_cases.input.parse({ case_number: '97/23' });
+      const err = await Promise.resolve(eurlex_get_cases.handler(input, ctx)).catch(
+        (e: unknown) => e,
+      );
+
+      expect((err as { message: string }).message).toMatch(/C-, T-, or F- prefix/);
+    });
+
+    it('says a joined-case value names more than one case, and to pass one per call', async () => {
+      const result = await runToolContract(eurlex_get_cases, {
+        case_number: 'C-131/12 and C-132/12',
+      });
+
+      expect(result.isError).toBe(true);
+      const structured = result.structuredContent as {
+        error?: { message?: string; data?: { reason?: string; recovery?: { hint?: string } } };
+      };
+      expect(structured.error?.data?.reason).toBe('invalid_case_number');
+      expect(structured.error?.message).toMatch(/more than one case/);
+      expect(structured.error?.data?.recovery?.hint).toMatch(/one case number per call/);
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    it('carries the accepted format to content[] and structuredContent.error', async () => {
+      const result = await runToolContract(eurlex_get_cases, { case_number: '97/23' });
+
+      expect(result.isError).toBe(true);
+      const structured = result.structuredContent as {
+        error?: { code?: number; data?: { reason?: string; recovery?: { hint?: string } } };
+      };
+      expect(structured.error?.code).toBe(JsonRpcErrorCode.ValidationError);
+      expect(structured.error?.data?.reason).toBe('invalid_case_number');
+      const hint = structured.error?.data?.recovery?.hint ?? '';
+      expect(hint).toContain('C-{number}/{year}');
+      const text = result.content
+        .map((block) => (block as { text?: string }).text ?? '')
+        .join('\n');
+      expect(text).toContain('97/23');
+      expect(text).toContain(hint);
+    });
+
+    /**
+     * Characterization: a value made only of CELEX characters kept HEAD's escaped,
+     * case-insensitive substring match — every value that can return results through
+     * that fallback is one, since no sector-6 CELEX carries any other character. The
+     * FILTER line is asserted whole so any drift in the fallback is caught.
+     */
+    it.each(['2023CJ0097', '62023CO0097(01)', '62023co0097', '2023CJ0097_RES'])(
+      'keeps the CELEX substring fallback byte-identical for %s',
+      async (caseNumber) => {
+        const { sparql, result } = await queryFor({ case_number: caseNumber });
+
+        expect(sparql).toContain(
+          `FILTER(CONTAINS(LCASE(STR(?celexNumber)), LCASE("${escapeSparqlLiteral(caseNumber)}")))`,
+        );
+        expect(result.query_echo.celex_fragment).toBeUndefined();
+        expect(result.query_echo.case_number).toBe(caseNumber);
+      },
+    );
+
+    it('keeps HEAD-parseable three-digit years reaching what they reached before', async () => {
+      // "C-131/012" parsed before #81 and matched the CELEX substring "12CJ0131".
+      const { sparql } = await queryFor({ case_number: 'C-131/012' });
+      expect(admits(sparql, '62012CJ0131')).toBe(true);
+    });
+
+    /**
+     * The parser runs over caller-sized text, so its cost must stay linear. Each
+     * adversarial shape is timed at 80k characters (best of five) against an
+     * absolute ceiling a linear parse clears by orders of magnitude and a
+     * quadratic one (billions of steps at this size) cannot. No small-input ratio:
+     * its sub-millisecond denominator turns one scheduler stall into a failure.
+     */
+    describe('parser cost on adversarial input', () => {
+      async function bestOfFive(caseNumber: string): Promise<number> {
+        let best = Number.POSITIVE_INFINITY;
+        for (let i = 0; i < 5; i++) {
+          mockQuery.mockResolvedValue([makeCaseBinding('62023CJ0097')]);
+          const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+          const input = eurlex_get_cases.input.parse({ case_number: caseNumber });
+          const start = performance.now();
+          await Promise.resolve(eurlex_get_cases.handler(input, ctx)).catch(() => undefined);
+          best = Math.min(best, performance.now() - start);
+        }
+        return best;
+      }
+
+      it.each([
+        ['a repeated prefix', (n: number) => 'Case C-'.repeat(Math.ceil(n / 7)).slice(0, n)],
+        ['digits with no year', (n: number) => `C-${'1'.repeat(n)}`],
+        ['a prefix-less number with no year', (n: number) => '1'.repeat(n)],
+        ['a long suffix', (n: number) => `C-97/23 ${'P'.repeat(n)}`],
+        ['repeated hyphen-number pairs', (n: number) => '1-'.repeat(Math.ceil(n / 2)).slice(0, n)],
+        ['a "Case" lead-in with a long run of spaces', (n: number) => `Case${' '.repeat(n)}x`],
+        ['a digit run before a one-digit year', (n: number) => `${'1'.repeat(n)}/1`],
+        ['a digit run after the year', (n: number) => `C-97/23 ${'1'.repeat(n)}`],
+        [
+          'alternating digits and spaces after the year',
+          (n: number) => `C-97/23 ${'1 '.repeat(Math.ceil(n / 2))}`,
+        ],
+      ])('stays linear for %s', async (_label, build) => {
+        expect(await bestOfFive(build(80_000))).toBeLessThan(250);
+      });
+    });
+  });
+
+  // --- #91: the court filter keys on the CELEX court letter ---
+
+  describe('court filter (#91)', () => {
+    async function courtQuery(input: Record<string, unknown>): Promise<string> {
+      const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+      mockQuery.mockResolvedValue([makeCaseBinding('62024TC0643')]);
+      await eurlex_get_cases.handler(eurlex_get_cases.input.parse(input), ctx);
+      return mockQuery.mock.calls[0]?.[0] as string;
+    }
+
+    const COURT_OF_JUSTICE = [
+      '62013CV0002',
+      '62023CC0097',
+      '62019CP0001',
+      '62020CS0003',
+      '62015CX0001',
+      '62023CN0097',
+    ];
+    const GENERAL_COURT = [
+      '62024TC0643',
+      '62024TC0589',
+      '62021TT0001',
+      '62023TJ0097',
+      '62023TA0097',
+    ];
+    const CIVIL_SERVICE_TRIBUNAL = ['62005FJ0012', '62010FO0001'];
+
+    it('CJEU reaches every Court of Justice record and no General Court or Tribunal record', async () => {
+      const sparql = await courtQuery({ court: 'CJEU' });
+
+      for (const celex of COURT_OF_JUSTICE) expect(admits(sparql, celex), celex).toBe(true);
+      for (const celex of [...GENERAL_COURT, ...CIVIL_SERVICE_TRIBUNAL]) {
+        expect(admits(sparql, celex), celex).toBe(false);
+      }
+    });
+
+    it('GC reaches every General Court record and no Court of Justice or Tribunal record', async () => {
+      const sparql = await courtQuery({ court: 'GC' });
+
+      for (const celex of GENERAL_COURT) expect(admits(sparql, celex), celex).toBe(true);
+      for (const celex of [...COURT_OF_JUSTICE, ...CIVIL_SERVICE_TRIBUNAL]) {
+        expect(admits(sparql, celex), celex).toBe(false);
+      }
+    });
+
+    it('GC with case_type ag_opinion reaches the General Court AG opinions', async () => {
+      const sparql = await courtQuery({ court: 'GC', case_type: 'ag_opinion' });
+
+      expect(admits(sparql, '62024TC0643')).toBe(true);
+      expect(sparql).toContain(
+        '?work cdm:work_has_resource-type <http://publications.europa.eu/resource/authority/resource-type/OPIN_AG> .',
+      );
+    });
+
+    it('CJEU with a CELEX keyword reaches Opinion 2/13', async () => {
+      const sparql = await courtQuery({ court: 'CJEU', keyword: '62013CV0002' });
+      expect(admits(sparql, '62013CV0002')).toBe(true);
+    });
+
+    it('a case number and a court compose: C-97/23 under GC reaches nothing', async () => {
+      const sparql = await courtQuery({ court: 'GC', case_number: 'C-97/23' });
+      for (const celex of [...C_97_23_PRIMARY, ...T_97_23_RECORDS]) {
+        expect(admits(sparql, celex), celex).toBe(false);
+      }
+    });
+
+    it('states the court letter each value selects', () => {
+      const description = eurlex_get_cases.input.shape.court.description ?? '';
+      expect(description).toContain('CJEU (C)');
+      expect(description).toContain('GC (T)');
+    });
+  });
+
+  // --- #84: each row carries its ECLI ---
+
+  describe('ECLI per row (#84)', () => {
+    it('binds the ECLI inside the grouped query, with no extra round trip', async () => {
+      const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+      mockQuery.mockResolvedValue([makeCaseBinding('62023CJ0097', { ecli: 'ECLI:EU:C:2026:81' })]);
+
+      await eurlex_get_cases.handler(eurlex_get_cases.input.parse({ case_number: 'C-97/23' }), ctx);
+
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+      const sparql = mockQuery.mock.calls[0]?.[0] as string;
+      expect(sparql).toMatch(
+        /OPTIONAL \{ \?work cdm:case-law_ecli \?caseEcli \. \}[\s\S]*\} GROUP BY \?celexNumber /,
+      );
+      expect(sparql).toContain('(MAX(?caseEcli) AS ?ecli)');
+    });
+
+    it('returns each primary record’s ECLI and omits it on a notice row, on both surfaces', async () => {
+      mockQuery.mockResolvedValue([
+        makeCaseBinding('62023CJ0097', {
+          ecli: 'ECLI:EU:C:2026:81',
+          types: 'http://publications.europa.eu/resource/authority/resource-type/JUDG',
+        }),
+        makeCaseBinding('62023CO0097(01)', {
+          ecli: 'ECLI:EU:C:2023:609',
+          types: 'http://publications.europa.eu/resource/authority/resource-type/ORDER',
+        }),
+        makeCaseBinding('62023CN0097', {
+          types: 'http://publications.europa.eu/resource/authority/resource-type/INFO_JUDICIAL',
+        }),
+      ]);
+
+      const result = await runToolContract(eurlex_get_cases, {
+        case_number: 'C-97/23',
+        include_derivative: true,
+      });
+
+      expect(result.isError).toBeFalsy();
+      const structured = eurlex_get_cases.output.parse(result.structuredContent);
+      expect(structured.cases.map((c) => [c.celex_number, c.ecli])).toEqual([
+        ['62023CJ0097', 'ECLI:EU:C:2026:81'],
+        ['62023CO0097(01)', 'ECLI:EU:C:2023:609'],
+        ['62023CN0097', undefined],
+      ]);
+      expect('ecli' in (structured.cases[2] ?? {})).toBe(false);
+
+      const text = result.content
+        .map((block) => (block as { text?: string }).text ?? '')
+        .join('\n');
+      expect(text).toContain('**ECLI:** ECLI:EU:C:2026:81');
+      expect(text).toContain('**ECLI:** ECLI:EU:C:2023:609');
+      const noticeSection = text.slice(text.indexOf('### 62023CN0097'));
+      expect(noticeSection).not.toContain('**ECLI:**');
     });
   });
 });
