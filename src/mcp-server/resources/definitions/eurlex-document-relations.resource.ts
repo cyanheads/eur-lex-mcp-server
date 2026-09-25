@@ -5,12 +5,10 @@
 
 import { resource, z } from '@cyanheads/mcp-ts-core';
 import { notFound } from '@cyanheads/mcp-ts-core/errors';
-import {
-  CellarSparqlService,
-  getCellarSparqlService,
-} from '@/services/cellar-sparql/cellar-sparql-service.js';
-import { CELEX_PATTERN, celexLiteral } from '@/services/cellar-sparql/eli-resolution.js';
+import { getCellarSparqlService } from '@/services/cellar-sparql/cellar-sparql-service.js';
+import { CELEX_PATTERN } from '@/services/cellar-sparql/eli-resolution.js';
 import { RELATION_TYPES, traverseRelations } from '@/services/cellar-sparql/relation-traversal.js';
+import { resolveCelexWorks } from '@/services/cellar-sparql/work-resolution.js';
 
 /**
  * Per-type relation cap for the summary resource — lighter than the
@@ -43,24 +41,12 @@ export const eurlex_document_relations_resource = resource(
       const svc = getCellarSparqlService();
       const celexNumber = params.celexNumber.trim();
 
-      // Resolve to work URI first, through the typed exact triple (#92) — CELLAR
-      // types the CELEX literal xsd:string, so it resolves from the index where a
-      // STR() equality filter scans. The shared helper escapes the value, never a
-      // local quote-only pass: without a backslash pass a trailing `\` escapes the
-      // closing quote and Virtuoso's raw compiler error — internal query text
-      // attached — reaches the client in place of this resource's not_found (#61).
-      const resolveSparql = `
-SELECT ?work WHERE {
-  ?work cdm:resource_legal_id_celex ${celexLiteral(celexNumber)} .
-} LIMIT 1`;
-
-      const resolveBindings = await svc.query(resolveSparql, ctx);
-
-      if (resolveBindings.length === 0) {
+      // Resolve to the CELEX's canonical work first (#97), so a CELEX held by
+      // several works never summarizes a copy that lacks edges.
+      const workUri = (await resolveCelexWorks(svc, [celexNumber], ctx)).get(celexNumber);
+      if (!workUri) {
         throw notFound(`No CELLAR work found for CELEX: ${celexNumber}`, { celexNumber });
       }
-
-      const workUri = CellarSparqlService.bindingValue(resolveBindings[0], 'work') ?? '';
 
       // Summarize all relation types via the shared traversal — one query per
       // type so amendment and consolidation relations (modeled one-directionally

@@ -131,12 +131,21 @@ function relationArm(
 
 /**
  * Build a single-relation-type SPARQL query, ordered by the related work's
- * document date DESC and paged (LIMIT + OFFSET).
+ * document date DESC, then by work URI, and paged (LIMIT + OFFSET).
  *
  * Ordering is the fix for the unordered-cap bug: an incoming edge on a
  * heavily-related act (e.g. works citing the GDPR) returns thousands of rows, so
- * an unordered LIMIT dropped the newest. `ORDER BY DESC(?relatedDate)` keeps the
- * most recent within the cap; `OFFSET` reaches the rest.
+ * an unordered LIMIT dropped the newest. Newest-first keeps the most recent within
+ * the cap; `OFFSET` reaches the rest.
+ *
+ * The date is aggregated as `MAX(STR(?relatedDate))`. CELLAR evaluates `MAX` over the
+ * OPTIONAL `xsd:date` wrongly in this grouped query, attaching dates of other works
+ * and not the same ones on every call, so pages were neither the newest works nor
+ * stable across calls. ISO `YYYY-MM-DD` strings sort lexically in date order, and
+ * the string aggregate returns each work its own date. `?relatedWork` breaks ties:
+ * it is the GROUP BY key, so the order is total and a same-date run cannot reorder
+ * across a page boundary. An undated work's aggregate stays unbound and sorts after
+ * every dated one.
  *
  * A symmetric type (`cites`, direction `both`) is a UNION of two subqueries, each
  * ordered and capped independently, so a dense outgoing set can't consume the
@@ -146,11 +155,12 @@ function relationArm(
  * bound only on the raw escape hatch), so an over-cap here would return an
  * over-budget arm — callers pass a limit already clamped to the service ceiling.
  *
- * The outer UNION carries its own `ORDER BY ?direction DESC(?relatedDateMax)`.
- * Without it the union order is implementation-defined, and the caller slices each
- * direction to `perTypeLimit` after grouping the rows by direction — so an
- * arbitrary interleaving can place the private continuation sentinel inside the
- * kept slice and drop a real relation instead.
+ * The outer UNION carries its own `ORDER BY ?direction DESC(?relatedDateMax)
+ * ?relatedWork`, the subquery order within each direction. Without it the union
+ * order is implementation-defined, and the caller slices each direction to
+ * `perTypeLimit` after grouping the rows by direction — so an arbitrary
+ * interleaving can place the private continuation sentinel inside the kept slice
+ * and drop a real relation instead.
  */
 function buildRelationQuery(
   workUri: string,
@@ -160,8 +170,8 @@ function buildRelationQuery(
   celex?: CelexConstraint,
 ): string {
   const projection =
-    'SELECT ?relatedWork (SAMPLE(?relatedCelex) AS ?relatedCelexSample) ?direction (MAX(?relatedDate) AS ?relatedDateMax)';
-  const paging = `GROUP BY ?relatedWork ?direction ORDER BY DESC(?relatedDateMax) LIMIT ${limit} OFFSET ${offset}`;
+    'SELECT ?relatedWork (SAMPLE(?relatedCelex) AS ?relatedCelexSample) ?direction (MAX(STR(?relatedDate)) AS ?relatedDateMax)';
+  const paging = `GROUP BY ?relatedWork ?direction ORDER BY DESC(?relatedDateMax) ?relatedWork LIMIT ${limit} OFFSET ${offset}`;
   if (spec.direction !== 'both') {
     return `${projection} WHERE {
     ${relationArm(workUri, spec.predicate, spec.direction, celex)}
@@ -173,7 +183,7 @@ function buildRelationQuery(
   } ${paging} }`;
   return `SELECT ?relatedWork ?relatedCelexSample ?direction ?relatedDateMax WHERE {
   ${subquery('outgoing')} UNION ${subquery('incoming')}
-} ORDER BY ?direction DESC(?relatedDateMax)`;
+} ORDER BY ?direction DESC(?relatedDateMax) ?relatedWork`;
 }
 
 /**

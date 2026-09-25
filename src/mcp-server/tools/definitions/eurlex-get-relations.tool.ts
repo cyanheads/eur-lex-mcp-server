@@ -9,16 +9,13 @@ import {
   CellarSparqlService,
   getCellarSparqlService,
 } from '@/services/cellar-sparql/cellar-sparql-service.js';
-import {
-  CELEX_PATTERN,
-  celexLiteral,
-  isSafeSparqlIri,
-} from '@/services/cellar-sparql/eli-resolution.js';
+import { CELEX_PATTERN, isSafeSparqlIri } from '@/services/cellar-sparql/eli-resolution.js';
 import {
   RELATION_TYPES,
   type RelationType,
   traverseRelations,
 } from '@/services/cellar-sparql/relation-traversal.js';
+import { resolveCelexWorks } from '@/services/cellar-sparql/work-resolution.js';
 
 export const eurlex_get_relations = tool('eurlex_get_relations', {
   title: 'Get CELLAR Relationship Graph',
@@ -246,19 +243,15 @@ SELECT ?sourceCelex WHERE {
         }
       }
     } else if (celexNumber && !workUriInput) {
-      // Typed exact triple (#92): resolves from the index, where STR() equality scans.
-      const resolveSparql = `
-SELECT ?work WHERE {
-  ?work cdm:resource_legal_id_celex ${celexLiteral(celexNumber)} .
-} LIMIT 1`;
-
-      const resolveBindings = await svc.query(resolveSparql, ctx);
-      if (resolveBindings.length === 0) {
+      // A CELEX held by several works resolves to its canonical work (#97), so the
+      // traversal never runs on a copy that lacks edges.
+      const resolved = (await resolveCelexWorks(svc, [celexNumber], ctx)).get(celexNumber);
+      if (!resolved) {
         throw ctx.fail('not_found', `No CELLAR work found for CELEX: ${celexNumber}`, {
           ...ctx.recoveryFor('not_found'),
         });
       }
-      workUri = CellarSparqlService.bindingValue(resolveBindings[0], 'work') ?? '';
+      workUri = resolved;
     } else {
       throw ctx.fail(
         'invalid_identifier_args',

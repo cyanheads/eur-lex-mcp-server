@@ -7,6 +7,13 @@ import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_document_relations_resource } from '@/mcp-server/resources/definitions/eurlex-document-relations.resource.js';
 import { escapeSparqlLiteral } from '@/services/cellar-sparql/eli-resolution.js';
+import {
+  CELLAR,
+  canonicalWork,
+  celexWorkRows,
+  isResolutionQuery,
+  requestedCelex,
+} from '../fixtures/cellar-works.js';
 
 // --- Service mock ---
 const mockQuery = vi.fn();
@@ -33,6 +40,12 @@ type Row = Record<string, { type: string; value: string }>;
 
 function makeResolveBinding(workUri: string): Row {
   return { work: { type: 'uri', value: workUri } };
+}
+
+/** The resolve rows, each stamped with the CELEX the resolution query asked for. */
+function resolveRowsFor(q: string, rows: Row[] = []): Row[] {
+  const [celex = ''] = requestedCelex(q);
+  return rows.map((row) => ({ celexNumber: { type: 'literal', value: celex }, ...row }));
 }
 
 /**
@@ -70,7 +83,7 @@ function routeQuery(handlers: {
     // Tolerate any unrecognized call shape (e.g. a stray no-arg call from the
     // test harness's async cleanup) — an unmatched query yields no rows.
     if (typeof q !== 'string') return [];
-    if (q.includes('SELECT ?work WHERE')) return handlers.resolve ?? [];
+    if (isResolutionQuery(q)) return resolveRowsFor(q, handlers.resolve);
     if (q.includes('cdm:work_cites_work')) return handlers.cites ?? [];
     if (q.includes('cdm:act_consolidated_consolidates_resource_legal'))
       return handlers.consolidated ?? [];
@@ -164,7 +177,7 @@ describe('eurlex_document_relations_resource', () => {
     // Incoming edges are ordered newest-first so the summary keeps the most recent.
     const relSparql = mockQuery.mock.calls
       .map((c) => c[0] as string)
-      .find((q) => !q.includes('SELECT ?work WHERE'))!;
+      .find((q) => !isResolutionQuery(q))!;
     expect(relSparql).toContain('ORDER BY DESC(?relatedDateMax)');
     expect(relSparql).toContain('LIMIT 26');
   });
@@ -326,7 +339,7 @@ describe('eurlex_document_relations_resource', () => {
 
   // --- #92: typed exact CELEX triple ---
 
-  it('resolves the CELEX through a typed exact triple, not a STR() scan (#92)', async () => {
+  it('resolves the CELEX through a typed literal, not a STR() scan (#92)', async () => {
     const ctx = createMockContext({ tenantId: 'test-tenant' });
     mockQuery.mockImplementation(routeQuery({ resolve: [makeResolveBinding(GDPR_WORK_URI)] }));
 
@@ -337,7 +350,8 @@ describe('eurlex_document_relations_resource', () => {
       .map((c) => c[0] as string)
       .filter((q) => q.includes('"32016R0679"'));
     expect(resolve).toHaveLength(1);
-    expect(resolve[0]).toContain('?work cdm:resource_legal_id_celex "32016R0679"^^xsd:string .');
+    expect(resolve[0]).toContain('VALUES ?celexNumber { "32016R0679"^^xsd:string }');
+    expect(resolve[0]).toContain('?work cdm:resource_legal_id_celex ?celexNumber .');
     expect(resolve[0]).not.toMatch(/STR\(\?\w+\)\s*=/);
   });
 
@@ -525,7 +539,7 @@ describe('eurlex_document_relations_resource', () => {
 
     const sparql = mockQuery.mock.calls[0]?.[0] as string;
     expect(sparql).toContain(
-      `cdm:resource_legal_id_celex "${escapeSparqlLiteral(celexNumber)}"^^xsd:string .`,
+      `VALUES ?celexNumber { "${escapeSparqlLiteral(celexNumber)}"^^xsd:string }`,
     );
     // The unterminated form the quote-only pass produced is gone.
     expect(sparql).not.toContain(String.raw`"32016R0679\"^^`);
@@ -540,7 +554,7 @@ describe('eurlex_document_relations_resource', () => {
 
     const sparql = mockQuery.mock.calls[0]?.[0] as string;
     // No regression for the overwhelmingly common input: escaping is a no-op.
-    expect(sparql).toContain('cdm:resource_legal_id_celex "32016R0679"^^xsd:string .');
+    expect(sparql).toContain('VALUES ?celexNumber { "32016R0679"^^xsd:string }');
   });
 
   // --- #69: CELEX shape gate on the path parameter ---
@@ -612,9 +626,63 @@ describe('eurlex_document_relations_resource', () => {
       const result = await eurlex_document_relations_resource.handler(params, ctx);
 
       expect(mockQuery.mock.calls[0]?.[0] as string).toContain(
-        'cdm:resource_legal_id_celex "32016R0679"^^xsd:string .',
+        'VALUES ?celexNumber { "32016R0679"^^xsd:string }',
       );
       expect(result).toMatchObject({ celex_number: '32016R0679' });
     });
+  });
+
+  // --- #97: a CELEX held by several works summarizes its canonical work ---
+
+  it('summarizes the canonical work of 62022TJ0181 (#97)', async () => {
+    const citer = `${CELLAR}citer`;
+    mockQuery.mockImplementation(async (q: string) => {
+      if (typeof q !== 'string') return [];
+      if (q.includes('cdm:work_cites_work')) {
+        return q.includes(`<${canonicalWork('62022TJ0181')}>`)
+          ? [makeRelationBinding({ relatedWork: citer, direction: 'incoming' })]
+          : [];
+      }
+      if (q.includes('cdm:resource_legal_id_celex "') || q.includes('owl#sameAs')) {
+        return celexWorkRows(q);
+      }
+      return [];
+    });
+
+    const params = eurlex_document_relations_resource.params!.parse({ celexNumber: '62022TJ0181' });
+    const result = (await eurlex_document_relations_resource.handler(
+      params,
+      createMockContext({ tenantId: 'test-tenant' }),
+    )) as Record<string, unknown>;
+
+    expect(result.work_uri).toBe(canonicalWork('62022TJ0181'));
+    expect(result.relations).toEqual([
+      { relation_type: 'cites', direction: 'incoming', related_work_uri: citer },
+    ]);
+  });
+
+  // --- #100: the summary is newest-first and identical on every read ---
+
+  it('orders every summary query by string date, then work URI, at both levels (#100)', async () => {
+    mockQuery.mockImplementation(routeQuery({ resolve: [makeResolveBinding(GDPR_WORK_URI)] }));
+
+    const params = eurlex_document_relations_resource.params!.parse({ celexNumber: '32016R0679' });
+    await eurlex_document_relations_resource.handler(
+      params,
+      createMockContext({ tenantId: 'test-tenant' }),
+    );
+
+    const relationQueries = mockQuery.mock.calls
+      .map((c) => c[0] as string)
+      .filter((q) => q.includes('?relatedWork'));
+    expect(relationQueries.length).toBeGreaterThan(0);
+    for (const q of relationQueries) {
+      expect(q).toContain('(MAX(STR(?relatedDate)) AS ?relatedDateMax)');
+      expect(q).toContain('ORDER BY DESC(?relatedDateMax) ?relatedWork LIMIT 26 OFFSET 0');
+    }
+    const cites = relationQueries.find((q) => q.includes('cdm:work_cites_work')) as string;
+    expect(cites.trimEnd().endsWith('ORDER BY ?direction DESC(?relatedDateMax) ?relatedWork')).toBe(
+      true,
+    );
   });
 });
