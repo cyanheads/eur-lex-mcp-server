@@ -64,9 +64,9 @@ All resource data is also reachable via tools.
 
 ### `eurlex_search_documents` <sub>tool</sub>
 
-- At least one filter: `keyword` (English titles and CELEX substrings, no body search), `document_type` (`REG`, `DIR`, `DEC`, `TREATY`, `JUDG`, `OPIN_AG`, `PROP`, `REC`, each its full CELLAR authority family), `date_from`/`date_to`, `eurovoc_concept` (from `eurlex_browse_subjects`), `author_institution`, or `in_force` (`true`/`false`)
+- At least one filter: `keyword` (English titles, plus CELEX numbers when it holds a digit: a whole CELEX with its `(01)`–`(20)` siblings and `R(01)`–`R(20)` corrigenda by exact lookup, a partial one by substring; no body search), `document_type` (`REG`, `DIR`, `DEC`, `TREATY`, `JUDG`, `OPIN_AG`, `PROP`, `REC`, each its full CELLAR authority family), `date_from`/`date_to`, `eurovoc_concept` (from `eurlex_browse_subjects`), `author_institution`, or `in_force` (`true`/`false`)
 - Pages of up to 100 via `offset`/`limit`, newest first with the CELEX breaking date ties, so a page is the same on every call; each row flags `is_consolidated` and `is_corrigendum`, and corrigenda join only under `include_corrigenda`, consolidated texts of a `document_type` only under `include_consolidated`
-- Typed errors: `no_filters`, `invalid_date_range`, `no_results`
+- No match returns an empty page with a `notice` naming the filters and how to broaden them; typed errors: `no_filters`, `invalid_date_range`, `invalid_author_institution` and `invalid_keyword` (no letters or digits)
 
 ---
 
@@ -88,9 +88,9 @@ All resource data is also reachable via tools.
 
 ### `eurlex_get_cases` <sub>tool</sub>
 
-- Filters: `case_number` (one case per value — `C-131/12`, `T-22/20`, `F-12/05`, or a pre-1989 `26/62` — reaching every judgment, order, and AG opinion filed under it), `court` (`CJEU` or `GC`, by CELEX court letter), `case_type` (`judgment`, `order`, `ag_opinion`), `keyword`, and `date_from`/`date_to`; primary records only unless `include_derivative` adds notices, abstracts, summaries, and corrigenda
+- Filters: `case_number` (one case per value — `C-131/12`, `T-22/20`, `F-12/05`, or a pre-1989 `26/62` — reaching every judgment, order, and AG opinion filed under it), `court` (`CJEU` or `GC`, by CELEX court letter), `case_type` (`judgment`, `order`, `ag_opinion`), `keyword` (English titles, plus CELEX numbers: a whole CELEX with its `(01)`–`(20)` siblings and `_INF`/`_RES`/`_SUM`/`_EXT` records, a partial one by substring), and `date_from`/`date_to`; primary records only unless `include_derivative` adds notices, abstracts, summaries, and corrigenda
 - Pages of up to 100 via `offset`/`limit`, newest first with the CELEX breaking date ties, so a page is the same on every call; each case carries its ECLI where CELLAR records one, plus `display_title`, `parties`, `subject_matter`, and `case_reference` parsed from the CELLAR title
-- Typed errors: `invalid_case_number`, `invalid_date_range`, `no_results`
+- No match returns an empty page with a `notice` naming the filters and how to broaden them; typed errors: `invalid_case_number`, `invalid_date_range`, `invalid_keyword` (no letters or digits)
 
 ---
 
@@ -98,14 +98,14 @@ All resource data is also reachable via tools.
 
 - Exactly one of `celex_number` or `work_uri`; `relation_types` narrows to any of `cites`, `amends`, `amended_by`, `repeals`, `repealed_by`, `implicitly_repeals`, `implicitly_repealed_by`, `legal_basis`, `consolidated_version`, `national_transposition` (omit for all)
 - One hop, paged per relation type and direction via `offset`/`limit` (max 100, default 100), newest first with the work URI breaking ties, so a page is the same on every call; undated works come last
-- Each relation carries `relation_type`, `direction` (`outgoing`/`incoming`), `related_work_uri`, `related_celex_number` when known, and on `national_transposition` rows `related_member_state` (ISO 3166-1 alpha-3, `GBR` for the United Kingdom); `empty_relation_types` separates "no edges of this type" from "paged out", and typed errors are `invalid_identifier_args`, `not_found`, and `no_relations` (an empty first page)
+- Each relation carries `relation_type`, `direction` (`outgoing`/`incoming`), `related_work_uri`, `related_celex_number` when known, and on `national_transposition` rows `related_member_state` (ISO 3166-1 alpha-3, `GBR` for the United Kingdom); `empty_relation_types` separates "no edges of this type" from "paged out", a work with no edges of the requested types returns an empty page with a `notice`, and typed errors are `invalid_identifier_args` and `not_found`
 
 ---
 
 ### `eurlex_browse_subjects` <sub>tool</sub>
 
 - Matches preferred and alternative EuroVoc labels, so a common synonym resolves to its concept, in any EU official `language` (default English); `offset`/`limit` pagination (max 50)
-- Returns concept URI, preferred label, code, broader (parent) label, and the alternative label that matched when one did; `no_concepts` when nothing matches
+- Returns concept URI, preferred label, code, broader (parent) label, and the alternative label that matched when one did; an empty page with a `notice` when nothing matches
 
 ---
 

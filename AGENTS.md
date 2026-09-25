@@ -43,7 +43,6 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 
 ```ts
 import { tool, z } from '@cyanheads/mcp-ts-core';
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getCellarSparqlService } from '@/services/cellar-sparql/cellar-sparql-service.js';
 
 export const eurlex_browse_subjects = tool('eurlex_browse_subjects', {
@@ -63,21 +62,16 @@ export const eurlex_browse_subjects = tool('eurlex_browse_subjects', {
     total_found: z.number().int().describe('Total concepts returned.'),
     keyword: z.string().describe('Search keyword used.'),
   }),
-  errors: [
-    { reason: 'no_concepts', code: JsonRpcErrorCode.NotFound,
-      when: 'No EuroVoc concepts matched the keyword',
-      recovery: 'Try a broader term or retry with language "en".' },
-  ],
+  // Zero hits is a result, not an error: an empty page plus a notice on both surfaces.
+  enrichment: {
+    notice: z.string().optional().describe('How to broaden the search when nothing matched.'),
+  },
 
   async handler(input, ctx) {
     const service = getCellarSparqlService();
     const concepts = await service.browseSubjects(input.keyword, input.language, input.limit);
     if (concepts.length === 0) {
-      throw ctx.fail(
-        'no_concepts',
-        `No EuroVoc concepts matched "${input.keyword}"`,
-        ctx.recoveryFor('no_concepts'),
-      );
+      ctx.enrich.notice(`No EuroVoc concepts matched "${input.keyword}". Try a broader term or retry with language "en".`);
     }
     ctx.log.info('EuroVoc subjects found', { keyword: input.keyword, count: concepts.length });
     return { concepts, total_found: concepts.length, keyword: input.keyword };
