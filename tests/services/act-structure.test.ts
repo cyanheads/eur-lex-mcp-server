@@ -11,6 +11,7 @@ import { describe, expect, it } from 'vitest';
 import {
   type ActHeading,
   extractSections,
+  outermostSections,
   parseActStructure,
 } from '@/services/eurlex-content/act-structure.js';
 import { FORMEX_DOC_2 } from '../fixtures/eurlex-formex-multipart.js';
@@ -246,6 +247,184 @@ describe('parseActStructure', () => {
       expect(chapter?.title).toBe('General provisions');
     });
   });
+
+  describe('Formex headings wrapped in inline formatting (#90)', () => {
+    /**
+     * The markup GDPR (32016R0679) carries live: every chapter keyword sits inside
+     * `<HT TYPE="ITALIC">`, every section keyword inside `<HT TYPE="EXPANDED">` in
+     * title case, and each subtitle inside two nested `<HT>` elements.
+     */
+    const WRAPPED_FORMEX = [
+      '<ACT><TITLE><TI><P><HT TYPE="UC">Regulation</HT> (EU) 2016/679</P></TI></TITLE>',
+      '<PREAMBLE><GR.CONSID><CONSID><NP><NO.P>(1)</NO.P><TXT>Recital.</TXT></NP></CONSID></GR.CONSID></PREAMBLE>',
+      '<ENACTING.TERMS>',
+      '<DIVISION><TITLE><TI><P><HT TYPE="ITALIC">CHAPTER I</HT></P></TI><STI><P><HT TYPE="BOLD"><HT TYPE="ITALIC">General provisions</HT></HT></P></STI></TITLE>',
+      '<ARTICLE IDENTIFIER="001"><TI.ART>Article 1</TI.ART><STI.ART>Subject-matter</STI.ART><ALINEA>One.</ALINEA></ARTICLE>',
+      '</DIVISION>',
+      '<DIVISION><TITLE><TI><P><HT TYPE="ITALIC">CHAPTER III</HT></P></TI><STI><P><HT TYPE="BOLD"><HT TYPE="ITALIC">Rights of the data subject</HT></HT></P></STI></TITLE>',
+      '<DIVISION><TITLE><TI><P><HT TYPE="EXPANDED">Section 1</HT></P></TI><STI><P><HT TYPE="BOLD"><HT TYPE="EXPANDED">Transparency and modalities</HT></HT></P></STI></TITLE>',
+      '<ARTICLE IDENTIFIER="012"><TI.ART>Article 12</TI.ART><STI.ART>Transparent information</STI.ART><ALINEA>Twelve.</ALINEA></ARTICLE>',
+      '</DIVISION>',
+      '<DIVISION><TITLE><TI><P><HT TYPE="BOLD"><HT TYPE="EXPANDED">Section 2</HT></HT></P></TI><STI><P>Information and access</P></STI></TITLE>',
+      '<ARTICLE IDENTIFIER="013"><TI.ART>Article 13</TI.ART><ALINEA>Thirteen.</ALINEA></ARTICLE>',
+      '</DIVISION></DIVISION>',
+      '</ENACTING.TERMS></ACT>',
+    ].join('');
+
+    it('detects an <HT>-wrapped chapter and strips nested <HT> from its <STI> title', () => {
+      const headings = parseActStructure(WRAPPED_FORMEX, 'xml');
+      const chapters = headings.filter((h) => h.kind === 'chapter');
+      expect(chapters.map((h) => [h.label, h.title])).toEqual([
+        ['CHAPTER I', 'General provisions'],
+        ['CHAPTER III', 'Rights of the data subject'],
+      ]);
+      // Each offset lands on the heading's own <TI>.
+      for (const h of chapters) expect(WRAPPED_FORMEX.slice(h.offset)).toMatch(/^<TI><P><HT/);
+    });
+
+    it('detects title-case sections under one or two nested <HT> wrappers', () => {
+      const sections = parseActStructure(WRAPPED_FORMEX, 'xml').filter((h) => h.kind === 'section');
+      expect(sections.map((h) => [h.label, h.title])).toEqual([
+        ['Section 1', 'Transparency and modalities'],
+        ['Section 2', 'Information and access'],
+      ]);
+    });
+
+    it('orders the wrapped headings with the articles and recitals, and skips the act title', () => {
+      expect(parseActStructure(WRAPPED_FORMEX, 'xml').map((h) => h.label)).toEqual([
+        'Recital 1',
+        'CHAPTER I',
+        'Article 1',
+        'CHAPTER III',
+        'Section 1',
+        'Article 12',
+        'Section 2',
+        'Article 13',
+      ]);
+    });
+
+    it('selects an <HT>-wrapped chapter by number in the XML body', () => {
+      const headings = parseActStructure(WRAPPED_FORMEX, 'xml');
+      const result = extractSections(WRAPPED_FORMEX, headings, { chapters: 'III' });
+      expect(result.matched).toEqual(['CHAPTER III']);
+      expect(result.missed).toEqual([]);
+      expect(result.text).toContain('Article 12');
+      expect(result.text).toContain('Article 13');
+      expect(result.text).not.toContain('Article 1<');
+    });
+
+    it('skips a keyword run into a longer word, and a wrapper that is not <HT>', () => {
+      const formex =
+        '<TI><P><HT TYPE="BOLD">CHAPTERS I to III</HT></P></TI><TI><P><HTML>CHAPTER I</HTML></P></TI>';
+      expect(parseActStructure(formex, 'xml')).toEqual([]);
+    });
+  });
+
+  /** Build a string of exactly `n` characters by repeating `unit`. */
+  const fill = (unit: string, n: number) => unit.repeat(Math.ceil(n / unit.length)).slice(0, n);
+
+  /**
+   * A 120k-character parse must finish in under 20 ms on its best of five rounds.
+   * The linear scan takes under 3 ms there even with every core busy; the lazy
+   * regexes it replaced took 60–380 ms on these shapes, re-reading the rest of the
+   * document once per unclosed opener. The best round discards
+   * scheduler and GC stalls, and a single absolute bound avoids timing a sub-0.1 ms
+   * small input, whose ratio one stall could swing past any threshold.
+   */
+  const expectLinearParse = (build: (n: number) => string) => {
+    const text = build(120_000);
+    let best = Number.POSITIVE_INFINITY;
+    for (let round = 0; round < 5; round++) {
+      const start = performance.now();
+      parseActStructure(text, 'xml');
+      best = Math.min(best, performance.now() - start);
+    }
+    expect(best).toBeLessThan(20);
+  };
+
+  describe('Formex heading scan stays linear on adversarial input (#90)', () => {
+    const ADVERSARIAL: Record<string, (n: number) => string> = {
+      'repeated <HT openers with no closer': (n) => `<TI><P>${fill('<HT', n - 7)}`,
+      'repeated <TI><P><HT openers': (n) => fill('<TI><P><HT TYPE="X"', n),
+      'nested <HT><HT>… before the keyword': (n) => `<TI><P>${fill('<HT>', n - 16)}CHAPTER I`,
+      'an unclosed <TI><P> heading, repeated': (n) => fill('<TI><P>CHAPTER I ', n),
+      'an unclosed <TI><P><HT> heading, repeated': (n) => fill('<TI><P><HT>CHAPTER I ', n),
+      'an unclosed <STI> subtitle, repeated': (n) => fill('<TI><P>CHAPTER I</P></TI><STI><P>xx', n),
+    };
+
+    it.each(Object.entries(ADVERSARIAL))('%s', (_label, build) => expectLinearParse(build));
+  });
+
+  describe('Formex article headings (#94)', () => {
+    /**
+     * Article markup in every shape the scan must keep reading the same way:
+     * whitespace before `<STI.ART>`, an empty subtitle, `<HT>`-wrapped label and
+     * subtitle, no subtitle, an unnumbered heading, an opener nested inside a
+     * heading, an opener inside a subtitle, an unclosed subtitle, and a trailing
+     * opener with no closer.
+     */
+    const ARTICLE_EDGE_FORMEX = [
+      '<ARTICLE><TI.ART>Article 1</TI.ART> \n <STI.ART>Spaced subtitle</STI.ART></ARTICLE>',
+      '<ARTICLE><TI.ART>Article 2</TI.ART><STI.ART></STI.ART></ARTICLE>',
+      '<ARTICLE><TI.ART><HT TYPE="BOLD">Article</HT> 3a</TI.ART><STI.ART><HT TYPE="ITALIC">Wrapped</HT> title</STI.ART></ARTICLE>',
+      '<ARTICLE><TI.ART>Article 4</TI.ART><ALINEA>No subtitle.</ALINEA></ARTICLE>',
+      '<ARTICLE><TI.ART>Final provision</TI.ART><STI.ART>Unnumbered</STI.ART></ARTICLE>',
+      '<ARTICLE><TI.ART>Article 6 <TI.ART>inner</TI.ART><STI.ART>Six</STI.ART></ARTICLE>',
+      '<ARTICLE><TI.ART>Article 7</TI.ART><STI.ART>Cites <TI.ART>Article 8</TI.ART> inline</STI.ART></ARTICLE>',
+      '<ARTICLE><TI.ART>Article 9</TI.ART><STI.ART>Unclosed subtitle</ARTICLE>',
+      '<ARTICLE><TI.ART>Article 10</TI.ART></ARTICLE><TI.ART>Article 11 unterminated',
+    ].join('');
+
+    const articles = (content: string) =>
+      parseActStructure(content, 'xml').filter((h) => h.kind === 'article');
+
+    it('reads number, label, offset, and subtitle from each article shape', () => {
+      expect(articles(ARTICLE_EDGE_FORMEX)).toEqual([
+        { kind: 'article', number: '1', label: 'Article 1', offset: 9, title: 'Spaced subtitle' },
+        { kind: 'article', number: '2', label: 'Article 2', offset: 91 },
+        { kind: 'article', number: '3A', label: 'Article 3a', offset: 155, title: 'Wrapped title' },
+        { kind: 'article', number: '4', label: 'Article 4', offset: 277 },
+        { kind: 'article', number: '', label: 'Final provision', offset: 351, title: 'Unnumbered' },
+        { kind: 'article', number: '6', label: 'Article 6 inner', offset: 431, title: 'Six' },
+        {
+          kind: 'article',
+          number: '7',
+          label: 'Article 7',
+          offset: 512,
+          title: 'Cites Article 8 inline',
+        },
+        { kind: 'article', number: '9', label: 'Article 9', offset: 615 },
+        { kind: 'article', number: '10', label: 'Article 10', offset: 686 },
+      ]);
+    });
+
+    it('reads the article of a live GDPR Formex document', () => {
+      expect(articles(FORMEX_DOC_2)).toEqual([
+        {
+          kind: 'article',
+          number: '1',
+          label: 'Article 1',
+          offset: 1313,
+          title: 'Subject-matter and objectives',
+        },
+      ]);
+    });
+
+    const ADVERSARIAL_ARTICLES: Record<string, (n: number) => string> = {
+      'repeated <TI.ART> openers with no closer': (n) => fill('<TI.ART>Article 1 ', n),
+      'nested <TI.ART> openers with no closer': (n) => fill('<TI.ART>', n),
+      'interleaved unclosed <TI.ART> and <STI.ART> openers': (n) =>
+        fill('<TI.ART>Article 1<STI.ART>Title ', n),
+      'a closed heading before an unclosed <STI.ART>, repeated': (n) =>
+        fill('<TI.ART>Article 1</TI.ART><STI.ART>xx', n),
+      'an unclosed <STI.ART> nesting the next <TI.ART>, repeated': (n) =>
+        fill('<TI.ART>Article 1</TI.ART><STI.ART><TI.ART>', n),
+    };
+
+    it.each(Object.entries(ADVERSARIAL_ARTICLES))('stays linear on %s', (_label, build) =>
+      expectLinearParse(build),
+    );
+  });
 });
 
 describe('extractSections', () => {
@@ -343,5 +522,152 @@ describe('extractSections', () => {
     const result = extractSections(ENTITY_HTML, entityHeadings, { articles: '1' });
     expect(result.text).toContain('&amp;lt;b&amp;gt;');
     expect(result.text).not.toContain('<b>');
+  });
+});
+
+describe('extractSections — nested and overlapping selections (#88)', () => {
+  /**
+   * Three chapters, the second split into two sections, and an annex. Every body
+   * line is unique, so counting one shows whether a source character was emitted
+   * more than once. CHAPTER III's last article ends where the chapter does.
+   */
+  const NESTED_HTML = [
+    '<p>(1)</p>',
+    '<p>Recital one.</p>',
+    '<p class="oj-ti-section-1">CHAPTER I</p>',
+    '<p>General provisions</p>',
+    '<p class="oj-ti-art">Article 1</p>',
+    '<p>Subject-matter</p>',
+    '<p>Body one.</p>',
+    '<p class="oj-ti-art">Article 2</p>',
+    '<p>Scope</p>',
+    '<p>Body two.</p>',
+    '<p class="oj-ti-section-1">CHAPTER II</p>',
+    '<p>Rights</p>',
+    '<p class="oj-ti-section-1">Section 1</p>',
+    '<p>Transparency</p>',
+    '<p class="oj-ti-art">Article 3</p>',
+    '<p>Information</p>',
+    '<p>Body three.</p>',
+    '<p class="oj-ti-art">Article 4</p>',
+    '<p>Access</p>',
+    '<p>Body four.</p>',
+    '<p class="oj-ti-section-1">Section 2</p>',
+    '<p>Rectification</p>',
+    '<p class="oj-ti-art">Article 5</p>',
+    '<p>Erasure</p>',
+    '<p>Body five.</p>',
+    '<p class="oj-ti-section-1">CHAPTER III</p>',
+    '<p>Final provisions</p>',
+    '<p class="oj-ti-art">Article 6</p>',
+    '<p>Entry into force</p>',
+    '<p>Body six.</p>',
+    '<p class="oj-ti-section-1">ANNEX I</p>',
+    '<p>Correlation table</p>',
+    '<p>Annex body.</p>',
+  ].join('\n');
+  const headings = parseActStructure(NESTED_HTML, 'html');
+  const select = (selectors: Parameters<typeof extractSections>[2]) =>
+    extractSections(NESTED_HTML, headings, selectors);
+  const BODIES = ['Body one.', 'Body two.', 'Body three.', 'Body four.', 'Body five.', 'Body six.'];
+  /** Every body line appears at most once — no source character is emitted twice. */
+  const expectEachBodyAtMostOnce = (text: string) => {
+    for (const body of BODIES) expect(text.split(body).length - 1).toBeLessThanOrEqual(1);
+  };
+
+  it('carries an article inside its selected chapter once, with the chapter slice unchanged', () => {
+    const result = select({ chapters: 'I', articles: '1' });
+
+    expect(result.text).toBe(select({ chapters: 'I' }).text);
+    expectEachBodyAtMostOnce(result.text);
+    expect(result.matched).toEqual(['CHAPTER I', 'Article 1']);
+    // The nested article keeps its own address, and that address still re-cuts it.
+    expect(result.sections.map((s) => s.label)).toEqual(['CHAPTER I', 'Article 1']);
+    const [chapter, article] = result.sections;
+    expect(article!.offset).toBeGreaterThan(chapter!.offset);
+    expect(article!.offset + article!.chars).toBeLessThanOrEqual(chapter!.offset + chapter!.chars);
+    const reread = NESTED_HTML.slice(article!.offset, article!.offset + article!.chars);
+    expect(reread).toContain('Body one.');
+    expect(reread).not.toContain('Body two.');
+    expect(outermostSections(result.sections).map((s) => s.label)).toEqual(['CHAPTER I']);
+  });
+
+  it('carries articles two levels down (chapter ⊃ section ⊃ article) once', () => {
+    const result = select({ chapters: 'II', articles: '3,5' });
+
+    expect(result.text).toBe(select({ chapters: 'II' }).text);
+    expectEachBodyAtMostOnce(result.text);
+    expect(result.sections.map((s) => s.label)).toEqual(['CHAPTER II', 'Article 3', 'Article 5']);
+    expect(outermostSections(result.sections)).toHaveLength(1);
+  });
+
+  it('carries nested articles once across two selected chapter ranges, which stay separate slices', () => {
+    const result = select({ chapters: 'I,II', articles: '2,4' });
+
+    expect(result.text).toBe(select({ chapters: 'I,II' }).text);
+    expectEachBodyAtMostOnce(result.text);
+    expect(result.sections.map((s) => s.label)).toEqual([
+      'CHAPTER I',
+      'Article 2',
+      'CHAPTER II',
+      'Article 4',
+    ]);
+    // The two chapters are adjacent, not merged: two slices joined in order.
+    const slices = outermostSections(result.sections);
+    expect(slices.map((s) => s.label)).toEqual(['CHAPTER I', 'CHAPTER II']);
+    expect(result.text).toBe(
+      slices.map((s) => NESTED_HTML.slice(s.offset, s.offset + s.chars).trim()).join('\n\n'),
+    );
+  });
+
+  it('drops a nested article whose span ends exactly where its chapter ends', () => {
+    const result = select({ articles: '6', chapters: 'III' });
+
+    const [chapter, article] = result.sections;
+    expect(article!.offset + article!.chars).toBe(chapter!.offset + chapter!.chars);
+    expect(result.text).toBe(select({ chapters: 'III' }).text);
+    expectEachBodyAtMostOnce(result.text);
+  });
+
+  it('drops a nested article requested before its chapter and more than once', () => {
+    const result = select({ articles: '4,4', chapters: 'II' });
+
+    expect(result.text).toBe(select({ chapters: 'II' }).text);
+    // matched is unchanged: one entry per request, in document order.
+    expect(result.matched).toEqual(['CHAPTER II', 'Article 4', 'Article 4']);
+    expect(result.sections.map((s) => s.label)).toEqual(['CHAPTER II', 'Article 4']);
+  });
+
+  it('keeps adjacent sections as separate slices, unchanged', () => {
+    const articles = select({ articles: '1,2' });
+    expect(outermostSections(articles.sections).map((s) => s.label)).toEqual([
+      'Article 1',
+      'Article 2',
+    ]);
+    expect(articles.text).toBe(
+      `${select({ articles: '1' }).text}\n\n${select({ articles: '2' }).text}`,
+    );
+
+    const chapters = select({ chapters: 'I,II' });
+    expect(outermostSections(chapters.sections)).toHaveLength(2);
+    expect(chapters.text).toBe(
+      `${select({ chapters: 'I' }).text}\n\n${select({ chapters: 'II' }).text}`,
+    );
+  });
+
+  it('carries a disjoint section beside a nested pair, in document order', () => {
+    const result = select({ chapters: 'I', articles: '1,5', annexes: 'I' });
+
+    expect(result.text).toBe(
+      [select({ chapters: 'I' }), select({ articles: '5' }), select({ annexes: 'I' })]
+        .map((r) => r.text)
+        .join('\n\n'),
+    );
+    expect(outermostSections(result.sections).map((s) => s.label)).toEqual([
+      'CHAPTER I',
+      'Article 5',
+      'ANNEX I',
+    ]);
+    expectEachBodyAtMostOnce(result.text);
   });
 });

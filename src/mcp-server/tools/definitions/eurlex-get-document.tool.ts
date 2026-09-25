@@ -16,7 +16,7 @@ import {
 } from '@/services/cellar-sparql/cellar-sparql-service.js';
 import {
   CELEX_PATTERN,
-  escapeSparqlLiteral,
+  celexLiteral,
   isSafeSparqlIri,
   resolveEliToWork,
 } from '@/services/cellar-sparql/eli-resolution.js';
@@ -28,6 +28,7 @@ import type { SparqlBinding } from '@/services/cellar-sparql/types.js';
 import {
   type ActHeading,
   extractSections,
+  outermostSections,
   parseActStructure,
   type SectionSelectors,
   type SelectedSection,
@@ -184,7 +185,7 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       })
       .optional()
       .describe(
-        'Return only the text of specific sections by type and number, instead of a raw character window (Roman and Arabic numbers are equivalent). Sections are located in the body of the requested format, so pair select with the same format used for any outline. A section that cannot be located is reported in selection.missed with no wrong text returned. Ignored when outline is true or in content_mode "metadata_only".',
+        'Return only the text of specific sections by type and number, instead of a raw character window (Roman and Arabic numbers are equivalent). Sections are located in the body of the requested format, so pair select with the same format used for any outline. A section inside another selected section (an article in a selected chapter) is returned once, within the enclosing one. A section that cannot be located is reported in selection.missed with no wrong text returned. Ignored when outline is true or in content_mode "metadata_only".',
       ),
   }),
   output: z.object({
@@ -284,7 +285,7 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .string()
       .optional()
       .describe(
-        `Body content of the act in the requested format and language. In "paged" mode this is the requested window; in "full" mode it starts at zero; under select it is the matched sections joined in document order. Every one is capped at ${MAX_CONTENT_LIMIT} characters. Omitted in "metadata_only" mode, when the window is empty, or when content is unavailable.`,
+        `Body content of the act in the requested format and language. In "paged" mode this is the requested window; in "full" mode it starts at zero; under select it is the matched sections joined in document order, each source character once — a section inside another selected section (an article in a selected chapter) is carried inside the enclosing one. Every one is capped at ${MAX_CONTENT_LIMIT} characters. Omitted in "metadata_only" mode, when the window is empty, or when content is unavailable.`,
       ),
     content_mode: z
       .string()
@@ -390,7 +391,7 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       })
       .optional()
       .describe(
-        `Outcome of a structural selection. Present only when select was used; content holds the matched sections joined in document order, capped at ${MAX_CONTENT_LIMIT} characters. When the cap cuts the join, a trailing matched section may be partly or wholly absent from content — read selected_sections for each one's own address.`,
+        `Outcome of a structural selection. Present only when select was used; content holds the matched sections joined in document order, a nested section's text once inside its enclosing section, capped at ${MAX_CONTENT_LIMIT} characters. When the cap cuts the join, a trailing matched section may be partly or wholly absent from content — read selected_sections for each one's own address.`,
       ),
     selected_sections: z
       .array(
@@ -414,7 +415,7 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       )
       .optional()
       .describe(
-        'Source address of each section the selection sliced, in document order. Present only when select was used. A selection is a set of disjoint slices, not a contiguous window, so these addresses — not content_offset — are how a caller navigates one; every section stays individually reachable even when the cap cut its text.',
+        'Source address of each distinct section the selection located, in document order. Present only when select was used. A section nested inside another selected section keeps its own entry, though its text appears in content only once, inside the enclosing section. A selection is a set of slices, not a contiguous window, so these addresses — not content_offset — are how a caller navigates one; every section stays individually reachable even when the cap cut its text.',
       ),
     structure_detected: z
       .boolean()
@@ -524,12 +525,16 @@ export const eurlex_get_document = tool('eurlex_get_document', {
     // co-legislators. Each dimension now gets its own query (as
     // relation-traversal.ts runs one per relation type); the core query carries the
     // single-valued fields. No dimension can truncate another.
+    //
+    // Every query binds the CELEX as a typed exact triple (#92): CELLAR types the
+    // literal xsd:string, so the triple resolves from the index where a STR()
+    // equality filter scans.
     const fetchMetadata = async (celex: string) => {
-      const safe = escapeSparqlLiteral(celex);
+      const typedCelex = celexLiteral(celex);
       const coreQuery = `
 SELECT ?work ?celexNumber ?type ?date ?title ?inForce WHERE {
-  ?work cdm:resource_legal_id_celex ?celexNumber .
-  FILTER(STR(?celexNumber) = "${safe}")
+  ?work cdm:resource_legal_id_celex ${typedCelex} .
+  BIND(${typedCelex} AS ?celexNumber)
   OPTIONAL { ?work cdm:work_has_resource-type ?type . }
   OPTIONAL { ?work cdm:work_date_document ?date . }
   OPTIONAL {
@@ -541,8 +546,7 @@ SELECT ?work ?celexNumber ?type ?date ?title ?inForce WHERE {
 } LIMIT 5`;
       const dimensionQuery = (predicate: string, variable: string) => `
 SELECT ?${variable} WHERE {
-  ?work cdm:resource_legal_id_celex ?c .
-  FILTER(STR(?c) = "${safe}")
+  ?work cdm:resource_legal_id_celex ${typedCelex} .
   ?work ${predicate} ?${variable} .
 } LIMIT ${META_DIMENSION_LIMIT}`;
       // Legal bases and EuroVoc subjects resolve inline (#67): each dimension
@@ -551,15 +555,13 @@ SELECT ?${variable} WHERE {
       // same round trip and a URI with no label still yields its row.
       const legalBasisQuery = `
 SELECT ?legalBasis (SAMPLE(?celexValue) AS ?celex) WHERE {
-  ?work cdm:resource_legal_id_celex ?c .
-  FILTER(STR(?c) = "${safe}")
+  ?work cdm:resource_legal_id_celex ${typedCelex} .
   ?work cdm:resource_legal_based_on_resource_legal ?legalBasis .
   OPTIONAL { ?legalBasis cdm:resource_legal_id_celex ?celexValue . }
 } GROUP BY ?legalBasis LIMIT ${META_DIMENSION_LIMIT}`;
       const eurovocQuery = `
 SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
-  ?work cdm:resource_legal_id_celex ?c .
-  FILTER(STR(?c) = "${safe}")
+  ?work cdm:resource_legal_id_celex ${typedCelex} .
   ?work cdm:work_is_about_concept_eurovoc ?eurovoc .
   OPTIONAL {
     ?eurovoc skos:prefLabel ?labelValue .
@@ -930,9 +932,17 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
         );
       }
       if (result.selection) {
+        // Count the slices content carries: a section nested inside another
+        // selected one rides in the enclosing slice (#88).
         const sections = result.selected_sections ?? [];
+        const slices = outermostSections(sections).length;
+        const nested = sections.length - slices;
+        const nestedNote =
+          nested > 0
+            ? ` (${nested} nested section${nested === 1 ? '' : 's'} carried inside ${slices === 1 ? 'it' : 'them'})`
+            : '';
         lines.push(
-          `**Body** (${result.content_mode}, selection): ${returned} characters from ${sections.length} disjoint section${sections.length === 1 ? '' : 's'} of a ${total}-character body — not a contiguous window, so there is no continuation offset (has_more ${result.has_more}).`,
+          `**Body** (${result.content_mode}, selection): ${returned} characters from ${slices} disjoint section${slices === 1 ? '' : 's'}${nestedNote} of a ${total}-character body — not a contiguous window, so there is no continuation offset (has_more ${result.has_more}).`,
         );
         if (returned >= MAX_CONTENT_LIMIT) {
           lines.push(

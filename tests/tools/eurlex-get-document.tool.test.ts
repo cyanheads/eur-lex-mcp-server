@@ -5,7 +5,7 @@
 
 import { z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_get_document } from '@/mcp-server/tools/definitions/eurlex-get-document.tool.js';
 import { EURLEX_LANGUAGES } from '@/services/eurlex-content/eurlex-content-service.js';
@@ -1315,10 +1315,126 @@ describe('eurlex_get_document', () => {
       expect(result.content_chars_returned).toBe(result.content!.length);
       expect(result.content_chars_returned).toBeLessThan(100_000);
       expect(result.has_more).toBe(false);
-      // One address per distinct slice, in document order — the twice-requested
-      // article collapses to a single entry, matching the sliced text.
+      // One address per distinct located section, in document order — the
+      // twice-requested article collapses to a single entry. It sits inside
+      // CHAPTER I, so its text rides once in the chapter's slice (#88).
       expect(result.selected_sections?.map((s) => s.label)).toEqual(['CHAPTER I', 'Article 2']);
       expect(result.selection?.matched).toEqual(['CHAPTER I', 'Article 2', 'Article 2']);
+      expect(result.content!.split('This Regulation applies broadly.')).toHaveLength(2);
+    });
+
+    // --- #88: a section nested inside another selected section is carried once,
+    // inside the enclosing slice. It keeps its own selected_sections address, and
+    // only the slices content actually carries are counted or charged to the cap.
+
+    it('#88: a chapter plus an article inside it returns exactly the chapter, in both channels', async () => {
+      mockStructured();
+      const chapterOnly = await runSelect(STRUCTURED_BODY, { chapters: 'I' });
+
+      mockStructured();
+      const result = await runToolContract(eurlex_get_document, {
+        celex_number: '32016R0679',
+        select: { chapters: 'I', articles: '1' },
+      });
+      expect(result.isError).toBeFalsy();
+      const structured = eurlex_get_document.output.parse(result.structuredContent);
+
+      expect(structured.content).toBe(chapterOnly.result.content);
+      expect(structured.content!.split('Subject-matter')).toHaveLength(2);
+      expect(structured.content_chars_returned).toBe(chapterOnly.result.content_chars_returned);
+      expect(structured.selection?.matched).toEqual(['CHAPTER I', 'Article 1']);
+      // The nested article keeps its own address inside the chapter's span.
+      const [chapter, article] = structured.selected_sections ?? [];
+      expect([chapter?.label, article?.label]).toEqual(['CHAPTER I', 'Article 1']);
+      expect(article!.offset).toBeGreaterThan(chapter!.offset);
+      expect(article!.offset + article!.chars).toBeLessThanOrEqual(
+        chapter!.offset + chapter!.chars,
+      );
+      expect(structured.has_more).toBe(false);
+      expect(structured.content_offset).toBeUndefined();
+
+      const text = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+      expect(text).toContain(
+        `${structured.content_chars_returned} characters from 1 disjoint section (1 nested section carried inside it)`,
+      );
+      expect(text).toContain(`Article 1 — offset ${article!.offset}, ${article!.chars} chars`);
+    });
+
+    it('#88: adjacent sections stay separate slices and the Body line counts both', async () => {
+      const { result } = await runSelect(STRUCTURED_BODY, { articles: '1,2' });
+      const text = (eurlex_get_document.format!(result)[0] as { text: string }).text;
+
+      expect(result.content).toContain('Subject-matter');
+      expect(result.content).toContain('Scope');
+      expect(text).toContain('from 2 disjoint sections of a');
+      expect(text).not.toContain('nested');
+    });
+
+    /**
+     * CHAPTER III spans ~95,000 characters and holds Article 14 (~10,000 of them);
+     * Article 33 sits in CHAPTER IV. Counting Article 14 twice pushes the join past
+     * the cap and cuts Article 33; counting it once fits.
+     */
+    const CAP_CROSSING_BODY = [
+      '<p class="oj-ti-grseq">CHAPTER III</p>',
+      '<p class="oj-ti-grseq">Rights of the data subject</p>',
+      '<p class="oj-ti-art">Article 13</p>',
+      `<p class="oj-normal">${'m'.repeat(84_000)}</p>`,
+      '<p class="oj-ti-art">Article 14</p>',
+      '<p class="oj-sti-art">Information to be provided</p>',
+      `<p class="oj-normal">${'f'.repeat(10_000)}</p>`,
+      '<p class="oj-ti-grseq">CHAPTER IV</p>',
+      '<p class="oj-ti-grseq">Controller and processor</p>',
+      '<p class="oj-ti-art">Article 33</p>',
+      '<p class="oj-sti-art">Notification of a breach</p>',
+      '<p class="oj-normal">Article thirty-three body.</p>',
+    ].join('\n');
+
+    it('#88: an overlap no longer pushes a fitting selection past the cap', async () => {
+      const withoutOverlap = await runSelect(CAP_CROSSING_BODY, {
+        chapters: 'III',
+        articles: '33',
+      });
+      const { result, enrichment } = await runSelect(CAP_CROSSING_BODY, {
+        chapters: 'III',
+        articles: '14,33',
+      });
+
+      expect(withoutOverlap.result.content_chars_returned).toBeLessThan(100_000);
+      expect(result.content).toBe(withoutOverlap.result.content);
+      expect(result.content).toContain('Article thirty-three body.');
+      expect(enrichment.truncated).toBeUndefined();
+      expect(result.selected_sections?.map((s) => s.label)).toEqual([
+        'CHAPTER III',
+        'Article 14',
+        'Article 33',
+      ]);
+      const text = (eurlex_get_document.format!(result)[0] as { text: string }).text;
+      expect(text).toContain('from 2 disjoint sections (1 nested section carried inside them)');
+    });
+
+    it('#88: a still-oversized overlap discloses a pre-cap total that counts each character once', async () => {
+      const chaptersOnly = await runSelect(OVERSIZED_BODY, { chapters: 'I' });
+      const { result, enrichment } = await runSelect(OVERSIZED_BODY, {
+        chapters: 'I',
+        articles: '1,2',
+      });
+
+      // The chapter alone is over the cap; its two nested articles add nothing.
+      expect(result.content).toBe(chaptersOnly.result.content);
+      expect(result.content!.length).toBe(100_000);
+      expect(enrichment.truncated).toBe(true);
+      expect(enrichment.notice).toBe(chaptersOnly.enrichment.notice);
+      const chapter = result.selected_sections![0]!;
+      const onceTotal = OVERSIZED_BODY.slice(chapter.offset, chapter.offset + chapter.chars).trim()
+        .length;
+      expect(enrichment.notice).toContain(`total ${onceTotal} characters`);
+      // Every nested section stays individually addressable after the cut.
+      expect(result.selected_sections?.map((s) => s.label)).toEqual([
+        'CHAPTER I',
+        'Article 1',
+        'Article 2',
+      ]);
     });
 
     it('#80: a selection that matches nothing addresses no sections and discloses no cut', async () => {
@@ -1459,6 +1575,34 @@ describe('eurlex_get_document', () => {
       const text = (eurlex_get_document.format!(result)[0] as { text: string }).text;
       expect(text).toContain('European Parliament');
       expect(text).toContain('Council of the EU');
+    });
+
+    // --- #95: sector-6 works name their authoring court, not its authority code ---
+
+    it.each([
+      ['62012CJ0131', 'CJ', 'Court of Justice'],
+      ['62019TJ0795', 'GCEU', 'General Court'],
+      ['62006FO0063', 'CST', 'Civil Service Tribunal'],
+      ['62004TB0293', 'CFI', 'Court of First Instance'],
+    ])('#95: %s names its author %s as "%s" in both channels', async (celex, code, name) => {
+      routeSparql({
+        core: [makeMetaBinding({ celex, title: 'Case-law work' })],
+        author: [row('author', `${CB}/${code}`)],
+      });
+
+      const result = await runToolContract(eurlex_get_document, {
+        celex_number: celex,
+        content_mode: 'metadata_only',
+      });
+      expect(result.isError).toBeFalsy();
+      const structured = eurlex_get_document.output.parse(result.structuredContent);
+      expect(structured.author_institution).toBe(name);
+      expect(structured.author_institutions).toEqual([name]);
+
+      const text = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+      expect(text).toContain(`**Author:** ${name}`);
+      expect(text).toContain(`**Authors:** ${name}`);
+      expect(text).not.toContain(`**Author:** ${code}`);
     });
 
     it('#33: captures the full set for every dimension — no cross-product truncation (REACH-shape)', async () => {
@@ -1797,6 +1941,66 @@ describe('eurlex_get_document', () => {
     });
   });
 
+  // --- #92: typed exact CELEX triple ---
+
+  describe('typed CELEX triple (#92)', () => {
+    /**
+     * CELLAR types every `cdm:resource_legal_id_celex` literal as `xsd:string`, so
+     * the typed exact triple resolves from the index while `FILTER(STR(?c) = "…")`
+     * scans. Every query keyed on the caller's CELEX — the metadata core, the three
+     * dimension queries, and the consolidation-staleness lookup — takes the typed form.
+     */
+    it('binds the CELEX as a typed exact triple in every CELEX-keyed query', async () => {
+      const ctx = createMockContext({ errors: eurlex_get_document.errors });
+      mockSparqlQuery.mockResolvedValue([makeMetaBinding({ celex: '32016R0679' })]);
+
+      const input = eurlex_get_document.input.parse({
+        celex_number: '32016R0679',
+        content_mode: 'metadata_only',
+      });
+      const result = await eurlex_get_document.handler(input, ctx);
+
+      const queries = mockSparqlQuery.mock.calls.map((c) => c[0] as string);
+      const keyed = queries.filter((q) => q.includes('"32016R0679"'));
+      expect(keyed).toHaveLength(5);
+      for (const q of keyed) {
+        expect(q).toContain('cdm:resource_legal_id_celex "32016R0679"^^xsd:string .');
+        expect(q).not.toMatch(/STR\(\?\w+\)\s*=/);
+      }
+      expect(keyed.some((q) => q.includes('act_consolidated_consolidates'))).toBe(true);
+      // The confirmed CELEX is still projected by the core query.
+      expect(keyed.some((q) => q.includes('BIND("32016R0679"^^xsd:string AS ?celexNumber)'))).toBe(
+        true,
+      );
+      expect(result.celex_number).toBe('32016R0679');
+    });
+
+    it('types both the requested and the served CELEX on the resolve "current_consolidated" path', async () => {
+      const ctx = createMockContext({ errors: eurlex_get_document.errors });
+      mockSparqlQuery.mockImplementation(async (q: string) =>
+        q.includes('act_consolidated_consolidates')
+          ? [{ consolidatedCelex: { type: 'literal', value: '02016R0679-20160504' } }]
+          : [makeMetaBinding({ celex: '02016R0679-20160504' })],
+      );
+
+      const input = eurlex_get_document.input.parse({
+        celex_number: '32016R0679',
+        content_mode: 'metadata_only',
+        resolve: 'current_consolidated',
+      });
+      await eurlex_get_document.handler(input, ctx);
+
+      const queries = mockSparqlQuery.mock.calls.map((c) => c[0] as string);
+      expect(queries[0]).toContain('cdm:resource_legal_id_celex "32016R0679"^^xsd:string .');
+      const served = queries.filter((q) => q.includes('"02016R0679-20160504"'));
+      expect(served).toHaveLength(4);
+      for (const q of served) {
+        expect(q).toContain('cdm:resource_legal_id_celex "02016R0679-20160504"^^xsd:string .');
+      }
+      expect(queries.join('\n')).not.toMatch(/STR\(\?\w+\)\s*=/);
+    });
+  });
+
   // --- #69: CELEX shape gate at the schema layer ---
 
   describe('CELEX shape validation (#69)', () => {
@@ -1882,7 +2086,7 @@ describe('eurlex_get_document', () => {
 
       expect(result.celex_number).toBe('32016R0679');
       expect(mockSparqlQuery.mock.calls[0]?.[0] as string).toContain(
-        'FILTER(STR(?celexNumber) = "32016R0679")',
+        'cdm:resource_legal_id_celex "32016R0679"^^xsd:string .',
       );
     });
   });

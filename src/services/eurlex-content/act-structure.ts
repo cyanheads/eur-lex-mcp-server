@@ -12,10 +12,11 @@
  *    survives. So detection keys off the visible-text patterns (`Article N`,
  *    `CHAPTER <roman>`, `ANNEX …`, recital `(N)`) that appear in BOTH strings, so
  *    the emitted offsets stay valid against whichever string is being paged.
- *  - **xml (Formex 4)** — element matching (`<TI.ART>`, `<TITLE><TI><P>CHAPTER …`,
+ *  - **xml (Formex 4)** — element matching (`<TI.ART>`, `<TITLE><TI><P>CHAPTER …` /
+ *    `Section …`, the keyword optionally wrapped in `<HT>` formatting, and
  *    `<NO.P>(N)</NO.P>`), a separate path since Formex is dense single-line XML
- *    with no rendered-text line anchors. Annex/section detection is not attempted
- *    for Formex — those selectors degrade to the floor.
+ *    with no rendered-text line anchors. Annex detection is not attempted for
+ *    Formex — that selector degrades to the floor.
  *
  * Detection is best-effort by design: an act with no parseable structure (case
  * law, malformed conversions) yields an empty result, never an error. The paging
@@ -51,10 +52,12 @@ export interface SectionSelectors {
 }
 
 /**
- * One sliced section's own address in the source body. A selection is a set of
- * disjoint slices rather than a contiguous window, so each section carries its
- * own span — which is also what keeps it individually reachable through the
- * paging floor after a capped response drops its text (#12, #80).
+ * One selected section's own address in the source body. A selection is a set of
+ * slices rather than a contiguous window, so each section carries its own span —
+ * which is also what keeps it individually reachable through the paging floor
+ * after a capped response drops its text (#12, #80). A section nested inside
+ * another selected section keeps its own address too, though its text rides in
+ * the enclosing slice (#88).
  */
 export interface SelectedSection {
   /** Source characters the section spans — `offset + chars` is its end. */
@@ -73,9 +76,15 @@ export interface SelectionResult {
   missed: string[];
   /** Human descriptors of every requested section, e.g. ["Article 17", "CHAPTER IV"]. */
   requested: string[];
-  /** Source address of each distinct slice that fed `text`, in document order. */
+  /**
+   * Source address of each distinct located section, in document order — nested
+   * ones included. {@link outermostSections} picks the slices that fed `text`.
+   */
   sections: SelectedSection[];
-  /** Concatenated text of the matched sections, in document order. Empty when nothing matched. */
+  /**
+   * The outermost matched sections joined in document order, so every source
+   * character appears at most once. Empty when nothing matched.
+   */
   text: string;
 }
 
@@ -283,42 +292,113 @@ function formexText(inner: string): string {
   return visibleText(inner);
 }
 
+/** Where a Formex article heading opens. */
+const FORMEX_TI_ART_OPEN_RE = /<TI\.ART>/g;
+
+/** A `<STI.ART>` subtitle directly after an article's `</TI.ART>`. Sticky. */
+const FORMEX_STI_ART_OPEN_RE = /\s*<STI\.ART>/y;
+
+/** Where a Formex title paragraph opens — the only place a chapter/section heading starts. */
+const FORMEX_TI_OPEN_RE = /<TI>\s*<P>/g;
+
+/**
+ * The heading keyword and number, matched where the title paragraph opens. Inline
+ * formatting may wrap the keyword — GDPR writes `<HT TYPE="ITALIC">CHAPTER I</HT>`
+ * and `<HT TYPE="EXPANDED">Section 1</HT>` — and wrappers nest, so any run of
+ * `<HT …>` openers is skipped first (#90). Case-insensitive for the title-case
+ * "Section". Sticky: it only ever reads forward from `lastIndex`.
+ */
+const FORMEX_HEADING_RE = /\s*(?:<HT\b[^>]*>\s*)*(CHAPTER|SECTION)\s+([IVXLCDM0-9]+)/iy;
+
+/** A `<STI>` subtitle directly after a heading's `</TI>`. Sticky, like the heading. */
+const FORMEX_STI_OPEN_RE = /\s*<STI>/y;
+
+/**
+ * Return a finder for the first index of `needle` at or after a position. The
+ * heading scan asks with a position that only moves forward, so the finder
+ * answers from its previous search whenever that answer still holds, and a run
+ * of openers with no closer costs one pass over the text rather than one per
+ * opener. A backward position falls back to a fresh search.
+ */
+function forwardFinder(text: string, needle: string): (from: number) => number {
+  let searchedFrom = Number.POSITIVE_INFINITY;
+  let found = -1;
+  return (from) => {
+    if (from >= searchedFrom && (found === -1 || found >= from)) return found;
+    searchedFrom = from;
+    found = text.indexOf(needle, from);
+    return found;
+  };
+}
+
 function parseFormexStructure(content: string): ActHeading[] {
   const headings: ActHeading[] = [];
 
   // Articles: <TI.ART>Article 17</TI.ART> optionally followed by <STI.ART>title</STI.ART>.
-  for (const m of content.matchAll(
-    /<TI\.ART>([\s\S]*?)<\/TI\.ART>(?:\s*<STI\.ART>([\s\S]*?)<\/STI\.ART>)?/gi,
-  )) {
-    const label = formexText(m[1] ?? '');
+  // Each heading runs to the first </TI.ART> after its opener, and its subtitle to
+  // the first </STI.ART>, both through forward-only finders (#94). An opener inside
+  // the previous heading or its subtitle belongs to that heading's text, not a new
+  // one, so the scan resumes past the span the previous heading consumed.
+  const nextTiArtClose = forwardFinder(content, '</TI.ART>');
+  const nextStiArtClose = forwardFinder(content, '</STI.ART>');
+  let consumedTo = 0;
+  for (const open of content.matchAll(FORMEX_TI_ART_OPEN_RE)) {
+    if (open.index < consumedTo) continue;
+    const labelStart = open.index + open[0].length;
+    const tiClose = nextTiArtClose(labelStart);
+    if (tiClose === -1) break; // no </TI.ART> anywhere past here, so no later heading closes either
+    consumedTo = tiClose + '</TI.ART>'.length;
+
+    FORMEX_STI_ART_OPEN_RE.lastIndex = consumedTo;
+    const stiOpen = FORMEX_STI_ART_OPEN_RE.exec(content);
+    const stiClose = stiOpen ? nextStiArtClose(FORMEX_STI_ART_OPEN_RE.lastIndex) : -1;
+    let title: string | undefined;
+    if (stiClose !== -1) {
+      title = formexText(content.slice(FORMEX_STI_ART_OPEN_RE.lastIndex, stiClose));
+      consumedTo = stiClose + '</STI.ART>'.length;
+    }
+
+    const label = formexText(content.slice(labelStart, tiClose));
     const number = (label.match(/(\d+[a-z]?)/)?.[1] ?? '').toUpperCase();
-    const title = m[2] ? formexText(m[2]) : undefined;
     headings.push({
       kind: 'article',
       number,
       label: label || labelFor('article', number),
-      offset: m.index ?? 0,
+      offset: open.index,
       ...(title ? { title } : {}),
     });
   }
 
-  // Chapters / sections: a <TITLE> whose <TI><P> reads "CHAPTER I" / "SECTION 1",
-  // with the descriptive title in the sibling <STI><P>. (The document-level title
-  // uses <TI><P> too, but its text isn't CHAPTER/SECTION-prefixed, so it's skipped.)
-  for (const m of content.matchAll(
-    /<TI>\s*<P>\s*((?:CHAPTER|SECTION)\s+[IVXLCDM0-9]+)[\s\S]*?<\/P>\s*<\/TI>(?:\s*<STI>\s*<P>([\s\S]*?)<\/P>\s*<\/STI>)?/gi,
-  )) {
-    const head = formexText(m[1] ?? '');
-    const parts = /^(CHAPTER|SECTION)\s+([IVXLCDM0-9]+)/i.exec(head);
-    if (!parts) continue;
-    const kind: SectionKind = (parts[1] ?? '').toUpperCase() === 'CHAPTER' ? 'chapter' : 'section';
-    const number = (parts[2] ?? '').toUpperCase();
-    const title = m[2] ? formexText(m[2]) : undefined;
+  // Chapters / sections: a <TITLE> whose <TI><P> reads "CHAPTER I" / "Section 1",
+  // closed by </TI>, with the descriptive title in a sibling <STI> directly after.
+  // (The document-level title uses <TI><P> too, but its text isn't CHAPTER/
+  // SECTION-prefixed, so it's skipped.) Each heading is bounded by its own </TI>
+  // and </STI> through forward-only finders rather than a lazy scan to the closer,
+  // which re-read the rest of the document once per unclosed opener.
+  const nextTiClose = forwardFinder(content, '</TI>');
+  const nextStiClose = forwardFinder(content, '</STI>');
+  for (const open of content.matchAll(FORMEX_TI_OPEN_RE)) {
+    FORMEX_HEADING_RE.lastIndex = open.index + open[0].length;
+    const head = FORMEX_HEADING_RE.exec(content);
+    if (!head) continue;
+    const tiClose = nextTiClose(FORMEX_HEADING_RE.lastIndex);
+    if (tiClose === -1) break; // no </TI> anywhere past here, so no later heading closes either
+    const kind: SectionKind = (head[1] ?? '').toUpperCase() === 'CHAPTER' ? 'chapter' : 'section';
+    const number = (head[2] ?? '').toUpperCase();
+
+    FORMEX_STI_OPEN_RE.lastIndex = tiClose + '</TI>'.length;
+    const stiOpen = FORMEX_STI_OPEN_RE.exec(content);
+    const stiClose = stiOpen ? nextStiClose(FORMEX_STI_OPEN_RE.lastIndex) : -1;
+    const title =
+      stiClose === -1
+        ? undefined
+        : formexText(content.slice(FORMEX_STI_OPEN_RE.lastIndex, stiClose));
+
     headings.push({
       kind,
       number,
       label: labelFor(kind, number),
-      offset: m.index ?? 0,
+      offset: open.index,
       ...(title ? { title } : {}),
     });
   }
@@ -387,6 +467,30 @@ function parseTokens(raw: string | undefined): string[] {
 }
 
 /**
+ * The sections not contained in another section of the list — the slices a
+ * selection's text is built from. `sections` must be in document order.
+ *
+ * A section spans from its heading to the next heading of the same or broader
+ * rank, so any two spans are nested or disjoint, never partially overlapping:
+ * every heading between a section's start and its end is narrower, so its own
+ * span closes no later. Containment is therefore the whole test, and one pass that
+ * tracks the furthest end seen so far finds it (#88).
+ */
+export function outermostSections<T extends { chars: number; offset: number }>(
+  sections: readonly T[],
+): T[] {
+  const outer: T[] = [];
+  let coveredTo = -1;
+  for (const section of sections) {
+    const end = section.offset + section.chars;
+    if (end <= coveredTo) continue;
+    outer.push(section);
+    coveredTo = end;
+  }
+  return outer;
+}
+
+/**
  * Extract the requested sections from the content, in document order. For each
  * requested section, slices from its heading to the next same-or-broader heading.
  * Reports which requests matched and which missed — a miss is never an error.
@@ -432,25 +536,27 @@ export function extractSections(
     matched.push({ descriptor: heading.label, offset: start, end });
   }
 
-  // Emit matched sections in document order, de-duplicated by offset (a chapter
-  // request and an article request inside it could overlap — keep each once).
+  // Address every distinct located section in document order — a section
+  // requested twice resolves to one heading offset, so it is addressed once.
   matched.sort((a, b) => a.offset - b.offset);
   const seen = new Set<number>();
-  const distinct = matched.filter((s) => {
-    if (seen.has(s.offset)) return false;
+  const sections: SelectedSection[] = [];
+  for (const s of matched) {
+    if (seen.has(s.offset)) continue;
     seen.add(s.offset);
-    return true;
-  });
+    sections.push({ label: s.descriptor, offset: s.offset, chars: s.end - s.offset });
+  }
 
+  // Slice only the outermost spans (#88): an article selected alongside the
+  // chapter holding it is already inside the chapter's slice, so slicing it too
+  // would emit its text twice and charge it twice against the body cap.
   return {
-    text: distinct.map((s) => content.slice(s.offset, s.end).trim()).join('\n\n'),
+    text: outermostSections(sections)
+      .map((s) => content.slice(s.offset, s.offset + s.chars).trim())
+      .join('\n\n'),
     requested: requests.map((r) => r.descriptor),
     matched: matched.map((s) => s.descriptor),
     missed,
-    sections: distinct.map((s) => ({
-      label: s.descriptor,
-      offset: s.offset,
-      chars: s.end - s.offset,
-    })),
+    sections,
   };
 }
