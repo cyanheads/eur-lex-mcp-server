@@ -476,4 +476,10 @@ describe('eurlex_query_sparql', () => {
 
     expect(getEnrichment(ctx).truncated).toBeUndefined();
   });
+
+  it('teaches the typed CELEX triple, not the STR() scan, in its sparql_query guidance (#92)', () => {
+    const guidance = eurlex_query_sparql.input.shape.sparql_query.description ?? '';
+    expect(guidance).toContain('?work cdm:resource_legal_id_celex "32016R0679"^^xsd:string');
+    expect(guidance).not.toContain('FILTER(STR(?celex) = "…")');
+  });
 });

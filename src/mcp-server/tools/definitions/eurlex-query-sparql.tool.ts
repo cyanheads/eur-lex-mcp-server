@@ -110,7 +110,7 @@ export const eurlex_query_sparql = tool('eurlex_query_sparql', {
       .string()
       .min(10)
       .describe(
-        'A read-only SPARQL SELECT query. Leading comments and PREFIX/BASE declarations are allowed; the cdm:, skos:, and xsd: prefixes are auto-injected. LIMIT is injected at 100 if absent, or capped to 100. Key CDM predicates: cdm:resource_legal_id_celex (CELEX), cdm:work_date_document (date), cdm:work_has_resource-type (type), cdm:work_is_about_concept_eurovoc (EuroVoc subject), cdm:work_cites_work (citation). CELEX is an xsd:string literal — match it with FILTER(STR(?celex) = "…"). For text, use bif:contains with a single-quoted phrase.',
+        'A read-only SPARQL SELECT query. Leading comments and PREFIX/BASE declarations are allowed; the cdm:, skos:, and xsd: prefixes are auto-injected. LIMIT is injected at 100 if absent, or capped to 100. Key CDM predicates: cdm:resource_legal_id_celex (CELEX), cdm:work_date_document (date), cdm:work_has_resource-type (type), cdm:work_is_about_concept_eurovoc (EuroVoc subject), cdm:work_cites_work (citation). CELEX is an xsd:string literal — match it as a typed triple, ?work cdm:resource_legal_id_celex "32016R0679"^^xsd:string (an untyped literal matches nothing, and a FILTER(STR(…)) comparison scans every CELEX). For text, use bif:contains with a single-quoted phrase.',
       ),
     timeout_hint: z
       .number()

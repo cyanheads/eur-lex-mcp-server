@@ -270,9 +270,11 @@ describe('eurlex_document_resource', () => {
 
     const sparql = mockQuery.mock.calls[0]?.[0] as string;
     // The literal carries exactly what the shared helper produces.
-    expect(sparql).toContain(`FILTER(STR(?celexNumber) = "${escapeSparqlLiteral(celexNumber)}")`);
+    expect(sparql).toContain(
+      `cdm:resource_legal_id_celex "${escapeSparqlLiteral(celexNumber)}"^^xsd:string .`,
+    );
     // The unterminated form the quote-only pass produced is gone.
-    expect(sparql).not.toContain(String.raw`= "32016R0679\")`);
+    expect(sparql).not.toContain(String.raw`"32016R0679\"^^`);
   });
 
   it('escapes an embedded quote-and-backslash sequence (#61)', async () => {
@@ -286,10 +288,12 @@ describe('eurlex_document_resource', () => {
     );
 
     const sparql = mockQuery.mock.calls[0]?.[0] as string;
-    expect(sparql).toContain(`FILTER(STR(?celexNumber) = "${escapeSparqlLiteral(celexNumber)}")`);
+    expect(sparql).toContain(
+      `cdm:resource_legal_id_celex "${escapeSparqlLiteral(celexNumber)}"^^xsd:string .`,
+    );
     // Every backslash and quote from the input is escaped, so the only unescaped
-    // double quotes in the FILTER are the literal's own delimiters.
-    expect(sparql).not.toContain(String.raw`= "32016R0679\\" x")`);
+    // double quotes in the literal are its own delimiters.
+    expect(sparql).not.toContain(String.raw`"32016R0679\\" x"^^`);
   });
 
   it('leaves an ordinary CELEX byte-identical through the shared helper (#61)', async () => {
@@ -301,7 +305,26 @@ describe('eurlex_document_resource', () => {
 
     const sparql = mockQuery.mock.calls[0]?.[0] as string;
     // No regression for the overwhelmingly common input: escaping is a no-op.
-    expect(sparql).toContain('FILTER(STR(?celexNumber) = "32016R0679")');
+    expect(sparql).toContain('cdm:resource_legal_id_celex "32016R0679"^^xsd:string .');
+  });
+
+  // --- #92: typed exact CELEX triple ---
+
+  it('binds the CELEX as a typed exact triple in the metadata and both dimension queries (#92)', async () => {
+    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    mockQuery.mockResolvedValue([makeMetaBinding({ celex: '62012CJ0131' })]);
+
+    const params = eurlex_document_resource.params!.parse({ celexNumber: '62012CJ0131' });
+    const result = (await eurlex_document_resource.handler(params, ctx)) as Record<string, unknown>;
+
+    const queries = mockQuery.mock.calls.map((c) => c[0] as string);
+    expect(queries).toHaveLength(3);
+    for (const q of queries) {
+      expect(q).toContain('cdm:resource_legal_id_celex "62012CJ0131"^^xsd:string .');
+      expect(q).not.toMatch(/STR\(\?\w+\)\s*=/);
+    }
+    expect(queries[0]).toContain('BIND("62012CJ0131"^^xsd:string AS ?celexNumber)');
+    expect(result.celex_number).toBe('62012CJ0131');
   });
 
   // --- #69: CELEX shape gate on the path parameter ---
@@ -364,7 +387,7 @@ describe('eurlex_document_resource', () => {
       await eurlex_document_resource.handler(params, ctx);
 
       expect(mockQuery.mock.calls[0]?.[0] as string).toContain(
-        'FILTER(STR(?celexNumber) = "32016R0679")',
+        'cdm:resource_legal_id_celex "32016R0679"^^xsd:string .',
       );
     });
   });

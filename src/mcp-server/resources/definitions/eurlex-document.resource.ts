@@ -14,7 +14,7 @@ import {
   CellarSparqlService,
   getCellarSparqlService,
 } from '@/services/cellar-sparql/cellar-sparql-service.js';
-import { CELEX_PATTERN, escapeSparqlLiteral } from '@/services/cellar-sparql/eli-resolution.js';
+import { CELEX_PATTERN, celexLiteral } from '@/services/cellar-sparql/eli-resolution.js';
 import type { SparqlBinding } from '@/services/cellar-sparql/types.js';
 
 /** Per-dimension row cap for the legal-basis and EuroVoc queries. */
@@ -57,16 +57,18 @@ export const eurlex_document_resource = resource('eurlex://document/{celexNumber
   async handler(params, ctx) {
     const svc = getCellarSparqlService();
     const celexNumber = params.celexNumber.trim();
-    // The shared helper, not a local quote-only pass: a hand-rolled escape without
-    // a backslash pass lets a trailing `\` escape the closing quote, so the literal
-    // never terminates and Virtuoso's raw compiler error — internal query text
-    // attached — reaches the client in place of this resource's not_found (#61).
-    const safeCelexNumber = escapeSparqlLiteral(celexNumber);
+    // Every query binds the CELEX as a typed exact triple (#92) — CELLAR types the
+    // literal xsd:string, so it resolves from the index where a STR() equality
+    // filter scans. The shared helper escapes the value, never a local quote-only
+    // pass: without a backslash pass a trailing `\` escapes the closing quote and
+    // Virtuoso's raw compiler error — internal query text attached — reaches the
+    // client in place of this resource's not_found (#61).
+    const typedCelex = celexLiteral(celexNumber);
 
     const sparql = `
 SELECT ?work ?celexNumber ?type ?date ?title ?inForce ?author WHERE {
-  ?work cdm:resource_legal_id_celex ?celexNumber .
-  FILTER(STR(?celexNumber) = "${safeCelexNumber}")
+  ?work cdm:resource_legal_id_celex ${typedCelex} .
+  BIND(${typedCelex} AS ?celexNumber)
   OPTIONAL { ?work cdm:work_has_resource-type ?type . }
   OPTIONAL { ?work cdm:work_date_document ?date . }
   OPTIONAL {
@@ -84,15 +86,13 @@ SELECT ?work ?celexNumber ?type ?date ?title ?inForce ?author WHERE {
     // language input, so labels are English.
     const legalBasisSparql = `
 SELECT ?legalBasis (SAMPLE(?celexValue) AS ?celex) WHERE {
-  ?work cdm:resource_legal_id_celex ?c .
-  FILTER(STR(?c) = "${safeCelexNumber}")
+  ?work cdm:resource_legal_id_celex ${typedCelex} .
   ?work cdm:resource_legal_based_on_resource_legal ?legalBasis .
   OPTIONAL { ?legalBasis cdm:resource_legal_id_celex ?celexValue . }
 } GROUP BY ?legalBasis LIMIT ${DIMENSION_LIMIT}`;
     const eurovocSparql = `
 SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
-  ?work cdm:resource_legal_id_celex ?c .
-  FILTER(STR(?c) = "${safeCelexNumber}")
+  ?work cdm:resource_legal_id_celex ${typedCelex} .
   ?work cdm:work_is_about_concept_eurovoc ?eurovoc .
   OPTIONAL {
     ?eurovoc skos:prefLabel ?labelValue .

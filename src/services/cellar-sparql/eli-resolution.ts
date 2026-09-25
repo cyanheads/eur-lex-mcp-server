@@ -6,8 +6,9 @@
  * both tools resolve ELIs identically rather than duplicating the mechanism.
  *
  * Also home to the SPARQL-safety primitives every CELLAR query builder shares —
- * `escapeSparqlLiteral` for values interpolated into a `"…"` literal, and
- * `isSafeSparqlIri` for URIs interpolated into a `<…>` IRI — and to the shared
+ * `escapeSparqlLiteral` for values interpolated into a `"…"` literal, `celexLiteral`
+ * for a caller's CELEX matched as a typed exact triple, and `isSafeSparqlIri` for
+ * URIs interpolated into a `<…>` IRI — and to the shared
  * input-validity primitives that reject a value before a CELLAR round-trip is
  * spent on it: `CELEX_PATTERN` and `isValidCalendarDate`.
  * @module services/cellar-sparql/eli-resolution
@@ -59,6 +60,19 @@ export function escapeSparqlLiteral(value: string): string {
     .replace(/\n/g, '\\n')
     .replace(/\r/g, '\\r')
     .replace(/\t/g, '\\t');
+}
+
+/**
+ * A CELEX as the typed SPARQL literal `cdm:resource_legal_id_celex` stores, ready to
+ * sit in the object position of `?work cdm:resource_legal_id_celex <literal> .`.
+ *
+ * CELLAR types every CELEX literal as `xsd:string` (confirmed across sectors 0–7, C,
+ * and E), so the typed exact triple resolves from the index in a fraction of a
+ * second, while `FILTER(STR(?c) = "…")` scans every CELEX literal and takes seconds.
+ * The datatype is load-bearing: an untyped literal matches no work at all.
+ */
+export function celexLiteral(celex: string): string {
+  return `"${escapeSparqlLiteral(celex)}"^^xsd:string`;
 }
 
 /**
