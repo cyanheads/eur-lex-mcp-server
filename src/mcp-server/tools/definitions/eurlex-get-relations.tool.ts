@@ -5,6 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { echoValue } from '@/mcp-server/tools/echo-value.js';
 import {
   CellarSparqlService,
   getCellarSparqlService,
@@ -136,7 +137,7 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
     empty_relation_types: z
       .array(z.string())
       .describe(
-        'Requested relation types that returned zero relations in THIS page. Page-scoped: a type can appear here because all its edges sit beyond the current offset/limit window, not only because the act genuinely has none of that relation — so absent-from-here does not prove absent-in-CELLAR. An empty first page throws no_relations; an exhausted non-zero page returns all requested types here.',
+        'Requested relation types that returned zero relations in THIS page. Page-scoped: a type can appear here because all its edges sit beyond the current offset/limit window, not only because the act genuinely has none of that relation — so absent-from-here does not prove absent-in-CELLAR. An empty page — a first page with no edges, or an exhausted later page — returns all requested types here.',
       ),
   }),
 
@@ -159,6 +160,12 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
       .describe(
         'The per-direction cap. It bounds each relation type and each direction independently, so it is not an upper bound on shown: a page spanning several types and both directions can return more relations than this number.',
       ),
+    notice: z
+      .string()
+      .optional()
+      .describe(
+        'Guidance for the next call: on an empty first page, how to widen the traversal; on a page with more rows, the offset to continue from.',
+      ),
   },
 
   errors: [
@@ -173,13 +180,6 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
       code: JsonRpcErrorCode.NotFound,
       when: 'CELEX number not found in CELLAR — resolve the identifier with eurlex_lookup_celex first.',
       recovery: 'Use eurlex_lookup_celex to confirm the CELEX number exists, then retry.',
-    },
-    {
-      reason: 'no_relations',
-      code: JsonRpcErrorCode.NotFound,
-      when: 'The first page (offset 0) was empty — the work exists but has no CDM relations of the requested types. A later page that comes back empty returns an empty success instead.',
-      recovery:
-        'Try other relation_types or omit the filter to fetch all available relation types.',
     },
   ],
 
@@ -290,13 +290,19 @@ SELECT ?sourceCelex WHERE {
       hasMore,
     });
 
+    /**
+     * Zero edges is an answer, not a failure (#112): an empty first page returns the
+     * same shape as a page past the end, with every requested type in
+     * empty_relation_types, plus a notice on how to widen the traversal. A work_uri
+     * is used as given and never checked for existence, so on that path the notice
+     * also routes a mistyped URI to a lookup. A page past the end stays silent.
+     */
     if (workRelations.length === 0 && input.offset === 0) {
-      throw ctx.fail(
-        'no_relations',
-        `Work ${celexNumber ?? workUri} has no CDM relations of the requested types.`,
-        {
-          ...ctx.recoveryFor('no_relations'),
-        },
+      const unchecked = celexNumber
+        ? ''
+        : ' The work URI is not checked for existence; confirm it with eurlex_get_document (content_mode "metadata_only").';
+      ctx.enrich.notice(
+        `Work ${echoValue(celexNumber ?? workUri)} has no CDM relations of the requested types. Try other relation_types or omit the filter to fetch all available relation types.${unchecked}`,
       );
     }
 
@@ -309,7 +315,11 @@ SELECT ?sourceCelex WHERE {
     }));
 
     if (hasMore) {
-      ctx.enrich.truncated({ shown: relations.length, cap: perDirectionLimit });
+      ctx.enrich.truncated({
+        shown: relations.length,
+        cap: perDirectionLimit,
+        guidance: `At least one relation type or direction has more related works; call again with offset=${input.offset + perDirectionLimit}.`,
+      });
     }
 
     // #47: make requested-but-empty types explicit. A requested type with zero

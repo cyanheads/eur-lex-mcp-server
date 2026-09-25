@@ -3,8 +3,7 @@
  * @module tests/tools/eurlex-browse-subjects.tool.test
  */
 
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_browse_subjects } from '@/mcp-server/tools/definitions/eurlex-browse-subjects.tool.js';
 import { escapeSparqlLiteral } from '@/services/cellar-sparql/eli-resolution.js';
@@ -41,6 +40,11 @@ function makeConceptBinding(opts: {
   // label, so its absence is how a prefLabel-only hit is represented.
   if (opts.matchedLabel) b.matchedLabel = { type: 'literal', value: opts.matchedLabel };
   return b;
+}
+
+/** Every text block of a tool result's content[], joined. */
+function contentText(result: { content: unknown[] }): string {
+  return result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
 }
 
 describe('eurlex_browse_subjects', () => {
@@ -156,17 +160,17 @@ describe('eurlex_browse_subjects', () => {
     expect(() => eurlex_browse_subjects.input.parse({ keyword: 'data', offset: -1 })).toThrow();
   });
 
-  // --- Error contract: no_concepts ---
+  // --- Empty pages ---
 
-  it('throws ctx.fail("no_concepts") when query returns no bindings', async () => {
+  it('returns an empty first page with a broadening notice when query returns no bindings', async () => {
     const ctx = createMockContext({ errors: eurlex_browse_subjects.errors });
     mockQuery.mockResolvedValue([]);
 
     const input = eurlex_browse_subjects.input.parse({ keyword: 'zznonexistentterm' });
-    await expect(eurlex_browse_subjects.handler(input, ctx)).rejects.toMatchObject({
-      code: JsonRpcErrorCode.NotFound,
-      data: { reason: 'no_concepts' },
-    });
+    const result = await eurlex_browse_subjects.handler(input, ctx);
+
+    expect(result).toEqual({ concepts: [], total: 0, offset: 0, has_more: false });
+    expect(getEnrichment(ctx).notice).toContain('"zznonexistentterm"');
   });
 
   it('returns an empty successful page when a non-zero offset is exhausted', async () => {
@@ -189,13 +193,31 @@ describe('eurlex_browse_subjects', () => {
     );
   });
 
+  it('carries no notice on either surface for a page past the end (#112)', async () => {
+    mockQuery.mockResolvedValue([]);
+
+    const result = await runToolContract(eurlex_browse_subjects, {
+      keyword: 'data',
+      offset: 200,
+    });
+
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toEqual({
+      concepts: [],
+      total: 0,
+      offset: 200,
+      has_more: false,
+    });
+    expect(contentText(result)).not.toMatch(/^> /m);
+  });
+
   // --- #62: keyword escaping routes through the shared helper ---
   //
   // The former hand-rolled `keyword.replace(/"/g, '\\"')` was a quote-only pass
   // with no backslash pass. A keyword ending in `\` then escaped the closing
   // quote, the literal never terminated, and Virtuoso's raw SP030 compiler error
   // — carrying the internal query text and PREFIX block — reached the client in
-  // place of this tool's own no_concepts. Asserting only on the thrown error would
+  // place of this tool's own empty result. Asserting only on the returned page would
   // pass against the unescaped keyword too (a mocked query returns its fixture
   // whatever it is handed); the built query text is the discriminating part.
 
@@ -204,10 +226,7 @@ describe('eurlex_browse_subjects', () => {
     mockQuery.mockResolvedValue([]);
 
     const input = eurlex_browse_subjects.input.parse({ keyword: 'data\\' });
-    await expect(eurlex_browse_subjects.handler(input, ctx)).rejects.toMatchObject({
-      code: JsonRpcErrorCode.NotFound,
-      data: { reason: 'no_concepts' },
-    });
+    await expect(eurlex_browse_subjects.handler(input, ctx)).resolves.toMatchObject({ total: 0 });
 
     const sparql = mockQuery.mock.calls[0]?.[0] as string;
     // The literal carries exactly what the shared helper produces.
@@ -222,9 +241,7 @@ describe('eurlex_browse_subjects', () => {
 
     const keyword = 'data\\" x';
     const input = eurlex_browse_subjects.input.parse({ keyword });
-    await expect(eurlex_browse_subjects.handler(input, ctx)).rejects.toMatchObject({
-      data: { reason: 'no_concepts' },
-    });
+    await expect(eurlex_browse_subjects.handler(input, ctx)).resolves.toMatchObject({ total: 0 });
 
     const sparql = mockQuery.mock.calls[0]?.[0] as string;
     // Keyword is lowercased before escaping, so the helper sees the lowercased value.
@@ -484,18 +501,15 @@ describe('eurlex_browse_subjects', () => {
       expect(result.concepts[0]).not.toHaveProperty('matched_label');
     });
 
-    it('still throws no_concepts when neither label path matches', async () => {
+    it('returns an empty page with a broadening notice when neither label path matches', async () => {
       const ctx = createMockContext({ errors: eurlex_browse_subjects.errors });
       mockQuery.mockResolvedValue([]);
 
       const input = eurlex_browse_subjects.input.parse({ keyword: 'zzzznotathing' });
-      await expect(eurlex_browse_subjects.handler(input, ctx)).rejects.toMatchObject({
-        code: JsonRpcErrorCode.NotFound,
-        data: {
-          reason: 'no_concepts',
-          recovery: { hint: expect.stringContaining('broader') as unknown as string },
-        },
-      });
+      const result = await eurlex_browse_subjects.handler(input, ctx);
+
+      expect(result.concepts).toEqual([]);
+      expect(getEnrichment(ctx).notice).toContain('broader');
     });
 
     it('leaves the continuation sentinel and OFFSET paging untouched', async () => {
@@ -549,6 +563,82 @@ describe('eurlex_browse_subjects', () => {
         has_more: false,
       });
       expect((withoutAlt[0] as { text: string }).text).not.toContain('**Matched via:**');
+    });
+  });
+
+  // --- #112: an empty first page is an empty page, not an error ---
+
+  describe('empty first page (#112)', () => {
+    it('returns an empty page with a notice on both surfaces', async () => {
+      mockQuery.mockResolvedValue([]);
+
+      const result = await runToolContract(eurlex_browse_subjects, {
+        keyword: 'zzqxunmatchablephrase',
+        language: 'FR',
+      });
+
+      expect(result.isError).toBeFalsy();
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured).toMatchObject({ concepts: [], total: 0, offset: 0, has_more: false });
+      expect(structured).not.toHaveProperty('next_offset');
+      expect(structured).not.toHaveProperty('truncated');
+      const notice = structured.notice as string;
+      expect(notice).toContain('"zzqxunmatchablephrase"');
+      expect(notice).toContain('"fr"');
+      expect(notice).toContain(
+        'Try a broader or simpler term, or retry with language "en" for wider coverage.',
+      );
+
+      const text = contentText(result);
+      expect(text).toContain(`> ${notice}`);
+      expect(text).toContain('**Has more:** false');
+      expect(text).not.toContain('**Next offset:**');
+    });
+
+    it('names the next offset in the notice of a page with more rows', async () => {
+      mockQuery.mockResolvedValue([
+        makeConceptBinding({ uri: 'http://eurovoc.europa.eu/1', label: 'data a' }),
+        makeConceptBinding({ uri: 'http://eurovoc.europa.eu/2', label: 'data b' }),
+        makeConceptBinding({ uri: 'http://eurovoc.europa.eu/3', label: 'data c' }),
+      ]);
+
+      const result = await runToolContract(eurlex_browse_subjects, { keyword: 'data', limit: 2 });
+
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured).toMatchObject({ has_more: true, next_offset: 2, truncated: true });
+      expect(structured.notice).toContain('offset=2');
+      expect(contentText(result)).toContain(`> ${structured.notice as string}`);
+    });
+
+    it.each(['en', 'EN'])(
+      'suggests no English retry for a search already in English (language %j)',
+      async (language) => {
+        mockQuery.mockResolvedValue([]);
+
+        const result = await runToolContract(eurlex_browse_subjects, {
+          keyword: 'zzqxunmatchablephrase',
+          language,
+        });
+
+        const notice = (result.structuredContent as { notice?: string }).notice ?? '';
+        expect(notice).toContain('in language "en"');
+        expect(notice).toContain('Try a broader or simpler term.');
+        expect(notice).not.toContain('retry with language');
+        expect(contentText(result)).toContain(`> ${notice}`);
+      },
+    );
+
+    it('bounds the keyword echoed in the notice', async () => {
+      mockQuery.mockResolvedValue([]);
+      const keyword = `zz${'q'.repeat(4998)}`;
+
+      const result = await runToolContract(eurlex_browse_subjects, { keyword });
+
+      const notice = (result.structuredContent as { notice?: string }).notice ?? '';
+      expect(notice).toContain(`"${keyword.slice(0, 100)}…"`);
+      expect(notice).not.toContain(keyword.slice(0, 101));
+      expect(notice.length).toBeLessThan(300);
+      expect(contentText(result)).toContain(`> ${notice}`);
     });
   });
 });

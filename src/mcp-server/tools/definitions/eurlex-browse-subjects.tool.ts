@@ -4,7 +4,7 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { echoValue } from '@/mcp-server/tools/echo-value.js';
 import {
   CellarSparqlService,
   getCellarSparqlService,
@@ -98,16 +98,13 @@ export const eurlex_browse_subjects = tool('eurlex_browse_subjects', {
       .describe('True when an additional CELLAR row proves more concepts exist beyond this page.'),
     shown: z.number().optional().describe('Number of concepts returned in this response.'),
     cap: z.number().optional().describe('The limit that was applied to this response.'),
+    notice: z
+      .string()
+      .optional()
+      .describe(
+        'Guidance for the next call: on an empty first page, the keyword and language that matched nothing and how to broaden them; on a page with more rows, the offset to continue from.',
+      ),
   },
-
-  errors: [
-    {
-      reason: 'no_concepts',
-      code: JsonRpcErrorCode.NotFound,
-      when: 'The first page (offset 0) was empty — no EuroVoc concepts matched the keyword in the requested language. A later page that comes back empty returns an empty success instead.',
-      recovery: 'Try a broader or simpler term, or retry with language "en" for wider coverage.',
-    },
-  ],
 
   async handler(input, ctx) {
     const svc = getCellarSparqlService();
@@ -174,13 +171,19 @@ SELECT ?concept ?label
       resultCount: bindings.length,
     });
 
+    /**
+     * Zero hits is an answer, not a failure (#112): an empty first page returns the
+     * same shape as a page past the end, plus a notice naming the keyword and how to
+     * broaden it, and a retry in English only when the search was in another language.
+     * A page past the end stays silent — the caller already has rows.
+     */
     if (bindings.length === 0 && input.offset === 0) {
-      throw ctx.fail(
-        'no_concepts',
-        `No EuroVoc concepts found for "${input.keyword}" in language "${lang}"`,
-        {
-          ...ctx.recoveryFor('no_concepts'),
-        },
+      const broaden =
+        lang === 'en'
+          ? 'Try a broader or simpler term.'
+          : 'Try a broader or simpler term, or retry with language "en" for wider coverage.';
+      ctx.enrich.notice(
+        `No EuroVoc concepts matched "${echoValue(input.keyword)}" in language "${lang}". ${broaden}`,
       );
     }
 
@@ -206,7 +209,11 @@ SELECT ?concept ?label
     });
 
     if (hasMore) {
-      ctx.enrich.truncated({ shown: concepts.length, cap: pageLimit });
+      ctx.enrich.truncated({
+        shown: concepts.length,
+        cap: pageLimit,
+        guidance: `More concepts match beyond this page; call again with offset=${input.offset + pageLimit}.`,
+      });
     }
 
     return {

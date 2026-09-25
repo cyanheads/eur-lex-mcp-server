@@ -130,6 +130,11 @@ function routeQuery(handlers: {
   };
 }
 
+/** Every text block of a tool result's content[], joined. */
+function contentText(result: { content: unknown[] }): string {
+  return result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+}
+
 describe('eurlex_get_relations', () => {
   beforeEach(() => {
     mockQuery.mockReset();
@@ -734,29 +739,30 @@ describe('eurlex_get_relations', () => {
     expect(getEnrichment(ctx)).toMatchObject({ truncated: true, shown: 2, cap: 2 });
   });
 
-  it('uses the existing no_relations error contract for an empty national transposition first page (#56)', async () => {
+  it('returns an empty national transposition first page with a widening notice (#56, #112)', async () => {
     const ctx = createMockContext({ errors: eurlex_get_relations.errors });
     mockQuery.mockImplementation(
       routeQuery({ resolve: [makeResolveBinding(DIRECTIVE_680_WORK_URI)] }),
     );
 
-    await expect(
-      eurlex_get_relations.handler(
-        eurlex_get_relations.input.parse({
-          celex_number: '32016L0680',
-          relation_types: ['national_transposition'],
-        }),
-        ctx,
-      ),
-    ).rejects.toMatchObject({
-      code: JsonRpcErrorCode.NotFound,
-      data: {
-        reason: 'no_relations',
-        recovery: {
-          hint: 'Try other relation_types or omit the filter to fetch all available relation types.',
-        },
-      },
+    const result = await eurlex_get_relations.handler(
+      eurlex_get_relations.input.parse({
+        celex_number: '32016L0680',
+        relation_types: ['national_transposition'],
+      }),
+      ctx,
+    );
+
+    expect(result).toMatchObject({
+      relations: [],
+      total: 0,
+      offset: 0,
+      has_more: false,
+      empty_relation_types: ['national_transposition'],
     });
+    expect(getEnrichment(ctx).notice).toContain(
+      'Try other relation_types or omit the filter to fetch all available relation types.',
+    );
   });
 
   it('returns an exhausted national transposition page with exact empty-type state (#56)', async () => {
@@ -1669,18 +1675,19 @@ describe('eurlex_get_relations', () => {
     });
   });
 
-  // --- Error contract: no_relations ---
+  // --- Empty pages ---
 
-  it('throws ctx.fail("no_relations") when every relation query returns empty', async () => {
+  it('returns an empty first page listing every type as empty when every relation query returns empty', async () => {
     const ctx = createMockContext({ errors: eurlex_get_relations.errors });
     // resolve succeeds; all per-type queries return [].
     mockQuery.mockImplementation(routeQuery({ resolve: [makeResolveBinding(GDPR_WORK_URI)] }));
 
     const input = eurlex_get_relations.input.parse({ celex_number: '32016R0679' });
-    await expect(eurlex_get_relations.handler(input, ctx)).rejects.toMatchObject({
-      code: JsonRpcErrorCode.NotFound,
-      data: { reason: 'no_relations' },
-    });
+    const result = await eurlex_get_relations.handler(input, ctx);
+
+    expect(result).toMatchObject({ relations: [], total: 0, offset: 0, has_more: false });
+    expect(result.empty_relation_types).toEqual([...RELATION_TYPES]);
+    expect(getEnrichment(ctx).notice).toContain('32016R0679');
   });
 
   it('returns an exhausted non-zero page with source and requested-type state intact', async () => {
@@ -1711,6 +1718,30 @@ describe('eurlex_get_relations', () => {
     expect(text).toContain('32016R0679');
     expect(text).toContain('offset 50');
     expect(text).toContain('**Has more:** false');
+  });
+
+  it('carries no notice on either surface for a page past the end (#112)', async () => {
+    mockQuery.mockImplementation(routeQuery({ resolve: [makeResolveBinding(GDPR_WORK_URI)] }));
+
+    const result = await runToolContract(eurlex_get_relations, {
+      celex_number: '32016R0679',
+      relation_types: ['amended_by', 'legal_basis'],
+      offset: 50,
+      limit: 25,
+    });
+
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toEqual({
+      celex_number: '32016R0679',
+      work_uri: GDPR_WORK_URI,
+      relations: [],
+      total: 0,
+      offset: 50,
+      has_more: false,
+      requested_relation_types: ['amended_by', 'legal_basis'],
+      empty_relation_types: ['amended_by', 'legal_basis'],
+    });
+    expect(contentText(result)).not.toMatch(/^> /m);
   });
 
   // --- Format ---
@@ -2002,11 +2033,14 @@ describe('eurlex_get_relations', () => {
       });
       // Selecting measures with no determinate source act is exactly the
       // arbitrary binding the constraint exists to prevent, so the type is empty
-      // and — being the only requested type — the page throws no_relations.
-      await expect(eurlex_get_relations.handler(input, ctx)).rejects.toMatchObject({
-        code: JsonRpcErrorCode.NotFound,
-        data: { reason: 'no_relations' },
+      // and — being the only requested type — the page comes back empty.
+      const result = await eurlex_get_relations.handler(input, ctx);
+      expect(result).toMatchObject({
+        relations: [],
+        total: 0,
+        empty_relation_types: ['national_transposition'],
       });
+      expect(result).not.toHaveProperty('celex_number');
 
       // No pattern could select this act's measures, so no CELLAR round-trip is
       // spent on the type at all — previously a query filtered by "^$" was sent.
@@ -2389,6 +2423,106 @@ describe('eurlex_get_relations', () => {
         .map((c) => c[0] as string)
         .find((q) => q.includes('cdm:resource_legal_amends_resource_legal')) as string;
       expect(sparql).toContain('OPTIONAL { ?relatedWork cdm:work_date_document ?relatedDate . }');
+    });
+  });
+
+  // --- #112: an empty first page is an empty page, not an error ---
+
+  describe('empty first page (#112)', () => {
+    it('returns an empty page with a notice on both surfaces for a work with no edges of the requested types', async () => {
+      mockQuery.mockImplementation(routeQuery({ resolve: [makeResolveBinding(GDPR_WORK_URI)] }));
+
+      const result = await runToolContract(eurlex_get_relations, {
+        celex_number: '32016R0679',
+        relation_types: ['repeals', 'implicitly_repeals'],
+      });
+
+      expect(result.isError).toBeFalsy();
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured).toMatchObject({
+        celex_number: '32016R0679',
+        work_uri: GDPR_WORK_URI,
+        relations: [],
+        total: 0,
+        offset: 0,
+        has_more: false,
+        requested_relation_types: ['repeals', 'implicitly_repeals'],
+        empty_relation_types: ['repeals', 'implicitly_repeals'],
+      });
+      expect(structured).not.toHaveProperty('next_offset');
+      expect(structured).not.toHaveProperty('truncated');
+      const notice = structured.notice as string;
+      expect(notice).toContain('32016R0679');
+      expect(notice).toContain(
+        'Try other relation_types or omit the filter to fetch all available relation types.',
+      );
+      expect(notice).not.toContain('eurlex_get_document');
+
+      const text = contentText(result);
+      expect(text).toContain(`> ${notice}`);
+      expect(text).toContain('**Has more:** false');
+      expect(text).toContain('**Empty types (this page):** repeals, implicitly_repeals');
+    });
+
+    it('points an unchecked work URI at eurlex_get_document in the notice', async () => {
+      mockQuery.mockImplementation(routeQuery({}));
+
+      const workUri = `${CELLAR}zzqx-no-such-work`;
+      const result = await runToolContract(eurlex_get_relations, {
+        work_uri: workUri,
+        relation_types: ['cites'],
+      });
+
+      expect(result.isError).toBeFalsy();
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured).toMatchObject({
+        work_uri: workUri,
+        relations: [],
+        total: 0,
+        has_more: false,
+        empty_relation_types: ['cites'],
+      });
+      expect(structured.notice).toContain(workUri);
+      expect(structured.notice).toContain('eurlex_get_document');
+      expect(contentText(result)).toContain(`> ${structured.notice as string}`);
+    });
+
+    it('bounds an oversized work URI echoed in the notice', async () => {
+      mockQuery.mockImplementation(routeQuery({}));
+
+      const workUri = `${CELLAR}${'z'.repeat(5000)}`;
+      const result = await runToolContract(eurlex_get_relations, {
+        work_uri: workUri,
+        relation_types: ['cites'],
+      });
+
+      const notice = (result.structuredContent as { notice?: string }).notice ?? '';
+      expect(notice).toContain(`Work ${workUri.slice(0, 100)}… has no CDM relations`);
+      expect(notice).not.toContain(workUri.slice(0, 101));
+      expect(notice.length).toBeLessThan(500);
+      expect(contentText(result)).toContain(`> ${notice}`);
+    });
+
+    it('names the next offset in the notice of a page with more rows', async () => {
+      mockQuery.mockImplementation(
+        routeQuery({
+          resolve: [makeResolveBinding(GDPR_WORK_URI)],
+          amendedBy: [1, 2, 3].map((n) =>
+            makeRelationBinding({ relatedWork: `${CELLAR}amending-${n}`, direction: 'incoming' }),
+          ),
+        }),
+      );
+
+      const result = await runToolContract(eurlex_get_relations, {
+        celex_number: '32016R0679',
+        relation_types: ['amended_by'],
+        limit: 2,
+      });
+
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured).toMatchObject({ has_more: true, next_offset: 2, truncated: true });
+      expect(structured.notice).toContain('offset=2');
+      expect(contentText(result)).toContain(`> ${structured.notice as string}`);
     });
   });
 });
