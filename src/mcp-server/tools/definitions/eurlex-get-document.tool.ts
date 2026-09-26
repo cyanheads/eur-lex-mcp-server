@@ -83,6 +83,28 @@ const META_DIMENSION_LIMIT = 100;
 /** CELLAR's end-of-validity value for an act with no end date. */
 const OPEN_ENDED_VALIDITY = '9999-12-31';
 
+/**
+ * The text channel's closing line for a body that did not resolve, keyed on why
+ * (#108): only an absent representation is a matter of language, and the
+ * English fallback was tried whenever another language was asked for.
+ */
+function unavailableBodyNote(
+  reason: ContentUnavailabilityReason | undefined,
+  format: string,
+  language: string,
+): string {
+  switch (reason) {
+    case 'no_representation':
+      return `*No ${format} body exists for this work in the requested language${language === 'EN' ? '' : ' or in English'}.*`;
+    case 'upstream_failure':
+      return '*The content host failed to return this work’s body; retry shortly.*';
+    case 'multipart_incomplete':
+      return '*This work’s Formex 4 body comes in parts that could not all be read, so none was assembled; format "html" or "markdown" may still serve it.*';
+    default:
+      return '*Document content is not available for this work.*';
+  }
+}
+
 export const eurlex_get_document = tool('eurlex_get_document', {
   title: 'Get EU Document',
   description:
@@ -910,18 +932,21 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
         const total = full.length;
         result.content_chars_total = total;
 
+        // Headings are read in the language served, after any English fallback
+        // (#107). A Markdown body arrives with its own, parsed once against the
+        // HTML it was rendered from so its quoted headings are told apart (#106);
+        // an html or xml body carries its own markup and is parsed here.
+        const headings = () => body.headings ?? parseActStructure(full, format, body.language);
+
         if (input.outline) {
           // Structure-only view: the detected headings and their offsets into the
           // same body the floor pages, no body text. Ignores offset/limit/select.
-          // No parseable structure yields an empty outline, never an error.
-          // Headings are read in the language served, after any English
-          // fallback (#107), and a Markdown body's quoted headings are told
-          // from its source HTML (#106); select below does the same. The
+          // No parseable structure yields an empty outline, never an error. The
           // preamble's recitals collapse into one entry unless asked for one by
           // one (#118); select keeps resolving against every heading.
-          const headings = parseActStructure(full, format, body.language, body.sourceHtml);
-          result.outline = input.include_recitals ? headings : collapseRecitals(headings);
-          result.structure_detected = headings.length > 0;
+          const outline = headings();
+          result.outline = input.include_recitals ? outline : collapseRecitals(outline);
+          result.structure_detected = outline.length > 0;
           result.content_chars_returned = 0;
           result.has_more = false;
         } else if (input.select) {
@@ -937,11 +962,11 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
           // truncated enrichment, and selected_sections carries each section's own
           // source address so every one stays individually reachable through the
           // paging floor (#12).
-          const headings = parseActStructure(full, format, body.language, body.sourceHtml);
-          result.structure_detected = headings.length > 0;
+          const located = headings();
+          result.structure_detected = located.length > 0;
           const selection = extractSections(
             full,
-            headings,
+            located,
             input.select as SectionSelectors,
             body.language,
           );
@@ -1211,7 +1236,13 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
       }
     } else {
       lines.push('');
-      lines.push('*Document content is not available for this work in the requested language.*');
+      lines.push(
+        unavailableBodyNote(
+          result.content_unavailability_reason,
+          result.content_format,
+          result.language,
+        ),
+      );
     }
     return [{ type: 'text', text: lines.join('\n') }];
   },

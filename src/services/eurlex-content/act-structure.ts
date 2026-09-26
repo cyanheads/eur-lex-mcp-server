@@ -10,8 +10,10 @@
  *    but {@link ./html-to-markdown} renders through the default `NodeHtmlMarkdown`
  *    translator, which discards the class — only the visible text ("Article 1")
  *    survives. So detection keys off the visible-text patterns (`Article N`,
- *    `CHAPTER <roman>`, `ANNEX …`, recital `(N)`) that appear in BOTH strings, so
- *    the emitted offsets stay valid against whichever string is being paged.
+ *    `CHAPTER <roman>`, `ANNEX …`, recital `(N)` or `N)`) that appear in BOTH strings, so
+ *    the emitted offsets stay valid against whichever string is being paged. In
+ *    HTML a block tag also ends a line, since a legacy `text/html` body writes its
+ *    whole text on one line (#126).
  *  - **xml (Formex 4)** — element matching (`<TI.ART>` numbered by its
  *    `<ARTICLE IDENTIFIER>`, `<TITLE><TI><P>CHAPTER …` / `Section …`, the keyword
  *    optionally wrapped in `<HT>` formatting, and `<NO.P>(N)</NO.P>`), a separate
@@ -158,7 +160,9 @@ export function parseActStructure(
 ): ActHeading[] {
   const vocabulary = vocabularyFor(language);
   if (format === 'xml') return parseFormexStructure(content, vocabulary);
-  return parseTextStructure(content, vocabulary, format === 'markdown' ? sourceHtml : undefined);
+  return format === 'markdown'
+    ? parseTextStructure(content, vocabulary, false, sourceHtml)
+    : parseTextStructure(content, vocabulary, true, undefined);
 }
 
 /**
@@ -335,16 +339,47 @@ function keywordSource(keyword: string): string {
 /**
  * A heading standing ALONE on its line — the OJ layout puts the descriptive title
  * on the following line, and requiring the heading alone rejects prose
- * cross-references ("Chapter V on the transfer of personal data…"). `number` is
- * the number's pattern source, with one capture group.
+ * cross-references ("Chapter V on the transfer of personal data…"); a chapter or
+ * section may also carry a title in capitals ({@link titledPattern}). A keyword
+ * after its number may carry a case ending, which the languages writing the number
+ * first attach to it ("34 artiklan", #131). `number` is the number's pattern
+ * source, with one capture group.
  */
-function linePattern(form: string, number: string, flags: string): RegExp {
+function linePattern(form: string, number: string): RegExp {
   const { keyword, numberFirst } = splitForm(form);
   const word = keywordSource(keyword);
   return new RegExp(
-    numberFirst ? `^${number}\\s+${word}\\s*$` : `^${word}\\s+${number}\\s*$`,
-    flags,
+    numberFirst ? `^${number}\\s+${word}\\p{Ll}*\\s*$` : `^${word}\\s+${number}\\s*$`,
+    'u',
   );
+}
+
+/**
+ * CHAPTER and SECTION also accept a title after the heading on the same line,
+ * captured in group 2, as legacy `text/html` acts write it ("CHAPTER I GENERAL
+ * PROVISIONS", "I JAKSO TIETOJEN LAATUA KOSKEVAT PERIAATTEET", #130). The pattern
+ * is case-insensitive for the keyword, and under that flag `\p{Lu}` and `\p{Ll}`
+ * match either case, so whether the title is in capitals is decided apart, by
+ * {@link isCapitalized}.
+ */
+function titledPattern(form: string, number: string): RegExp {
+  const { keyword, numberFirst } = splitForm(form);
+  const word = keywordSource(keyword);
+  const title = '(?:\\s+(.*?))?';
+  return new RegExp(
+    numberFirst ? `^${number}\\s+${word}${title}\\s*$` : `^${word}\\s+${number}${title}\\s*$`,
+    'iu',
+  );
+}
+
+/**
+ * True when text has a capital letter and no lower-case one, in any script — Greek
+ * and Cyrillic have case like Latin. German `ß` has no traditional capital, so an
+ * all-caps title may keep it. A prose cross-reference ("Chapter V on the transfer
+ * of…") always runs into lower case, so an inline heading title must pass this.
+ */
+function isCapitalized(text: string): boolean {
+  return /\p{Lu}/u.test(text) && !/\p{Ll}/u.test(text.replaceAll('ß', ''));
 }
 
 /**
@@ -406,9 +441,9 @@ function vocabularyFor(language: EurLexLanguage): Vocabulary {
     formexHeading: formexHeadingPattern(forms),
     selectorWord: new RegExp(`^(?:${words})$`, 'iu'),
     lines: {
-      article: linePattern(forms.article, `(\\d+[a-z]?${one})(?:\\\\?\\.(?:\\s*[oº])?)?`, 'u'),
-      chapter: linePattern(forms.chapter, numeral, 'iu'),
-      section: linePattern(forms.section, numeral, 'iu'),
+      article: linePattern(forms.article, `(\\d+[a-z]?${one})(?:\\\\?\\.(?:\\s*[oº])?)?`),
+      chapter: titledPattern(forms.chapter, numeral),
+      section: titledPattern(forms.section, numeral),
       annex: annexPattern(forms.annex),
     },
   };
@@ -432,13 +467,40 @@ interface RawLine {
   visible: string;
 }
 
-/** Split into lines, preserving each line's character offset in the source string. */
-function splitLines(content: string): RawLine[] {
+/**
+ * A block-level HTML tag, open or close: paragraph, division, line break, heading,
+ * list item, and table, row, cell, and table-section tags. `[^<>]` keeps each match
+ * attempt inside one tag, so a run of unclosed openers costs one pass.
+ */
+const BLOCK_TAG_RE =
+  /<\/?(?:p|div|br|h[1-6]|li|table|thead|tbody|tfoot|tr|td|th)(?=[\s/>])[^<>]*>/gi;
+
+/**
+ * Split into lines, preserving each line's character offset in the source string.
+ * In an HTML body a block tag also ends a line (#126): a legacy `text/html` act
+ * writes its whole text as one line of `<p>…</p>` paragraphs, so no heading would
+ * otherwise stand alone on its line. A tag preceded only by whitespace on its line
+ * does not split it, so a CONVEX line — one indented tag per line — keeps its
+ * offset. Each segment keeps its offset in the string as served, which is never
+ * rewritten (#12, #48).
+ */
+function splitLines(content: string, html: boolean): RawLine[] {
   const out: RawLine[] = [];
-  let offset = 0;
-  for (const raw of content.split('\n')) {
+  const push = (raw: string, offset: number) =>
     out.push({ raw, visible: visibleText(raw), offset });
-    offset += raw.length + 1; // + 1 for the consumed '\n'
+  let offset = 0;
+  for (const line of content.split('\n')) {
+    let start = 0;
+    if (html) {
+      const lead = line.search(/\S/);
+      for (const tag of line.matchAll(BLOCK_TAG_RE)) {
+        if (tag.index <= lead) continue;
+        push(line.slice(start, tag.index), offset + start);
+        start = tag.index;
+      }
+    }
+    push(line.slice(start), offset + start);
+    offset += line.length + 1; // + 1 for the consumed '\n'
   }
   return out;
 }
@@ -467,13 +529,15 @@ function visibleText(line: string): string {
  * Named references worth resolving in OJ heading text. A Map, not an object
  * literal: the reference name comes from the document, and an object lookup
  * walks the prototype chain, so `&constructor;` would resolve to `Object` and
- * stringify into the heading. A Map resolves these four names and nothing else.
+ * stringify into the heading. A Map resolves these five names and nothing else;
+ * legacy `text/html` bodies write straight quotes as `&quot;` (#126).
  */
 const NAMED_ENTITIES = new Map<string, string>([
   ['amp', '&'],
   ['gt', '>'],
   ['lt', '<'],
   ['nbsp', ' '],
+  ['quot', '"'],
 ]);
 
 /** Highest Unicode code point `String.fromCodePoint` accepts. */
@@ -496,8 +560,11 @@ function decodeEntities(text: string): string {
   });
 }
 
-/** A preamble recital marker, `(N)`, the same in every language. */
-const RECITAL_RE = /^\((\d+)\)(?:\s|$)/;
+/**
+ * A preamble recital marker, `(N)` in every language, or `N)` as legacy Finnish
+ * and Swedish bodies write it (#131).
+ */
+const RECITAL_RE = /^\(?(\d+)\)(?:\s|$)/;
 
 /** Classify a line's visible text as a structural (non-recital) heading, or null. */
 function classifyStructural(
@@ -509,10 +576,13 @@ function classifyStructural(
     const number = article[1] ?? '';
     return { kind: 'article', number: number === articleOne ? '1' : neutralNumber(number) };
   }
-  const chapter = lines.chapter.exec(v);
-  if (chapter) return { kind: 'chapter', number: neutralNumber(chapter[1] ?? '') };
-  const section = lines.section.exec(v);
-  if (section) return { kind: 'section', number: neutralNumber(section[1] ?? '') };
+  for (const kind of ['chapter', 'section'] as const) {
+    const heading = lines[kind].exec(v);
+    const title = heading?.[2];
+    if (heading && (title === undefined || isCapitalized(title))) {
+      return { kind, number: neutralNumber(heading[1] ?? ''), ...(title ? { title } : {}) };
+    }
+  }
   const annex = lines.annex.exec(v);
   if (annex) {
     const title = annex[2]?.trim();
@@ -568,7 +638,7 @@ function headingLines(content: string, lines: readonly RawLine[], vocabulary: Vo
  * before quoted text was recognized. Both sequences are read once, forward only.
  */
 function markdownQuoted(found: readonly HeadingLine[], html: string, vocabulary: Vocabulary) {
-  const source = headingLines(html, splitLines(html), vocabulary);
+  const source = headingLines(html, splitLines(html, true), vocabulary);
   const keepAll = () => found.map(() => false);
   const quoted: boolean[] = [];
   let next = 0;
@@ -591,9 +661,10 @@ function markdownQuoted(found: readonly HeadingLine[], html: string, vocabulary:
 function parseTextStructure(
   content: string,
   vocabulary: Vocabulary,
+  html: boolean,
   sourceHtml: string | undefined,
 ): ActHeading[] {
-  const lines = splitLines(content);
+  const lines = splitLines(content, html);
   const found = headingLines(content, lines, vocabulary);
   const quoted =
     sourceHtml === undefined
@@ -621,8 +692,8 @@ function parseTextStructure(
     }
   }
 
-  // Recitals: parenthesized `(N)` markers in the preamble, before the enacting
-  // terms begin. After the first article/chapter/section, `(N)` markers are
+  // Recitals: `(N)` or `N)` markers in the preamble, before the enacting
+  // terms begin. After the first article/chapter/section, such markers are
   // numbered sub-points, not recitals — so gate on the first enacting offset.
   const firstEnacting = Math.min(
     ...structural

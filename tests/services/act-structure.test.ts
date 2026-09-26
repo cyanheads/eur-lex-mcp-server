@@ -16,7 +16,10 @@ import {
   outermostSections,
   parseActStructure,
 } from '@/services/eurlex-content/act-structure.js';
-import { EURLEX_LANGUAGES } from '@/services/eurlex-content/eurlex-content-service.js';
+import {
+  EURLEX_LANGUAGES,
+  type EurLexLanguage,
+} from '@/services/eurlex-content/eurlex-content-service.js';
 import { htmlToMarkdown } from '@/services/eurlex-content/html-to-markdown.js';
 import { AI_ACT_HEADINGS, actHtml } from '../fixtures/eurlex-act-headings.js';
 import {
@@ -25,6 +28,11 @@ import {
   CRR2_EXCERPT_HTML,
 } from '../fixtures/eurlex-amending-act.js';
 import { FORMEX_DOC_2 } from '../fixtures/eurlex-formex-multipart.js';
+import {
+  LEGACY_ACT_HTML,
+  LEGACY_FINNISH_ACT_HTML,
+  LEGACY_TWO_CHAPTER_ACT_HTML,
+} from '../fixtures/eurlex-legacy-act.js';
 
 /** A structured act: two preamble recitals, two chapters, three articles, one annex. */
 const STRUCTURED_HTML = [
@@ -1494,5 +1502,418 @@ describe('quoted amending text is not the act’s own structure (#106)', () => {
     ]) {
       expect(labels(headings)).toEqual(OWN);
     }
+  });
+});
+
+describe('html bodies written on one line (#126)', () => {
+  const labels = (headings: readonly ActHeading[]) => headings.map((h) => h.label);
+  const legacyMd = htmlToMarkdown(LEGACY_ACT_HTML);
+  const LEGACY_LABELS = [
+    'Recital 1',
+    'Recital 2',
+    'CHAPTER I',
+    'Article 1',
+    'Article 2',
+    'Section I',
+    'Article 6',
+    'ANNEX',
+  ];
+
+  /** CONVEX layout: one tag per line, indented, as the OJ XHTML writes it. */
+  const CONVEX_HTML = [
+    '<html><body>',
+    '   <table width="100%" border="0">',
+    '      <tbody>',
+    '         <tr>',
+    '            <td valign="top">',
+    '               <p class="oj-normal">(1)</p>',
+    '            </td>',
+    '            <td valign="top">',
+    '               <p class="oj-normal">The protection of natural persons is a fundamental right.</p>',
+    '            </td>',
+    '         </tr>',
+    '      </tbody>',
+    '   </table>',
+    '   <div class="eli-subdivision" id="cpt_I">',
+    '      <p class="oj-ti-section-1">CHAPTER I</p>',
+    '      <div class="eli-title"><p class="oj-ti-section-2">General provisions</p></div>',
+    '      <div class="eli-subdivision" id="art_1">',
+    '         <p id="d1e1384-1-1" class="oj-ti-art">Article 1</p>',
+    '         <div class="eli-title">',
+    '            <p class="oj-sti-art">Subject-matter and objectives</p>',
+    '         </div>',
+    '         <p class="oj-normal">This Regulation lays down rules.</p>',
+    '      </div>',
+    '   </div>',
+    '</body></html>',
+  ].join('\n');
+
+  it('keeps CONVEX offsets at the start of each heading line', () => {
+    const headings = parseActStructure(CONVEX_HTML, 'html', 'EN');
+    expect(headings.map(({ label, offset, title }) => ({ label, offset, title }))).toEqual([
+      {
+        label: 'Recital 1',
+        offset: CONVEX_HTML.indexOf('               <p class="oj-normal">(1)'),
+      },
+      {
+        label: 'CHAPTER I',
+        offset: CONVEX_HTML.indexOf('      <p class="oj-ti-section-1">'),
+        title: 'General provisions',
+      },
+      {
+        label: 'Article 1',
+        offset: CONVEX_HTML.indexOf('         <p id="d1e1384-1-1"'),
+        title: 'Subject-matter and objectives',
+      },
+    ]);
+  });
+
+  it('keeps the Markdown outline of a legacy body', () => {
+    const headings = parseActStructure(legacyMd, 'markdown', 'EN', LEGACY_ACT_HTML);
+    expect(labels(headings)).toEqual(LEGACY_LABELS);
+    expect(headings.map((h) => h.title)).toEqual([
+      undefined,
+      undefined,
+      'GENERAL PROVISIONS',
+      'Object of the Directive',
+      'Definitions',
+      'PRINCIPLES RELATING TO DATA QUALITY',
+      '"Mere conduit"',
+      'For the purposes of Article 2 (a): the expression "specialist" indicates a qualification.',
+    ]);
+  });
+
+  it('outlines a legacy body in html as its Markdown rendering does', () => {
+    const html = parseActStructure(LEGACY_ACT_HTML, 'html', 'EN');
+    const md = parseActStructure(legacyMd, 'markdown', 'EN', LEGACY_ACT_HTML);
+    expect(labels(html)).toEqual(LEGACY_LABELS);
+    expect(html.map((h) => h.title)).toEqual(md.map((h) => h.title));
+  });
+
+  it('addresses each html heading at its own tag in the served string', () => {
+    const headings = parseActStructure(LEGACY_ACT_HTML, 'html', 'EN');
+    for (const h of headings) {
+      expect(LEGACY_ACT_HTML.slice(h.offset)).toMatch(
+        /^<p>\s*(?:\(\d+\)|CHAPTER|Article|SECTION|ANNEX)/,
+      );
+    }
+    expect(LEGACY_ACT_HTML.slice(headings[3]!.offset)).toMatch(/^<p>Article 1 <\/p>/);
+  });
+
+  it('selects an article of a legacy body in html, from its heading to the next', () => {
+    const headings = parseActStructure(LEGACY_ACT_HTML, 'html', 'EN');
+    const result = extractSections(LEGACY_ACT_HTML, headings, { articles: '2' }, 'EN');
+    expect(result).toMatchObject({ matched: ['Article 2'], missed: [] });
+    expect(result.text.startsWith('<p>Article 2 </p><p>Definitions</p>')).toBe(true);
+    expect(result.text.endsWith('natural person;</p>')).toBe(true);
+    expect(result.sections).toEqual([
+      {
+        label: 'Article 2',
+        offset: LEGACY_ACT_HTML.indexOf('<p>Article 2 </p>'),
+        chars:
+          LEGACY_ACT_HTML.indexOf('<p> SECTION I</p>') -
+          LEGACY_ACT_HTML.indexOf('<p>Article 2 </p>'),
+      },
+    ]);
+  });
+
+  it('reports a miss, not an error, for an article a legacy body lacks', () => {
+    const headings = parseActStructure(LEGACY_ACT_HTML, 'html', 'EN');
+    expect(extractSections(LEGACY_ACT_HTML, headings, { articles: '99' }, 'EN')).toMatchObject({
+      matched: [],
+      missed: ['Article 99'],
+      text: '',
+    });
+  });
+
+  it('decodes &quot; in heading titles', () => {
+    const html = parseActStructure(LEGACY_ACT_HTML, 'html', 'EN');
+    expect(html.find((h) => h.label === 'Article 6')?.title).toBe('"Mere conduit"');
+  });
+
+  it('still finds nothing in a one-line body with no headings', () => {
+    expect(
+      parseActStructure('<p>Judgment</p><p>(1) The Court</p><br><div>text</div>', 'html', 'EN'),
+    ).toEqual([]);
+    expect(parseActStructure('', 'html', 'EN')).toEqual([]);
+  });
+
+  it('aligns Markdown headings with a one-line source body, skipping its quoted ones (#106)', () => {
+    const oneLine = AMENDING_HTML.replace(/\n/g, '');
+    expect(labels(parseActStructure(oneLine, 'html', 'EN'))).toEqual(
+      labels(parseActStructure(AMENDING_HTML, 'html', 'EN')),
+    );
+    const md = htmlToMarkdown(oneLine);
+    expect(labels(parseActStructure(md, 'markdown', 'EN', oneLine))).toEqual([
+      'Recital 1',
+      'Recital 2',
+      'Article 1',
+      'Article 2',
+      'Article 3',
+      'ANNEX',
+    ]);
+  });
+
+  const fill = (unit: string, n: number) => unit.repeat(Math.ceil(n / unit.length)).slice(0, n);
+
+  it.each([
+    ['block tags on one line', (n: number) => fill('<p>x</p>', n)],
+    ['unclosed block tags on one line', (n: number) => fill('<p class="a" ', n)],
+    [
+      'a whitespace run before block tags',
+      (n: number) => `${' '.repeat(n / 2)}${fill('<br>', n / 2)}`,
+    ],
+    ['heading paragraphs on one line', (n: number) => fill('<p>Article 1 </p><p>Title</p>', n)],
+  ])('splits a one-line html body in linear time: %s', (_label, build) => {
+    // Best of seven at 5k, 20k, and 80k characters: linear grows ~16×, quadratic
+    // ~256×, so the 80k/5k ratio stays under 64 (5k floored at 0.1 ms), and the 80k
+    // parse stays under an absolute bound.
+    const time = (n: number) => {
+      const text = build(n);
+      let best = Number.POSITIVE_INFINITY;
+      for (let round = 0; round < 7; round++) {
+        const start = performance.now();
+        parseActStructure(text, 'html', 'EN');
+        best = Math.min(best, performance.now() - start);
+      }
+      return best;
+    };
+    const t5k = time(5_000);
+    time(20_000);
+    const t80k = time(80_000);
+    expect(t80k / Math.max(t5k, 0.1)).toBeLessThan(64);
+    expect(t80k).toBeLessThan(40);
+  });
+});
+
+describe('chapter and section headings with an inline title in capitals (#130)', () => {
+  const html = LEGACY_TWO_CHAPTER_ACT_HTML;
+  const md = htmlToMarkdown(html);
+  const CHAPTER_II =
+    '<p>CHAPTER II GENERAL RULES ON THE LAWFULNESS OF THE PROCESSING OF PERSONAL DATA </p>';
+  const chapters = (headings: readonly ActHeading[]) =>
+    headings.filter((h) => h.kind === 'chapter').map(({ label, title }) => [label, title]);
+
+  it.each([
+    ['html', html, undefined],
+    ['markdown', md, html],
+  ] as const)('%s: outlines each chapter with its inline title', (format, content, sourceHtml) => {
+    const headings = parseActStructure(content, format, 'EN', sourceHtml);
+
+    expect(headings.map((h) => h.label)).toEqual([
+      'Recital 1',
+      'Recital 2',
+      'CHAPTER I',
+      'Article 1',
+      'Article 2',
+      'Section I',
+      'Article 6',
+      'CHAPTER II',
+      'Article 7',
+      'ANNEX',
+    ]);
+    expect(chapters(headings)).toEqual([
+      ['CHAPTER I', 'GENERAL PROVISIONS'],
+      ['CHAPTER II', 'GENERAL RULES ON THE LAWFULNESS OF THE PROCESSING OF PERSONAL DATA'],
+    ]);
+  });
+
+  it('addresses an html chapter at its own paragraph tag', () => {
+    const headings = parseActStructure(html, 'html', 'EN');
+    expect(headings.filter((h) => h.kind === 'chapter').map((h) => h.offset)).toEqual([
+      html.indexOf('<p>CHAPTER I GENERAL PROVISIONS </p>'),
+      html.indexOf(CHAPTER_II),
+    ]);
+  });
+
+  it('selects chapter II from its heading to the annex, in html and Markdown', () => {
+    const inHtml = extractSections(
+      html,
+      parseActStructure(html, 'html', 'EN'),
+      { chapters: 'II' },
+      'EN',
+    );
+    expect(inHtml).toMatchObject({ matched: ['CHAPTER II'], missed: [] });
+    expect(inHtml.sections).toEqual([
+      {
+        label: 'CHAPTER II',
+        offset: html.indexOf(CHAPTER_II),
+        chars: html.indexOf('<p>ANNEX</p>') - html.indexOf(CHAPTER_II),
+      },
+    ]);
+    expect(inHtml.text).toContain('<p>CHAPTER III Judicial remedies</p>');
+
+    const inMd = extractSections(
+      md,
+      parseActStructure(md, 'markdown', 'EN', html),
+      { chapters: '2' },
+      'EN',
+    );
+    expect(inMd).toMatchObject({ matched: ['CHAPTER II'], missed: [] });
+    expect(inMd.text.startsWith('CHAPTER II GENERAL RULES')).toBe(true);
+    expect(inMd.text).not.toContain('ANNEX');
+  });
+
+  it('ends chapter I where chapter II begins, its cross-references inside', () => {
+    const result = extractSections(
+      html,
+      parseActStructure(html, 'html', 'EN'),
+      { chapters: 'I' },
+      'EN',
+    );
+    expect(result.text.startsWith('<p>CHAPTER I GENERAL PROVISIONS </p>')).toBe(true);
+    expect(result.text).toContain('<p>Chapter IV on the transfer');
+    expect(result.sections[0]!.offset + result.sections[0]!.chars).toBe(html.indexOf(CHAPTER_II));
+  });
+
+  it.each<[EurLexLanguage, string, string, string]>([
+    ['EN', 'CHAPTER VII COMMUNITY IMPLEMENTING MEASURES', 'VII', 'COMMUNITY IMPLEMENTING MEASURES'],
+    [
+      'EL',
+      'ΚΕΦΑΛΑΙΟ II ΓΕΝΙΚΕΣ ΠΡΟΫΠΟΘΕΣΕΙΣ ΣΧΕΤΙΚΑ ΜΕ ΤΗ ΘΕΜΙΤΗ ΕΠΕΞΕΡΓΑΣΙΑ',
+      'II',
+      'ΓΕΝΙΚΕΣ ΠΡΟΫΠΟΘΕΣΕΙΣ ΣΧΕΤΙΚΑ ΜΕ ΤΗ ΘΕΜΙΤΗ ΕΠΕΞΕΡΓΑΣΙΑ',
+    ],
+    ['EL', 'ΚΕΦΑΛΑΙΟ ΙΧ ΕΙΔΙΚΕΣ ΔΙΑΤΑΞΕΙΣ', 'IX', 'ΕΙΔΙΚΕΣ ΔΙΑΤΑΞΕΙΣ'],
+    ['BG', 'ГЛАВА III СРЕДСТВА ЗА ПРАВНА ЗАЩИТА', 'III', 'СРЕДСТВА ЗА ПРАВНА ЗАЩИТА'],
+    [
+      'FI',
+      'IV LUKU HENKILÖTIETOJEN SIIRTO KOLMANSIIN MAIHIN',
+      'IV',
+      'HENKILÖTIETOJEN SIIRTO KOLMANSIIN MAIHIN',
+    ],
+    ['HU', 'I. FEJEZET ÁLTALÁNOS RENDELKEZÉSEK', 'I', 'ÁLTALÁNOS RENDELKEZÉSEK'],
+    [
+      'DE',
+      'KAPITEL VII DURCHFÜHRUNGSMAßNAHMEN DER GEMEINSCHAFT',
+      'VII',
+      'DURCHFÜHRUNGSMAßNAHMEN DER GEMEINSCHAFT',
+    ],
+  ])('%s: reads "%s" as a chapter with its title', (language, line, number, title) => {
+    for (const [format, body] of [
+      ['html', `<p>${line} </p><p></p>`],
+      ['markdown', `${line}\n\ntext`],
+    ] as const) {
+      expect(parseActStructure(body, format, language)).toEqual([
+        { kind: 'chapter', number, label: `CHAPTER ${number}`, offset: 0, title },
+      ]);
+    }
+  });
+
+  it.each<[EurLexLanguage, string, string, string]>([
+    [
+      'FI',
+      'I JAKSO TIETOJEN LAATUA KOSKEVAT PERIAATTEET',
+      'I',
+      'TIETOJEN LAATUA KOSKEVAT PERIAATTEET',
+    ],
+    ['EN', 'SECTION IX NOTIFICATION', 'IX', 'NOTIFICATION'],
+    ['EL', 'ΤΜΗΜΑ 2 ΚΡΙΤΗΡΙΑ ΝΟΜΙΜΟΤΗΤΑΣ', '2', 'ΚΡΙΤΗΡΙΑ ΝΟΜΙΜΟΤΗΤΑΣ'],
+  ])('%s: reads "%s" as a section with its title', (language, line, number, title) => {
+    for (const [format, body] of [
+      ['html', `<p>${line} </p><p></p>`],
+      ['markdown', `${line}\n\ntext`],
+    ] as const) {
+      expect(parseActStructure(body, format, language)).toEqual([
+        { kind: 'section', number, label: `Section ${number}`, offset: 0, title },
+      ]);
+    }
+  });
+
+  it.each<[EurLexLanguage, string]>([
+    ['EN', 'Chapter V on the transfer of personal data to third countries'],
+    ['EN', 'CHAPTER III Judicial remedies'],
+    ['EN', 'CHAPTER III 1995'],
+    ['EL', 'Κεφάλαιο IV σχετικά με τη διαβίβαση δεδομένων'],
+    ['EL', 'ΚΕΦΑΛΑΙΟ IV της οδηγίας'],
+    ['BG', 'Глава V относно предаването на лични данни'],
+    ['FI', 'IV luku henkilötietojen siirrosta'],
+    ['HU', 'I. FEJEZETBEN FOGLALTAK'],
+    ['EN', 'Section 2 of Chapter IV shall apply'],
+    ['FI', 'I jakson säännöksiä sovelletaan'],
+  ])('%s: leaves "%s" unmatched', (language, line) => {
+    expect(parseActStructure(`<p>${line}</p>`, 'html', language)).toEqual([]);
+    expect(parseActStructure(line, 'markdown', language)).toEqual([]);
+  });
+});
+
+describe('legacy recitals numbered N) and inflected article keywords (#131)', () => {
+  const html = LEGACY_FINNISH_ACT_HTML;
+  const md = htmlToMarkdown(html);
+  const ARTICLE_34 = '<p>34 artiklan </p>';
+
+  it.each([
+    ['html', html, undefined],
+    ['markdown', md, html],
+  ] as const)(
+    '%s: outlines every recital and article of the Finnish body',
+    (format, content, sourceHtml) => {
+      const headings = parseActStructure(content, format, 'FI', sourceHtml);
+
+      expect(headings.map((h) => h.label)).toEqual([
+        'Recital 1',
+        'Recital 2',
+        'CHAPTER I',
+        'Article 1',
+        'Article 33',
+        'Article 34',
+      ]);
+      expect(headings.at(-1)).toMatchObject({
+        number: '34',
+        title: 'Tämä direktiivi on osoitettu kaikille jäsenvaltioille.',
+      });
+    },
+  );
+
+  it('addresses each html recital and Article 34 at its own paragraph tag', () => {
+    const headings = parseActStructure(html, 'html', 'FI');
+    expect(headings.filter((h) => h.kind === 'recital').map((h) => h.offset)).toEqual([
+      html.indexOf('<p>1) perustamissopimuksessa'),
+      html.indexOf('<p>2) tietojenkäsittelyjärjestelmät'),
+    ]);
+    expect(headings.at(-1)?.offset).toBe(html.indexOf(ARTICLE_34));
+  });
+
+  it('ends Article 33 where Article 34 begins, and selects Article 34 in html and Markdown', () => {
+    const inHtml = extractSections(
+      html,
+      parseActStructure(html, 'html', 'FI'),
+      { articles: '33,34' },
+      'FI',
+    );
+    expect(inHtml).toMatchObject({ matched: ['Article 33', 'Article 34'], missed: [] });
+    expect(inHtml.sections[0]!.offset + inHtml.sections[0]!.chars).toBe(html.indexOf(ARTICLE_34));
+
+    const inMd = extractSections(
+      md,
+      parseActStructure(md, 'markdown', 'FI', html),
+      { articles: '34 artikla' },
+      'FI',
+    );
+    expect(inMd).toMatchObject({ matched: ['Article 34'], missed: [] });
+    expect(inMd.text.startsWith('34 artiklan')).toBe(true);
+  });
+
+  it.each<[EurLexLanguage, string, string]>([
+    ['EN', '(12) Whereas', '12'],
+    ['FI', '12) jäsenvaltiot', '12'],
+    ['SV', '72) Principen om allmänhetens tillgång', '72'],
+  ])('%s: reads "%s" in the preamble as a recital', (language, line, number) => {
+    const article = language === 'EN' ? 'Article 1' : language === 'FI' ? '1 artikla' : 'Artikel 1';
+    const headings = parseActStructure(`<p>${line}</p><p>${article}</p>`, 'html', language);
+    expect(headings.map((h) => [h.kind, h.number])).toEqual([
+      ['recital', number],
+      ['article', '1'],
+    ]);
+  });
+
+  it.each<[EurLexLanguage, string]>([
+    ['FI', '34 artiklan 1 kohta'],
+    ['FI', '34 artiklassa tarkoitetut toimenpiteet'],
+    ['FI', '34 Artiklan'],
+    ['EN', 'Articles 12'],
+  ])('%s: leaves "%s" unmatched', (language, line) => {
+    expect(parseActStructure(`<p>${line}</p>`, 'html', language)).toEqual([]);
+    expect(parseActStructure(line, 'markdown', language)).toEqual([]);
   });
 });

@@ -8,6 +8,7 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_get_document } from '@/mcp-server/tools/definitions/eurlex-get-document.tool.js';
+import { parseActStructure } from '@/services/eurlex-content/act-structure.js';
 import { EURLEX_LANGUAGES } from '@/services/eurlex-content/eurlex-content-service.js';
 import { htmlToMarkdown } from '@/services/eurlex-content/html-to-markdown.js';
 import {
@@ -28,6 +29,8 @@ import {
 } from '../fixtures/cellar-works.js';
 import { AI_ACT_HEADINGS, actHtml } from '../fixtures/eurlex-act-headings.js';
 import { AMENDING_FORMEX, AMENDING_HTML } from '../fixtures/eurlex-amending-act.js';
+import { CONSOLIDATED_ACT_HTML } from '../fixtures/eurlex-consolidated-act.js';
+import { LEGACY_ACT_HTML, LEGACY_TWO_CHAPTER_ACT_HTML } from '../fixtures/eurlex-legacy-act.js';
 
 // --- Service mocks ---
 const mockSparqlQuery = vi.fn();
@@ -412,6 +415,72 @@ describe('eurlex_get_document', () => {
     const text = (eurlex_get_document.format!(result)[0] as { text: string }).text;
     expect(text).toContain('**Content status:** unavailable');
     expect(text).toContain('upstream_failure');
+  });
+
+  describe('an unavailable body, per reason (#108)', () => {
+    const REASONS = ['no_representation', 'upstream_failure', 'multipart_incomplete'] as const;
+
+    async function unavailable(
+      reason: (typeof REASONS)[number],
+      language: 'EN' | 'FR' = 'EN',
+      format: 'html' | 'xml' = 'xml',
+    ) {
+      const ctx = createMockContext({ errors: eurlex_get_document.errors });
+      mockSparqlQuery.mockResolvedValue([makeMetaBinding({ celex: '32024R1689' })]);
+      mockFetchContent.mockResolvedValue({
+        content: '',
+        contentAvailable: false,
+        format,
+        language,
+        unavailabilityReason: reason,
+      });
+      const input = eurlex_get_document.input.parse({
+        celex_number: '32024R1689',
+        language,
+        format,
+      });
+      const result = await eurlex_get_document.handler(input, ctx);
+      const text = (eurlex_get_document.format!(result)[0] as { text: string }).text;
+      return { result, closing: text.split('\n').at(-1) ?? '' };
+    }
+
+    it.each(REASONS)('keeps structuredContent to status and reason for %s', async (reason) => {
+      const { result } = await unavailable(reason);
+      expect(result).toMatchObject({
+        content_available: false,
+        content_status: 'unavailable',
+        content_unavailability_reason: reason,
+        content_format: 'xml',
+        language: 'EN',
+      });
+      expect(result.content).toBeUndefined();
+      expect(result.content_chars_total).toBeUndefined();
+    });
+
+    it('closes each reason with its own line, and only no_representation names the language', async () => {
+      const closings = await Promise.all(
+        REASONS.map(async (reason) => (await unavailable(reason)).closing),
+      );
+
+      expect(new Set(closings).size).toBe(3);
+      for (const closing of closings) expect(closing).toMatch(/^\*.+\*$/);
+      const [none, failed, incomplete] = closings;
+      expect(none).toMatch(/requested language/);
+      expect(none).toContain('xml');
+      expect(failed).not.toMatch(/language/i);
+      expect(failed).toMatch(/retry/i);
+      expect(incomplete).not.toMatch(/language/i);
+      expect(incomplete).toMatch(/Formex/);
+    });
+
+    it('says no_representation covered the English fallback when another language was asked for', async () => {
+      const english = (await unavailable('no_representation', 'EN', 'html')).closing;
+      const french = (await unavailable('no_representation', 'FR', 'html')).closing;
+
+      expect(english).not.toMatch(/English/);
+      expect(french).toMatch(/requested language or in English/);
+      expect(french).toContain('html');
+    });
   });
 
   // --- Title traversal (issue #7) ---
@@ -1683,7 +1752,7 @@ describe('eurlex_get_document', () => {
   // --- #106 quoted amending text, #118 collapsed recitals ---
 
   describe('quoted amending text (#106) and the recital run (#118)', () => {
-    /** Mock one body; a Markdown body carries the HTML it was rendered from. */
+    /** Mock one body; a Markdown body carries its headings, read against the HTML it was rendered from. */
     const serve = (content: string, format = 'html', sourceHtml?: string) => {
       mockSparqlQuery.mockImplementation(async (q: string) =>
         isResolutionQuery(q) ? resolutionRows(q) : [makeMetaBinding({ celex: '32015R2120' })],
@@ -1693,7 +1762,9 @@ describe('eurlex_get_document', () => {
         contentAvailable: true,
         format,
         language: 'EN',
-        ...(sourceHtml ? { sourceHtml } : {}),
+        ...(sourceHtml
+          ? { headings: parseActStructure(content, 'markdown', 'EN', sourceHtml) }
+          : {}),
       });
     };
     /** Run through the full contract, returning both surfaces and the enrichment. */
@@ -1792,7 +1863,9 @@ describe('eurlex_get_document', () => {
         kind: 'recital',
         number: '1–5',
         label: 'Recitals 1–5',
-        offset: body.indexOf('<td valign="top"><p class="oj-normal">(1)</p>'),
+        // The cell and its paragraph share a line, so the paragraph tag starts the
+        // recital's line in html (#126).
+        offset: body.indexOf('<p class="oj-normal">(1)</p>'),
       });
       expect(rest.map((h) => h.label)).toEqual(['CHAPTER I', 'Article 1']);
       expect(text).toContain(`\`offset ${run!.offset}\` — [recital 1–5] Recitals 1–5`);
@@ -1874,6 +1947,211 @@ describe('eurlex_get_document', () => {
       expect(shape.select.description).toContain('capped at 100000 characters');
       expect(shape.select.description).toContain('selected_sections');
       expect(shape.limit.description).toContain('select ignores it');
+    });
+  });
+
+  // --- #127 a Markdown body's headings come from the content service ---
+
+  describe('Markdown headings from the content service (#127)', () => {
+    const CONTENT = 'REGULATION\n\nArticle 1\n\nBody one.\n\nArticle 2\n\nBody two.';
+    const serve = (headings: unknown[] | undefined, format = 'markdown') => {
+      mockSparqlQuery.mockImplementation(async (q: string) =>
+        isResolutionQuery(q) ? resolutionRows(q) : [makeMetaBinding({ celex: '32016R0679' })],
+      );
+      mockFetchContent.mockResolvedValue({
+        content: CONTENT,
+        contentAvailable: true,
+        format,
+        language: 'EN',
+        ...(headings ? { headings } : {}),
+      });
+    };
+    const call = async (args: Record<string, unknown>) => {
+      const response = await runToolContract(eurlex_get_document, {
+        celex_number: '32016R0679',
+        ...args,
+      });
+      expect(response.isError).toBeFalsy();
+      const text = response.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+      return { result: eurlex_get_document.output.parse(response.structuredContent), text };
+    };
+    /** Differs from what the body parses to, so a reparse would show. */
+    const SERVED = [
+      {
+        kind: 'article',
+        label: 'Article 7',
+        number: '7',
+        offset: CONTENT.indexOf('Article 2'),
+        title: 'Served',
+      },
+    ];
+
+    it('outlines the served heading list rather than reparsing the body, on both surfaces', async () => {
+      serve(SERVED);
+      const { result, text } = await call({ format: 'markdown', outline: true });
+
+      expect(result.outline).toEqual(SERVED);
+      expect(result.structure_detected).toBe(true);
+      expect(result.content_chars_total).toBe(CONTENT.length);
+      expect(text).toContain(`\`offset ${SERVED[0]?.offset}\` — [article 7] Article 7: Served`);
+      expect(text).not.toContain('Article 1');
+    });
+
+    it('selects against the served heading list, on both surfaces', async () => {
+      serve(SERVED);
+      const { result, text } = await call({ format: 'markdown', select: { articles: '7,1' } });
+
+      expect(result.selection).toEqual({
+        requested: ['Article 7', 'Article 1'],
+        matched: ['Article 7'],
+        missed: ['Article 1'],
+      });
+      expect(result.content).toBe('Article 2\n\nBody two.');
+      expect(text).toContain('Not found: Article 1');
+    });
+
+    it('reports an empty served heading list as no structure, on both surfaces', async () => {
+      serve([]);
+      const { result, text } = await call({ format: 'markdown', outline: true });
+
+      expect(result.outline).toEqual([]);
+      expect(result.structure_detected).toBe(false);
+      expect(text).toContain('No act structure detected in the');
+    });
+
+    it('parses an html body itself, which arrives without headings', async () => {
+      serve(undefined, 'html');
+      const { result } = await call({ format: 'html', outline: true });
+
+      expect(result.outline?.map((h) => h.label)).toEqual(['Article 1', 'Article 2']);
+    });
+  });
+
+  // --- #120 legacy chrome and consolidated labels, #126 one-line legacy html ---
+
+  describe('legacy text/html and consolidated bodies (#120, #126)', () => {
+    const serve = (content: string, format = 'html', sourceHtml?: string) => {
+      mockSparqlQuery.mockImplementation(async (q: string) =>
+        isResolutionQuery(q) ? resolutionRows(q) : [makeMetaBinding({ celex: '31995L0046' })],
+      );
+      mockFetchContent.mockResolvedValue({
+        content,
+        contentAvailable: true,
+        format,
+        language: 'EN',
+        ...(sourceHtml
+          ? { headings: parseActStructure(content, 'markdown', 'EN', sourceHtml) }
+          : {}),
+      });
+    };
+    const call = async (args: Record<string, unknown>) => {
+      const response = await runToolContract(eurlex_get_document, {
+        celex_number: '31995L0046',
+        ...args,
+      });
+      expect(response.isError).toBeFalsy();
+      const text = response.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+      return { result: eurlex_get_document.output.parse(response.structuredContent), text };
+    };
+    const LEGACY_MD = htmlToMarkdown(LEGACY_ACT_HTML);
+    const LEGACY_OUTLINE = [
+      'Recitals 1–2',
+      'CHAPTER I',
+      'Article 1',
+      'Article 2',
+      'Section I',
+      'Article 6',
+      'ANNEX',
+    ];
+
+    it.each([
+      ['html', LEGACY_ACT_HTML, undefined],
+      ['markdown', LEGACY_MD, LEGACY_ACT_HTML],
+    ] as const)('%s: outlines a legacy body, on both surfaces', async (format, content, html) => {
+      serve(content, format, html);
+      const { result, text } = await call({ format, outline: true });
+
+      expect(result.structure_detected).toBe(true);
+      expect(result.outline?.map((h) => h.label)).toEqual(LEGACY_OUTLINE);
+      for (const h of result.outline ?? []) {
+        expect(text).toContain(`\`offset ${h.offset}\` — [${h.kind} ${h.number}] ${h.label}`);
+      }
+      expect(result.outline?.find((h) => h.label === 'Article 6')?.title).toBe('"Mere conduit"');
+    });
+
+    it('html: selects a legacy article at its own paragraph tag, on both surfaces', async () => {
+      serve(LEGACY_ACT_HTML);
+      const { result, text } = await call({ select: { articles: '2,99' } });
+
+      expect(result.selection).toEqual({
+        requested: ['Article 2', 'Article 99'],
+        matched: ['Article 2'],
+        missed: ['Article 99'],
+      });
+      expect(result.content?.startsWith('<p>Article 2 </p><p>Definitions</p>')).toBe(true);
+      const [section] = result.selected_sections ?? [];
+      expect(section?.offset).toBe(LEGACY_ACT_HTML.indexOf('<p>Article 2 </p>'));
+      expect(text).toContain('<p>Article 2 </p><p>Definitions</p>');
+      expect(text).toContain('Not found: Article 99 — no such section in this act');
+    });
+
+    it.each([
+      ['html', LEGACY_TWO_CHAPTER_ACT_HTML, undefined],
+      ['markdown', htmlToMarkdown(LEGACY_TWO_CHAPTER_ACT_HTML), LEGACY_TWO_CHAPTER_ACT_HTML],
+    ] as const)(
+      '%s: selects a legacy chapter headed with its inline title, on both surfaces (#130)',
+      async (format, content, html) => {
+        serve(content, format, html);
+        const { result, text } = await call({ format, select: { chapters: 'II' } });
+
+        expect(result.selection).toEqual({
+          requested: ['CHAPTER II'],
+          matched: ['CHAPTER II'],
+          missed: [],
+        });
+        expect(result.content).toMatch(/^(?:<p>)?CHAPTER II GENERAL RULES ON THE LAWFULNESS/);
+        expect(result.content).toContain('Article 7');
+        expect(result.content).not.toContain('ANNEX');
+        expect(text).toContain('CHAPTER II GENERAL RULES ON THE LAWFULNESS');
+      },
+    );
+
+    it('html: a one-line body with no headings outlines as empty, on both surfaces', async () => {
+      serve('<html><body><p>Judgment of the Court</p><p>(1) The request.</p></body></html>');
+      const { result, text } = await call({ outline: true });
+
+      expect(result.structure_detected).toBe(false);
+      expect(result.outline).toEqual([]);
+      expect(text).toContain('No act structure detected');
+    });
+
+    it('markdown: a legacy body opens at its CELEX heading, on both surfaces', async () => {
+      serve(LEGACY_MD, 'markdown', LEGACY_ACT_HTML);
+      const { result, text } = await call({
+        format: 'markdown',
+        content_mode: 'paged',
+        limit: 200,
+      });
+
+      expect(result.content?.startsWith('# 31995L0046\n')).toBe(true);
+      expect(text).toContain('# 31995L0046');
+      expect(text).not.toContain('Avis juridique');
+    });
+
+    it('markdown: a consolidated article reads each point on its label’s line', async () => {
+      serve(htmlToMarkdown(CONSOLIDATED_ACT_HTML), 'markdown', CONSOLIDATED_ACT_HTML);
+      const { result, text } = await call({ format: 'markdown', select: { articles: '30' } });
+
+      expect(result.selection?.matched).toEqual(['Article 30']);
+      for (const line of [
+        '(a) the name and contact details of the controller;',
+        '(i) the first purpose;',
+        '— their government.',
+      ]) {
+        expect(result.content).toContain(line);
+        expect(text).toContain(line);
+      }
+      expect(result.content).not.toMatch(/^\(\w+\) *$/m);
     });
   });
 

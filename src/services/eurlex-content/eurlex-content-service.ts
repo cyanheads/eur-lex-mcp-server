@@ -15,8 +15,12 @@
  *    (Multiple Choices) for multi-part OJ acts — a small `<BIB.DOC>`/`<DOC>`
  *    notice header plus the `<ACT>` body split across sibling streams. The XML
  *    path follows those sibling references and concatenates the parts into one
- *    document (see {@link EurLexContentService.assembleFormexParts}); assembly is
- *    best-effort and falls back to unavailable if any part cannot be fetched.
+ *    document (see {@link EurLexContentService.assembleFormexParts}). Acts CELLAR
+ *    holds only as a zipped Formex package answer that variant with 404; the XML
+ *    path then requests `application/zip;mtype=fmx4` and assembles the package's
+ *    `<DOC>` manifest and the parts it names, in manifest order, into the same
+ *    wrapper (#108, see `formex-package.ts`). Both assemblies are best-effort and
+ *    fall back to unavailable (`multipart_incomplete`) if any part cannot be read.
  *  - `Accept-Language`: CELLAR requires an ISO 639-2/T (three-letter) code and
  *    400s on a missing one or on a bibliographic 639-2/B code (`ger`, `fre`);
  *    EUR-Lex two-letter codes are mapped before the request.
@@ -24,6 +28,10 @@
  * Defense in depth: any response carrying an AWS WAF challenge signature is
  * refused (never surfaced as content) and raised as a ServiceUnavailable error,
  * so a challenge stub can never again be reported as `contentAvailable: true`.
+ *
+ * Served bodies are cached in process (#127, #129) — keyed by CELEX, requested
+ * language, and format, one hour each, 16 million characters in all — so paging
+ * a large act fetches and converts it once rather than on every page.
  * @module services/eurlex-content/eurlex-content-service
  */
 
@@ -33,6 +41,8 @@ import { serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { withRetry } from '@cyanheads/mcp-ts-core/utils';
 import type { ServerConfig } from '@/config/server-config.js';
+import { type ActHeading, parseActStructure } from './act-structure.js';
+import { readFormexPackage } from './formex-package.js';
 import { htmlToMarkdown } from './html-to-markdown.js';
 
 /**
@@ -127,17 +137,120 @@ const ACCEPT_BY_FORMAT: Record<WireFormat, readonly string[]> = {
 };
 
 /**
- * Render a fetched wire body into the requested output format. `html`/`xml` pass
- * through verbatim; `markdown` is converted server-side from the HTML body, which
- * rides along as `sourceHtml` for the structure parser (#106).
+ * The zipped Formex package (#108): requested only after the Formex variant
+ * answered 404, since acts CELLAR serves as XML or a 300 index never need it.
  */
-function renderContent(
-  body: string,
+const FORMEX_PACKAGE_ACCEPT = 'application/zip;mtype=fmx4';
+
+/** How long a served body stays cached (#127): CELLAR text per CELEX is effectively immutable. */
+const BODY_CACHE_TTL_MS = 60 * 60 * 1000;
+
+/**
+ * Most characters the body cache retains across all entries (#127). An engine
+ * string holds one or two bytes per character, so this bounds the cached text at
+ * 32 MB; an entry larger than the cap on its own is not stored.
+ */
+const BODY_CACHE_MAX_CHARS = 16_000_000;
+
+/**
+ * An available body as a call serves it: the text in the requested format, the
+ * language it was served in, and for Markdown the heading list read once against
+ * the HTML it was rendered from. The HTML itself is never kept.
+ */
+interface ServedBody {
+  content: string;
+  headings?: ActHeading[];
+  language: EurLexLanguage;
+  languageFallback?: string;
+}
+
+/**
+ * Render a fetched wire body into the requested output format. `html`/`xml` pass
+ * through verbatim; `markdown` is converted server-side from the HTML body, and its
+ * headings are parsed then, while the HTML is at hand to tell an act's own
+ * headings from the ones it quotes (#106).
+ */
+function renderBody(
+  wire: string,
   format: ContentFormat,
-): Pick<FetchContentResult, 'content' | 'sourceHtml'> {
-  return format === 'markdown'
-    ? { content: htmlToMarkdown(body), sourceHtml: body }
-    : { content: body };
+  language: EurLexLanguage,
+  languageFallback: string | undefined,
+): ServedBody {
+  const fallback = languageFallback ? { languageFallback } : {};
+  if (format !== 'markdown') return { content: wire, language, ...fallback };
+  const content = htmlToMarkdown(wire);
+  const headings = parseActStructure(content, 'markdown', language, wire);
+  return { content, headings, language, ...fallback };
+}
+
+/** Characters an entry retains: its text, fallback note, and heading strings. */
+function retainedChars(body: ServedBody): number {
+  let chars = body.content.length + (body.languageFallback?.length ?? 0);
+  for (const h of body.headings ?? []) {
+    chars += h.label.length + h.number.length + (h.title?.length ?? 0);
+  }
+  return chars;
+}
+
+/**
+ * In-process LRU of served bodies (#127, #129), shared by every caller: act text
+ * is public and the same for each tenant, so this is not `ctx.state`. Entries
+ * expire after {@link BODY_CACHE_TTL_MS}, and the least recently used are evicted
+ * to keep retained characters within {@link BODY_CACHE_MAX_CHARS}. Only completed
+ * calls store, and there is no in-flight sharing, so a cold fetch runs under its
+ * own caller's signal alone.
+ */
+class BodyCache {
+  private readonly entries = new Map<
+    string,
+    { body: ServedBody; chars: number; expiresAt: number }
+  >();
+  private retained = 0;
+
+  get(key: string): ServedBody | undefined {
+    const entry = this.entries.get(key);
+    if (!entry) return;
+    this.remove(key);
+    if (entry.expiresAt <= Date.now()) return;
+    this.entries.set(key, entry);
+    this.retained += entry.chars;
+    return entry.body;
+  }
+
+  set(key: string, body: ServedBody): void {
+    this.remove(key);
+    const chars = retainedChars(body);
+    if (chars > BODY_CACHE_MAX_CHARS) return;
+    const now = Date.now();
+    for (const [stale, entry] of this.entries) {
+      if (entry.expiresAt <= now) this.remove(stale);
+    }
+    for (const oldest of this.entries.keys()) {
+      if (this.retained + chars <= BODY_CACHE_MAX_CHARS) break;
+      this.remove(oldest);
+    }
+    this.entries.set(key, { body, chars, expiresAt: now + BODY_CACHE_TTL_MS });
+    this.retained += chars;
+  }
+
+  private remove(key: string): void {
+    const entry = this.entries.get(key);
+    if (!entry) return;
+    this.entries.delete(key);
+    this.retained -= entry.chars;
+  }
+}
+
+/** A call's result from a served body, its heading list copied so no caller shares the cached one. */
+function servedResult(body: ServedBody, format: ContentFormat): FetchContentResult {
+  return {
+    content: body.content,
+    contentAvailable: true,
+    format,
+    language: body.language,
+    ...(body.languageFallback ? { languageFallback: body.languageFallback } : {}),
+    ...(body.headings ? { headings: body.headings.map((h) => ({ ...h })) } : {}),
+  };
 }
 
 /**
@@ -189,36 +302,64 @@ function extractFormexPartUrls(indexBody: string): string[] {
   return urls.sort((a, b) => docSequence(a) - docSequence(b));
 }
 
+/** Where an assembled act's parts came from, as the wrapper's comment states it. */
+const FORMEX_SOURCE_NOTE = {
+  streams:
+    'multi-part Formex 4 streams (CELLAR returned HTTP 300 Multiple Choices). Each child is one part root, in stream order.',
+  package:
+    'a zipped Formex 4 package (application/zip;mtype=fmx4). The first child is the package manifest, followed by each part it names, in manifest order.',
+} as const;
+
 /**
- * Combine fetched Formex part bodies into one well-formed XML document. A
- * multi-part act has no canonical single-file form — CELLAR serves the parts as
- * independent streams (a `<BIB.DOC>`/`<DOC>` notice header plus the `<ACT>`
- * body), each its own document with its own prolog. Concatenating them verbatim
- * would yield multiple prologs and roots (not parseable), so each part's prolog
- * is stripped and the roots are wrapped in one synthetic container — preserving
- * every part verbatim and in order while keeping the result a single document the
- * caller can parse for structured processing.
+ * Combine Formex part bodies into one well-formed XML document. A multi-part act
+ * has no canonical single-file form — CELLAR serves the parts as independent
+ * streams behind an HTTP 300 index, or as files in a zipped package (#108): a
+ * `<DOC>` notice/manifest plus the `<ACT>` body and any `<ANNEX>` parts, each its
+ * own document with its own prolog. Concatenating them verbatim would yield
+ * multiple prologs and roots (not parseable), so each part's prolog is stripped
+ * and the roots are wrapped in one synthetic container — preserving every part
+ * verbatim and in order while keeping the result a single document the caller
+ * can parse for structured processing.
  */
-function combineFormexParts(parts: readonly string[]): string {
+function combineFormexParts(
+  parts: readonly string[],
+  source: keyof typeof FORMEX_SOURCE_NOTE,
+): string {
   const children = parts.map((part) => part.replace(/^\s*<\?xml[^>]*\?>\s*/i, '').trim());
   return `<?xml version="1.0" encoding="UTF-8"?>
-<!-- Assembled by eur-lex-mcp-server from multi-part Formex 4 streams (CELLAR returned HTTP 300 Multiple Choices). Each child is one part root, in stream order. -->
+<!-- Assembled by eur-lex-mcp-server from ${FORMEX_SOURCE_NOTE[source]} -->
 <formex-multipart parts="${parts.length}">
 ${children.join('\n')}
 </formex-multipart>`;
 }
 
+/** The unrecoverable refusal of a WAF challenge in place of the act text (#16). */
+function contentChallenge(celexNumber: string) {
+  return serviceUnavailable(
+    `The EU content endpoint returned a bot-challenge interstitial instead of the act text for CELEX ${celexNumber}.`,
+    {
+      celexNumber,
+      reason: 'content_challenge',
+      recovery: {
+        hint: 'The content host is behind a WAF/bot challenge. Retry shortly; metadata remains reachable via content_mode "metadata_only". A persistent challenge means EURLEX_CONTENT_BASE_URL points at a WAF-protected host rather than the EU Publications Office CELLAR resolver.',
+      },
+    },
+  );
+}
+
 /**
  * Outcome of a single content-negotiation attempt. `multipart` carries the CELLAR
  * "300 Multiple Choices" index body listing the sibling Formex part URLs — only
- * the `application/xml;type=fmx4` variant ever produces it.
+ * the `application/xml;type=fmx4` variant ever produces it. `package` carries the
+ * raw bytes of a 2xx answer to the zipped-package variant, zip or not (#108).
  */
 type FetchOutcome =
   | { kind: 'content'; text: string }
   | { kind: 'no_representation' }
   | { kind: 'upstream_failure' }
   | { kind: 'challenge' }
-  | { kind: 'multipart'; body: string };
+  | { kind: 'multipart'; body: string }
+  | { kind: 'package'; bytes: Uint8Array };
 
 type LanguageFetchOutcome =
   | { kind: 'content'; text: string }
@@ -242,15 +383,15 @@ export interface FetchContentResult {
   content: string;
   contentAvailable: boolean;
   format: ContentFormat;
+  /**
+   * Headings of an available `markdown` body, parsed against the wire HTML it was
+   * rendered from: the conversion drops the table layout that tells an act's own
+   * headings from the ones it quotes (#106), and that HTML is not kept (#127).
+   */
+  headings?: ActHeading[];
   language: EurLexLanguage;
   /** Set when a language fallback occurred. */
   languageFallback?: string;
-  /**
-   * The wire HTML a Markdown body was rendered from. Set only for an available
-   * `markdown` body: the conversion drops the table layout that tells an act's own
-   * headings from the ones it quotes, so the structure parser reads it here.
-   */
-  sourceHtml?: string;
   /** Set when contentAvailable is false. */
   unavailabilityReason?: ContentUnavailabilityReason;
 }
@@ -258,6 +399,7 @@ export interface FetchContentResult {
 export class EurLexContentService {
   private readonly baseUrl: string;
   private readonly timeoutMs: number;
+  private readonly cache = new BodyCache();
 
   constructor(_config: AppConfig, _storage: StorageService, serverConfig: ServerConfig) {
     this.baseUrl = serverConfig.eurLexContentBaseUrl.replace(/\/$/, '');
@@ -278,6 +420,10 @@ export class EurLexContentService {
    * Returns `contentAvailable: false` with an empty string and a classified
    * unavailability reason if both attempts fail ordinarily.
    *
+   * An available body is cached by CELEX, requested language, and format (#127,
+   * #129), so paging it costs one fetch and one conversion; the same string is
+   * served each time, so offsets measured on one page hold on the next.
+   *
    * Throws ServiceUnavailable if the content host returns an AWS WAF bot-challenge
    * stub — a challenge is never reported as available content.
    */
@@ -287,31 +433,31 @@ export class EurLexContentService {
     format: ContentFormat,
     ctx: Context,
   ): Promise<FetchContentResult> {
+    const key = `${celexNumber}|${language}|${format}`;
+    const cached = this.cache.get(key);
+    if (cached) return servedResult(cached, format);
+
     // `markdown` is rendered from the HTML body, so it is fetched as HTML; the
-    // returned `format` still reports `markdown` and `renderContent` converts.
+    // returned `format` still reports `markdown` and `renderBody` converts.
     const wireFormat: WireFormat = format === 'markdown' ? 'html' : format;
+    const serve = (text: string, served: EurLexLanguage, languageFallback?: string) => {
+      const body = renderBody(text, format, served, languageFallback);
+      if (!ctx.signal.aborted) this.cache.set(key, body);
+      return servedResult(body, format);
+    };
 
     const primary = await this.fetchForLanguage(celexNumber, language, wireFormat, ctx);
-    if (primary.kind === 'content') {
-      return {
-        ...renderContent(primary.text, format),
-        language,
-        format,
-        contentAvailable: true,
-      };
-    }
+    if (primary.kind === 'content') return serve(primary.text, language);
 
     // Language fallback: try English if primary language failed.
     if (language !== 'EN') {
       const fallback = await this.fetchForLanguage(celexNumber, 'EN', wireFormat, ctx);
       if (fallback.kind === 'content') {
-        return {
-          ...renderContent(fallback.text, format),
-          language: 'EN',
-          format,
-          contentAvailable: true,
-          languageFallback: `Requested language ${language} unavailable; returned English content.`,
-        };
+        return serve(
+          fallback.text,
+          'EN',
+          `Requested language ${language} unavailable; returned English content.`,
+        );
       }
       return {
         content: '',
@@ -333,9 +479,11 @@ export class EurLexContentService {
 
   /**
    * Resolve content for one language by trying each `Accept` variant for the
-   * format. Returns the first non-empty body, or a classified unavailable result
+   * format, then, for xml whose Formex variant answered 404, the zipped package
+   * (#108). Returns the first non-empty body, or a classified unavailable result
    * when none of the variants yield content (so the caller can fall back to
-   * English). Throws when a primary variant returns a bot-challenge stub.
+   * English). Throws when a primary variant — the package request included —
+   * returns a bot-challenge stub.
    */
   private async fetchForLanguage(
     celexNumber: string,
@@ -349,18 +497,7 @@ export class EurLexContentService {
     let reason: ContentUnavailabilityReason = 'no_representation';
     for (const accept of ACCEPT_BY_FORMAT[format]) {
       const outcome = await this.fetchUrl(url, accept, isoLanguage, ctx);
-      if (outcome.kind === 'challenge') {
-        throw serviceUnavailable(
-          `The EU content endpoint returned a bot-challenge interstitial instead of the act text for CELEX ${celexNumber}.`,
-          {
-            celexNumber,
-            reason: 'content_challenge',
-            recovery: {
-              hint: 'The content host is behind a WAF/bot challenge. Retry shortly; metadata remains reachable via content_mode "metadata_only". A persistent challenge means EURLEX_CONTENT_BASE_URL points at a WAF-protected host rather than the EU Publications Office CELLAR resolver.',
-            },
-          },
-        );
-      }
+      if (outcome.kind === 'challenge') throw contentChallenge(celexNumber);
       // A 300 (multi-part Formex, xml path only): follow the sibling part
       // references and assemble the full act. Assembly is best-effort — on
       // failure falls through so the variant loop ends as unavailable, never a
@@ -376,19 +513,42 @@ export class EurLexContentService {
         reason = combineUnavailabilityReasons(reason, 'upstream_failure');
       }
     }
-    return { kind: 'unavailable', reason };
+    if (format !== 'xml' || reason !== 'no_representation') return { kind: 'unavailable', reason };
+
+    // Every Formex variant answered 404: the act may exist only as a zipped
+    // package (#108). Its assembly is best-effort like the 300 path's.
+    const outcome = await this.fetchUrl(url, FORMEX_PACKAGE_ACCEPT, isoLanguage, ctx);
+    switch (outcome.kind) {
+      case 'challenge':
+        throw contentChallenge(celexNumber);
+      case 'package': {
+        const parts = readFormexPackage(outcome.bytes);
+        return parts
+          ? { kind: 'content', text: combineFormexParts(parts, 'package') }
+          : { kind: 'unavailable', reason: 'multipart_incomplete' };
+      }
+      case 'no_representation':
+      case 'upstream_failure':
+        return { kind: 'unavailable', reason: outcome.kind };
+      default:
+        // A 300 index answering the package request: a representation, not one to read.
+        return { kind: 'unavailable', reason: 'multipart_incomplete' };
+    }
   }
 
   /**
    * Single content-negotiation GET for one URL / `Accept` / `Accept-Language`.
    * A 300 (Multiple Choices — multi-part Formex, xml path only) resolves to
-   * `multipart` carrying the index body. A 404 or short body resolves to
-   * `no_representation`; other non-2xx and exhausted network failures resolve to
-   * `upstream_failure`, so callers can try the next variant or language. A WAF
-   * challenge body resolves to `challenge`. The inner function only throws on a
-   * `fetch` rejection, so `withRetry` retries transient network errors but never
-   * a 300, 404, or challenge. A rejection after the request signal aborted is
-   * rethrown rather than degraded, so cancellation surfaces as `RequestCancelled`.
+   * `multipart` carrying the index body. A 2xx answer to the zipped-package
+   * variant resolves to `package` carrying its bytes, read as bytes rather than
+   * text, unless its head carries a WAF challenge (#108). A 404 or short body
+   * resolves to `no_representation`; other non-2xx and exhausted network failures
+   * resolve to `upstream_failure`, so callers can try the next variant or
+   * language. A WAF challenge body resolves to `challenge`. The inner function
+   * only throws on a `fetch` rejection, so `withRetry` retries transient network
+   * errors but never a 300, 404, or challenge. Each attempt's fetch is bound to
+   * the caller's signal, and a rejection after it aborted is rethrown rather than
+   * degraded, so cancellation surfaces as `RequestCancelled`.
    */
   private fetchUrl(
     url: string,
@@ -397,13 +557,18 @@ export class EurLexContentService {
     ctx: Context,
   ): Promise<FetchOutcome> {
     return withRetry(
-      async (): Promise<FetchOutcome> => {
+      async ({ signal }): Promise<FetchOutcome> => {
         const response = await fetch(url, {
           headers: { Accept: accept, 'Accept-Language': isoLanguage },
-          signal: AbortSignal.timeout(this.timeoutMs),
+          signal: AbortSignal.any([signal, AbortSignal.timeout(this.timeoutMs)]),
           redirect: 'follow',
         });
 
+        if (accept === FORMEX_PACKAGE_ACCEPT && response.ok) {
+          const bytes = new Uint8Array(await response.arrayBuffer());
+          const head = new TextDecoder().decode(bytes.subarray(0, 4096));
+          return isChallengeResponse(head) ? { kind: 'challenge' } : { kind: 'package', bytes };
+        }
         const text = await response.text();
         if (isChallengeResponse(text)) return { kind: 'challenge' };
         if (response.status === 300) return { kind: 'multipart', body: text };
@@ -451,7 +616,7 @@ export class EurLexContentService {
       if (outcome.kind !== 'content') return null;
       parts.push(outcome.text);
     }
-    return combineFormexParts(parts);
+    return combineFormexParts(parts, 'streams');
   }
 }
 
