@@ -29,17 +29,29 @@ function makeConceptBinding(opts: {
   code?: string;
   broaderLabel?: string;
   matchedLabel?: string;
+  /** Tier of the matched alternative label (1 exact, 2 word start, 3 substring). */
+  matchedTier?: 1 | 2 | 3;
+  tier?: 1 | 2 | 3;
 }): Record<string, { type: string; value: string }> {
   const b: Record<string, { type: string; value: string }> = {
     concept: { type: 'uri', value: opts.uri },
     label: { type: 'literal', value: opts.label },
+    tier: { type: 'literal', value: String(opts.tier ?? 3) },
+    // Mirrors MIN(tier digit + ?altValue): the best-tier alternative label behind
+    // its tier digit, or "" when no alternative label matched (#113).
+    matchedKey: {
+      type: 'literal',
+      value: opts.matchedLabel ? `${opts.matchedTier ?? 3}${opts.matchedLabel}` : '',
+    },
   };
   if (opts.code) b.code = { type: 'literal', value: opts.code };
   if (opts.broaderLabel) b.broaderLabel = { type: 'literal', value: opts.broaderLabel };
-  // Mirrors SAMPLE(?altValue): bound only when the keyword matched an alternative
-  // label, so its absence is how a prefLabel-only hit is represented.
-  if (opts.matchedLabel) b.matchedLabel = { type: 'literal', value: opts.matchedLabel };
   return b;
+}
+
+/** The SPARQL text of the first query the handler sent. */
+function sentQuery(): string {
+  return mockQuery.mock.calls[0]?.[0] as string;
 }
 
 /** Every text block of a tool result's content[], joined. */
@@ -342,7 +354,7 @@ describe('eurlex_browse_subjects', () => {
     expect(sparql).toContain('LIMIT 51');
     expect(sparql).toContain('OFFSET 50');
     // Deterministic order — the unique concept URI breaks label ties so OFFSET pages don't drift.
-    expect(sparql).toContain('ORDER BY ?label ?concept');
+    expect(sparql).toContain('ORDER BY ?tier ?label ?concept LIMIT 51 OFFSET 50');
   });
 
   it('defaults offset to 0 for the first page (issue #51)', async () => {
@@ -428,9 +440,9 @@ describe('eurlex_browse_subjects', () => {
       expect(sparql).toContain(
         'FILTER(CONTAINS(LCASE(STR(?label)), "product liability") || BOUND(?altValue))',
       );
-      expect(sparql).toContain('(SAMPLE(?altValue) AS ?matchedLabel)');
-      // Grouping and ordering key on the preferred label, never the matched one.
-      expect(sparql).toContain('GROUP BY ?concept ?label ORDER BY ?label ?concept');
+      expect(sparql).toContain('AS ?matchedKey)');
+      // Grouping keys on the preferred label, never the matched one.
+      expect(sparql).toContain('GROUP BY ?concept ?label ORDER BY ?tier ?label ?concept');
     });
 
     it('escapes the keyword in the alternative-label filter too', async () => {
@@ -563,6 +575,144 @@ describe('eurlex_browse_subjects', () => {
         has_more: false,
       });
       expect((withoutAlt[0] as { text: string }).text).not.toContain('**Matched via:**');
+    });
+  });
+
+  // --- #113: tiered ranking, computed in CELLAR ahead of LIMIT/OFFSET ---
+
+  describe('tiered ranking (#113)', () => {
+    it('ranks by tier inside the SPARQL ORDER BY, ahead of LIMIT and OFFSET', async () => {
+      const ctx = createMockContext({ errors: eurlex_browse_subjects.errors });
+      mockQuery.mockResolvedValue([]);
+
+      await eurlex_browse_subjects.handler(
+        eurlex_browse_subjects.input.parse({ keyword: 'AI', limit: 5, offset: 10 }),
+        ctx,
+      );
+
+      const sparql = sentQuery();
+      expect(sparql).toMatch(/\(MIN\(IF\([\s\S]+\) AS \?tier\)/);
+      expect(sparql).toMatch(/ORDER BY \?tier \?label \?concept LIMIT 6 OFFSET 10$/);
+    });
+
+    it('builds the tiers from plain string functions over both labels, with no REGEX', async () => {
+      const ctx = createMockContext({ errors: eurlex_browse_subjects.errors });
+      mockQuery.mockResolvedValue([]);
+
+      await eurlex_browse_subjects.handler(
+        eurlex_browse_subjects.input.parse({ keyword: 'Data Protection' }),
+        ctx,
+      );
+
+      const sparql = sentQuery();
+      // Tier 1: an exact preferred or alternative label.
+      expect(sparql).toContain('LCASE(STR(?label)) = "data protection"');
+      expect(sparql).toContain('(BOUND(?altValue) && LCASE(STR(?altValue)) = "data protection")');
+      // Tier 2: the label, or a word in it, starts with the keyword.
+      expect(sparql).toContain(
+        'STRSTARTS(LCASE(STR(?label)), "data protection") || CONTAINS(LCASE(STR(?label)), " data protection")',
+      );
+      expect(sparql).toContain(
+        '(BOUND(?altValue) && (STRSTARTS(LCASE(STR(?altValue)), "data protection") || CONTAINS(LCASE(STR(?altValue)), " data protection")))',
+      );
+      expect(sparql).not.toMatch(/REGEX/i);
+    });
+
+    it('maps an exact label to tier 1, a label or word start to tier 2, and any other match to tier 3', async () => {
+      const ctx = createMockContext({ errors: eurlex_browse_subjects.errors });
+      mockQuery.mockResolvedValue([]);
+
+      await eurlex_browse_subjects.handler(
+        eurlex_browse_subjects.input.parse({ keyword: 'ai' }),
+        ctx,
+      );
+
+      const exact =
+        'LCASE(STR(?label)) = "ai" || (BOUND(?altValue) && LCASE(STR(?altValue)) = "ai")';
+      const wordStart =
+        'STRSTARTS(LCASE(STR(?label)), "ai") || CONTAINS(LCASE(STR(?label)), " ai") || (BOUND(?altValue) && (STRSTARTS(LCASE(STR(?altValue)), "ai") || CONTAINS(LCASE(STR(?altValue)), " ai")))';
+      expect(sentQuery()).toContain(
+        `(MIN(IF(${exact}, 1,\n       IF(${wordStart}, 2, 3))) AS ?tier)`,
+      );
+    });
+
+    it('escapes the keyword in every tier comparison', async () => {
+      const ctx = createMockContext({ errors: eurlex_browse_subjects.errors });
+      mockQuery.mockResolvedValue([]);
+      const keyword = 'a"b\\c';
+
+      await eurlex_browse_subjects.handler(eurlex_browse_subjects.input.parse({ keyword }), ctx);
+
+      const escaped = escapeSparqlLiteral(keyword.toLowerCase());
+      const sparql = sentQuery();
+      expect(sparql).toContain(`= "${escaped}"`);
+      expect(sparql).toContain(`STRSTARTS(LCASE(STR(?label)), "${escaped}")`);
+      expect(sparql).toContain(`CONTAINS(LCASE(STR(?altValue)), " ${escaped}")`);
+      expect(sparql).not.toContain('a"b');
+    });
+
+    it('selects matched_label as the best-tier alternative, alphabetical among equals', async () => {
+      const ctx = createMockContext({ errors: eurlex_browse_subjects.errors });
+      mockQuery.mockResolvedValue([]);
+
+      await eurlex_browse_subjects.handler(
+        eurlex_browse_subjects.input.parse({ keyword: 'ai' }),
+        ctx,
+      );
+
+      // MIN over the tier digit + label: "2airship" sorts ahead of "3hot-air balloon".
+      expect(sentQuery()).toContain(
+        '(MIN(IF(BOUND(?altValue),\n       CONCAT(IF(LCASE(STR(?altValue)) = "ai", "1", IF(STRSTARTS(LCASE(STR(?altValue)), "ai") || CONTAINS(LCASE(STR(?altValue)), " ai"), "2", "3")), STR(?altValue)),\n       "")) AS ?matchedKey)',
+      );
+      expect(sentQuery()).not.toContain('SAMPLE(?altValue)');
+    });
+
+    it('keeps CELLAR row order and reports the matched alternative without its tier digit', async () => {
+      const ctx = createMockContext({ errors: eurlex_browse_subjects.errors });
+      mockQuery.mockResolvedValue([
+        makeConceptBinding({
+          uri: 'http://eurovoc.europa.eu/3030',
+          label: 'artificial intelligence',
+          matchedLabel: 'AI',
+          matchedTier: 1,
+          tier: 1,
+        }),
+        makeConceptBinding({ uri: 'http://eurovoc.europa.eu/5172', label: 'AIDS', tier: 2 }),
+        makeConceptBinding({
+          uri: 'http://eurovoc.europa.eu/c_ea3f5ed2',
+          label: 'aerostat',
+          matchedLabel: 'airship',
+          matchedTier: 2,
+          tier: 2,
+        }),
+        makeConceptBinding({ uri: 'http://eurovoc.europa.eu/1094', label: 'ALADI', tier: 3 }),
+      ]);
+
+      const result = await eurlex_browse_subjects.handler(
+        eurlex_browse_subjects.input.parse({ keyword: 'ai' }),
+        ctx,
+      );
+
+      // No in-memory re-sort: the page arrives ranked and stays that way.
+      expect(result.concepts.map((c) => c.concept_uri)).toEqual([
+        'http://eurovoc.europa.eu/3030',
+        'http://eurovoc.europa.eu/5172',
+        'http://eurovoc.europa.eu/c_ea3f5ed2',
+        'http://eurovoc.europa.eu/1094',
+      ]);
+      expect(result.concepts[0]?.matched_label).toBe('AI');
+      expect(result.concepts[2]?.matched_label).toBe('airship');
+      expect(result.concepts[1]).not.toHaveProperty('matched_label');
+      // The output shape is unchanged: no tier or score field.
+      for (const concept of result.concepts) expect(concept).not.toHaveProperty('tier');
+    });
+
+    it('describes the ranking instead of an alphabetical order', () => {
+      expect(eurlex_browse_subjects.description).not.toContain('alphabetically');
+      expect(eurlex_browse_subjects.description).toContain('exact');
+      expect(eurlex_browse_subjects.output.shape.concepts.description).not.toContain(
+        'alphabetically',
+      );
     });
   });
 

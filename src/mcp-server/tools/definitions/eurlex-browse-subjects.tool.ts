@@ -24,7 +24,7 @@ const EUROVOC_CONCEPT_NAMESPACE = 'http://eurovoc.europa.eu/';
 export const eurlex_browse_subjects = tool('eurlex_browse_subjects', {
   title: 'Browse EuroVoc Subjects',
   description:
-    'Search the EuroVoc thesaurus, resolving a keyword into concept URIs usable in the eurovoc_concept subject filter of eurlex_search_documents. Matches both preferred and alternative (non-preferred) labels, so a common synonym reaches the concept it stands for. Returns each concept URI, its preferred label in the requested language, code, broader (parent) label, and the alternative label that matched when one did, ordered alphabetically by preferred label.',
+    'Search the EuroVoc thesaurus, resolving a keyword into concept URIs usable in the eurovoc_concept subject filter of eurlex_search_documents. Matches both preferred and alternative (non-preferred) labels, so a common synonym reaches the concept it stands for. Returns each concept URI, its preferred label in the requested language, code, broader (parent) label, and the alternative label that matched when one did. Concepts with an exact label match come first, then those whose label or one of its words starts with the keyword, then other substring matches, each group ordered by preferred label.',
   annotations: { readOnlyHint: true, openWorldHint: true, idempotentHint: true },
   input: z.object({
     keyword: z
@@ -74,12 +74,14 @@ export const eurlex_browse_subjects = tool('eurlex_browse_subjects', {
               .string()
               .optional()
               .describe(
-                'Alternative (non-preferred) EuroVoc label that matched the keyword, when the concept was reached through one. Absent when the keyword matched the preferred label alone.',
+                'Alternative (non-preferred) EuroVoc label that matched the keyword, when one did — the closest match (exact, then word start, then substring), alphabetical among equals. Absent when the keyword matched the preferred label alone.',
               ),
           })
           .describe('A single EuroVoc concept with its URI, label, code, and hierarchy context.'),
       )
-      .describe('Matching EuroVoc concepts ordered alphabetically by label.'),
+      .describe(
+        'Matching EuroVoc concepts, exact label matches first, then word-start matches, then other substring matches, each group ordered by preferred label.',
+      ),
     total: z.number().describe('Number of concepts returned in this response.'),
     offset: z.number().describe('Pagination offset used for this response.'),
     has_more: z
@@ -124,9 +126,8 @@ export const eurlex_browse_subjects = tool('eurlex_browse_subjects', {
      * most one prefLabel per language (verified live — no EuroVoc concept carries two
      * English prefLabels), so grouping by it stays one row per concept AND lets
      * ORDER BY sort the real label string, which Virtuoso does not do for a SAMPLE
-     * alias. ORDER BY ?label ?concept is a deterministic alphabetical order (the
-     * unique concept URI breaks ties) so OFFSET pages are stable and non-overlapping;
-     * no relevance signal is computed.
+     * alias. The unique concept URI breaks the last tie, so OFFSET pages are stable
+     * and non-overlapping.
      *
      * The keyword is matched against alternative labels as well as the preferred
      * one. EuroVoc carries its non-preferred terms — the exact phrases people
@@ -134,17 +135,38 @@ export const eurlex_browse_subjects = tool('eurlex_browse_subjects', {
      * that exist ("product liability" is an English altLabel of concept 3635,
      * prefLabel "producer's liability"). A keyword-filtered OPTIONAL binds
      * `?altValue` only when an alternative label matches, and `|| BOUND(?altValue)`
-     * admits the concept on that basis; `SAMPLE(?altValue)` reports which term hit.
-     * CELLAR asserts the plain SKOS form directly, so no `skosxl:literalForm` join
-     * is needed. Grouping and ordering are untouched — `?label` is always the
-     * prefLabel, never the matched alternative — so a concept reachable by both
-     * paths still returns exactly one row and page boundaries are unaffected.
+     * admits the concept on that basis. CELLAR asserts the plain SKOS form directly,
+     * so no `skosxl:literalForm` join is needed. `?label` is always the prefLabel,
+     * never the matched alternative, so a concept reachable by both paths still
+     * returns exactly one row.
+     *
+     * Matches rank in tiers (#113), computed per concept as the best any of its
+     * labels reaches: 1 an exact label, 2 a label that starts with the keyword or
+     * has a word that does (the keyword follows a space), 3 any other substring.
+     * `ORDER BY ?tier ?label ?concept` runs in CELLAR ahead of LIMIT/OFFSET because
+     * the page is cut there — re-sorting a returned page could never lift "AI"
+     * (concept 3030, 125th alphabetically) onto page 1. The tier is plain string
+     * functions over the already-lowercased labels: a per-row REGEX word test made
+     * the "ai" query several times slower. Alternative-label terms sit behind
+     * `BOUND(?altValue) &&`, so a concept with no matching alternative never
+     * evaluates a function over an unbound variable. `?matchedKey` is the matching
+     * alternative label behind its own tier digit, and its MIN is the best-tier
+     * one, alphabetical among equals; an empty key means none matched.
      */
+    const kw = escapeSparqlLiteral(keyword);
+    const pref = 'LCASE(STR(?label))';
+    const alt = 'LCASE(STR(?altValue))';
+    const startsOrWordStarts = (label: string) =>
+      `STRSTARTS(${label}, "${kw}") || CONTAINS(${label}, " ${kw}")`;
     const sparql = `
 SELECT ?concept ?label
+  (MIN(IF(${pref} = "${kw}" || (BOUND(?altValue) && ${alt} = "${kw}"), 1,
+       IF(${startsOrWordStarts(pref)} || (BOUND(?altValue) && (${startsOrWordStarts(alt)})), 2, 3))) AS ?tier)
   (SAMPLE(?codeValue) AS ?code)
   (SAMPLE(?broaderLabelValue) AS ?broaderLabel)
-  (SAMPLE(?altValue) AS ?matchedLabel) WHERE {
+  (MIN(IF(BOUND(?altValue),
+       CONCAT(IF(${alt} = "${kw}", "1", IF(${startsOrWordStarts(alt)}, "2", "3")), STR(?altValue)),
+       "")) AS ?matchedKey) WHERE {
   ?concept a skos:Concept .
   ?concept skos:prefLabel ?label .
   OPTIONAL { ?concept skos:notation ?codeValue . }
@@ -156,12 +178,12 @@ SELECT ?concept ?label
   OPTIONAL {
     ?concept skos:altLabel ?altValue .
     FILTER(LANG(?altValue) = "${lang}")
-    FILTER(CONTAINS(LCASE(STR(?altValue)), "${escapeSparqlLiteral(keyword)}"))
+    FILTER(CONTAINS(${alt}, "${kw}"))
   }
   FILTER(STRSTARTS(STR(?concept), "${EUROVOC_CONCEPT_NAMESPACE}"))
   FILTER(LANG(?label) = "${lang}")
-  FILTER(CONTAINS(LCASE(STR(?label)), "${escapeSparqlLiteral(keyword)}") || BOUND(?altValue))
-} GROUP BY ?concept ?label ORDER BY ?label ?concept LIMIT ${pageLimit + 1} OFFSET ${input.offset}`;
+  FILTER(CONTAINS(${pref}, "${kw}") || BOUND(?altValue))
+} GROUP BY ?concept ?label ORDER BY ?tier ?label ?concept LIMIT ${pageLimit + 1} OFFSET ${input.offset}`;
 
     const bindings = await svc.queryWithContinuation(sparql, ctx);
     ctx.log.info('EuroVoc subject browse', {
@@ -203,8 +225,8 @@ SELECT ?concept ?label
       if (code) entry.concept_code = code;
       const broaderLabel = CellarSparqlService.bindingValue(b, 'broaderLabel');
       if (broaderLabel) entry.broader_label = broaderLabel;
-      const matchedLabel = CellarSparqlService.bindingValue(b, 'matchedLabel');
-      if (matchedLabel) entry.matched_label = matchedLabel;
+      const matchedKey = CellarSparqlService.bindingValue(b, 'matchedKey');
+      if (matchedKey) entry.matched_label = matchedKey.slice(1);
       return entry;
     });
 
