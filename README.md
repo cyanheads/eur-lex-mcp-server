@@ -36,7 +36,7 @@ EU legislation, CJEU case law, and treaties over the EU Publications Office's CE
 | Tool | Description |
 |:-----|:------------|
 | `eurlex_search_documents` | Search EU legislation, treaties, and preparatory acts by type, date, EuroVoc subject, author institution, and in-force status |
-| `eurlex_get_document` | Fetch metadata and full text (HTML, Markdown, or Formex4 XML) for an act by CELEX, ELI, or work URI |
+| `eurlex_get_document` | Fetch metadata and full text (HTML, Markdown, or Formex4 XML) for an act or case by CELEX, ELI, or work URI, with a section outline of either |
 | `eurlex_lookup_celex` | Resolve a CELEX number, ELI URI, ECLI, or OJ citation (`Regulation (EU) 2016/679`) to its canonical CELLAR work |
 | `eurlex_get_cases` | Search CJEU and General Court case law by case number, court, case type, and date range |
 | `eurlex_get_relations` | Traverse the CELLAR relationship graph — amendments, repeals, consolidations, legal basis, citations, transpositions |
@@ -64,7 +64,7 @@ All resource data is also reachable via tools.
 
 ### `eurlex_search_documents` <sub>tool</sub>
 
-- At least one filter: `keyword` (English titles, plus CELEX numbers when it holds a digit: a whole CELEX with its `(01)`–`(20)` siblings and `R(01)`–`R(20)` corrigenda by exact lookup, a partial one such as `2016R0679`, `R0679`, or `J0131` through the CELEX full-text index; one opening with letters no digit follows, such as `R(01)`, or with a year and a slash, such as `2024/01469`, by a scan of every CELEX that can take tens of seconds; a bare year or a fragment opening mid-year or mid-number, such as `0679R`, matches titles only; no body search), `document_type` (`REG`, `DIR`, `DEC`, `TREATY`, `JUDG`, `OPIN_AG`, `PROP`, `REC`, each its full CELLAR authority family), `date_from`/`date_to`, `eurovoc_concept` (from `eurlex_browse_subjects`), `author_institution`, or `in_force` (`true`/`false`; `false` covers repealed, expired, and not-yet-in-force acts)
+- At least one filter: `keyword` (English titles, plus CELEX numbers when it holds a digit: a whole CELEX with its `(01)`–`(20)` siblings and `R(01)`–`R(20)` corrigenda by exact lookup, a partial one such as `2016R0679`, `R0679`, `J0131`, or the OJ C `2024/01469` through the CELEX full-text index; one opening with letters no digit follows, such as `R(01)`, or with a year, a slash, and a number under four characters, such as `2017/111`, by a scan of every CELEX that can take tens of seconds; a bare year or a fragment opening mid-year or mid-number, such as `0679R`, matches titles only; no body search), `document_type` (`REG`, `DIR`, `DEC`, `TREATY`, `JUDG`, `OPIN_AG`, `PROP`, `REC`, each its full CELLAR authority family), `date_from`/`date_to`, `eurovoc_concept` (from `eurlex_browse_subjects`), `author_institution`, or `in_force` (`true`/`false`; `false` covers repealed, expired, and not-yet-in-force acts)
 - Pages of up to 100 via `offset`/`limit`, newest first with the CELEX breaking date ties, so a page is the same on every call; each row flags `is_consolidated` and `is_corrigendum`, and corrigenda join only under `include_corrigenda`, consolidated texts of a `document_type` only under `include_consolidated`
 - No match returns an empty page with a `notice` naming the filters and how to broaden them; typed errors: `no_filters`, `invalid_date_range`, `invalid_author_institution` and `invalid_keyword` (no letters or digits)
 
@@ -72,8 +72,11 @@ All resource data is also reachable via tools.
 
 ### `eurlex_get_document` <sub>tool</sub>
 
-- Exactly one of `celex_number`, `eli_uri`, or `work_uri`, served as the work the CELEX resolves to (see `eurlex_lookup_celex`); a `work_uri` carrying several CELEX numbers (a national implementing measure) serves its lowest, with a `notice` giving the count; body as `html` (default), `markdown`, or `xml` (Formex4) in any of the 24 EUR-Lex languages, falling back to English; metadata names `author_institution(s)` and, for case law, `advocates_general`
+- Exactly one of `celex_number`, `eli_uri`, or `work_uri`, served as the work the CELEX resolves to (see `eurlex_lookup_celex`); a `work_uri` carrying several CELEX numbers (a national implementing measure) serves its lowest, with a `notice` giving the count; body as `html` (default), `markdown`, or `xml` (Formex4) in any of the 24 EUR-Lex languages, falling back to English; `title` is in the language served, or English when CELLAR has none in that language
+- `author_institution(s)` name each author by the English label of its CELLAR authority code — an EU institution or body (`European Union`, `Council of the European Union`), a member state (`Netherlands`), an MEP (`VAN MIERT`), or a national court — the same labels `eurlex_search_documents` accepts as `author_institution`; case law lists its `advocates_general` apart
+- Case law also carries its `ecli` (the one `eurlex_lookup_celex` reports) and its English CELLAR title, in every language, parsed as `eurlex_get_cases` parses it: `title` is the parties (the court/AG descriptor when there are none), with `formation`, `referring_court`, `subject_matter`, and `case_reference` alongside, or the raw `#`-joined title when the parse misses part of it
 - `content_mode` `"paged"` (default), `"full"`, or `"metadata_only"`, every body capped at 100,000 characters per call with `content_chars_total`/`has_more` to page on; `outline: true` lists chapter/section/article/annex headings with offsets, the preamble's recitals as one `Recitals 1–173` entry (`include_recitals: true` lists each), and `select` (e.g. `{ articles: "1,5,17" }`) returns just those sections, each source character once, under the same cap with no `offset`/`limit`, with `selected_sections` giving each one's own `offset`/`chars` for a `paged` read. Headings are read in the language served and labelled in English in every format (`Article 4`, `CHAPTER IV`); a selector number may carry an English kind word or the served language's (`Artikel 4`, `4. cikk`). Headings of text an amending act inserts into another act are not the act's own and are skipped
+- For a judgment, order, or AG opinion, `outline` lists each top-level section heading as served (`Legal context`, `Sur les dépens`), numbered by position, and a judgment's or order's ruling as one `operative_part` entry; `select: { headings: "2" }` returns a headed section up to the next heading, and `select: { operative_part: true }` the ruling alone to the end: from "On those grounds, …" in a modern body, from the "Operative part" section in a legacy one. Headings come from the body's heading markup in each CELLAR html generation and in Formex, so html, Markdown, and xml get the same outline; a summary-only body and some AG opinions carry no heading markup and outline empty
 - `is_superseded` says whether a newer consolidated version than the text served is in effect (`false` on the newest one, and on a consolidated version dated after it that does not apply yet), with `current_consolidated_celex`/`consolidated_as_of` naming that version; `resolve: "current_consolidated"` serves it, for a base act or any of its consolidated texts; when no consolidated version is in effect yet, a `notice` says a future-dated consolidated text does not apply yet, or that `resolve` served the base act
 - `in_force: false` comes with its reason where CELLAR records one: `repealed_by` (CELEX of the explicitly repealing acts), `end_of_validity` (omitted when open-ended; a future date on an act not yet in force), or `entry_into_force` (the earliest date, when still ahead)
 - A consolidated text keeps its own title, date, and type and reports its base act as `base_act_celex`, with that act's authors, `in_force` and its reason, legal basis, and EuroVoc subjects; typed errors: `invalid_identifier_args`, `not_found`, `content_challenge` (a WAF bot-challenge in place of text)
@@ -92,7 +95,7 @@ All resource data is also reachable via tools.
 ### `eurlex_get_cases` <sub>tool</sub>
 
 - Filters: `case_number` (one case per value — `C-131/12`, `T-22/20`, `F-12/05`, or a pre-1989 `26/62` — reaching every judgment, order, and AG opinion filed under it), `court` (`CJEU` or `GC`, by CELEX court letter), `case_type` (`judgment`, `order`, `ag_opinion`), `keyword` (English titles, plus CELEX numbers: a whole CELEX with its `(01)`–`(20)` siblings and `_INF`/`_RES`/`_SUM`/`_EXT` records, a partial one such as `2013CJ0131` or `J0131` through the CELEX full-text index, one opening with letters no digit follows by a scan of every CELEX), and `date_from`/`date_to`; primary records only unless `include_derivative` adds notices, abstracts, summaries, and corrigenda
-- Pages of up to 100 via `offset`/`limit`, newest first with the CELEX breaking date ties, so a page is the same on every call; each case carries its ECLI where CELLAR records one, plus `display_title`, `parties`, `subject_matter`, and `case_reference` parsed from the CELLAR title
+- Pages of up to 100 via `offset`/`limit`, newest first with the CELEX breaking date ties, so a page is the same on every call; each case carries its ECLI where CELLAR records one, plus `formation`, `advocate_general`, `display_title`, `parties`, `referring_court`, `subject_matter`, and `case_reference` parsed from the CELLAR title; the raw `title` comes back only when those fields miss part of it (an unrecognized segment, an "(Extracts)" marker, or a title date that differs from the case date)
 - No match returns an empty page with a `notice` naming the filters and how to broaden them; typed errors: `invalid_case_number`, `invalid_date_range`, `invalid_keyword` (no letters or digits)
 
 ---
@@ -101,7 +104,7 @@ All resource data is also reachable via tools.
 
 - Exactly one of `celex_number` or `work_uri`; `relation_types` narrows to any of `cites`, `amends`, `amended_by`, `repeals`, `repealed_by`, `implicitly_repeals`, `implicitly_repealed_by`, `legal_basis`, `consolidated_version`, `national_transposition` (omit for all)
 - One hop, paged per relation type and direction via `offset`/`limit` (max 100, default 100), newest first with the work URI breaking ties, so a page is the same on every call; undated works come last
-- Each relation carries `relation_type`, `direction` (`outgoing`/`incoming`), `related_work_uri`, `related_celex_number` when known, and on `national_transposition` rows `related_member_state` (ISO 3166-1 alpha-3, `GBR` for the United Kingdom); `empty_relation_types` separates "no edges of this type" from "paged out", a work with no edges of the requested types returns an empty page with a `notice`, and typed errors are `invalid_identifier_args` and `not_found`
+- Each relation carries `relation_type`, `direction` (`outgoing`/`incoming`), `related_work_uri`, `related_celex_number` when known, `related_date` (the date the page is ordered by) and `related_title` (the English title, whole) when the work has them, and on `national_transposition` rows `related_member_state` (ISO 3166-1 alpha-3, `GBR` for the United Kingdom) — national measures rarely carry an English title, and no other language stands in; `empty_relation_types` separates "no edges of this type" from "paged out", a work with no edges of the requested types returns an empty page with a `notice`, and typed errors are `invalid_identifier_args` and `not_found`
 
 ---
 
@@ -124,14 +127,14 @@ All resource data is also reachable via tools.
 
 ### `eurlex://document/{celexNumber}` <sub>resource</sub>
 
-- Metadata snapshot as `application/json` — resource type, author institution(s), Advocates General, date, title, in-force flag, legal basis, EuroVoc subjects; a consolidated text adds `base_act_celex` and reads authors, in-force flag, legal basis, and subjects from that act
+- Metadata snapshot as `application/json` — resource type, author institution(s) labelled as `eurlex_get_document` labels them, Advocates General, date, English title, in-force flag, legal basis, EuroVoc subjects; a consolidated text adds `base_act_celex` and reads authors, in-force flag, legal basis, and subjects from that act
 - `celexNumber` comes from `eurlex_search_documents`, `eurlex_get_cases`, or `eurlex_lookup_celex`
 
 ---
 
 ### `eurlex://document/{celexNumber}/relations` <sub>resource</sub>
 
-- One-hop relationship summary — amendment chain, consolidations, national transposition (each measure's `related_member_state` included), legal basis, citations — capped at 25 per relation type and direction, keeping the newest
+- One-hop relationship summary — amendment chain, consolidations, national transposition (each measure's `related_member_state` included), legal basis, citations — each related work with its `related_date` and English `related_title` where it has them, capped at 25 per relation type and direction, keeping the newest
 - `truncated` plus a `continuation` pointer to `eurlex_get_relations` when more relations exist
 
 ---
