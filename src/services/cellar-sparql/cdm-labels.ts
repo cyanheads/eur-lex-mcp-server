@@ -28,14 +28,15 @@ export const EUROVOC_CONCEPT_NAMESPACE = 'http://eurovoc.europa.eu/';
  * the scheme and host. Scheme and host are case-insensitive, and every EuroVoc object
  * in CELLAR sits under the http form, so each spelling maps one-to-one onto
  * {@link EUROVOC_CONCEPT_NAMESPACE}. The trailing `/` keeps a lookalike host
- * (`eurovoc.europa.eu.example`) out.
+ * (`eurovoc.europa.eu.example`) out, and the lookahead requires a concept after it:
+ * no work is about the bare namespace.
  */
-const EUROVOC_NAMESPACE_SPELLING = /^https?:\/\/eurovoc\.europa\.eu\//i;
+const EUROVOC_NAMESPACE_SPELLING = /^https?:\/\/eurovoc\.europa\.eu\/(?=.)/i;
 
 /**
  * `value` with its EuroVoc namespace rewritten to the canonical
- * {@link EUROVOC_CONCEPT_NAMESPACE}, or undefined when it is outside that namespace.
- * The path is kept as given.
+ * {@link EUROVOC_CONCEPT_NAMESPACE}, or undefined when it names no concept in that
+ * namespace. The path is kept as given.
  */
 export function canonicalEurovocConceptUri(value: string): string | undefined {
   return EUROVOC_NAMESPACE_SPELLING.test(value)

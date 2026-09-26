@@ -1454,12 +1454,14 @@ describe('eurlex_search_documents', () => {
     /**
      * `cdm:work_is_about_concept_eurovoc` binds only `http://eurovoc.europa.eu/`
      * concepts (#11), so a URI from any other namespace — another authority table,
-     * an ELI, a CELLAR work, a lookalike host — can match no work. It is rejected
-     * with a message naming the namespace rather than answered with an empty page.
+     * an ELI, a CELLAR work, a lookalike host — can match no work, and neither can the
+     * bare namespace. Each is rejected with a message naming the namespace rather than
+     * answered with an empty page.
      */
     it.each([
       ['a lookalike host', 'http://eurovoc.europa.eu.evil/2828'],
       ['the host without a path', 'http://eurovoc.europa.eu'],
+      ['the namespace without a concept', 'https://eurovoc.europa.eu/'],
       ['an ELI', 'http://data.europa.eu/eli/reg/2016/679/oj'],
       [
         'a CELLAR work URI',
