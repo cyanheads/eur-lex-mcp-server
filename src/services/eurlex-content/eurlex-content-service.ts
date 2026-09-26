@@ -128,10 +128,16 @@ const ACCEPT_BY_FORMAT: Record<WireFormat, readonly string[]> = {
 
 /**
  * Render a fetched wire body into the requested output format. `html`/`xml` pass
- * through verbatim; `markdown` is converted server-side from the HTML body.
+ * through verbatim; `markdown` is converted server-side from the HTML body, which
+ * rides along as `sourceHtml` for the structure parser (#106).
  */
-function renderContent(body: string, format: ContentFormat): string {
-  return format === 'markdown' ? htmlToMarkdown(body) : body;
+function renderContent(
+  body: string,
+  format: ContentFormat,
+): Pick<FetchContentResult, 'content' | 'sourceHtml'> {
+  return format === 'markdown'
+    ? { content: htmlToMarkdown(body), sourceHtml: body }
+    : { content: body };
 }
 
 /**
@@ -239,6 +245,12 @@ export interface FetchContentResult {
   language: EurLexLanguage;
   /** Set when a language fallback occurred. */
   languageFallback?: string;
+  /**
+   * The wire HTML a Markdown body was rendered from. Set only for an available
+   * `markdown` body: the conversion drops the table layout that tells an act's own
+   * headings from the ones it quotes, so the structure parser reads it here.
+   */
+  sourceHtml?: string;
   /** Set when contentAvailable is false. */
   unavailabilityReason?: ContentUnavailabilityReason;
 }
@@ -282,7 +294,7 @@ export class EurLexContentService {
     const primary = await this.fetchForLanguage(celexNumber, language, wireFormat, ctx);
     if (primary.kind === 'content') {
       return {
-        content: renderContent(primary.text, format),
+        ...renderContent(primary.text, format),
         language,
         format,
         contentAvailable: true,
@@ -294,7 +306,7 @@ export class EurLexContentService {
       const fallback = await this.fetchForLanguage(celexNumber, 'EN', wireFormat, ctx);
       if (fallback.kind === 'content') {
         return {
-          content: renderContent(fallback.text, format),
+          ...renderContent(fallback.text, format),
           language: 'EN',
           format,
           contentAvailable: true,

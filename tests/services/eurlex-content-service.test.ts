@@ -388,6 +388,21 @@ describe('EurLexContentService', () => {
     expect(result.content).toContain('(1) The protection of natural persons');
     expect(result.content).toMatch(/\|\s*CN code\s*\|\s*Description\s*\|/);
     expect(result.content).not.toMatch(/<table|<td|<div/i);
+    // The wire HTML rides along for the structure parser (#106).
+    expect(result.sourceHtml).toBe(ACT_XHTML);
+  });
+
+  it('carries the wire HTML only behind a Markdown body (#106)', async () => {
+    mockFetch.mockImplementation(() => Promise.resolve(new Response(ACT_XHTML, { status: 200 })));
+    const service = makeService();
+    const html = await service.fetchContent('32016R0679', 'EN', 'html', createMockContext());
+    expect(html.content).toBe(ACT_XHTML);
+    expect(html.sourceHtml).toBeUndefined();
+
+    mockFetch.mockImplementation(() => Promise.resolve(new Response('not found', { status: 404 })));
+    const missing = await service.fetchContent('32016R0679', 'EN', 'markdown', createMockContext());
+    expect(missing.contentAvailable).toBe(false);
+    expect(missing.sourceHtml).toBeUndefined();
   });
 
   it('renders Markdown from the English fallback body when the requested language is unavailable', async () => {
@@ -411,6 +426,7 @@ describe('EurLexContentService', () => {
     expect(result.format).toBe('markdown');
     expect(result.languageFallback).toContain('FR');
     expect(result.content).toContain('(1) The protection of natural persons');
+    expect(result.sourceHtml).toBe(ACT_XHTML);
   });
 
   // --- The bug: an AWS WAF challenge must NEVER be reported as content (issue #16) ---
