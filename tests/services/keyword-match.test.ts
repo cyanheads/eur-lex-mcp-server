@@ -179,6 +179,20 @@ describe('celexFragmentRoute (#123)', () => {
     },
   );
 
+  it.each(['2024/01469', '2017/111', '2024/'])(
+    'scans for %s, a year followed by the / only C-sector CELEX hold',
+    (keyword) => {
+      expect(celexFragmentRoute(keyword)).toEqual({ kind: 'scan' });
+    },
+  );
+
+  it.each(['9999/01469', '1950/111'])(
+    'matches titles only for %s, whose four digits before a / are no year',
+    (keyword) => {
+      expect(celexFragmentRoute(keyword)).toEqual({ kind: 'titles' });
+    },
+  );
+
   it.each(['016R0679', '0679', '2016', '20R0679', '(01)', '-20160504', ''])(
     'matches titles only for %j, which opens mid-year or mid-number',
     (keyword) => {
@@ -304,6 +318,8 @@ describe('partial-CELEX parity with the substring scan (#123)', () => {
     ['ROU_202405', 'scan'],
     ['R(01)', 'scan'],
     ['C/2024/0146', 'scan'],
+    ['2024/01469', 'scan'],
+    ['2017/111', 'scan'],
   ])('reaches every CELEX the scan reached for %s, by the %s route', (keyword, kind) => {
     const route = celexFragmentRoute(keyword);
     expect(route.kind).toBe(kind);
@@ -355,7 +371,7 @@ describe('keywordMatchPattern partial-CELEX arm (#123)', () => {
     expect(confirmingLiterals(pattern)).toEqual(['J0131']);
   });
 
-  it.each(['R(01)', 'rou_202405', 'C/2024/0146'])(
+  it.each(['R(01)', 'rou_202405', 'C/2024/0146', '2024/01469'])(
     'scans every CELEX literal for %s, with no full-text expression',
     async (keyword) => {
       const pattern = await keywordMatchPattern(svc, keyword, createMockContext());
