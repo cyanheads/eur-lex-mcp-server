@@ -41,7 +41,7 @@ function collectResolved(
 export const eurlex_document_resource = resource('eurlex://document/{celexNumber}', {
   name: 'EUR-Lex document metadata',
   description:
-    "Metadata snapshot for a CELLAR work by CELEX number — human-readable document type and author institution labels, Advocates General of a case-law record, date, title, in-force flag, legal basis acts (work URI plus CELEX), and EuroVoc subjects (concept URI plus English label). A consolidated text keeps its own type, date, and title, and reports its base act (base_act_celex) with that act's authors, in-force flag, legal bases, and subjects.",
+    "Metadata snapshot for a CELLAR work by CELEX number — human-readable document type, authors by English authority label (an EU institution or body, a member state, an MEP, or a national court; each usable as the author_institution filter of eurlex_search_documents), Advocates General of a case-law record, date, English title, in-force flag, legal basis acts (work URI plus CELEX), and EuroVoc subjects (concept URI plus English label). A consolidated text keeps its own type, date, and title, and reports its base act (base_act_celex) with that act's authors, in-force flag, legal bases, and subjects.",
   mimeType: 'application/json',
   params: z.object({
     celexNumber: z

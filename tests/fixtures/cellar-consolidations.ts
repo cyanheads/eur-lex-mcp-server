@@ -16,6 +16,19 @@ type Row = Record<string, { type: string; value: string }>;
 const CB = 'http://publications.europa.eu/resource/authority/corporate-body/';
 const RT = 'http://publications.europa.eu/resource/authority/resource-type/';
 
+/** English `skos:prefLabel` of each authority code the fixture works name as author. */
+const AGENT_LABELS: ReadonlyMap<string, string> = new Map(
+  Object.entries({
+    EP: 'European Parliament',
+    CONSIL: 'Council of the European Union',
+    COM: 'European Commission',
+    ECB: 'European Central Bank',
+    CYP: 'Cyprus',
+    CZE: 'Czechia',
+    OP_DATPRO: 'Provisional data',
+  }).map(([code, label]) => [`${CB}${code}`, label]),
+);
+
 /** One CELLAR work in the fixture set. */
 export interface FixtureAct {
   /** Base act work, via `cdm:act_consolidated_based_on_resource_legal`. */
@@ -368,7 +381,15 @@ export async function fakeConsolidationCellar(sparql: string): Promise<Row[]> {
   const act = addressedAct(sparql);
   if (!act) return [];
   if (sparql.includes('cdm:work_created_by_agent')) {
-    return act.creators.map((c) => ({ agent: uri(c), role: literal('creator') }));
+    const readsLabel = sparql.includes('?agentLabel');
+    return act.creators.map((c) => {
+      const label = readsLabel ? AGENT_LABELS.get(c) : undefined;
+      return {
+        agent: uri(c),
+        role: literal('creator'),
+        ...(label ? { agentLabel: literal(label) } : {}),
+      };
+    });
   }
   if (sparql.includes('cdm:resource_legal_based_on_resource_legal')) {
     return act.legalBases.map((lb) => ({ legalBasis: uri(lb) }));

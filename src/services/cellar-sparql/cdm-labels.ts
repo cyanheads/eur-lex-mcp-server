@@ -1,13 +1,17 @@
 /**
- * @fileoverview CDM authority-register URI → human-readable label maps and resolvers,
- * plus a parser for CELLAR's `#`-delimited case-law expression titles.
- * Covers resource types (legislation, case law) and corporate bodies (EU institutions).
- * Used by tool handlers that normalise raw CDM URIs and titles before returning results.
+ * @fileoverview CDM resource-type URI → human-readable label map and resolvers, plus a
+ * parser for CELLAR's `#`-delimited case-law expression titles. Used by tool handlers
+ * that normalise raw CDM URIs and titles before returning results. Authors are not
+ * labelled here: work-agents.ts reads each authority code's English `skos:prefLabel`
+ * in its agent query.
  * @module services/cellar-sparql/cdm-labels
  */
 
+/** CELLAR's language authority table; a language's URI appends its upper-case ISO 639-2/T code. */
+export const LANGUAGE_AUTHORITY_URI = 'http://publications.europa.eu/resource/authority/language/';
+
 /** English language URI used in expression-level title queries. */
-export const ENG_LANGUAGE_URI = 'http://publications.europa.eu/resource/authority/language/ENG';
+export const ENG_LANGUAGE_URI = `${LANGUAGE_AUTHORITY_URI}ENG`;
 
 /**
  * CDM resource-type URI → human-readable short label.
@@ -187,142 +191,238 @@ export function resolveResourceTypeLabels(concatenated: string | undefined): str
 }
 
 /**
- * Structured decomposition of a CELLAR case-law expression title. Every field is
- * optional — a real title may carry fewer segments, empty segments, or no `#`
- * delimiter at all, and no segment is ever fabricated from missing data.
+ * Structured decomposition of a CELLAR case-law expression title. Every field but
+ * `complete` is optional — a real title may carry fewer segments, empty segments,
+ * or no `#` delimiter at all, and no field is ever fabricated from missing data.
  */
 export interface ParsedCaseTitle {
-  /** Case reference, e.g. "Case C-97/23 P.". */
+  /** Advocate General named by an opinion's leading segment, e.g. "Jääskinen". */
+  advocateGeneral?: string;
+  /** Case reference, e.g. "Case C-97/23 P." or "Joined Cases C-443/14 and C-444/14.". */
   caseReference?: string;
+  /**
+   * True when the fields hold everything the raw title carries: every non-empty
+   * segment was assigned to a field (the leading court/AG descriptor counts as
+   * assigned when it parses and marks no publication by extracts), and the
+   * descriptor's date equals the record's date. A caller may drop the raw title
+   * only when this is true.
+   */
+  complete: boolean;
   /** Clean human-readable title for display: the parties, or the court/AG descriptor when there are none. */
   displayTitle?: string;
+  /**
+   * The formation named in the leading segment, verbatim: the parenthetical after
+   * the court ("Grand Chamber", "Fourth Chamber, Extended Composition"), or the
+   * issuing office of an order so titled ("President", "Vice-President",
+   * "President of the Second Chamber"). Never "(Extracts)", never inferred.
+   */
+  formation?: string;
   /** The parties segment, e.g. "Google Spain SL v AEPD". */
   parties?: string;
+  /** National court that referred a preliminary ruling, e.g. "Audiencia Nacional" or "Tariefcommissie - Netherlands". */
+  referringCourt?: string;
   /** Subject-matter keyword summary — the en-dash-delimited keyword list. */
   subjectMatter?: string;
 }
 
+const MONTH_NUMBERS: ReadonlyMap<string, string> = new Map(
+  [
+    'january',
+    'february',
+    'march',
+    'april',
+    'may',
+    'june',
+    'july',
+    'august',
+    'september',
+    'october',
+    'november',
+    'december',
+  ].map((month, i) => [month, String(i + 1).padStart(2, '0')]),
+);
+
+/** `{day} {Month} {year}` as three groups, the date form every leading segment uses. */
+const TITLE_DATE = String.raw`(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})`;
+const TITLE_COURT =
+  '(?:Court of First Instance|General Court|Court(?: of Justice)?|(?:European Union )?Civil Service Tribunal)';
+
 /**
- * Parse a CELLAR case-law expression title into structured fields.
+ * Leading segment of a judgment or order: the court, an optional formation
+ * parenthetical, the date (after "of" or a comma, or neither in the upper-case
+ * Civil Service Tribunal form), and an optional trailing extracts marker, captured
+ * last ("(Extracts)", 62014TJ0353).
+ */
+const JUDGMENT_OR_ORDER_DESCRIPTOR = new RegExp(
+  String.raw`^(?:Judgment|Order)\s+of\s+the\s+${TITLE_COURT}(?:\s*\(([^)]+)\))?,?\s+(?:of\s+)?${TITLE_DATE}(\s*\((?:Extracts?|publication by extracts)\))?\.?$`,
+  'i',
+);
+
+/** Leading segment of an order issued by a court's President, Vice-President, or a chamber President. */
+const PRESIDENT_ORDER_DESCRIPTOR = new RegExp(
+  String.raw`^Order\s+of\s+the\s+((?:Vice-)?President(?:\s+of\s+the\s+\w+\s+Chamber)?)\s+of\s+the\s+${TITLE_COURT},?\s+(?:of\s+)?${TITLE_DATE}\.?$`,
+  'i',
+);
+
+/** Leading segment of an AG opinion: "[Joined] Opinion of [Mr] [First] Advocate General X delivered on DATE." */
+const AG_OPINION_DESCRIPTOR = new RegExp(
+  String.raw`^(?:Joined\s+)?Opinion\s+of\s+(?:(?:Mr|Mrs|Ms)\s+)?(?:First\s+)?Advocate\s+General\s+(.+?)\s+delivered\s+on\s+${TITLE_DATE}\.?$`,
+  'i',
+);
+
+/**
+ * Referral segment of a preliminary ruling: "Request(s)/Reference(s) for a
+ * preliminary ruling from [the] X." or the older "…: X - Country.". The first word
+ * is any word, since CELLAR carries typos of it ("Reqeust"). The dash form
+ * ("Reference for a preliminary ruling – VAT – …") is a keyword list, not a
+ * referral, and does not match.
+ */
+const REFERRAL_SEGMENT = /^\p{L}+ for a preliminary ruling(?: from (?:the )?|\s*:\s*)(.+?)\.?$/iu;
+
+/** Trailing case-reference segment: "Case …", "Cases …", or "Joined Case(s) …", in either capitalization. */
+const CASE_REFERENCE_SEGMENT = /^(?:Joined\s+)?Cases?\b/i;
+
+/** ISO `YYYY-MM-DD` from a matched day, English month name, and year; undefined for an unknown month. */
+function titleDateIso(day = '', month = '', year = ''): string | undefined {
+  const monthNumber = MONTH_NUMBERS.get(month.toLowerCase());
+  return monthNumber ? `${year}-${monthNumber}-${day.padStart(2, '0')}` : undefined;
+}
+
+/** What a leading court/AG descriptor of a known shape carries. */
+interface TitleDescriptor {
+  advocateGeneral?: string | undefined;
+  /** ISO date; undefined when the month name is not an English one. */
+  date: string | undefined;
+  /**
+   * True when the descriptor marks the text as published by extracts, which no
+   * field carries: the trailing "(Extracts)", or an extracts parenthetical where
+   * the formation sits.
+   */
+  extracts?: boolean;
+  formation?: string;
+}
+
+/** What the leading court/AG descriptor carries, or undefined when it has none of the known shapes. */
+function parseDescriptor(segment: string): TitleDescriptor | undefined {
+  const judgmentOrOrder = JUDGMENT_OR_ORDER_DESCRIPTOR.exec(segment);
+  if (judgmentOrOrder) {
+    const [, formation, day, month, year, trailingExtracts] = judgmentOrOrder;
+    const extractsFormation = formation !== undefined && /extract/i.test(formation);
+    return {
+      date: titleDateIso(day, month, year),
+      extracts: trailingExtracts !== undefined || extractsFormation,
+      ...(formation && !extractsFormation ? { formation } : {}),
+    };
+  }
+  const presidentOrder = PRESIDENT_ORDER_DESCRIPTOR.exec(segment);
+  if (presidentOrder) {
+    const [, office = '', day, month, year] = presidentOrder;
+    return {
+      date: titleDateIso(day, month, year),
+      formation: office.charAt(0).toUpperCase() + office.slice(1),
+    };
+  }
+  const opinion = AG_OPINION_DESCRIPTOR.exec(segment);
+  if (opinion) {
+    const [, advocateGeneral, day, month, year] = opinion;
+    return { advocateGeneral, date: titleDateIso(day, month, year) };
+  }
+  return;
+}
+
+/**
+ * Parse a CELLAR case-law expression title into structured fields. This is the one
+ * parser every tool that reads a case-law title shares, so each field and the
+ * `complete` verdict mean the same thing wherever a title is decomposed.
  *
  * Case-law titles pack several segments into one `#`-delimited string, roughly
- *   `{court + date}#{parties}#[request for a ruling]#{subject-matter keywords}#{case reference}`
+ *   `{court + formation + date}#{parties}#[referral]#{subject-matter keywords}#{case reference}`
  * e.g. `Judgment of the Court (Grand Chamber) of 10 February 2026.#WhatsApp
  * Ireland Ltd v European Data Protection Board.#Appeal – … .#Case C-97/23 P.`
  *
- * The segment count is not fixed: preliminary-ruling judgments insert a "Request
- * for a preliminary ruling from …" provenance segment before the subject matter,
- * and AG opinions leave the parties/subject/reference segments empty (`Opinion of
- * Advocate General … .###`). Rather than assume a fixed layout, this anchors on
- * the reliable positions — the parties are the second segment, the case reference
- * is the trailing `Case …` segment, and the subject matter is the segment
- * immediately before it. Absent or empty segments are left unset, never invented.
- * A title with no `#` (already a plain title, or an older sparse record) yields an
- * empty object so the caller keeps the raw title untouched.
+ * The segment count is not fixed: preliminary-ruling titles insert a referral
+ * segment naming the national court before the subject matter, and AG opinions
+ * leave the parties/subject/reference segments empty (`Opinion of Advocate General
+ * … .###`). Rather than assume a fixed layout, this anchors on the reliable
+ * positions:
+ * - the leading segment is the court/AG descriptor, read for the formation, the
+ *   Advocate General, and the date — a pre-chamber "Judgment of the Court of DATE."
+ *   names no formation, and none is inferred. A descriptor marking publication by
+ *   extracts ("… of 15 September 2016 (Extracts).") is read the same way but left
+ *   unassigned, since no field says the text is an extract;
+ * - the parties are the second segment;
+ * - the case reference is the trailing "Case …", "Cases …", or "Joined Cases …"
+ *   segment past the parties;
+ * - the referring court is the first referral segment between the parties and the
+ *   case reference;
+ * - the subject matter is the segment immediately before the case reference (or
+ *   the trailing segment when there is none) that is not the referral.
+ * Absent or empty segments are left unset, never invented.
+ *
+ * `date` is the record's own date (`YYYY-MM-DD`, any time or zone suffix ignored).
+ * The parse is `complete` only when every non-empty segment was assigned and the
+ * descriptor's date equals it — so a caller that drops the raw title on a complete
+ * parse loses nothing the fields and the record's date do not already carry. A
+ * title with no `#` (a plain title, or an older sparse record) yields only
+ * `complete: false`, so the caller keeps the raw title untouched.
  */
-export function parseCaseLawTitle(raw: string | undefined): ParsedCaseTitle {
-  if (!raw?.includes('#')) return {};
+export function parseCaseLawTitle(raw: string | undefined, date?: string): ParsedCaseTitle {
+  if (!raw?.includes('#')) return { complete: false };
   const segments = raw.split('#').map((s) => s.trim());
-  const result: ParsedCaseTitle = {};
+  const assigned = new Set<number>();
+  const result: ParsedCaseTitle = { complete: false };
+
+  const descriptor = parseDescriptor(segments[0] ?? '');
+  if (descriptor) {
+    if (!descriptor.extracts) assigned.add(0);
+    if (descriptor.formation) result.formation = descriptor.formation;
+    if (descriptor.advocateGeneral) result.advocateGeneral = descriptor.advocateGeneral;
+  }
 
   // Parties: the second segment — the reliable display-name position.
   const parties = segments[1];
-  if (parties) result.parties = parties;
+  if (parties) {
+    result.parties = parties;
+    assigned.add(1);
+  }
 
-  // Locate the trailing non-empty segment; it anchors the case reference.
+  // Case reference: the trailing non-empty segment, only when it has the case
+  // shape and sits past the parties (index ≥ 2). The optional "s" matches the plural
+  // joined-case form (issue #42), and the optional "Joined" its long form.
   const lastIdx = segments.findLastIndex((s) => s !== '');
+  let end = lastIdx;
+  const last = segments[lastIdx];
+  if (lastIdx >= 2 && last && CASE_REFERENCE_SEGMENT.test(last)) {
+    result.caseReference = last;
+    assigned.add(lastIdx);
+    end = lastIdx - 1;
+  }
 
-  // Case reference: the trailing segment, only when it has the "Case …"/"Cases …"
-  // shape and sits past the parties (index ≥ 2). The optional trailing "s" matches
-  // CELLAR's plural joined-case form ("Cases T-318/24 and T-362/24.") — `\b` never
-  // asserts between "Case" and "s", so a singular-only anchor missed it (issue #42).
-  // AG-opinion titles whose trailing segments are all empty leave this unset.
-  const last = lastIdx >= 2 ? segments[lastIdx] : undefined;
-  const hasCaseReference = last !== undefined && /^Cases?\b/i.test(last);
-  if (hasCaseReference && last) result.caseReference = last;
+  for (let i = 2; i <= end; i++) {
+    const court = REFERRAL_SEGMENT.exec(segments[i] ?? '')?.[1];
+    if (court) {
+      result.referringCourt = court;
+      assigned.add(i);
+      break;
+    }
+  }
 
-  // Subject matter: the keyword list — the segment right before the case reference,
-  // or, absent a case reference, the trailing segment when it sits past the parties.
-  const subjectIdx = hasCaseReference ? lastIdx - 1 : lastIdx;
-  if (subjectIdx >= 2) {
-    const subject = segments[subjectIdx];
-    if (subject) result.subjectMatter = subject;
+  // Subject matter: the keyword list right before the case reference, unless that
+  // segment is the referral itself.
+  const subject = segments[end];
+  if (end >= 2 && subject && !assigned.has(end)) {
+    result.subjectMatter = subject;
+    assigned.add(end);
   }
 
   // Display title: the parties for contested cases, else the leading court/AG descriptor.
   const displayTitle = result.parties ?? segments[0];
   if (displayTitle) result.displayTitle = displayTitle;
 
+  const everySegmentAssigned = segments.every((s, i) => s === '' || assigned.has(i));
+  result.complete =
+    everySegmentAssigned &&
+    descriptor?.date !== undefined &&
+    descriptor.date === date?.slice(0, 10);
   return result;
-}
-
-/**
- * CDM corporate-body URI → human-readable institution name.
- * Falls back to the last URI path segment when not in the map.
- */
-const CORPORATE_BODY_LABEL_ENTRIES: Record<string, string> = {
-  'http://publications.europa.eu/resource/authority/corporate-body/EP': 'European Parliament',
-  'http://publications.europa.eu/resource/authority/corporate-body/CONSIL': 'Council of the EU',
-  'http://publications.europa.eu/resource/authority/corporate-body/COM': 'European Commission',
-  'http://publications.europa.eu/resource/authority/corporate-body/CURIA':
-    'Court of Justice of the EU',
-  // The courts that author sector-6 (case-law) works, from a CELLAR survey of their
-  // cdm:work_created_by_agent values; each label is the corporate-body authority
-  // register's English skos:prefLabel.
-  'http://publications.europa.eu/resource/authority/corporate-body/CJ': 'Court of Justice',
-  'http://publications.europa.eu/resource/authority/corporate-body/GCEU': 'General Court',
-  'http://publications.europa.eu/resource/authority/corporate-body/CST': 'Civil Service Tribunal',
-  'http://publications.europa.eu/resource/authority/corporate-body/CFI': 'Court of First Instance',
-  'http://publications.europa.eu/resource/authority/corporate-body/ECB': 'European Central Bank',
-  'http://publications.europa.eu/resource/authority/corporate-body/EIB': 'European Investment Bank',
-  'http://publications.europa.eu/resource/authority/corporate-body/ECA':
-    'European Court of Auditors',
-  'http://publications.europa.eu/resource/authority/corporate-body/ESC':
-    'European Economic and Social Committee',
-  'http://publications.europa.eu/resource/authority/corporate-body/COR': 'Committee of the Regions',
-  'http://publications.europa.eu/resource/authority/corporate-body/EURATOM': 'Euratom',
-  'http://publications.europa.eu/resource/authority/corporate-body/SRB': 'Single Resolution Board',
-  'http://publications.europa.eu/resource/authority/corporate-body/ESMA':
-    'European Securities and Markets Authority',
-  'http://publications.europa.eu/resource/authority/corporate-body/EBA':
-    'European Banking Authority',
-  'http://publications.europa.eu/resource/authority/corporate-body/EIOPA':
-    'European Insurance and Occupational Pensions Authority',
-  'http://publications.europa.eu/resource/authority/corporate-body/ECDC':
-    'European Centre for Disease Prevention and Control',
-  'http://publications.europa.eu/resource/authority/corporate-body/EEA':
-    'European Environment Agency',
-  'http://publications.europa.eu/resource/authority/corporate-body/EASA':
-    'European Union Aviation Safety Agency',
-  'http://publications.europa.eu/resource/authority/corporate-body/EFSA':
-    'European Food Safety Authority',
-  'http://publications.europa.eu/resource/authority/corporate-body/EMA':
-    'European Medicines Agency',
-  'http://publications.europa.eu/resource/authority/corporate-body/EMEA':
-    'European Medicines Agency',
-  'http://publications.europa.eu/resource/authority/corporate-body/FRONTEX': 'Frontex',
-  'http://publications.europa.eu/resource/authority/corporate-body/EUIPO':
-    'European Union Intellectual Property Office',
-  'http://publications.europa.eu/resource/authority/corporate-body/ETF':
-    'European Training Foundation',
-  'http://publications.europa.eu/resource/authority/corporate-body/EASO':
-    'European Asylum Support Office',
-  'http://publications.europa.eu/resource/authority/corporate-body/ESTAT': 'Eurostat',
-  'http://publications.europa.eu/resource/authority/corporate-body/JUST': 'DG Justice',
-  'http://publications.europa.eu/resource/authority/corporate-body/GROW': 'DG Internal Market',
-  'http://publications.europa.eu/resource/authority/corporate-body/SANTE':
-    'DG Health and Food Safety',
-  'http://publications.europa.eu/resource/authority/corporate-body/COMP': 'DG Competition',
-  'http://publications.europa.eu/resource/authority/corporate-body/FISMA': 'DG Financial Stability',
-  'http://publications.europa.eu/resource/authority/corporate-body/TRADE': 'DG Trade',
-};
-
-/** Lookup view of {@link CORPORATE_BODY_LABEL_ENTRIES}, a `Map` for the same reason as {@link RESOURCE_TYPE_LABELS}. */
-export const CORPORATE_BODY_LABELS: ReadonlyMap<string, string> = new Map(
-  Object.entries(CORPORATE_BODY_LABEL_ENTRIES),
-);
-
-/** Resolve a CDM corporate-body URI to a human-readable institution name. Falls back to last path segment. */
-export function resolveCorporateBodyLabel(uri: string): string {
-  return CORPORATE_BODY_LABELS.get(uri) ?? uri.split('/').pop() ?? uri;
 }

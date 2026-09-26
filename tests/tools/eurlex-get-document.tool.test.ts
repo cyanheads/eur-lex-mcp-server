@@ -511,6 +511,113 @@ describe('eurlex_get_document', () => {
     expect(sparql).not.toContain('cdm:work_title');
   });
 
+  // --- Title in the served language (#133) ---
+
+  describe('title in the served language (#133)', () => {
+    const EN_TITLE = 'Regulation (EU) 2016/679 of the European Parliament and of the Council';
+    const FR_TITLE = 'Règlement (UE) 2016/679 du Parlement européen et du Conseil';
+    const literal = (value: string) => ({ type: 'literal', value });
+
+    /** Answer the core query with the given titles and every other metadata query with nothing. */
+    const routeTitles = (titles: { title?: string; languageTitle?: string }) =>
+      mockSparqlQuery.mockImplementation(async (sparql: string) => {
+        if (isResolutionQuery(sparql)) return resolutionRows(sparql);
+        if (!sparql.includes('cdm:expression_belongs_to_work')) return [];
+        return [
+          {
+            ...(titles.title ? { title: literal(titles.title) } : {}),
+            ...(titles.languageTitle ? { languageTitle: literal(titles.languageTitle) } : {}),
+          },
+        ];
+      });
+    const titleQueries = () =>
+      mockSparqlQuery.mock.calls
+        .map((c) => c[0] as string)
+        .filter((q) => q.includes('cdm:expression_title'));
+    const getTitle = async (args: Record<string, unknown>) => {
+      const result = await runToolContract(eurlex_get_document, {
+        celex_number: '32016R0679',
+        ...args,
+      });
+      const text = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+      return { title: eurlex_get_document.output.parse(result.structuredContent).title, text };
+    };
+
+    it.each([
+      ['fr', 'FRA'],
+      ['de', 'DEU'],
+      ['ga', 'GLE'],
+    ])(
+      'reads the %s expression title beside the English one, in the one core query',
+      async (language, code) => {
+        routeTitles({ title: EN_TITLE, languageTitle: FR_TITLE });
+        const { title, text } = await getTitle({ language, content_mode: 'metadata_only' });
+
+        expect(title).toBe(FR_TITLE);
+        expect(text).toContain(`## 32016R0679 — ${FR_TITLE}`);
+        const [query, ...others] = titleQueries();
+        expect(others).toEqual([]);
+        expect(query).toContain(
+          `?languageExpr cdm:expression_uses_language <http://publications.europa.eu/resource/authority/language/${code}> .`,
+        );
+        expect(query).toContain('?languageExpr cdm:expression_title ?languageTitleValue .');
+        expect(query).toContain('(MAX(STR(?languageTitleValue)) AS ?languageTitle)');
+        expect(query).toContain('?expr cdm:expression_uses_language <');
+      },
+    );
+
+    it('picks the served-language title deterministically, never by SAMPLE', async () => {
+      routeTitles({ title: EN_TITLE, languageTitle: FR_TITLE });
+      await getTitle({ language: 'fr', content_mode: 'metadata_only' });
+      const [query] = titleQueries();
+      // A work with several French titles yields the greatest one on every call.
+      expect(query).toMatch(/\(MAX\(STR\(\?languageTitleValue\)\) AS \?languageTitle\)/);
+      expect(query).not.toContain('SAMPLE(?languageTitleValue)');
+      expect(query).toMatch(/GROUP BY \?type \?date \?title \?inForce/);
+      expect(query).not.toMatch(/GROUP BY[^\n]*\?languageTitle/);
+    });
+
+    it('falls back to the English title when the requested language records none', async () => {
+      routeTitles({ title: EN_TITLE });
+      const { title } = await getTitle({ language: 'fr', content_mode: 'metadata_only' });
+      expect(title).toBe(EN_TITLE);
+    });
+
+    it('titles the body served in the requested language with that language', async () => {
+      routeTitles({ title: EN_TITLE, languageTitle: FR_TITLE });
+      mockFetchContent.mockResolvedValue({
+        content: '<html>Texte</html>',
+        contentAvailable: true,
+        format: 'html',
+        language: 'FR',
+      });
+      const { title } = await getTitle({ language: 'fr' });
+      expect(title).toBe(FR_TITLE);
+    });
+
+    it('titles a body that fell back to English in English', async () => {
+      routeTitles({ title: EN_TITLE, languageTitle: FR_TITLE });
+      mockFetchContent.mockResolvedValue({
+        content: '<html>Text</html>',
+        contentAvailable: true,
+        format: 'html',
+        language: 'EN',
+        languageFallback: 'Requested language FR unavailable; returned English content.',
+      });
+      const { title } = await getTitle({ language: 'fr' });
+      expect(title).toBe(EN_TITLE);
+    });
+
+    it('asks English for no second title', async () => {
+      routeTitles({ title: EN_TITLE });
+      const { title } = await getTitle({ content_mode: 'metadata_only' });
+      expect(title).toBe(EN_TITLE);
+      const [query] = titleQueries();
+      expect(query).not.toContain('?languageExpr');
+      expect(query).not.toContain('languageTitle');
+    });
+  });
+
   // --- ELI URI alternative (issue #8) ---
 
   it('resolves an eli_uri to the same document as the equivalent CELEX', async () => {
@@ -2164,10 +2271,11 @@ describe('eurlex_get_document', () => {
     const row = (field: string, value: string): SparqlRows[number] => ({
       [field]: { type: 'uri', value },
     });
-    /** An agent-query row for a `cdm:work_created_by_agent` value. */
-    const creator = (value: string): SparqlRows[number] => ({
+    /** An agent-query row for a `cdm:work_created_by_agent` value and its English label. */
+    const creator = (value: string, label?: string): SparqlRows[number] => ({
       agent: { type: 'uri', value },
       role: { type: 'literal', value: 'creator' },
+      ...(label ? { agentLabel: { type: 'literal', value: label } } : {}),
     });
 
     /**
@@ -2208,7 +2316,10 @@ describe('eurlex_get_document', () => {
       const ctx = createMockContext({ errors: eurlex_get_document.errors });
       routeSparql({
         core: [makeMetaBinding({ celex: '32016R0679', title: 'GDPR' })],
-        author: [creator(`${CB}/EP`), creator(`${CB}/CONSIL`)],
+        author: [
+          creator(`${CB}/EP`, 'European Parliament'),
+          creator(`${CB}/CONSIL`, 'Council of the European Union'),
+        ],
       });
 
       const input = eurlex_get_document.input.parse({
@@ -2218,16 +2329,60 @@ describe('eurlex_get_document', () => {
       const result = await eurlex_get_document.handler(input, ctx);
 
       // Full set present regardless of order; primary is one of them.
-      expect(result.author_institutions).toEqual(
-        expect.arrayContaining(['European Parliament', 'Council of the EU']),
-      );
+      const authors = ['European Parliament', 'Council of the European Union'];
+      expect(result.author_institutions).toEqual(expect.arrayContaining(authors));
       expect(result.author_institutions).toHaveLength(2);
-      expect(['European Parliament', 'Council of the EU']).toContain(result.author_institution);
+      expect(authors).toContain(result.author_institution);
 
       // format() surfaces the full set (parity).
       const text = (eurlex_get_document.format!(result)[0] as { text: string }).text;
       expect(text).toContain('European Parliament');
-      expect(text).toContain('Council of the EU');
+      expect(text).toContain('Council of the European Union');
+    });
+
+    // --- #103: every authority-code author renders as its English prefLabel ---
+
+    it.each([
+      [
+        '22026A00757',
+        [
+          ['corporate-body/EURUN', 'European Union'],
+          ['country/AUT', 'Austria'],
+          ['country/SWE', 'Sweden'],
+        ],
+      ],
+      ['71991L0683NLD_87862', [['country/NLD', 'Netherlands']]],
+      [
+        '91980E001013',
+        [
+          ['corporate-body/EP', 'European Parliament'],
+          ['fd_013/VAN-MIERT', 'VAN MIERT'],
+        ],
+      ],
+      ['51988AC0454', [['corporate-body/EESC', 'European Economic and Social Committee']]],
+    ])('#103: %s names its authors by label on both channels', async (celex, codes) => {
+      const AUTHORITY = 'http://publications.europa.eu/resource/authority/';
+      routeSparql({
+        core: [makeMetaBinding({ celex, title: 'A work' })],
+        author: codes.map(([code, label]) => creator(`${AUTHORITY}${code}`, label)),
+      });
+
+      const result = await runToolContract(eurlex_get_document, {
+        celex_number: celex,
+        content_mode: 'metadata_only',
+      });
+      const structured = eurlex_get_document.output.parse(result.structuredContent);
+      const labels = codes.map(([, label]) => label as string);
+      expect(structured.author_institutions).toEqual(labels);
+      expect(structured.author_institution).toBe(labels[0]);
+      const text = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+      expect(text).toContain(`**Authors:** ${labels.join(', ')}`);
+      const authorLines = text.split('\n').filter((line) => line.startsWith('**Author'));
+      for (const [code] of codes) {
+        const bare = (code as string).split('/').pop() as string;
+        expect(structured.author_institutions).not.toContain(bare);
+        for (const line of authorLines) expect(line).not.toMatch(new RegExp(`\\b${bare}\\b`));
+      }
     });
 
     // --- #95: sector-6 works name their authoring court, not its authority code ---
@@ -2240,7 +2395,7 @@ describe('eurlex_get_document', () => {
     ])('#95: %s names its author %s as "%s" in both channels', async (celex, code, name) => {
       routeSparql({
         core: [makeMetaBinding({ celex, title: 'Case-law work' })],
-        author: [creator(`${CB}/${code}`)],
+        author: [creator(`${CB}/${code}`, name)],
       });
 
       const result = await runToolContract(eurlex_get_document, {
@@ -2265,7 +2420,10 @@ describe('eurlex_get_document', () => {
       const eurovoc = Array.from({ length: 8 }, (_, i) => row('eurovoc', `http://eurovoc/${i}`));
       routeSparql({
         core: [makeMetaBinding({ celex: '32006R1907', title: 'REACH' })],
-        author: [creator(`${CB}/EP`), creator(`${CB}/CONSIL`)],
+        author: [
+          creator(`${CB}/EP`, 'European Parliament'),
+          creator(`${CB}/CONSIL`, 'Council of the European Union'),
+        ],
         legalBasis: [row('legalBasis', 'http://lb/1'), row('legalBasis', 'http://lb/2')],
         eurovoc,
       });
@@ -2869,8 +3027,11 @@ describe('eurlex_get_document', () => {
       const result = await getDocument({ celex_number: '32016R0679' });
 
       const structured = eurlex_get_document.output.parse(result.structuredContent);
-      expect(structured.author_institution).toBe('Council of the EU');
-      expect(structured.author_institutions).toEqual(['Council of the EU', 'European Parliament']);
+      expect(structured.author_institution).toBe('Council of the European Union');
+      expect(structured.author_institutions).toEqual([
+        'Council of the European Union',
+        'European Parliament',
+      ]);
       expect(structured).not.toHaveProperty('advocates_general');
       expect(textOf(result)).not.toContain('Advocates General');
     });
@@ -3186,7 +3347,7 @@ describe('eurlex_get_document', () => {
       const structured = structuredOf(result);
       expect(structured.base_act_celex).toBe('32024R1689');
       expect(structured.author_institutions).toEqual(
-        expect.arrayContaining(['European Parliament', 'Council of the EU']),
+        expect.arrayContaining(['European Parliament', 'Council of the European Union']),
       );
       expect(structured.author_institutions).toHaveLength(2);
       expect(structured.in_force).toBe(true);
@@ -3250,7 +3411,7 @@ describe('eurlex_get_document', () => {
 
       const structured = structuredOf(result);
       expect(structured).not.toHaveProperty('base_act_celex');
-      expect(structured.author_institutions).toEqual(['OP_DATPRO']);
+      expect(structured.author_institutions).toEqual(['Provisional data']);
       expect(structured).not.toHaveProperty('in_force');
     });
 

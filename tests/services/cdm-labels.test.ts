@@ -6,7 +6,6 @@
 import { describe, expect, it } from 'vitest';
 import {
   parseCaseLawTitle,
-  resolveCorporateBodyLabel,
   resolveResourceTypeLabel,
   resolveResourceTypeLabels,
 } from '@/services/cellar-sparql/cdm-labels.js';
@@ -111,13 +110,13 @@ describe('parseCaseLawTitle', () => {
     expect(parsed.caseReference).toBe('Case 19-68.');
   });
 
-  it('returns an empty object for a plain title with no "#" delimiter', () => {
-    expect(parseCaseLawTitle('Google Spain SL v AEPD')).toEqual({});
+  it('returns only an incomplete verdict for a plain title with no "#" delimiter', () => {
+    expect(parseCaseLawTitle('Google Spain SL v AEPD')).toEqual({ complete: false });
   });
 
-  it('returns an empty object for empty or undefined input', () => {
-    expect(parseCaseLawTitle('')).toEqual({});
-    expect(parseCaseLawTitle(undefined)).toEqual({});
+  it('returns only an incomplete verdict for empty or undefined input', () => {
+    expect(parseCaseLawTitle('')).toEqual({ complete: false });
+    expect(parseCaseLawTitle(undefined)).toEqual({ complete: false });
   });
 
   it('does not treat a trailing non-"Case" segment as a case reference', () => {
@@ -129,6 +128,229 @@ describe('parseCaseLawTitle', () => {
     expect(parsed.parties).toBe('A v B.');
     expect(parsed.caseReference).toBeUndefined();
     expect(parsed.subjectMatter).toBe('Some subject – keywords.');
+  });
+});
+
+/**
+ * CELLAR titles and record dates (live, 2026-09-25; some keyword segments
+ * shortened, every other segment verbatim) for the shared parser
+ * contract of #116: formation, referring court, Advocate General, the joined-case
+ * reference, and the complete-parse verdict that decides whether a caller may drop
+ * the raw title.
+ */
+const GOOGLE_SPAIN_SUBJECT =
+  'Personal data — Protection of individuals with regard to the processing of such data — Directive 95/46/EC — Articles 2, 4, 12 and 14 — Material and territorial scope — Internet search engines — Processing of data contained on websites — Searching for, indexing and storage of such data — Responsibility of the operator of the search engine — Establishment on the territory of a Member State — Extent of that operator’s obligations and of the data subject’s rights — Charter of Fundamental Rights of the European Union — Articles 7 and 8.';
+const GOOGLE_SPAIN_PARTIES =
+  'Google Spain SL and Google Inc. v Agencia Española de Protección de Datos (AEPD) and Mario Costeja González.';
+const GOOGLE_SPAIN_TAIL = `#${GOOGLE_SPAIN_PARTIES}#Request for a preliminary ruling from the Audiencia Nacional.#${GOOGLE_SPAIN_SUBJECT}#Case C‑131/12.`;
+/** 62012CJ0131, dated 2014-05-13 — the comma date form. */
+const GOOGLE_SPAIN_JUDGMENT = `Judgment of the Court (Grand Chamber), 13 May 2014.${GOOGLE_SPAIN_TAIL}`;
+/** 62012CC0131, dated 2013-06-25. */
+const GOOGLE_SPAIN_OPINION = `Opinion of Advocate General Jääskinen delivered on 25 June 2013.${GOOGLE_SPAIN_TAIL}`;
+/** 62014CJ0443, dated 2016-03-01. */
+const ALO_JOINED =
+  'Judgment of the Court (Grand Chamber) of 1 March 2016.#Kreis Warendorf v Ibrahim Alo and Amira Osso v and Region Hannover.#Requests for a preliminary ruling from the Bundesverwaltungsgericht.#Reference for a preliminary ruling — Convention relating to the Status of Refugees, signed in Geneva on 28 July 1951 — Articles 23 and 26 — Area of freedom, security and justice.#Joined Cases C-443/14 and C-444/14.';
+/** 61985CO0082, dated 1985-04-22. */
+const EURASIAN_ORDER =
+  'Order of the President of the Court of 22 April 1985.#Eurasian Corporation Ltd v Commission of the European Communities.#Application for the adoption of interim measures.#Joined cases 82/85 R and 83/85 R.';
+/** 62025TJ0069, dated 2026-02-25 — a General Court preliminary ruling. */
+const GC_PRELIMINARY =
+  'Judgment of the General Court (Fifth Chamber, Extended Composition) of 25 February 2026.#A GmbH v Hauptzollamt C.#Request for a preliminary ruling from the Bundesfinanzhof.#Reference for a preliminary ruling – Customs union – Common Customs Tariff – Tariff classification.#Case T-69/25.';
+/** 61985CO0069, dated 1986-03-05 — a referral segment with no keyword segment after it. */
+const WUNSCHE_ORDER =
+  'Order of the Court of 5 March 1986.#Wünsche Handelsgesellschaft GmbH & Co. v Federal Republic of Germany.#Reference for a preliminary ruling: Verwaltungsgericht Frankfurt am Main - Germany.#Case 69/85.';
+/** 61962CJ0026, dated 1963-02-05 — pre-chamber descriptor. */
+const VAN_GEND =
+  'Judgment of the Court of 5 February 1963.#NV Algemene Transport- en Expeditie Onderneming van Gend & Loos v Netherlands Inland Revenue Administration.#Reference for a preliminary ruling: Tariefcommissie - Netherlands.#Case 26-62.';
+/** 62019CJ0130, dated 2021-09-30 — a direct action before the Full Court. */
+const PINXTEN_FULL_COURT =
+  'Judgment of the Court (Full Court) of 30 September 2021.#European Court of Auditors v Karel Pinxten.#Article 286(6) TFEU – Breach of obligations arising from the office of Member of the European Court of Auditors.#Case C-130/19.';
+/** 62019CJ0470, dated 2021-04-15 — the dash form is a keyword list, not a referral. */
+const DASH_REFERENCE =
+  'Judgment of the Court (First Chamber) of 15 April 2021.#Friends of the Irish Environment Ltd v Commissioner for Environmental Information.#Reference for a preliminary ruling – Aarhus Convention – Directive 2003/4/EC.#Case C-470/19.';
+/** 62014TJ0353, dated 2016-09-15 — "(Extracts)" after the date. */
+const EXTRACTS =
+  'Judgment of the General Court (Eighth Chamber) of 15 September 2016 (Extracts).#Italian Republic v European Commission.#Rules on languages — Notices of open competition.#Cases T-353/14 and T-17/15.';
+/** 62014CO0078(01), dated 2014-04-08. */
+const VICE_PRESIDENT_ORDER =
+  'Order of the Vice-President of the Court, 8 April 2014.#European Commission v ANKO AE Antiprosopeion, Emporiou kai Viomichanias.#Application for interim measures — Appeals.#Case C‑78/14 P-R.';
+/** 61985CO0074, dated 1985-03-29. */
+const CHAMBER_PRESIDENT_ORDER =
+  'Order of the President of the Second Chamber of the Court of 29 March 1985.#Jaqueline Remy v Commission of the European Communities.#Officials - Suspension of the operation of a decision.#Case 74/85 R.';
+/** 62014CO0123, dated 2015-07-15 — CELLAR's own typo in the referral's first word. */
+const REQEUST_TYPO =
+  'Order of the Court (Tenth Chamber) of 15 July 2015.#"Itales" OOD v Direktor na Direktsia.#Reqeust for a preliminary ruling from the Administrativen sad - Varna.#Reference for a preliminary ruling — Taxation — VAT.#Case C-123/14.';
+/** 62014CC0080, dated 2015-02-05 — a leading segment of no known shape. */
+const USDAW_OPINION =
+  'Advocate General’s Opinion - 5 February 2015#USDAW and Wilson#Case C-80/14#Advocate General: Wahl';
+/** 62019CJ0793, a work dated 2022-10-27 whose title dates the judgment 20 September 2022. */
+const SPACENET =
+  'Judgment of the Court (Grand Chamber) of 20 September 2022.#Bundesrepublik Deutschland v SpaceNet AG and Telekom Deutschland GmbH.#Requests for a preliminary ruling from the Bundesverwaltungsgericht.#Reference for a preliminary ruling – Processing of personal data.#Joined Cases C-793/19 and C-794/19.';
+
+describe('parseCaseLawTitle — shared contract (#116)', () => {
+  it('decomposes the C-131/12 judgment completely, formation and referring court included', () => {
+    expect(parseCaseLawTitle(GOOGLE_SPAIN_JUDGMENT, '2014-05-13')).toEqual({
+      complete: true,
+      formation: 'Grand Chamber',
+      displayTitle: GOOGLE_SPAIN_PARTIES,
+      parties: GOOGLE_SPAIN_PARTIES,
+      referringCourt: 'Audiencia Nacional',
+      subjectMatter: GOOGLE_SPAIN_SUBJECT,
+      caseReference: 'Case C‑131/12.',
+    });
+  });
+
+  it('reads the Advocate General of the C-131/12 opinion and names no formation', () => {
+    const parsed = parseCaseLawTitle(GOOGLE_SPAIN_OPINION, '2013-06-25');
+    expect(parsed.advocateGeneral).toBe('Jääskinen');
+    expect(parsed.referringCourt).toBe('Audiencia Nacional');
+    expect(parsed.formation).toBeUndefined();
+    expect(parsed.complete).toBe(true);
+  });
+
+  it('reads the Advocate General of a "Mr" opinion and a sparse one', () => {
+    expect(
+      parseCaseLawTitle('Opinion of Mr Advocate General Lenz delivered on 12 March 1986.###')
+        .advocateGeneral,
+    ).toBe('Lenz');
+    expect(parseCaseLawTitle(AG_OPINION, '2026-07-02')).toMatchObject({
+      advocateGeneral: 'Richard de la Tour',
+      complete: true,
+    });
+  });
+
+  it('parses a "Joined Cases" reference and keeps the keyword segment as subject matter', () => {
+    const parsed = parseCaseLawTitle(ALO_JOINED, '2016-03-01');
+    expect(parsed.caseReference).toBe('Joined Cases C-443/14 and C-444/14.');
+    expect(parsed.referringCourt).toBe('Bundesverwaltungsgericht');
+    expect(parsed.subjectMatter).toMatch(
+      /^Reference for a preliminary ruling — Convention relating to the Status of Refugees/,
+    );
+    expect(parsed.complete).toBe(true);
+  });
+
+  it('parses a lower-case "Joined cases" reference and a President order', () => {
+    const parsed = parseCaseLawTitle(EURASIAN_ORDER, '1985-04-22');
+    expect(parsed.caseReference).toBe('Joined cases 82/85 R and 83/85 R.');
+    expect(parsed.formation).toBe('President');
+    expect(parsed.subjectMatter).toBe('Application for the adoption of interim measures.');
+    expect(parsed.complete).toBe(true);
+  });
+
+  it('names the Vice-President and a chamber President as the formation', () => {
+    expect(parseCaseLawTitle(VICE_PRESIDENT_ORDER, '2014-04-08')).toMatchObject({
+      formation: 'Vice-President',
+      complete: true,
+    });
+    expect(parseCaseLawTitle(CHAMBER_PRESIDENT_ORDER, '1985-03-29')).toMatchObject({
+      formation: 'President of the Second Chamber',
+      complete: true,
+    });
+  });
+
+  it('reads the referring court of a General Court preliminary ruling and an extended composition', () => {
+    const parsed = parseCaseLawTitle(GC_PRELIMINARY, '2026-02-25');
+    expect(parsed.referringCourt).toBe('Bundesfinanzhof');
+    expect(parsed.formation).toBe('Fifth Chamber, Extended Composition');
+    expect(parsed.complete).toBe(true);
+  });
+
+  it('takes a referral with no keyword segment after it as the referring court, not subject matter', () => {
+    const parsed = parseCaseLawTitle(WUNSCHE_ORDER, '1986-03-05');
+    expect(parsed.referringCourt).toBe('Verwaltungsgericht Frankfurt am Main - Germany');
+    expect(parsed.subjectMatter).toBeUndefined();
+    expect(parsed.complete).toBe(true);
+  });
+
+  it('infers no formation for a pre-chamber judgment and reads its colon-form referral', () => {
+    const parsed = parseCaseLawTitle(VAN_GEND, '1963-02-05');
+    expect(parsed.formation).toBeUndefined();
+    expect(parsed.referringCourt).toBe('Tariefcommissie - Netherlands');
+    expect(parsed.complete).toBe(true);
+  });
+
+  it('names no referring court on a direct action, and reads the Full Court', () => {
+    const parsed = parseCaseLawTitle(PINXTEN_FULL_COURT, '2021-09-30');
+    expect(parsed.referringCourt).toBeUndefined();
+    expect(parsed.formation).toBe('Full Court');
+    expect(parsed.complete).toBe(true);
+    expect(parseCaseLawTitle(WHATSAPP, '2026-02-10').referringCourt).toBeUndefined();
+  });
+
+  it('keeps the dash form "Reference for a preliminary ruling – …" as subject matter', () => {
+    const parsed = parseCaseLawTitle(DASH_REFERENCE, '2021-04-15');
+    expect(parsed.referringCourt).toBeUndefined();
+    expect(parsed.subjectMatter).toBe(
+      'Reference for a preliminary ruling – Aarhus Convention – Directive 2003/4/EC.',
+    );
+    expect(parsed.complete).toBe(true);
+  });
+
+  it('never takes "(Extracts)" as the formation, and leaves an extracts title incomplete', () => {
+    const parsed = parseCaseLawTitle(EXTRACTS, '2016-09-15');
+    expect(parsed).toMatchObject({
+      formation: 'Eighth Chamber',
+      parties: 'Italian Republic v European Commission.',
+      caseReference: 'Cases T-353/14 and T-17/15.',
+      complete: false,
+    });
+    // Without its marker the same title parses completely: the marker alone keeps it.
+    expect(parseCaseLawTitle(EXTRACTS.replace(' (Extracts)', ''), '2016-09-15').complete).toBe(
+      true,
+    );
+  });
+
+  it('keeps no formation and no complete verdict for an extracts parenthetical in the formation slot', () => {
+    const parsed = parseCaseLawTitle(
+      EXTRACTS.replace(
+        '(Eighth Chamber) of 15 September 2016 (Extracts)',
+        '(Extracts) of 15 September 2016',
+      ),
+      '2016-09-15',
+    );
+    expect(parsed.formation).toBeUndefined();
+    expect(parsed.complete).toBe(false);
+  });
+
+  it('reads a referral whose first word CELLAR misspells', () => {
+    expect(parseCaseLawTitle(REQEUST_TYPO, '2015-07-15')).toMatchObject({
+      referringCourt: 'Administrativen sad - Varna',
+      complete: true,
+    });
+  });
+
+  describe('complete-parse verdict', () => {
+    it('is incomplete when the leading segment has no known shape', () => {
+      const parsed = parseCaseLawTitle(USDAW_OPINION, '2015-02-05');
+      expect(parsed.complete).toBe(false);
+    });
+
+    it('is incomplete when the leading date differs from the record date', () => {
+      expect(parseCaseLawTitle(SPACENET, '2022-10-27').complete).toBe(false);
+      expect(parseCaseLawTitle(SPACENET, '2022-09-20').complete).toBe(true);
+    });
+
+    it('is incomplete when the record has no date to confirm the leading one against', () => {
+      expect(parseCaseLawTitle(SPACENET).complete).toBe(false);
+    });
+
+    it('compares only the date part of a record date', () => {
+      expect(parseCaseLawTitle(SPACENET, '2022-09-20+02:00').complete).toBe(true);
+    });
+
+    it('is incomplete when a middle segment is left unassigned', () => {
+      const withExtra = WHATSAPP.replace('#Appeal', '#An unplaced segment.#Appeal');
+      expect(parseCaseLawTitle(withExtra, '2026-02-10').complete).toBe(false);
+    });
+
+    it('is incomplete for a title with no "#"', () => {
+      expect(
+        parseCaseLawTitle(
+          'Opinion of Advocate General Cruz Villalón delivered on 8 September 2015.',
+          '2015-09-08',
+        ).complete,
+      ).toBe(false);
+    });
   });
 });
 
@@ -343,38 +565,5 @@ describe('resolveResourceTypeLabels', () => {
   it('resolves a lone CONS_TEXT and MEAS_NATION_IMPL through the multi-type path (#86)', () => {
     expect(resolveResourceTypeLabels(CONS_TEXT_URI)).toBe('Consolidated Text');
     expect(resolveResourceTypeLabels(MEAS_NATION_IMPL_URI)).toBe('National Implementing Measure');
-  });
-});
-
-/**
- * Every corporate body that authors a sector-6 work, from a live survey of CELLAR
- * (works whose CELEX starts with "6", grouped by `cdm:work_created_by_agent`), with
- * the English skos:prefLabel of its corporate-body authority concept. CURIA keeps
- * its existing shortened label.
- */
-const CORPORATE_BODY_BASE = 'http://publications.europa.eu/resource/authority/corporate-body/';
-const SECTOR_6_AUTHORS: Record<string, string> = {
-  CJ: 'Court of Justice',
-  GCEU: 'General Court',
-  CST: 'Civil Service Tribunal',
-  CFI: 'Court of First Instance',
-  CURIA: 'Court of Justice of the EU',
-};
-
-describe('resolveCorporateBodyLabel', () => {
-  it('names every court that authors a sector-6 work — none falls back to its code (#95)', () => {
-    for (const [code, label] of Object.entries(SECTOR_6_AUTHORS)) {
-      expect(resolveCorporateBodyLabel(`${CORPORATE_BODY_BASE}${code}`)).toBe(label);
-    }
-  });
-
-  it('falls back to the last path segment for an unmapped corporate body', () => {
-    expect(resolveCorporateBodyLabel(`${CORPORATE_BODY_BASE}UNKNOWN_BODY`)).toBe('UNKNOWN_BODY');
-  });
-
-  it('never resolves a key through the prototype chain', () => {
-    for (const key of ['constructor', 'toString', '__proto__']) {
-      expect(resolveCorporateBodyLabel(key)).toBe(key);
-    }
   });
 });

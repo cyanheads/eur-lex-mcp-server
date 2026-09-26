@@ -5,13 +5,19 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { ENG_LANGUAGE_URI, resolveResourceTypeLabel } from '@/services/cellar-sparql/cdm-labels.js';
+import {
+  ENG_LANGUAGE_URI,
+  LANGUAGE_AUTHORITY_URI,
+  parseCaseLawTitle,
+  resolveResourceTypeLabel,
+} from '@/services/cellar-sparql/cdm-labels.js';
 import {
   CellarSparqlService,
   getCellarSparqlService,
 } from '@/services/cellar-sparql/cellar-sparql-service.js';
 import {
   CELEX_PATTERN,
+  celexLiteral,
   isSafeSparqlIri,
   resolveEliToWork,
 } from '@/services/cellar-sparql/eli-resolution.js';
@@ -27,8 +33,9 @@ import {
   type ActHeading,
   collapseRecitals,
   extractSections,
+  isCaseLawCelex,
   outermostSections,
-  parseActStructure,
+  parseDocumentStructure,
   type SectionSelectors,
   type SelectedSection,
 } from '@/services/eurlex-content/act-structure.js';
@@ -38,6 +45,7 @@ import {
   EURLEX_LANGUAGES,
   type EurLexLanguage,
   getEurLexContentService,
+  LANGUAGE_TO_ISO_639_2,
 } from '@/services/eurlex-content/eurlex-content-service.js';
 
 /**
@@ -108,7 +116,7 @@ function unavailableBodyNote(
 export const eurlex_get_document = tool('eurlex_get_document', {
   title: 'Get EU Document',
   description:
-    'Fetch the metadata and full text of an EU act by CELEX number, ELI URI, or work URI. Returns structured metadata (title, date, type, author institution, Advocates General, legal basis, EuroVoc subjects, in-force status and, for an act not in force, its repealing acts, end of validity, or pending entry into force) plus the act body as HTML, Markdown, or Formex4 XML, defaulting to English with automatic fallback. Every body returned in one call is capped at 100,000 characters — paged and full windows page onward with offset/limit; use outline: true for a heading map and select to pull specific articles, chapters, recitals, or annexes, reading a selected section on its own from the offset and chars in selected_sections.',
+    'Fetch the metadata and full text of an EU act or case-law record by CELEX number, ELI URI, or work URI. Returns structured metadata (title, date, type, author institution, Advocates General, legal basis, EuroVoc subjects, in-force status and, for an act not in force, its repealing acts, end of validity, or pending entry into force; for case law, the ECLI and the formation, referring court, subject matter, and case reference parsed from the title) plus the body as HTML, Markdown, or Formex4 XML, defaulting to English with automatic fallback. Every body returned in one call is capped at 100,000 characters — paged and full windows page onward with offset/limit; use outline: true for a heading map and select to pull specific articles, chapters, recitals, or annexes of an act, or the headed sections and operative part of a judgment or order, reading a selected section on its own from the offset and chars in selected_sections.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     celex_number: z
@@ -192,7 +200,7 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .boolean()
       .default(false)
       .describe(
-        'Return a structural outline of the act — chapters, sections, articles, annexes, and the preamble\'s recitals as a heading list, each with its character offset — instead of body text. The recitals appear as one entry spanning the run (e.g. "Recitals 1–173") at the first recital\'s offset unless include_recitals is true. Headings of text an amending act inserts into another act are not listed. Read a section by paging with its offset, keeping the same format: outline offsets are measured in the requested format\'s body and land in the wrong place under any other format. Ignores offset/limit and select; no detectable structure returns an empty outline. Not applied in content_mode "metadata_only".',
+        'Return a structural outline of the act — chapters, sections, articles, annexes, and the preamble\'s recitals as a heading list, each with its character offset — instead of body text. The recitals appear as one entry spanning the run (e.g. "Recitals 1–173") at the first recital\'s offset unless include_recitals is true. Headings of text an amending act inserts into another act are not listed. For case law, the outline lists each top-level section heading ("Legal context", "Costs") and, for a judgment or order, the operative part (the ruling). Read a section by paging with its offset, keeping the same format: outline offsets are measured in the requested format\'s body and land in the wrong place under any other format. Ignores offset/limit and select; no detectable structure returns an empty outline. Not applied in content_mode "metadata_only".',
       ),
     include_recitals: z
       .boolean()
@@ -212,10 +220,22 @@ export const eurlex_get_document = tool('eurlex_get_document', {
           .string()
           .optional()
           .describe('Comma-separated annex numbers or letters, e.g. "I,II".'),
+        headings: z
+          .string()
+          .optional()
+          .describe(
+            'Case law: comma-separated positions of section headings, as numbered in the outline, e.g. "2" or "1,4". A section runs to the next heading or the operative part.',
+          ),
+        operative_part: z
+          .boolean()
+          .optional()
+          .describe(
+            'Case law: true to return a judgment\'s or order\'s operative part (the ruling) to the end of the body: from its opening words ("On those grounds, …") in a modern body, from the "Operative part" section in a legacy one.',
+          ),
       })
       .optional()
       .describe(
-        `Return only the text of specific sections by type and number, instead of a raw character window (Roman and Arabic numbers are equivalent; a number may carry an English kind word or one in the language served, e.g. "Article 5", "Artikel 5", "5. cikk"). Sections are located in the body of the requested format, so pair select with the same format used for any outline. A section inside another selected section (an article in a selected chapter) is returned once, within the enclosing one. A section that cannot be located — including a number that appears only in text an amending act inserts into another act — is reported in selection.missed with no wrong text returned. offset and limit do not apply: the joined sections are capped at ${MAX_CONTENT_LIMIT} characters with no continuation, and each section stays readable on its own from its offset and chars in selected_sections. Ignored when outline is true or in content_mode "metadata_only".`,
+        `Return only the text of specific sections by type and number, instead of a raw character window (Roman and Arabic numbers are equivalent; a number may carry an English kind word or one in the language served, e.g. "Article 5", "Artikel 5", "5. cikk"). For case law, select headed sections by position or the operative part. Sections are located in the body of the requested format, so pair select with the same format used for any outline. A section inside another selected section (an article in a selected chapter) is returned once, within the enclosing one. A section that cannot be located — including a number that appears only in text an amending act inserts into another act — is reported in selection.missed with no wrong text returned. offset and limit do not apply: the joined sections are capped at ${MAX_CONTENT_LIMIT} characters with no continuation, and each section stays readable on its own from its offset and chars in selected_sections. Ignored when outline is true or in content_mode "metadata_only".`,
       ),
   }),
   output: z.object({
@@ -225,8 +245,36 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .string()
       .optional()
       .describe(
-        'Document title in the requested language (absent for some older works and judgments).',
+        'Document title in the language the body is served in (see language), or in English when CELLAR records no title in that language. Case law is titled in English whatever the language, parsed from its English CELLAR title: the parties (e.g. "Google Spain SL and Google Inc. v Agencia Española de Protección de Datos (AEPD) and Mario Costeja González."), or the court/AG descriptor when the case names none, with the rest in formation, referring_court, subject_matter, and case_reference, when the parser places the title whole; otherwise the raw "#"-delimited English title, or the served language\'s raw title when there is no English one. Absent for some older works and judgments.',
       ),
+    ecli: z
+      .string()
+      .optional()
+      .describe(
+        'European Case Law Identifier of a case-law record (e.g. "ECLI:EU:C:2014:317"), as eurlex_lookup_celex reports it: the work\'s own, or the lowest another work holding the same CELEX records. Absent for legislation.',
+      ),
+    formation: z
+      .string()
+      .optional()
+      .describe(
+        'Case law: the formation that decided, from the title\'s leading segment, verbatim (e.g. "Grand Chamber"), or "President", "Vice-President", or "President of the Second Chamber" for an order issued by that office. Absent when the title names none.',
+      ),
+    referring_court: z
+      .string()
+      .optional()
+      .describe(
+        'Case law: the national court that referred a preliminary ruling, from the title (e.g. "Audiencia Nacional"). Absent on direct actions and appeals.',
+      ),
+    subject_matter: z
+      .string()
+      .optional()
+      .describe(
+        'Case law: the subject-matter keyword list from the title (e.g. "Personal data – Protection of individuals …").',
+      ),
+    case_reference: z
+      .string()
+      .optional()
+      .describe('Case law: the case reference from the title (e.g. "Case C-131/12.").'),
     date: z.string().optional().describe('Document date in ISO 8601 format (YYYY-MM-DD).'),
     resource_type: z
       .string()
@@ -238,13 +286,13 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .string()
       .optional()
       .describe(
-        'Human-readable name of the primary (first) originating institution — an EU institution (e.g. "European Parliament", "Court of Justice"), or for a national-court decision the deciding court (e.g. "Supremo Tribunal de Justiça"). For co-legislated acts, prefer author_institutions for the complete set. For a consolidated text, the base act\'s (see base_act_celex). Absent when not recorded, and for an AG opinion whose only recorded author is the Advocate General.',
+        'Primary (first) author, by the English label of its CELLAR authority code: an EU institution or body (e.g. "European Parliament", "Court of Justice", "European Union"), a member state on a national implementing measure (e.g. "Netherlands"), an MEP by surname on a parliamentary question (e.g. "VAN MIERT"), "Provisional data" for a consolidated text with no linked base act, or for a national-court decision the deciding court (e.g. "Supremo Tribunal de Justiça"). A code with no English label shows the last segment of its code. Each label is accepted by the author_institution filter of eurlex_search_documents. For co-legislated acts, prefer author_institutions for the complete set. For a consolidated text, the base act\'s (see base_act_celex). Absent when not recorded, and for an AG opinion whose only recorded author is the Advocate General.',
       ),
     author_institutions: z
-      .array(z.string().describe('Human-readable institution name.'))
+      .array(z.string().describe('Author label, as in author_institution.'))
       .optional()
       .describe(
-        'All originating institutions, for acts adopted by more than one body (e.g. ["European Parliament", "Council of the EU"]). Institutions only: an Advocate General appears in advocates_general. For a consolidated text, the base act\'s. Absent when none recorded.',
+        'All authors, labelled as in author_institution and listed once each, for acts adopted by more than one body (e.g. ["European Parliament", "Council of the European Union"]) or signed by several states. Advocates General appear in advocates_general instead. For a consolidated text, the base act\'s. Absent when none recorded.',
       ),
     advocates_general: z
       .array(z.string().describe('Advocate General surname, as CELLAR records it.'))
@@ -424,17 +472,17 @@ export const eurlex_get_document = tool('eurlex_get_document', {
             kind: z
               .string()
               .describe(
-                'Structural unit kind: "chapter", "section", "article", "annex", or "recital".',
+                'Structural unit kind: "chapter", "section", "article", "annex", or "recital" in an act; "heading" or "operative_part" in case law.',
               ),
             number: z
               .string()
               .describe(
-                'Numbering token, the same in every language (e.g. "17", "6A", "IV" — Roman numerals in Latin letters, French "premier" as "1"); empty for a lone unnumbered annex. A recital entry covering a run reads as a range, first–last (e.g. "1–173"), unless include_recitals is true.',
+                'Numbering token, the same in every language (e.g. "17", "6A", "IV" — Roman numerals in Latin letters, French "premier" as "1"); empty for a lone unnumbered annex. A recital entry covering a run reads as a range, first–last (e.g. "1–173"), unless include_recitals is true. A case-law heading is numbered by its 1-based position, the number select.headings takes; empty for the operative part.',
               ),
             label: z
               .string()
               .describe(
-                'Human label in English whatever the language and format, e.g. "Article 17", "CHAPTER IV", "Recitals 1–173" — the form selection.matched reports; only an xml article with no number to read keeps its own heading text.',
+                'Human label in English whatever the language and format, e.g. "Article 17", "CHAPTER IV", "Recitals 1–173" — the form selection.matched reports; only an xml article with no number to read keeps its own heading text. A case-law heading keeps its text as served (e.g. "Legal context", "Sur les dépens"); the operative part is "Operative part".',
               ),
             title: z.string().optional().describe('Descriptive title where the act supplies one.'),
             offset: z
@@ -455,12 +503,12 @@ export const eurlex_get_document = tool('eurlex_get_document', {
         requested: z
           .array(z.string())
           .describe(
-            'Section descriptors requested, in English whatever the language, e.g. ["Article 17", "CHAPTER IV"].',
+            'Section descriptors requested, in English whatever the language, e.g. ["Article 17", "CHAPTER IV"], or ["Heading 2", "Operative part"] for case law.',
           ),
         matched: z
           .array(z.string())
           .describe(
-            'Labels of the sections located in the body, in document order — in English whatever the language and format, as in the outline.',
+            'Labels of the sections located in the body, in document order, as in the outline — in English whatever the language and format, except a case-law heading, which keeps its text as served.',
           ),
         missed: z
           .array(z.string())
@@ -477,7 +525,7 @@ export const eurlex_get_document = tool('eurlex_get_document', {
             label: z
               .string()
               .describe(
-                'Section label in English whatever the language and format, e.g. "Article 17".',
+                'Section label as in the outline, e.g. "Article 17", or a case-law heading\'s served text.',
               ),
             offset: z
               .number()
@@ -502,7 +550,7 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .boolean()
       .optional()
       .describe(
-        'Whether any act structure was parsed from the body. Present when outline or select was used; false means no detectable chapter/article/annex structure — read it via offset/limit or content_mode "full".',
+        'Whether any structure was parsed from the body. Present when outline or select was used; false means no detectable chapter/article/annex structure, or for case law no section heading or operative part — read it via offset/limit or content_mode "full".',
       ),
   }),
 
@@ -651,19 +699,51 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       // computes a grouped MIN/MAX over an OPTIONAL xsd:date wrongly. The open-ended
       // placeholder is filtered inside its OPTIONAL, so the MAX sees only real dates
       // on an act that records one alongside it.
+      //
+      // A case-law record's ECLI rides it too (#117), by eurlex_lookup_celex's
+      // rule: the resolved work's own, else the lowest any work of the CELEX
+      // records, since the canonical work can carry none while a copy does.
+      const caseLaw = isCaseLawCelex(celex);
+      const ecliSelect = caseLaw
+        ? '\n  (MIN(STR(?ownEcli)) AS ?ecli) (MIN(STR(?celexEcli)) AS ?anyEcli)'
+        : '';
+      const ecliPatterns = caseLaw
+        ? `
+  OPTIONAL { <${workUri}> cdm:case-law_ecli ?ownEcli . }
+  OPTIONAL {
+    ?celexWork cdm:resource_legal_id_celex ${celexLiteral(celex)} .
+    ?celexWork cdm:case-law_ecli ?celexEcli .
+  }`
+        : '';
+      // The title is read in English and, for any other language, in that language
+      // too (#133), each through its own expression variable: which one is served
+      // is known only once the body settles on a language, and the metadata stays
+      // one query. MAX(STR()) rather than SAMPLE picks the same title on every call
+      // when the work carries several in that language.
+      const languageTitleSelect =
+        language === 'EN' ? '' : '\n  (MAX(STR(?languageTitleValue)) AS ?languageTitle)';
+      const languageTitlePattern =
+        language === 'EN'
+          ? ''
+          : `
+  OPTIONAL {
+    ?languageExpr cdm:expression_belongs_to_work <${workUri}> .
+    ?languageExpr cdm:expression_uses_language <${LANGUAGE_AUTHORITY_URI}${LANGUAGE_TO_ISO_639_2[language].toUpperCase()}> .
+    ?languageExpr cdm:expression_title ?languageTitleValue .
+  }`;
       const coreQuery = `
 SELECT ?type ?date ?title ?inForce
   (MIN(STR(?entryIntoForceDate)) AS ?entryIntoForce)
   (MAX(STR(?endOfValidityDate)) AS ?endOfValidity)
-  (GROUP_CONCAT(DISTINCT STR(?repealerCelex); separator=" ") AS ?repealedBy)
-WHERE {
+  (GROUP_CONCAT(DISTINCT STR(?repealerCelex); separator=" ") AS ?repealedBy)${ecliSelect}${languageTitleSelect}
+WHERE {${ecliPatterns}
   OPTIONAL { <${workUri}> cdm:work_has_resource-type ?type . }
   OPTIONAL { <${workUri}> cdm:work_date_document ?date . }
   OPTIONAL {
     ?expr cdm:expression_belongs_to_work <${workUri}> .
     ?expr cdm:expression_uses_language <${ENG_LANGUAGE_URI}> .
     ?expr cdm:expression_title ?title .
-  }
+  }${languageTitlePattern}
   OPTIONAL { <${actWork}> cdm:resource_legal_in-force ?inForce . }
   OPTIONAL { <${actWork}> cdm:resource_legal_date_entry-into-force ?entryIntoForceDate . }
   OPTIONAL {
@@ -723,6 +803,10 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
         resourceType: CellarSparqlService.bindingValue(first, 'type'),
         date: CellarSparqlService.bindingValue(first, 'date'),
         title: CellarSparqlService.bindingValue(first, 'title'),
+        languageTitle: CellarSparqlService.bindingValue(first, 'languageTitle'),
+        ecli:
+          CellarSparqlService.bindingValue(first, 'ecli') ||
+          CellarSparqlService.bindingValue(first, 'anyEcli'),
         inForce: CellarSparqlService.parseBoolean(
           CellarSparqlService.bindingValue(first, 'inForce'),
         ),
@@ -804,6 +888,11 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
       requested_celex?: string;
       work_uri?: string;
       title?: string;
+      ecli?: string;
+      formation?: string;
+      referring_court?: string;
+      subject_matter?: string;
+      case_reference?: string;
       date?: string;
       resource_type?: string;
       author_institution?: string;
@@ -848,7 +937,34 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
 
     result.work_uri = metaResult.workUri;
     if (metaResult.baseActCelex) result.base_act_celex = metaResult.baseActCelex;
-    if (metaResult.title) result.title = metaResult.title;
+    // The title follows the language the body is served in (#133): the requested
+    // language's expression title, or English when that language has none or the
+    // body fell back to English. Without a body, the served language is the one
+    // requested.
+    const servedLanguage = body?.language ?? language;
+    const servedTitle = (servedLanguage !== 'EN' && metaResult.languageTitle) || metaResult.title;
+    if (metaResult.title && isCaseLawCelex(servedCelex)) {
+      /**
+       * A case-law title is CELLAR's "#"-joined segments (#117), decomposed by the
+       * parser eurlex_get_cases shares (#116). The parser reads the English segment
+       * shapes ("Judgment of the Court", "Request for a preliminary ruling from",
+       * English month names), so case law parses its English title in every
+       * language. The title becomes the parties (or the court/AG descriptor of a
+       * case with none) only when every segment was placed and the descriptor's
+       * date is the record's, so nothing the raw string carries is lost; otherwise
+       * the raw English title stays. The court, date, type, and Advocate General
+       * are already fields of their own.
+       */
+      const parsed = parseCaseLawTitle(metaResult.title, metaResult.date);
+      result.title = (parsed.complete && parsed.displayTitle) || metaResult.title;
+      if (parsed.formation) result.formation = parsed.formation;
+      if (parsed.referringCourt) result.referring_court = parsed.referringCourt;
+      if (parsed.subjectMatter) result.subject_matter = parsed.subjectMatter;
+      if (parsed.caseReference) result.case_reference = parsed.caseReference;
+    } else if (servedTitle) {
+      result.title = servedTitle;
+    }
+    if (metaResult.ecli) result.ecli = metaResult.ecli;
     if (metaResult.date) result.date = metaResult.date;
     if (metaResult.resourceType) {
       result.resource_type = resolveResourceTypeLabel(metaResult.resourceType);
@@ -933,10 +1049,13 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
         result.content_chars_total = total;
 
         // Headings are read in the language served, after any English fallback
-        // (#107). A Markdown body arrives with its own, parsed once against the
-        // HTML it was rendered from so its quoted headings are told apart (#106);
-        // an html or xml body carries its own markup and is parsed here.
-        const headings = () => body.headings ?? parseActStructure(full, format, body.language);
+        // (#107), by the parser the served CELEX calls for (#117). A Markdown body
+        // arrives with its own, parsed once against the HTML it was rendered from
+        // so its quoted headings are told apart (#106) and a judgment's section
+        // headings found; an html or xml body carries its own markup and is parsed
+        // here.
+        const headings = () =>
+          body.headings ?? parseDocumentStructure(servedCelex, full, format, body.language);
 
         if (input.outline) {
           // Structure-only view: the detected headings and their offsets into the
@@ -1042,6 +1161,7 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
       `## ${result.celex_number}${result.title ? ` — ${result.title}` : ''}\n`,
     ];
     if (result.date) lines.push(`**Date:** ${result.date}`);
+    if (result.ecli) lines.push(`**ECLI:** ${result.ecli}`);
     if (result.resource_type) lines.push(`**Type:** ${result.resource_type}`);
     if (result.base_act_celex) lines.push(`**Base act:** ${result.base_act_celex}`);
     if (result.author_institution) lines.push(`**Author:** ${result.author_institution}`);
@@ -1051,6 +1171,10 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
     if (result.advocates_general && result.advocates_general.length > 0) {
       lines.push(`**Advocates General:** ${result.advocates_general.join(', ')}`);
     }
+    if (result.formation) lines.push(`**Formation:** ${result.formation}`);
+    if (result.referring_court) lines.push(`**Referring court:** ${result.referring_court}`);
+    if (result.subject_matter) lines.push(`**Subject matter:** ${result.subject_matter}`);
+    if (result.case_reference) lines.push(`**Case reference:** ${result.case_reference}`);
     if (typeof result.in_force === 'boolean') lines.push(`**In Force:** ${result.in_force}`);
     if (result.repealed_by && result.repealed_by.length > 0) {
       lines.push(`**Repealed by:** ${result.repealed_by.join(', ')}`);
@@ -1181,14 +1305,17 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
           );
           lines.push('');
           for (const h of result.outline) {
+            const tag = h.kind === 'operative_part' ? h.kind : `${h.kind} ${h.number}`;
             lines.push(
-              `- \`offset ${h.offset}\` — [${h.kind} ${h.number}] ${h.label}${h.title ? `: ${h.title}` : ''}`,
+              `- \`offset ${h.offset}\` — [${tag}] ${h.label}${h.title ? `: ${h.title}` : ''}`,
             );
           }
         } else {
           lines.push('');
           lines.push(
-            `*No act structure detected in the ${total}-character ${result.content_format} body (e.g. case law or a non-standard layout). Use content_mode "paged"/"full" to read it.*`,
+            isCaseLawCelex(result.celex_number)
+              ? `*No section headings or operative part detected in the ${total}-character ${result.content_format} body. Use content_mode "paged"/"full" to read it.*`
+              : `*No act structure detected in the ${total}-character ${result.content_format} body (a non-standard layout). Use content_mode "paged"/"full" to read it.*`,
           );
         }
       }
@@ -1202,9 +1329,10 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
           lines.push(`Returned: ${result.selection.matched.join(', ')}.`);
         }
         if (result.selection.missed.length > 0) {
+          const work = isCaseLawCelex(result.celex_number) ? 'document' : 'act';
           lines.push(
-            `Not found: ${result.selection.missed.join(', ')} — ${result.structure_detected ? 'no such section in this act' : 'no act structure detected'}. ` +
-              'Use offset/limit or content_mode "full" to read the act.',
+            `Not found: ${result.selection.missed.join(', ')} — ${result.structure_detected ? `no such section in this ${work}` : `no ${work} structure detected`}. ` +
+              `Use offset/limit or content_mode "full" to read the ${work}.`,
           );
         }
       }

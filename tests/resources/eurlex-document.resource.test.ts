@@ -63,16 +63,18 @@ function makeMetaBinding(opts: {
 }
 
 /**
- * Resolve every CELEX to one work, return `creators` from the agent query, and a
- * Regulation-typed row from every other query.
+ * Resolve every CELEX to one work, return `creators` (authority code plus its English
+ * label, when it has one) from the agent query, and a Regulation-typed row from every
+ * other query.
  */
-function mockAgents(creators: string[]): void {
+function mockAgents(creators: [code: string, label?: string][]): void {
   mockQuery.mockImplementation(async (sparql: string) => {
     if (isResolutionQuery(sparql)) return resolutionRows(sparql);
     if (sparql.includes('cdm:work_created_by_agent')) {
-      return creators.map((value) => ({
+      return creators.map(([value, label]) => ({
         agent: { type: 'uri', value },
         role: { type: 'literal', value: 'creator' },
+        ...(label ? { agentLabel: { type: 'literal', value: label } } : {}),
       }));
     }
     return [
@@ -177,24 +179,82 @@ describe('eurlex_document_resource', () => {
     const CB = 'http://publications.europa.eu/resource/authority/corporate-body';
     // A co-legislated act: the agent query returns one row per author. CONSIL is
     // first, so it is the primary — matching the tool's output for GDPR.
-    mockAgents([`${CB}/CONSIL`, `${CB}/EP`]);
+    mockAgents([
+      [`${CB}/CONSIL`, 'Council of the European Union'],
+      [`${CB}/EP`, 'European Parliament'],
+    ]);
 
     const params = eurlex_document_resource.params!.parse({ celexNumber: '32016R0679' });
     const result = (await eurlex_document_resource.handler(params, ctx)) as Record<string, unknown>;
 
     // No raw authority URIs leak: type and author are human-readable labels.
     expect(result.resource_type).toBe('Regulation');
-    expect(result.author_institution).toBe('Council of the EU');
-    expect(result.author_institutions).toEqual(['Council of the EU', 'European Parliament']);
+    expect(result.author_institution).toBe('Council of the European Union');
+    expect(result.author_institutions).toEqual([
+      'Council of the European Union',
+      'European Parliament',
+    ]);
     // The label fields are not overloaded with the raw URIs.
     expect(result.resource_type).not.toContain('http');
     expect(result.author_institution).not.toContain('http');
   });
 
+  it.each([
+    [
+      '22026A00757',
+      [
+        ['corporate-body/EURUN', 'European Union'],
+        ['corporate-body/EURUN', 'European Union'],
+        ['country/AUT', 'Austria'],
+      ],
+      ['European Union', 'Austria'],
+    ],
+    ['71991L0683NLD_87862', [['country/NLD', 'Netherlands']], ['Netherlands']],
+    [
+      '91980E001013',
+      [
+        ['corporate-body/EP', 'European Parliament'],
+        ['fd_013/VAN-MIERT', 'VAN MIERT'],
+      ],
+      ['European Parliament', 'VAN MIERT'],
+    ],
+    [
+      '51988AC0454',
+      [['corporate-body/EESC', 'European Economic and Social Committee']],
+      ['European Economic and Social Committee'],
+    ],
+  ] as [string, [string, string][], string[]][])(
+    '#103: %s names its authority-code authors by English label, once each',
+    async (celex, codes, labels) => {
+      const ctx = createMockContext({ tenantId: 'test-tenant' });
+      const AUTHORITY = 'http://publications.europa.eu/resource/authority/';
+      mockAgents(codes.map(([code, label]) => [`${AUTHORITY}${code}`, label]));
+
+      const params = eurlex_document_resource.params!.parse({ celexNumber: celex });
+      const result = (await eurlex_document_resource.handler(params, ctx)) as Record<
+        string,
+        unknown
+      >;
+
+      expect(result.author_institutions).toEqual(labels);
+      expect(result.author_institution).toBe(labels[0]);
+    },
+  );
+
+  it('#103: renders an authority code with no English label as its last path segment', async () => {
+    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    mockAgents([['http://publications.europa.eu/resource/agent/UNLABELLED']]);
+
+    const params = eurlex_document_resource.params!.parse({ celexNumber: '32024R2822' });
+    const result = (await eurlex_document_resource.handler(params, ctx)) as Record<string, unknown>;
+
+    expect(result.author_institutions).toEqual(['UNLABELLED']);
+  });
+
   it('surfaces a single author as both the primary and the one-element institutions list', async () => {
     const ctx = createMockContext({ tenantId: 'test-tenant' });
     const CB = 'http://publications.europa.eu/resource/authority/corporate-body';
-    mockAgents([`${CB}/COM`]);
+    mockAgents([[`${CB}/COM`, 'European Commission']]);
 
     const params = eurlex_document_resource.params!.parse({ celexNumber: '32024R2822' });
     const result = (await eurlex_document_resource.handler(params, ctx)) as Record<string, unknown>;
@@ -504,8 +564,11 @@ describe('eurlex_document_resource', () => {
     it('#96: leaves a co-legislated act unchanged and without advocates_general', async () => {
       const result = await read('32016R0679');
 
-      expect(result.author_institution).toBe('Council of the EU');
-      expect(result.author_institutions).toEqual(['Council of the EU', 'European Parliament']);
+      expect(result.author_institution).toBe('Council of the European Union');
+      expect(result.author_institutions).toEqual([
+        'Council of the European Union',
+        'European Parliament',
+      ]);
       expect(result).not.toHaveProperty('advocates_general');
     });
   });
@@ -525,13 +588,21 @@ describe('eurlex_document_resource', () => {
 
       expect(result.base_act_celex).toBe('32024R1689');
       expect(result.author_institutions).toEqual(
-        expect.arrayContaining(['European Parliament', 'Council of the EU']),
+        expect.arrayContaining(['European Parliament', 'Council of the European Union']),
       );
       expect(result.author_institutions).toHaveLength(2);
       expect(result.in_force).toBe(true);
       expect(result.eurovoc_subjects).toHaveLength(7);
       expect(result.legal_basis).toHaveLength(2);
       expect(JSON.stringify(result)).not.toContain('OP_DATPRO');
+      expect(JSON.stringify(result)).not.toContain('Provisional data');
+    });
+
+    it('#103: a consolidated text with no based-on link names its own author by label', async () => {
+      const result = await read('02099R9999-20200101');
+
+      expect(result).not.toHaveProperty('base_act_celex');
+      expect(result.author_institutions).toEqual(['Provisional data']);
     });
 
     it('leaves a base act unchanged, with no base_act_celex and no lookup', async () => {

@@ -136,10 +136,14 @@ const CORPORATE_BODY = 'http://publications.europa.eu/resource/authority/corpora
 export interface FixtureAgent {
   /** `cdm:court_national_name`, carried by a `cdm:court_national` resource. */
   courtName?: string;
+  /** English `skos:prefLabel`, carried by an authority code. */
+  label?: string;
   /** `cdm:agent_name`, carried by a `cdm:person` resource. */
   personName?: string;
   uri: string;
 }
+
+const COURT_OF_JUSTICE: FixtureAgent = { uri: `${CORPORATE_BODY}CJ`, label: 'Court of Justice' };
 
 /** Agents of the canonical work of each CELEX, as CELLAR returned them on 2026-09-25. */
 export const WORK_AGENTS: Record<
@@ -147,13 +151,16 @@ export const WORK_AGENTS: Record<
   { advocatesGeneral: FixtureAgent[]; creators: FixtureAgent[] }
 > = {
   '32016R0679': {
-    creators: [{ uri: `${CORPORATE_BODY}CONSIL` }, { uri: `${CORPORATE_BODY}EP` }],
+    creators: [
+      { uri: `${CORPORATE_BODY}CONSIL`, label: 'Council of the European Union' },
+      { uri: `${CORPORATE_BODY}EP`, label: 'European Parliament' },
+    ],
     advocatesGeneral: [],
   },
   '62012CJ0131': {
     creators: [
       { uri: `${CELLAR}233d79cc-67e5-4048-9fd0-fda2509029b4`, personName: 'Jääskinen' },
-      { uri: `${CORPORATE_BODY}CJ` },
+      COURT_OF_JUSTICE,
     ],
     advocatesGeneral: [
       { uri: `${CELLAR}233d79cc-67e5-4048-9fd0-fda2509029b4`, personName: 'Jääskinen' },
@@ -178,7 +185,7 @@ export const WORK_AGENTS: Record<
     creators: [
       { uri: `${CELLAR}f2960242-438e-421c-8dc9-2c27c46de49d`, personName: 'VerLoren van Themaat' },
       { uri: `${CELLAR}abcde658-756b-448d-acad-8e2b122e23c6`, personName: 'Mischo' },
-      { uri: `${CORPORATE_BODY}CJ` },
+      COURT_OF_JUSTICE,
     ],
     advocatesGeneral: [
       { uri: `${CELLAR}f2960242-438e-421c-8dc9-2c27c46de49d`, personName: 'VerLoren van Themaat' },
@@ -207,18 +214,21 @@ export function addressedWorks(sparql: string): { celex: string; work: FixtureWo
 /**
  * Answer an author query for the fixture CELEX it addresses. A query that also reads
  * `cdm:case-law_delivered_by_advocate-general` gets one row per agent and role, with
- * the person and court names bound where CELLAR carries them; a query that reads only
+ * the person and court names bound where CELLAR carries them, and the English label
+ * bound only when the query reads `?agentLabel`; a query that reads only
  * `cdm:work_created_by_agent` gets one `?author` row per creator.
  */
 export function agentRows(sparql: string): Row[] {
   const celex = addressedCelex(sparql);
   const agents = celex ? WORK_AGENTS[celex] : undefined;
   if (!agents) return [];
+  const readsLabel = sparql.includes('?agentLabel');
   const named = (a: FixtureAgent, role: string): Row => ({
     agent: { type: 'uri', value: a.uri },
     role: { type: 'literal', value: role },
     ...(a.personName ? { personName: { type: 'literal', value: a.personName } } : {}),
     ...(a.courtName ? { courtName: { type: 'literal', value: a.courtName } } : {}),
+    ...(a.label && readsLabel ? { agentLabel: { type: 'literal', value: a.label } } : {}),
   });
   if (sparql.includes('cdm:case-law_delivered_by_advocate-general')) {
     return [
