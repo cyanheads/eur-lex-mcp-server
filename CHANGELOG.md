@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.18.1](changelog/0.18.x/0.18.1.md) — 2026-09-26 · 🛡️ Security
+
+Caller URIs are checked against the full SPARQL IRI exclusion set before any CELLAR query is built, eurovoc_concept accepts only EuroVoc concept URIs and reads https and upper-case forms as the http form, and a lexical-safety test gates every caller value that reaches generated SPARQL.
+
 ## [0.18.0](changelog/0.18.x/0.18.0.md) — 2026-09-25 · ⚠️ Breaking
 
 eurlex_get_cases and eurlex_get_document parse CELLAR's case-law title into formation, referring court, and related fields, and eurlex_get_document adds the ECLI and a heading and operative-part outline for case law. Relation rows carry a date and title, authors use CELLAR's English labels, and document titles follow the served language.

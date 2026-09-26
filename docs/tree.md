@@ -1,6 +1,6 @@
 # eur-lex-mcp-server - Directory Structure
 
-Generated on: 2026-09-26 06:00:51
+Generated on: 2026-09-26 06:29:17
 
 ```text
 eur-lex-mcp-server/
@@ -221,17 +221,18 @@ eur-lex-mcp-server/
 │   │   ├── keyword-match.test.ts
 │   │   ├── work-agents.test.ts
 │   │   └── work-resolution.test.ts
-│   └── tools/
-│       ├── eurlex-browse-subjects.tool.test.ts
-│       ├── eurlex-get-cases.tool.test.ts
-│       ├── eurlex-get-document.cache.test.ts
-│       ├── eurlex-get-document.case-law.test.ts
-│       ├── eurlex-get-document.formex-package.test.ts
-│       ├── eurlex-get-document.tool.test.ts
-│       ├── eurlex-get-relations.tool.test.ts
-│       ├── eurlex-lookup-celex.tool.test.ts
-│       ├── eurlex-query-sparql.tool.test.ts
-│       └── eurlex-search-documents.tool.test.ts
+│   ├── tools/
+│   │   ├── eurlex-browse-subjects.tool.test.ts
+│   │   ├── eurlex-get-cases.tool.test.ts
+│   │   ├── eurlex-get-document.cache.test.ts
+│   │   ├── eurlex-get-document.case-law.test.ts
+│   │   ├── eurlex-get-document.formex-package.test.ts
+│   │   ├── eurlex-get-document.tool.test.ts
+│   │   ├── eurlex-get-relations.tool.test.ts
+│   │   ├── eurlex-lookup-celex.tool.test.ts
+│   │   ├── eurlex-query-sparql.tool.test.ts
+│   │   └── eurlex-search-documents.tool.test.ts
+│   └── sparql-lexical-safety.test.ts
 ├── .dockerignore
 ├── .env.example
 ├── .gitattributes
