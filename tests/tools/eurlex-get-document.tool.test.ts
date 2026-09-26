@@ -2717,8 +2717,21 @@ describe('eurlex_get_document', () => {
       ['an opening angle bracket', `${WORK_URI}<X`],
       ['a closing angle bracket', `${WORK_URI}>X`],
       ['a double quote', `${WORK_URI}"X`],
-    ])('rejects a work_uri containing %s at the schema, before any query', (_label, uri) => {
-      expect(() => eurlex_get_document.input.parse({ work_uri: uri })).toThrow();
+      // The rest of the IRIREF exclusion set, each confirmed live to leak SP030 (#140).
+      ['a brace', `${WORK_URI}{X}`],
+      ['a pipe', `${WORK_URI}|X`],
+      ['U+0001', `${WORK_URI}\x01X`],
+      // Unicode whitespace outside U+0000–U+0020, which only the \s half of the guard catches.
+      ['a no-break space', `${WORK_URI} X`],
+      ['a line separator', `${WORK_URI} X`],
+    ])('rejects a work_uri containing %s at the schema, before any query', async (_label, uri) => {
+      mockSparqlQuery.mockResolvedValue([]);
+      const result = await runToolContract(eurlex_get_document, { work_uri: uri });
+      expect(result.isError).toBe(true);
+      // The message names the whole rejected set, not only whitespace and quotes.
+      const text = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+      expect(text).toContain('control characters');
+      expect(text).toContain('{ } | ^');
       expect(mockSparqlQuery).not.toHaveBeenCalled();
     });
 

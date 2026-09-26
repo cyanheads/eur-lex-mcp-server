@@ -1820,8 +1820,19 @@ describe('eurlex_get_relations', () => {
       ['an opening angle bracket', `${GDPR_WORK_URI}<X`],
       ['a closing angle bracket', `${GDPR_WORK_URI}>X`],
       ['a double quote', `${GDPR_WORK_URI}"X`],
-    ])('rejects a work_uri containing %s at the schema, before any query', (_label, uri) => {
-      expect(() => eurlex_get_relations.input.parse({ work_uri: uri })).toThrow();
+      // The rest of the IRIREF exclusion set, each confirmed live to leak SP030 (#140).
+      ['a brace', `${GDPR_WORK_URI}{X}`],
+      ['a pipe', `${GDPR_WORK_URI}|X`],
+      ['U+0001', `${GDPR_WORK_URI}\x01X`],
+      // Unicode whitespace outside U+0000–U+0020, which only the \s half of the guard catches.
+      ['a no-break space', `${GDPR_WORK_URI} X`],
+      ['a line separator', `${GDPR_WORK_URI} X`],
+    ])('rejects a work_uri containing %s at the schema, before any query', async (_label, uri) => {
+      mockQuery.mockResolvedValue([]);
+      const result = await runToolContract(eurlex_get_relations, { work_uri: uri });
+      expect(result.isError).toBe(true);
+      expect(contentText(result)).toContain('control characters');
+      expect(contentText(result)).toContain('{ } | ^');
       expect(mockQuery).not.toHaveBeenCalled();
     });
 

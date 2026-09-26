@@ -146,7 +146,8 @@ export const eurlex_get_document = tool('eurlex_get_document', {
     work_uri: z
       .string()
       .refine((v) => !v || isSafeSparqlIri(v), {
-        message: 'work_uri must be a valid http URI with no whitespace, angle brackets, or quotes.',
+        message:
+          'work_uri must be an http URI with no whitespace, control characters, or any of < > " { } | ^ ` \\.',
       })
       .optional()
       .describe(

@@ -8,9 +8,13 @@
  * Also home to the SPARQL-safety primitives every CELLAR query builder shares —
  * `escapeSparqlLiteral` for values interpolated into a `"…"` literal, `celexLiteral`
  * for a caller's CELEX matched as a typed exact triple, and `isSafeSparqlIri` for
- * URIs interpolated into a `<…>` IRI — and to the shared
- * input-validity primitives that reject a value before a CELLAR round-trip is
- * spent on it: `CELEX_PATTERN` and `isValidCalendarDate`.
+ * URIs interpolated into a `<…>` IRI (with `keywordTitlePhrase` in keyword-match.ts
+ * for a `bif:contains` phrase). `tests/sparql-lexical-safety.test.ts` gates their
+ * use: it sends hostile values to every tool and resource string input and fails
+ * when a caller value lands in a generated query outside a well-formed literal, IRI,
+ * or phrase. The file also holds the shared input-validity primitives that reject a
+ * value before a CELLAR round-trip is spent on it: `CELEX_PATTERN` and
+ * `isValidCalendarDate`.
  * @module services/cellar-sparql/eli-resolution
  */
 
@@ -127,11 +131,13 @@ export function isValidCalendarDate(value: string): boolean {
 }
 
 /**
- * Characters that cannot appear inside a SPARQL IRI reference (`<…>`): any
- * whitespace — including the tab and newline a bare space check misses — plus the
- * angle brackets that delimit the IRI and a double quote.
+ * Characters that cannot appear inside a SPARQL IRI reference (`<…>`): the whole
+ * IRIREF exclusion set of SPARQL 1.1 grammar rule [139] — U+0000–U+0020 and
+ * `` <>"{}|^`\ `` — plus any other Unicode whitespace, which no real URI carries.
+ * CELLAR rejects every excluded character with SP030, U+0000 as an HTTP 500 (#140).
  */
-const UNSAFE_SPARQL_IRI_CHARS = /[\s<>"]/;
+// biome-ignore lint/suspicious/noControlCharactersInRegex: SPARQL excludes the C0 controls from an IRI, so the guard must match them.
+const UNSAFE_SPARQL_IRI_CHARS = /[\s\x00-\x20<>"{}|^`\\]/;
 
 /**
  * True when `value` is an http URI safe to interpolate into a SPARQL `<…>` IRI.
@@ -139,8 +145,8 @@ const UNSAFE_SPARQL_IRI_CHARS = /[\s<>"]/;
  * Caller-supplied URIs reach the query as `<${uri}>`, so a value carrying an IRI-
  * forbidden character builds an unparseable query and leaks Virtuoso's raw compiler
  * error — with the internal query text attached — in place of the tool's own error
- * (#53, #60). Real CELLAR work URIs and EuroVoc concept URIs contain none of these
- * characters, so the check has no false-positive risk against genuine values.
+ * (#53, #60, #140). Real CELLAR work URIs and EuroVoc concept URIs contain none of
+ * these characters, so the check has no false-positive risk against genuine values.
  */
 export function isSafeSparqlIri(value: string): boolean {
   return value.startsWith('http') && !UNSAFE_SPARQL_IRI_CHARS.test(value);

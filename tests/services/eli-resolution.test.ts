@@ -118,6 +118,41 @@ describe('isSafeSparqlIri', () => {
     expect(isSafeSparqlIri(uri)).toBe(false);
   });
 
+  /**
+   * The rest of the IRIREF exclusion set (#140). Each passed the whitespace, angle
+   * bracket, and quote check, and each is confirmed live to make CELLAR reject the
+   * `<…>` IRI with SP030 — U+0000 as an HTTP 500 — leaking the internal query.
+   */
+  it.each([
+    ['an opening brace', `${EUROVOC_URI}{X`],
+    ['a closing brace', `${EUROVOC_URI}}X`],
+    ['a pipe', `${CELLAR_WORK_URI}|X`],
+    ['a caret', `${CELLAR_WORK_URI}^X`],
+    ['a backtick', `${CELLAR_WORK_URI}\`X`],
+    ['a backslash', `${CELLAR_WORK_URI}\\X`],
+    ['U+0000', `${CELLAR_WORK_URI}\x00X`],
+    ['U+0001', `${CELLAR_WORK_URI}\x01X`],
+    ['U+001F', `${CELLAR_WORK_URI}\x1fX`],
+  ])('rejects a URI containing %s', (_label, uri) => {
+    expect(isSafeSparqlIri(uri)).toBe(false);
+  });
+
+  /**
+   * Whitespace past U+0020, which the IRIREF grammar admits but no real URI carries:
+   * the `\s` half of the guard rejects it, since the U+0000–U+0020 range cannot.
+   */
+  it.each([
+    ['a no-break space', `${EUROVOC_URI} X`],
+    ['a line separator', `${CELLAR_WORK_URI} X`],
+    ['an ideographic space', `${CELLAR_WORK_URI}　X`],
+  ])('rejects a URI containing %s', (_label, uri) => {
+    expect(isSafeSparqlIri(uri)).toBe(false);
+  });
+
+  it('accepts U+007F, which the IRIREF grammar does not exclude', () => {
+    expect(isSafeSparqlIri(`${EUROVOC_URI}\x7f`)).toBe(true);
+  });
+
   it.each([
     ['a bare token', 'not-a-uri'],
     ['a non-http scheme', 'ftp://example.org/x'],
