@@ -148,7 +148,7 @@ EUR-Lex-specific:
 
 - No API key required — CELLAR SPARQL and the EUR-Lex REST content endpoints are both publicly accessible
 - SPARQL is POSTed with CDM prefix declarations built in; server-side LIMIT enforcement (max 100) guards against Virtuoso timeouts
-- Act text is fetched via CELLAR content negotiation (`/resource/celex/{CELEX}`); HTML and Formex4 XML pass through, Markdown is converted server-side
+- Act text is fetched via CELLAR content negotiation (`/resource/celex/{CELEX}`); HTML passes through as served; Formex4 XML passes through for a single-part act and is assembled into one document from the parts of a multi-part act (HTTP 300 streams) or a zipped Formex package; Markdown is converted server-side
 - Virtuoso errors (HTTP 200 with a `Virtuoso 37000 Error` body) are classified and re-raised as `ServiceUnavailable` or `ValidationError`
 - Automatic English fallback when a requested translation is unavailable, with requested/effective language reported
 
@@ -339,7 +339,7 @@ The Dockerfile defaults to HTTP transport, stateless session mode, and logs to `
 | `src/index.ts` | `createApp()` entry point — registers tools, resources, and prompts; initializes services. |
 | `src/config` | Server-specific environment variable parsing and validation with Zod. |
 | `src/services/cellar-sparql` | CELLAR SPARQL service — POST client, binding mapper, LIMIT enforcement, CDM PREFIX declarations. |
-| `src/services/eurlex-content` | CELLAR content service — content-negotiation GET client for `/resource/celex/{CELEX}` (`Accept` / `Accept-Language`) with English language fallback. |
+| `src/services/eurlex-content` | CELLAR content service — content-negotiation GET client for `/resource/celex/{CELEX}` (`Accept` / `Accept-Language`) with English language fallback, and an in-process cache of served bodies so paging an act fetches it once. |
 | `src/mcp-server/tools` | Tool definitions (`*.tool.ts`). Seven tools across document search, retrieval, resolution, case law, relations, EuroVoc, and raw SPARQL. |
 | `src/mcp-server/resources` | Resource definitions (`*.resource.ts`). Metadata and relations resources. |
 | `src/mcp-server/prompts` | Prompt definitions (`*.prompt.ts`). Comparative analysis prompt. |

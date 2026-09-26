@@ -226,8 +226,9 @@ src/
       work-resolution.ts                # CELEX → canonical work resolution
       types.ts                          # SPARQL binding types
     eurlex-content/
-      eurlex-content-service.ts         # EUR-Lex content API GET client, language fallback
+      eurlex-content-service.ts         # EUR-Lex content API GET client, language fallback, body cache
       act-structure.ts                  # Outline and section selection over an act body
+      formex-package.ts                 # Zipped Formex 4 package reader (manifest-ordered parts)
       html-to-markdown.ts               # Server-side HTML → Markdown conversion
   mcp-server/
     tools/definitions/
