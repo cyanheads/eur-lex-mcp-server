@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.17.0](changelog/0.17.x/0.17.0.md) — 2026-09-25 · ⚠️ Breaking
+
+eurlex_lookup_celex resolves OJ citations such as Regulation (EU) 2016/679, partial-CELEX keywords and case_number fallbacks are answered from the CELEX full-text index instead of a scan, EuroVoc matches rank exact labels first, and non-SELECT SPARQL forms fail as unsupported_query_form.
+
 ## [0.16.1](changelog/0.16.x/0.16.1.md) — 2026-09-25
 
 eurlex_get_document serves Formex XML for acts CELLAR holds only as a zipped package, outlines legacy text/html acts, and caches served bodies so paging an act fetches and converts it once.
