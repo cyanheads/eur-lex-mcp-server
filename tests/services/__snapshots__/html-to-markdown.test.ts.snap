@@ -1,0 +1,298 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`conversion output on every act fixture > AI Act headings (EN) 1`] = `
+"REGULATION (EU) 2024/1689
+
+(1)
+
+Recital one.
+
+(2)
+
+Recital two.
+
+CHAPTER I
+
+General provisions
+
+SECTION 1
+
+Classification
+
+Article 1
+
+Subject matter
+
+Body one.
+
+Article 2
+
+Scope
+
+Body two.
+
+CHAPTER IV
+
+Transparency
+
+Body four.
+
+ANNEX I
+
+List of legislation
+
+Annex body."
+`;
+
+exports[`conversion output on every act fixture > AI Act headings (HU) 1`] = `
+"REGULATION (EU) 2024/1689
+
+(1)
+
+Recital one.
+
+(2)
+
+Recital two.
+
+I. FEJEZET
+
+General provisions
+
+1\\. SZAKASZ
+
+Classification
+
+1\\. cikk
+
+Subject matter
+
+Body one.
+
+2\\. cikk
+
+Scope
+
+Body two.
+
+IV. FEJEZET
+
+Transparency
+
+Body four.
+
+I. MELLÉKLET
+
+List of legislation
+
+Annex body."
+`;
+
+exports[`conversion output on every act fixture > CRR2 excerpt 1`] = `
+"Article 1
+
+Amendments to Regulation (EU) No 575/2013
+
+Regulation (EU) No 575/2013 is amended as follows:
+
+(1) Articles 1 and 2 are replaced by the following:
+
+‘Article 1
+
+Scope
+
+This Regulation lays down uniform rules.
+
+Article 2
+
+Supervisory powers
+
+1\\. For the purpose of ensuring compliance with this Regulation.’;
+
+(74) in Chapter 6 of Title II of Part Three, Sections 3, 4 and 5 are replaced by the following:
+
+‘ Section 3
+
+Standardised approach for counterparty credit risk
+
+Article 274
+
+Exposure value
+
+1\\. An institution may calculate a single exposure value.’;
+
+Article 2
+
+Amendments to Regulation (EU) No 648/2012
+
+Regulation (EU) No 648/2012 is amended as follows:"
+`;
+
+exports[`conversion output on every act fixture > OJ act 1`] = `
+"REGULATION (EU) 2016/679
+
+Having regard to the opinion of the Committee(1),
+
+(1) The protection of natural persons in relation to the processing of personal data is a fundamental right.
+
+(2) This Regulation respects the fundamental rights and freedoms enshrined in the Charter.
+
+Article 1
+
+1\\. This Regulation lays down rules relating to the protection of natural persons.
+
+| CN code | Description            |
+| ------- | ---------------------- |
+| 0203    | Meat of swine          |
+| 0204    | Meat of sheep or goats |"
+`;
+
+exports[`conversion output on every act fixture > amending act 1`] = `
+"REGULATION (EU) 2015/2120
+
+(1) Recital one.
+
+(2) Recital two.
+
+Article 1
+
+Subject matter
+
+Body one.
+
+Article 2
+
+Amendments to Regulation (EU) No 531/2012
+
+Regulation (EU) No 531/2012 is amended as follows:
+
+(1) the following Articles are inserted:
+
+‘Article 6a
+
+Abolition of retail roaming surcharges
+
+Quoted six a.
+
+Article 6b
+
+Fair use
+
+Quoted six b.
+
+(2) Section 4 is amended as follows:
+
+(a) the heading is replaced:
+
+SECTION 4
+
+Final provisions
+
+Article 19
+
+Review
+
+Quoted nineteen.
+
+ANNEX II
+
+Quoted annex.’
+
+Amending article tail.
+
+Article 3
+
+Entry into force
+
+Body three.
+
+ANNEX
+
+Annex body."
+`;
+
+exports[`conversion output on every act fixture > consolidated act 1`] = `
+"Article 1
+
+Subject-matter and objectives
+
+1\\. This Regulation lays down rules relating to the protection of natural persons.
+
+Article 30
+
+Records of processing activities
+
+1\\. Each controller shall maintain a record of processing activities.
+
+(a) the name and contact details of the controller;
+
+(b) the purposes of the processing, including:
+
+(i) the first purpose;
+
+(ii) the second purpose;
+
+2\\. Members shall be appointed by:
+
+— their parliament;
+
+— their government."
+`;
+
+exports[`conversion output on every act fixture > legacy text/html act 1`] = `
+"# 31995L0046
+
+**Directive 95/46/EC of the European Parliament and of the Council of 24 October 1995 on the protection of individuals with regard to the processing of personal data**
+
+_Official Journal L 281 , 23/11/1995 P. 0031 - 0050_
+
+DIRECTIVE 95/46/EC OF THE EUROPEAN PARLIAMENT AND OF THE COUNCIL
+
+of 24 October 1995
+
+ Having regard to the proposal from the Commission (1),
+
+ (1) Whereas the objectives of the Community include creating an ever closer union;
+
+ (2) Whereas data-processing systems are designed to serve man;
+
+ HAVE ADOPTED THIS DIRECTIVE:
+
+CHAPTER I GENERAL PROVISIONS
+
+Article 1
+
+Object of the Directive
+
+1\\. Member States shall protect the fundamental rights and freedoms of natural persons.
+
+Article 2
+
+Definitions
+
+For the purposes of this Directive:
+
+ (a) "personal data" shall mean any information relating to a natural person;
+
+ SECTION I
+
+PRINCIPLES RELATING TO DATA QUALITY
+
+Article 6
+
+"Mere conduit"
+
+1\\. Member States shall provide that personal data must be processed fairly.
+
+ANNEX
+
+ For the purposes of Article 2 (a): the expression "specialist" indicates a qualification."
+`;
+
+exports[`conversion output on every act fixture > nested data table 1`] = `
+"7\\. The indication shall be given in the following terms:
+
+| Language | Term        |
+| -------- | ----------- |
+| English  | formed meat |"
+`;

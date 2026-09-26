@@ -9,13 +9,19 @@
  *
  * This module pre-processes the parsed DOM before conversion:
  *  - strips non-body chrome (`<head>`, inline `<style>`/`<script>`, the OJ
- *    masthead table, separators, dead intra-document fragment links);
+ *    masthead table, the legacy `text/html` page's legal-notice banner,
+ *    separators, dead intra-document fragment links);
  *  - flattens the numbering layout tables into inline-marked block text
  *    (`(1) The protection of natural persons…`), recursing innermost-first so
  *    nested points collapse cleanly;
+ *  - joins a consolidated text's point labels to their text (#120): consolidated
+ *    versions lay points out as CSS-grid divs rather than numbering tables, so a
+ *    label would otherwise render as a paragraph of its own;
  *  - preserves genuine data tables — CONVEX tags them `class="oj-table"` — so
  *    node-html-markdown renders them as real GFM tables.
  *
+ * The pre-processed body is then translated block by block (#127), never
+ * serialized whole, so node-html-markdown never parses a second whole-act DOM.
  * The conversion produces the full Markdown body; windowing/pagination is applied
  * downstream by the caller (a paged window may land mid-structure — acceptable).
  * @module services/eurlex-content/html-to-markdown
@@ -24,8 +30,12 @@
 import { NodeHtmlMarkdown } from 'node-html-markdown';
 import { HTMLElement, type Node, NodeType, parse } from 'node-html-parser';
 
-/** Chrome removed wholesale before conversion (head/style/script/link/separators). */
-const CHROME_SELECTOR = 'head, style, script, link, hr';
+/**
+ * Chrome removed wholesale before conversion: head/style/script/link, separators,
+ * and the legal-notice banner (`<div id="banner">`) every legacy `text/html` page
+ * opens with (#120).
+ */
+const CHROME_SELECTOR = 'head, style, script, link, hr, #banner';
 
 /**
  * The OJ masthead table (date | language | "Official Journal of the European
@@ -56,7 +66,97 @@ export function htmlToMarkdown(html: string): string {
   stripChrome(root);
   const body = root.querySelector('body') ?? root;
   flattenLayoutTables(body);
-  return NodeHtmlMarkdown.translate(body.innerHTML).trim();
+  joinConsolidatedLabels(body);
+  const blocks: string[] = [];
+  translateBlocks(body, new NodeHtmlMarkdown(), blocks);
+  return blocks.join('\n\n').trim();
+}
+
+/**
+ * Tags node-html-markdown lays out as blocks, each separated from its neighbours
+ * by a blank line — its own `defaultBlockElements`, less those chrome stripping
+ * or the ignore list already removes.
+ */
+const BLOCK_TAGS = new Set([
+  'address',
+  'article',
+  'aside',
+  'blockquote',
+  'center',
+  'dd',
+  'dir',
+  'div',
+  'dl',
+  'dt',
+  'fieldset',
+  'figcaption',
+  'figure',
+  'footer',
+  'form',
+  'h1',
+  'h2',
+  'h3',
+  'h4',
+  'h5',
+  'h6',
+  'header',
+  'hgroup',
+  'hr',
+  'li',
+  'main',
+  'menu',
+  'nav',
+  'ol',
+  'p',
+  'pre',
+  'section',
+  'table',
+  'tbody',
+  'td',
+  'tfoot',
+  'th',
+  'thead',
+  'tr',
+  'ul',
+]);
+
+/**
+ * Translate a container one block at a time into `out` (#127): a `<div>` holding
+ * elements is descended into, any other block child is translated alone, and each
+ * run of inline children between blocks — text beside a `<b>`, a label moved in
+ * front of its text — is translated together as the paragraph it forms. A
+ * whole-body translation re-serializes the body and has node-html-markdown parse
+ * that string into a second whole-act DOM; this walk hands it one block at a time.
+ */
+function translateBlocks(container: HTMLElement, nhm: NodeHtmlMarkdown, out: string[]): void {
+  let inline = '';
+  const flush = () => {
+    push(inline);
+    inline = '';
+  };
+  const push = (html: string) => {
+    if (html.trim() === '') return;
+    const markdown = nhm.translate(html).replace(/^\n+|\n+$/g, '');
+    if (markdown.trim() !== '') out.push(markdown);
+  };
+  for (const child of container.childNodes) {
+    if (!(child instanceof HTMLElement)) {
+      inline += child.rawText;
+      continue;
+    }
+    const tag = child.rawTagName?.toLowerCase() ?? '';
+    if (!BLOCK_TAGS.has(tag)) {
+      inline += child.outerHTML;
+      continue;
+    }
+    flush();
+    if (tag === 'div' && child.childNodes.some((node) => node instanceof HTMLElement)) {
+      translateBlocks(child, nhm, out);
+    } else {
+      push(child.outerHTML);
+    }
+  }
+  flush();
 }
 
 /** Remove document chrome and neutralize dead intra-document links in place. */
@@ -70,7 +170,7 @@ function stripChrome(root: HTMLElement): void {
   for (const anchor of root.querySelectorAll('a')) {
     const href = anchor.getAttribute('href') ?? '';
     if (href === '' || href.startsWith('#')) {
-      anchor.replaceWith(parse(`<span>${anchor.innerHTML}</span>`));
+      anchor.replaceWith(`<span>${anchor.innerHTML}</span>`);
     }
   }
 }
@@ -85,7 +185,7 @@ function flattenLayoutTables(node: HTMLElement): void {
     if (child instanceof HTMLElement) flattenLayoutTables(child);
   }
   if (isTag(node, 'table') && !isGenuineDataTable(node)) {
-    node.replaceWith(parse(flattenNumberingTable(node)));
+    node.replaceWith(flattenNumberingTable(node));
   }
 }
 
@@ -151,6 +251,79 @@ function flattenNumberingTable(table: HTMLElement): string {
     if (inner) blocks.push(inner);
   }
   return `<div>${blocks.join('\n')}</div>`;
+}
+
+/**
+ * Join a consolidated text's point labels to the text after them, as the OJ
+ * rendering reads (#120), innermost-first so a nested row is already joined when
+ * its parent row is rebuilt. A `div.grid-container.grid-list` row becomes its
+ * `.grid-list-column-2` text with the `.grid-list-column-1` label in front, and a
+ * `span.no-parag` paragraph number moves into the element that follows it. Each
+ * element's children are read once, so the pass is linear in the body.
+ */
+function joinConsolidatedLabels(node: HTMLElement): void {
+  const children = node.childNodes;
+  for (const child of children) {
+    if (child instanceof HTMLElement) joinConsolidatedLabels(child);
+  }
+  const kept: Node[] = [];
+  for (let i = 0; i < children.length; i++) {
+    const child = children[i] as Node;
+    kept.push(child);
+    if (!(child instanceof HTMLElement)) continue;
+    if (child.classList.contains('grid-container') && child.classList.contains('grid-list')) {
+      const cells = directChildrenByTag(child, ['div']);
+      const label = cells.find((cell) => cell.classList.contains('grid-list-column-1'));
+      const text = cells.find((cell) => cell.classList.contains('grid-list-column-2'));
+      if (!label || !text) continue;
+      prefixLabel(label, text);
+      text.parentNode = node;
+      kept[kept.length - 1] = text;
+    } else if (isTag(child, 'span') && child.classList.contains('no-parag')) {
+      let next = i + 1;
+      while (next < children.length && isBlankText(children[next] as Node)) next++;
+      const target = children[next];
+      if (!(target instanceof HTMLElement)) continue;
+      prefixLabel(child, target);
+      kept.pop();
+    }
+  }
+  node.childNodes = kept;
+}
+
+/**
+ * Put a label at the start of the first block of `container`'s text — descending
+ * through leading `<p>`/`<div>` wrappers — or of its bare text.
+ */
+function prefixLabel(label: HTMLElement, container: HTMLElement): void {
+  const markup = labelMarkup(label).replace(/\s+/g, ' ').trim();
+  if (markup === '') return;
+  let target = container;
+  for (;;) {
+    const lead = target.childNodes.find((child) => !isBlankText(child));
+    if (!(lead instanceof HTMLElement) || !(isTag(lead, 'p') || isTag(lead, 'div'))) break;
+    target = lead;
+  }
+  target.insertAdjacentHTML('afterbegin', `${markup} `);
+}
+
+/**
+ * A label's content as inline markup, its `<span>` wrappers dropped: the number
+ * then joins the text after it as one run, which the conversion escapes where it
+ * would read as a list item (`1\.`), while other markup — an amendment marker
+ * linked beside a point number — keeps its link.
+ */
+function labelMarkup(node: HTMLElement): string {
+  return node.childNodes
+    .map((child) => {
+      if (isTag(child, 'span')) return labelMarkup(child);
+      return child instanceof HTMLElement ? child.outerHTML : child.rawText;
+    })
+    .join('');
+}
+
+function isBlankText(node: Node): boolean {
+  return node.nodeType === NodeType.TEXT_NODE && node.text.trim() === '';
 }
 
 function isTag(node: Node, tag: string): node is HTMLElement {
