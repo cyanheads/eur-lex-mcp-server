@@ -172,15 +172,31 @@ describe('celexFragmentRoute (#123)', () => {
     },
   );
 
-  it.each(['R(01)', 'ROU_202405', 'C/2024/0146', 'R_1'])(
+  it.each(['R(01)', 'ROU_202405', 'C/24', 'C/202', 'R_1'])(
     'scans for %s, whose letters no digit follows',
     (keyword) => {
       expect(celexFragmentRoute(keyword)).toEqual({ kind: 'scan' });
     },
   );
 
-  it.each(['2024/01469', '2017/111', '2024/'])(
-    'scans for %s, a year followed by the / only C-sector CELEX hold',
+  it.each([
+    ['2024/01469', '01469'],
+    ['C/2024/01469', '01469'],
+    ['C/2024/0146', '0146'],
+    ['2024/0146', '0146'],
+    ['2024/01469(01)', '01469'],
+    ['2024/01469/X', '01469'],
+    ['2024/0146A', '0146A'],
+    ['C/9999/01469', '01469'],
+  ])(
+    'uses the number word of the C-sector fragment %s, a word of its own on the index (#137)',
+    (keyword, numberWord) => {
+      expect(celexFragmentRoute(keyword)).toEqual({ kind: 'index', terms: [numberWord] });
+    },
+  );
+
+  it.each(['2017/111', '2024/014', 'C/2024/014', '2024/1', '2024/', 'C/2024/', '2024/(01)'])(
+    'scans for %s, whose number word is too short for a prefix term (#137)',
     (keyword) => {
       expect(celexFragmentRoute(keyword)).toEqual({ kind: 'scan' });
     },
@@ -286,6 +302,10 @@ describe('partial-CELEX parity with the substring scan (#123)', () => {
     '82002IE0124(01)',
     '82013BE0124(02)',
     '92011E012400',
+    'C/2024/01461',
+    'C/2024/01462',
+    'C/2024/01467',
+    'C/2024/01468',
     'C/2024/01469',
     'C2017/111/07',
     'E1994C0123',
@@ -315,11 +335,14 @@ describe('partial-CELEX parity with the substring scan (#123)', () => {
     ['20160504', 'index'],
     ['C2017', 'index'],
     ['E1952', 'index'],
+    ['C/2024/0146', 'index'],
+    ['C/2024/01469', 'index'],
+    ['2024/0146', 'index'],
+    ['2024/01469', 'index'],
     ['ROU_202405', 'scan'],
     ['R(01)', 'scan'],
-    ['C/2024/0146', 'scan'],
-    ['2024/01469', 'scan'],
     ['2017/111', 'scan'],
+    ['2024/014', 'scan'],
   ])('reaches every CELEX the scan reached for %s, by the %s route', (keyword, kind) => {
     const route = celexFragmentRoute(keyword);
     expect(route.kind).toBe(kind);
@@ -371,7 +394,22 @@ describe('keywordMatchPattern partial-CELEX arm (#123)', () => {
     expect(confirmingLiterals(pattern)).toEqual(['J0131']);
   });
 
-  it.each(['R(01)', 'rou_202405', 'C/2024/0146', '2024/01469'])(
+  it.each([
+    ['2024/01469', `'01469*'`, '2024/01469'],
+    ['c/2024/0146', `'0146*'`, 'C/2024/0146'],
+    ['2024/01469-x', `'01469*'`, '2024/01469-X'],
+  ])(
+    'narrows the C-sector fragment %s on its number word, then confirms the whole fragment (#137)',
+    async (keyword, expression, confirmed) => {
+      const pattern = await keywordMatchPattern(svc, keyword, createMockContext());
+
+      expect(pattern).toContain('?work cdm:resource_legal_id_celex ?kwCelex .');
+      expect(celexFullTextExpressions(pattern)).toEqual([expression]);
+      expect(confirmingLiterals(pattern)).toEqual([confirmed]);
+    },
+  );
+
+  it.each(['R(01)', 'rou_202405', '2024/014', 'c/2024/'])(
     'scans every CELEX literal for %s, with no full-text expression',
     async (keyword) => {
       const pattern = await keywordMatchPattern(svc, keyword, createMockContext());
@@ -413,6 +451,11 @@ describe('keywordMatchPattern partial-CELEX arm (#123)', () => {
     'R(01)',
     'Ｒ0679',
     '2016ℝ0679',
+    "2024/01469' OR 'x",
+    "C/2024/0146*' AND 'Z",
+    '2024/0146"',
+    '2024/0146\\',
+    'C/2024/01469 AND 1',
   ])('keeps %j from breaking out of the CELEX full-text expression', async (keyword) => {
     const pattern = await keywordMatchPattern(svc, keyword, createMockContext());
 
@@ -438,6 +481,10 @@ describe('keywordMatchPattern partial-CELEX arm (#123)', () => {
       const pattern = await keywordMatchPattern(svc, keyword, createMockContext());
       for (const expression of celexFullTextExpressions(pattern)) {
         expect(expression, keyword).toMatch(SAFE_EXPRESSION);
+        // CELLAR rejects a prefix term with fewer than four leading characters (FT370).
+        for (const [, term] of expression.matchAll(/'([0-9A-Z]+)\*'/g)) {
+          expect(term?.length, keyword).toBeGreaterThanOrEqual(4);
+        }
       }
       for (const literal of confirmingLiterals(pattern)) {
         expect(literal, keyword).toMatch(/^[0-9A-Z()/_-]+$/);

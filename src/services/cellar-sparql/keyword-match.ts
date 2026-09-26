@@ -73,6 +73,13 @@ const CELEX_SECTORS = Object.keys(CELEX_TYPE_CODES) as (keyof typeof CELEX_TYPE_
 const FIRST_CELEX_YEAR = 1951;
 
 /**
+ * Fewest characters a full-text prefix term may hold before its `*`. CELLAR rejects a
+ * shorter one with Virtuoso error FT370, "Wildcard word needs at least 4 leading
+ * characters" (live, 2026-09-25).
+ */
+const MIN_PREFIX_TERM_LENGTH = 4;
+
+/**
  * The keyword reduced to letters, digits, and single spaces: the phrase the title
  * arm quotes for `bif:contains`, which it cannot break out of. Empty when the
  * keyword holds no letter or digit — then no title matches it, and no CELEX either,
@@ -107,11 +114,13 @@ export function keywordTitlePhrase(keyword: string): string {
  * - **Partial** otherwise, routed by {@link celexFragmentRoute} (#123): prefix terms
  *   on the full-text index CELLAR keeps on CELEX literals, then a confirming
  *   substring test on the narrowed literals, so a partial CELEX (`2016R0679`,
- *   `R0679`) still reaches its consolidated versions from index hits. A fragment
- *   opening with letters no type code ends in, with letters not followed by a digit
- *   (`R(01)`), or with a year and `/` (`2024/01469`), keeps the substring test of
- *   every CELEX literal; one opening mid-year or mid-number (`016R0679`, `0679`), or
- *   a bare year, gets no CELEX arm and matches titles only.
+ *   `R0679`) still reaches its consolidated versions from index hits, and a C-sector
+ *   `[C/]{year}/{number}` fragment (`2024/01469`) is reached on its number word (#137).
+ *   A fragment opening with letters no type code ends in, with letters not followed
+ *   by a digit (`R(01)`), or with a year and `/` and fewer than four number
+ *   characters (`2017/111`), keeps the substring test of every CELEX literal; one
+ *   opening mid-year or mid-number (`016R0679`, `0679`), or a bare year, gets no
+ *   CELEX arm and matches titles only.
  *
  * The family lookup is the one CELLAR call made here; it propagates any failure,
  * cancellation included, rather than falling back to the partial arm.
@@ -207,14 +216,24 @@ export function celexPrefixMatch(
   upperValue: string,
   terms: readonly string[],
 ): string {
-  return `${variable} bif:contains "${terms.map((term) => `'${term}*'`).join(' OR ')}" .
+  return `${celexPrefixTerms(variable, terms)}
     FILTER(CONTAINS(STR(${variable}), "${escapeSparqlLiteral(upperValue)}"))`;
+}
+
+/**
+ * Binds `variable`, a CELEX literal, to the literals with a word starting with one
+ * of `terms` on the CELEX full-text index. Each term must be `[0-9A-Z]` built from
+ * validated input, at least {@link MIN_PREFIX_TERM_LENGTH} characters, and the hits
+ * need a confirming filter, since the index splits words at `/`, `-`, and `_`.
+ */
+export function celexPrefixTerms(variable: `?${string}`, terms: readonly string[]): string {
+  return `${variable} bif:contains "${terms.map((term) => `'${term}*'`).join(' OR ')}" .`;
 }
 
 /**
  * How a partial CELEX keyword reaches the CELEX it is part of:
  *
- * - `index`: full-text prefix terms that complete it to the start of every CELEX
+ * - `index`: full-text prefix terms, one of which starts a word of every CELEX
  *   holding it, for {@link celexPrefixMatch};
  * - `scan`: no completion is known, so a substring test of every CELEX literal;
  * - `titles`: it opens mid-year or mid-number, or is a bare year, where no index
@@ -228,24 +247,28 @@ export type CelexFragmentRoute =
 /**
  * Routes a partial CELEX keyword by its leading run of `[0-9A-Z]` (#123). The index
  * does not split a word between digits and letters, so `'2016R0679*'` matches
- * nothing: a term must open where a CELEX opens, `{sector}{year}{type code}`. Every
- * term is that run behind a sector character, a year, and a type code from
- * {@link CELEX_TYPE_CODES}, so no character a caller typed outside the run reaches
- * the full-text expression, and the run cannot break out of its quotes. A year is
- * {@link FIRST_CELEX_YEAR} through next year.
+ * nothing: a term must open where a CELEX word opens, as `{sector}{year}{type code}`
+ * does. Every term is that run behind a sector character, a year, and a type code
+ * from {@link CELEX_TYPE_CODES}, or the `[0-9A-Z]` run after a year's `/`, so no
+ * character a caller typed outside such a run reaches the full-text expression, and
+ * the run cannot break out of its quotes. A year is {@link FIRST_CELEX_YEAR} through
+ * next year.
  *
  * - Five digits (`02016R0679`): the run itself, a sector digit and a year. The index
  *   also splits words at `-`, so `20160504` reaches the consolidations of that date.
  * - `C` or `E` and a year (`C2006`, `E2003C0097`): the run itself, and the run read
  *   as type letters followed by the number, since `51973PC2017` holds `C2017`.
  * - A year and a letter (`2016R0679`): the run behind each sector.
- * - A year and `/` (`2024/01469`, `2017/111`): `scan`. Only the C-sector forms
- *   `C/2024/01469` and `C2017/111/07` hold a `/`, and in the first the year is a word
- *   of its own that no sector term completes.
+ * - A year and `/`, alone or behind `C/` (`2024/01469`, `C/2024/0146`, #137): the
+ *   `[0-9A-Z]` run after the `/`, the number word. Only the C-sector forms
+ *   `C/2024/01469` and `C2017/111/07` hold a `/`, and the index splits words at it,
+ *   so every CELEX holding the fragment has a word starting with its number word.
+ *   `scan` when that word is shorter than {@link MIN_PREFIX_TERM_LENGTH} (`2017/111`,
+ *   `2024/`), and `titles` when four digits before a bare `/` are no year.
  * - Letters and a digit (`R0679`, `CJ0362`, `J0131`, `C0097`): the run behind every
  *   sector, year, and type code ending in those letters, so `J0131` reaches
  *   `62013CJ0131`; `scan` when no type code ends in them.
- * - Letters and anything else (`R(01)`, `ROU_202405`, `C/2024/0146`): `scan`.
+ * - Letters and anything else (`R(01)`, `ROU_202405`, `C/24`): `scan`.
  * - Anything else (`016R0679`, `0679`, `0679R`, `9999R0679`, a bare year `2016`):
  *   `titles`. Four digits that are no year sit mid-number (`31979R0679R(01)`).
  *
@@ -272,8 +295,13 @@ export function celexFragmentRoute(upperKeyword: string): CelexFragmentRoute {
       ? { kind: 'index', terms: CELEX_SECTORS.map((sector) => `${sector}${run}`) }
       : { kind: 'titles' };
   }
-  if (/^\d{4}\//.test(upperKeyword)) {
-    return isYear(run) ? { kind: 'scan' } : { kind: 'titles' };
+  const slashed = /^(C\/)?(\d{4})\/([0-9A-Z]*)/.exec(upperKeyword);
+  if (slashed) {
+    const [, sectorPrefix, year = '', numberWord = ''] = slashed;
+    if (!sectorPrefix && !isYear(year)) return { kind: 'titles' };
+    return numberWord.length >= MIN_PREFIX_TERM_LENGTH
+      ? { kind: 'index', terms: [numberWord] }
+      : { kind: 'scan' };
   }
   if (/^[A-Z]+\d/.test(run)) {
     const terms = typeCodeTerms(run, lastYear);

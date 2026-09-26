@@ -2334,6 +2334,9 @@ describe('eurlex_search_documents', () => {
       // #123: a partial CELEX is completed from its start; a mid-number fragment is not.
       expect(description).toContain('partial CELEX');
       expect(description).toMatch(/016R0679[^.]*titles only/);
+      // #137: an OJ C year/number fragment is indexed; one with a short number scans.
+      expect(description).toMatch(/2024\/01469[^;]*matches every CELEX holding it/);
+      expect(description).toMatch(/2017\/111[^;]*tests every CELEX/);
     });
   });
 });

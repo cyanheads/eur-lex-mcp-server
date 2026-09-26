@@ -92,7 +92,7 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
       .string()
       .optional()
       .describe(
-        'Keyword matched against English document titles via the full-text index (multi-word input is treated as a phrase), and against CELEX numbers. A keyword that is a whole CELEX (e.g. 32016R0679) matches that document, its numbered siblings (…(01) to …(20)), and for case law its _INF, _RES, _SUM, and _EXT records, plus its corrigenda (…R(01) to …R(20), and any work recorded as correcting it) when include_corrigenda is set. A partial CELEX that opens with the sector and year (02016R0679), the year and type letters (2016R0679), or type letters followed by the number (R0679, J0131) matches every CELEX that holds it at that position, consolidated versions included; one opening with letters not followed by a digit (R(01), ROU_2024) or with a year and a slash (2024/01469) tests every CELEX and can take tens of seconds; a bare year (2016) or a fragment opening mid-year or mid-number (016R0679, 0679, 0679R) matches titles only. A keyword with no digit, or with a character no CELEX holds (a space, a period), matches titles only. A keyword with no letter or digit is rejected.',
+        'Keyword matched against English document titles via the full-text index (multi-word input is treated as a phrase), and against CELEX numbers. A keyword that is a whole CELEX (e.g. 32016R0679) matches that document, its numbered siblings (…(01) to …(20)), and for case law its _INF, _RES, _SUM, and _EXT records, plus its corrigenda (…R(01) to …R(20), and any work recorded as correcting it) when include_corrigenda is set. A partial CELEX that opens with the sector and year (02016R0679), the year and type letters (2016R0679), or type letters followed by the number (R0679, J0131) matches every CELEX that holds it at that position, consolidated versions included; an OJ C fragment of a year, a slash, and at least four characters of the number (2024/01469, C/2024/0146) matches every CELEX holding it; one with a shorter number (2017/111) or opening with letters not followed by a digit (R(01), ROU_2024) tests every CELEX and can take tens of seconds; a bare year (2016) or a fragment opening mid-year or mid-number (016R0679, 0679, 0679R) matches titles only. A keyword with no digit, or with a character no CELEX holds (a space, a period), matches titles only. A keyword with no letter or digit is rejected.',
       ),
     document_type: z
       .union([
@@ -168,7 +168,7 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
       .string()
       .optional()
       .describe(
-        'Author institution name (e.g. "European Parliament", "Council", "European Commission"), matched against the English names of EU corporate bodies.',
+        'Author name (e.g. "European Parliament", "Council", "European Commission"), matched as a phrase against the English labels of each work\'s authors — the labels eurlex_get_document reports in author_institution(s), member states and MEPs included.',
       ),
     in_force: z
       .boolean()
