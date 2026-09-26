@@ -1655,6 +1655,19 @@ describe('eurlex_get_relations', () => {
     });
   });
 
+  it('bounds the CELEX the not_found message echoes (#135)', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_relations.errors });
+    mockQuery.mockImplementation(routeQuery({ resolve: [] }));
+    const celex = `32016R0679${'0'.repeat(50_000)}`;
+
+    await expect(
+      eurlex_get_relations.handler(eurlex_get_relations.input.parse({ celex_number: celex }), ctx),
+    ).rejects.toMatchObject({
+      data: { reason: 'not_found' },
+      message: `No CELLAR work found for CELEX: ${celex.slice(0, 100)}…`,
+    });
+  });
+
   // --- Empty pages ---
 
   it('returns an empty first page listing every type as empty when every relation query returns empty', async () => {
