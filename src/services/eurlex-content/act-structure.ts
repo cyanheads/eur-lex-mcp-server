@@ -1345,7 +1345,7 @@ function normalizeToken(
 ): string {
   const words = token
     .trim()
-    .replace(/^(article|chapter|section|annex|recital)\s+/i, '')
+    .replace(/^(article|chapter|section|annex|recital|heading)\s+/i, '')
     .split(/\s+/);
   if (words.length > 1 && selectorWord.test(words[0] ?? '')) words.shift();
   else if (words.length > 1 && selectorWord.test(words.at(-1) ?? '')) words.pop();

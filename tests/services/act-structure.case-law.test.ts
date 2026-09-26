@@ -409,6 +409,15 @@ describe('case-law selection (#117)', () => {
     expect(result.text).not.toContain('Consideration of the questions referred');
   });
 
+  it('takes a heading position written as selection.requested reports it', () => {
+    const result = extractSections(html, headings, { headings: 'Heading 2, heading 4' }, 'EN');
+    expect(result).toMatchObject({
+      requested: ['Heading 2', 'Heading 4'],
+      matched: [GOOGLE_SPAIN_EN[1], 'Costs'],
+      missed: [],
+    });
+  });
+
   it('ends the last headed section at the operative part', () => {
     const result = extractSections(html, headings, { headings: '4' }, 'EN');
     expect(result.text).toContain('Since these proceedings');
