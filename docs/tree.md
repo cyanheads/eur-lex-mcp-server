@@ -1,6 +1,6 @@
 # eur-lex-mcp-server - Directory Structure
 
-Generated on: 2026-09-26 03:47:32
+Generated on: 2026-09-26 06:00:51
 
 ```text
 eur-lex-mcp-server/
@@ -33,6 +33,7 @@ eur-lex-mcp-server/
 │   ├── 0.15.x/
 │   ├── 0.16.x/
 │   ├── 0.17.x/
+│   ├── 0.18.x/
 │   ├── 0.2.x/
 │   ├── 0.3.x/
 │   ├── 0.4.x/
@@ -196,6 +197,7 @@ eur-lex-mcp-server/
 │   │   ├── eurlex-act-headings.ts
 │   │   ├── eurlex-act-html.ts
 │   │   ├── eurlex-amending-act.ts
+│   │   ├── eurlex-case-law.ts
 │   │   ├── eurlex-consolidated-act.ts
 │   │   ├── eurlex-formex-multipart.ts
 │   │   ├── eurlex-legacy-act.ts
@@ -208,6 +210,7 @@ eur-lex-mcp-server/
 │   ├── services/
 │   │   ├── __snapshots__/
 │   │   │   └── html-to-markdown.test.ts.snap
+│   │   ├── act-structure.case-law.test.ts
 │   │   ├── act-structure.test.ts
 │   │   ├── cdm-labels.test.ts
 │   │   ├── cellar-sparql-service.test.ts
@@ -222,6 +225,7 @@ eur-lex-mcp-server/
 │       ├── eurlex-browse-subjects.tool.test.ts
 │       ├── eurlex-get-cases.tool.test.ts
 │       ├── eurlex-get-document.cache.test.ts
+│       ├── eurlex-get-document.case-law.test.ts
 │       ├── eurlex-get-document.formex-package.test.ts
 │       ├── eurlex-get-document.tool.test.ts
 │       ├── eurlex-get-relations.tool.test.ts

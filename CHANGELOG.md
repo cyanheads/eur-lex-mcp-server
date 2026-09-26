@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.18.0](changelog/0.18.x/0.18.0.md) — 2026-09-25 · ⚠️ Breaking
+
+eurlex_get_cases and eurlex_get_document parse CELLAR's case-law title into formation, referring court, and related fields, and eurlex_get_document adds the ECLI and a heading and operative-part outline for case law. Relation rows carry a date and title, authors use CELLAR's English labels, and document titles follow the served language.
+
 ## [0.17.0](changelog/0.17.x/0.17.0.md) — 2026-09-25 · ⚠️ Breaking
 
 eurlex_lookup_celex resolves OJ citations such as Regulation (EU) 2016/679, partial-CELEX keywords and case_number fallbacks are answered from the CELEX full-text index instead of a scan, EuroVoc matches rank exact labels first, and non-SELECT SPARQL forms fail as unsupported_query_form.
