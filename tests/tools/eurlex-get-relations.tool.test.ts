@@ -1111,7 +1111,7 @@ describe('eurlex_get_relations', () => {
     // interleaving could keep the private continuation sentinel and drop a real
     // relation.
     expect(citesSparql).toContain(
-      'SELECT ?relatedWork ?relatedCelexSample ?direction ?relatedDateMax WHERE {',
+      'SELECT ?relatedWork ?relatedCelexSample ?direction ?relatedDateMax (MAX(STR(?relatedTitle)) AS ?relatedTitleMax) WHERE {',
     );
     expect(
       citesSparql.trimEnd().endsWith('ORDER BY ?direction DESC(?relatedDateMax) ?relatedWork'),
@@ -2420,6 +2420,221 @@ describe('eurlex_get_relations', () => {
         .map((c) => c[0] as string)
         .find((q) => q.includes('cdm:resource_legal_amends_resource_legal')) as string;
       expect(sparql).toContain('OPTIONAL { ?relatedWork cdm:work_date_document ?relatedDate . }');
+    });
+  });
+
+  // --- #119: each relation row carries the related work's date and English title ---
+
+  describe('related date and title (#119)', () => {
+    const ENG = 'http://publications.europa.eu/resource/authority/language/ENG';
+
+    /** The query issued for one relation type, on a limit-25 page at offset 25. */
+    const relationQuery = async (type: 'cites' | 'amended_by', marker: string) => {
+      mockQuery.mockImplementation(routeQuery({ resolve: [makeResolveBinding(GDPR_WORK_URI)] }));
+      await eurlex_get_relations.handler(
+        eurlex_get_relations.input.parse({
+          celex_number: '32016R0679',
+          relation_types: [type],
+          limit: 25,
+          offset: 25,
+        }),
+        createMockContext({ errors: eurlex_get_relations.errors }),
+      );
+      return mockQuery.mock.calls
+        .map((c) => c[0] as string)
+        .find((q) => q.includes(marker)) as string;
+    };
+
+    /** The title join: everything after the last per-direction subquery closes. */
+    const afterPage = (sparql: string) =>
+      sparql.slice(sparql.lastIndexOf('LIMIT 26 OFFSET 25 }') + 'LIMIT 26 OFFSET 25 }'.length);
+
+    it.each([
+      ['cites', 'cdm:work_cites_work', 2],
+      ['amended_by', 'cdm:resource_legal_amends_resource_legal', 1],
+    ] as const)(
+      'joins the English title after paging in the %s query',
+      async (type, marker, arms) => {
+        const sparql = await relationQuery(type, marker);
+        // The page is found first: each direction subquery is the unchanged paged form.
+        expect(
+          sparql.match(/ORDER BY DESC\(\?relatedDateMax\) \?relatedWork LIMIT 26 OFFSET 25 \}/g),
+        ).toHaveLength(arms);
+        // The title is joined once, outside the paged subqueries, so it touches the page's works alone.
+        expect(sparql.match(/cdm:expression_title/g)).toHaveLength(1);
+        const join = afterPage(sparql);
+        expect(join).toContain('?relatedExpr cdm:expression_belongs_to_work ?relatedWork .');
+        expect(join).toContain(`?relatedExpr cdm:expression_uses_language <${ENG}> .`);
+        expect(join).toContain('?relatedExpr cdm:expression_title ?relatedTitle .');
+        expect(sparql).toContain(
+          'SELECT ?relatedWork ?relatedCelexSample ?direction ?relatedDateMax (MAX(STR(?relatedTitle)) AS ?relatedTitleMax) WHERE {',
+        );
+        expect(
+          sparql
+            .trimEnd()
+            .endsWith(
+              '} GROUP BY ?relatedWork ?relatedCelexSample ?direction ?relatedDateMax ORDER BY ?direction DESC(?relatedDateMax) ?relatedWork',
+            ),
+        ).toBe(true);
+      },
+    );
+
+    it('returns each row’s date and English title in its ordered position, omitting either when absent', async () => {
+      const titled = `${CELLAR}titled`;
+      const untitled = `${CELLAR}untitled`;
+      const undated = `${CELLAR}undated`;
+      mockQuery.mockImplementation(
+        routeQuery({
+          resolve: [makeResolveBinding(GDPR_WORK_URI)],
+          amendedBy: [
+            {
+              ...makeRelationBinding({
+                relatedWork: titled,
+                direction: 'incoming',
+                relatedCelex: '32026R2099',
+              }),
+              relatedDateMax: { type: 'literal', value: '2026-09-21' },
+              relatedTitleMax: {
+                type: 'literal',
+                value: 'Commission Implementing Regulation (EU) 2026/2099 of 21 September 2026',
+              },
+            },
+            {
+              ...makeRelationBinding({ relatedWork: untitled, direction: 'incoming' }),
+              relatedDateMax: { type: 'literal', value: '2026-07-16' },
+            },
+            {
+              ...makeRelationBinding({ relatedWork: undated, direction: 'incoming' }),
+              relatedTitleMax: { type: 'literal', value: 'An undated act' },
+            },
+          ],
+        }),
+      );
+
+      const result = await runToolContract(eurlex_get_relations, {
+        celex_number: '32016R0679',
+        relation_types: ['amended_by'],
+      });
+
+      const structured = eurlex_get_relations.output.parse(result.structuredContent);
+      expect(structured.relations).toEqual([
+        {
+          relation_type: 'amended_by',
+          direction: 'incoming',
+          related_work_uri: titled,
+          related_celex_number: '32026R2099',
+          related_date: '2026-09-21',
+          related_title: 'Commission Implementing Regulation (EU) 2026/2099 of 21 September 2026',
+        },
+        {
+          relation_type: 'amended_by',
+          direction: 'incoming',
+          related_work_uri: untitled,
+          related_date: '2026-07-16',
+        },
+        {
+          relation_type: 'amended_by',
+          direction: 'incoming',
+          related_work_uri: undated,
+          related_title: 'An undated act',
+        },
+      ]);
+
+      const text = contentText(result);
+      expect(text).toContain(
+        `- 32026R2099 (${titled}) · 2026-09-21 · Commission Implementing Regulation (EU) 2026/2099 of 21 September 2026`,
+      );
+      expect(text).toContain(`- ${untitled} · 2026-07-16\n`);
+      expect(text).toContain(`- ${undated} · An undated act\n`);
+    });
+
+    it('cuts a related date carrying a zone or time to its day, on both surfaces', async () => {
+      mockQuery.mockImplementation(
+        routeQuery({
+          resolve: [makeResolveBinding(GDPR_WORK_URI)],
+          amendedBy: [
+            {
+              ...makeRelationBinding({ relatedWork: `${CELLAR}zoned`, direction: 'incoming' }),
+              relatedDateMax: { type: 'literal', value: '2026-09-21+02:00' },
+            },
+            {
+              ...makeRelationBinding({ relatedWork: `${CELLAR}timed`, direction: 'incoming' }),
+              relatedDateMax: { type: 'literal', value: '2026-07-16T00:00:00' },
+            },
+          ],
+        }),
+      );
+
+      const result = await runToolContract(eurlex_get_relations, {
+        celex_number: '32016R0679',
+        relation_types: ['amended_by'],
+      });
+
+      const structured = eurlex_get_relations.output.parse(result.structuredContent);
+      expect(structured.relations.map((r) => r.related_date)).toEqual(['2026-09-21', '2026-07-16']);
+      const text = contentText(result);
+      expect(text).toContain(`- ${CELLAR}zoned · 2026-09-21\n`);
+      expect(text).not.toContain('+02:00');
+      expect(text).not.toContain('T00:00:00');
+    });
+
+    it('carries the date after the member state on a national_transposition row', async () => {
+      mockQuery.mockImplementation(
+        routeQuery({
+          resolve: [makeResolveBinding(DIRECTIVE_680_WORK_URI)],
+          nationalTransposition: [
+            {
+              ...makeRelationBinding({
+                relatedWork: CZECH_MEASURE_WORK_URI,
+                direction: 'incoming',
+                relatedCelex: '72016L0680CZE_225030',
+              }),
+              relatedDateMax: { type: 'literal', value: '2019-02-27' },
+            },
+          ],
+        }),
+      );
+
+      const result = await runToolContract(eurlex_get_relations, {
+        celex_number: '32016L0680',
+        relation_types: ['national_transposition'],
+      });
+
+      const structured = eurlex_get_relations.output.parse(result.structuredContent);
+      expect(structured.relations[0]).toMatchObject({
+        related_member_state: 'CZE',
+        related_date: '2019-02-27',
+      });
+      expect(structured.relations[0]).not.toHaveProperty('related_title');
+      expect(contentText(result)).toContain(
+        `- 72016L0680CZE_225030 (${CZECH_MEASURE_WORK_URI}) — member state CZE · 2019-02-27\n`,
+      );
+    });
+
+    it('keeps the rows, order, has_more, and next_offset of a full page', async () => {
+      const rows = [1, 2, 3].map((n) => ({
+        ...makeRelationBinding({ relatedWork: `${CELLAR}amending-${n}`, direction: 'incoming' }),
+        relatedDateMax: { type: 'literal', value: `2026-0${4 - n}-01` },
+        relatedTitleMax: { type: 'literal', value: `Act ${n}` },
+      }));
+      mockQuery.mockImplementation(
+        routeQuery({ resolve: [makeResolveBinding(GDPR_WORK_URI)], amendedBy: rows }),
+      );
+
+      const result = await eurlex_get_relations.handler(
+        eurlex_get_relations.input.parse({
+          celex_number: '32016R0679',
+          relation_types: ['amended_by'],
+          limit: 2,
+        }),
+        createMockContext({ errors: eurlex_get_relations.errors }),
+      );
+
+      expect(result.relations.map((r) => [r.related_work_uri, r.related_date])).toEqual([
+        [`${CELLAR}amending-1`, '2026-03-01'],
+        [`${CELLAR}amending-2`, '2026-02-01'],
+      ]);
+      expect(result).toMatchObject({ has_more: true, next_offset: 2 });
     });
   });
 

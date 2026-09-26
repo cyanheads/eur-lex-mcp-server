@@ -110,6 +110,18 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
               .describe(
                 'ISO 3166-1 alpha-3 code of the member state whose national measure this is (e.g. "CZE"), read from the three letters after the directive number in related_celex_number. Present on national_transposition rows only. The codes are the 27 member states plus "GBR" (the United Kingdom).',
               ),
+            related_date: z
+              .string()
+              .optional()
+              .describe(
+                'Document date of the related work (YYYY-MM-DD), the date rows are ordered by within each relation type and direction. Absent when CELLAR records none; such rows sort last.',
+              ),
+            related_title: z
+              .string()
+              .optional()
+              .describe(
+                "The related work's English title, whole. Absent when the work has no English title — most national_transposition measures are titled only in their member state's language — with no other language substituted.",
+              ),
           })
           .describe('A single CDM relation between the source work and a related work.'),
       )
@@ -308,6 +320,8 @@ SELECT ?sourceCelex WHERE {
       related_work_uri: r.relatedWorkUri,
       ...(r.relatedCelexNumber ? { related_celex_number: r.relatedCelexNumber } : {}),
       ...(r.relatedMemberState ? { related_member_state: r.relatedMemberState } : {}),
+      ...(r.relatedDate ? { related_date: r.relatedDate } : {}),
+      ...(r.relatedTitle ? { related_title: r.relatedTitle } : {}),
     }));
 
     if (hasMore) {
@@ -383,7 +397,9 @@ SELECT ?sourceCelex WHERE {
         const memberState = item.related_member_state
           ? ` — member state ${item.related_member_state}`
           : '';
-        lines.push(`- ${label}${memberState}`);
+        const date = item.related_date ? ` · ${item.related_date}` : '';
+        const title = item.related_title ? ` · ${item.related_title}` : '';
+        lines.push(`- ${label}${memberState}${date}${title}`);
       }
       lines.push('');
     }

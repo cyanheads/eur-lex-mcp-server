@@ -22,7 +22,7 @@ export const eurlex_document_relations_resource = resource(
   {
     name: 'EUR-Lex document relations',
     description:
-      'One-hop CDM relationship summary for a CELLAR work by CELEX number: amendment chain, consolidations, national transposition measures, legal basis, and citations.',
+      'One-hop CDM relationship summary for a CELLAR work by CELEX number: amendment chain, consolidations, national transposition measures, legal basis, and citations. Each related work carries its CELEX, its document date, and its English title where it has them.',
     mimeType: 'application/json',
     params: z.object({
       celexNumber: z
@@ -70,6 +70,8 @@ export const eurlex_document_relations_resource = resource(
         related_work_uri: r.relatedWorkUri,
         ...(r.relatedCelexNumber ? { related_celex_number: r.relatedCelexNumber } : {}),
         ...(r.relatedMemberState ? { related_member_state: r.relatedMemberState } : {}),
+        ...(r.relatedDate ? { related_date: r.relatedDate } : {}),
+        ...(r.relatedTitle ? { related_title: r.relatedTitle } : {}),
       }));
 
       return {

@@ -656,6 +656,55 @@ describe('eurlex_document_relations_resource', () => {
     ]);
   });
 
+  // --- #119: rows carry the related work's date and English title ---
+
+  it('carries related_date and related_title on each row, omitting either when absent (#119)', async () => {
+    const titled = `${CELLAR}titled`;
+    const bare = `${CELLAR}bare`;
+    mockQuery.mockImplementation(
+      routeQuery({
+        resolve: [makeResolveBinding(GDPR_WORK_URI)],
+        cites: [
+          {
+            ...makeRelationBinding({
+              relatedWork: titled,
+              direction: 'incoming',
+              relatedCelex: '62024CJ0001',
+            }),
+            relatedDateMax: { type: 'literal', value: '2026-09-01' },
+            relatedTitleMax: {
+              type: 'literal',
+              value: 'Judgment of the Court of 1 September 2026.',
+            },
+          },
+          makeRelationBinding({ relatedWork: bare, direction: 'incoming' }),
+        ],
+      }),
+    );
+
+    const params = eurlex_document_relations_resource.params!.parse({ celexNumber: '32016R0679' });
+    const result = (await eurlex_document_relations_resource.handler(
+      params,
+      createMockContext({ tenantId: 'test-tenant' }),
+    )) as { relations: Record<string, string>[] };
+
+    expect(result.relations).toEqual([
+      {
+        relation_type: 'cites',
+        direction: 'incoming',
+        related_work_uri: titled,
+        related_celex_number: '62024CJ0001',
+        related_date: '2026-09-01',
+        related_title: 'Judgment of the Court of 1 September 2026.',
+      },
+      { relation_type: 'cites', direction: 'incoming', related_work_uri: bare },
+    ]);
+    const cites = mockQuery.mock.calls
+      .map((c) => c[0] as string)
+      .find((q) => q.includes('cdm:work_cites_work')) as string;
+    expect(cites).toContain('(MAX(STR(?relatedTitle)) AS ?relatedTitleMax)');
+  });
+
   // --- #100: the summary is newest-first and identical on every read ---
 
   it('orders every summary query by string date, then work URI, at both levels (#100)', async () => {

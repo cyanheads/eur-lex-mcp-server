@@ -7,6 +7,7 @@
  */
 
 import type { Context } from '@cyanheads/mcp-ts-core';
+import { ENG_LANGUAGE_URI } from './cdm-labels.js';
 import { CellarSparqlService } from './cellar-sparql-service.js';
 import { celexLiteral } from './eli-resolution.js';
 import type { SparqlBinding, WorkRelation } from './types.js';
@@ -162,12 +163,21 @@ function relationArm(
  * bound only on the raw escape hatch), so an over-cap here would return an
  * over-budget arm — callers pass a limit already clamped to the service ceiling.
  *
- * The outer UNION carries its own `ORDER BY ?direction DESC(?relatedDateMax)
+ * Each row's English title is joined after paging (#119): the per-direction
+ * subqueries find the page, and the outer query adds one `OPTIONAL` English
+ * expression title per paged work, so the join touches at most `limit` works per
+ * direction however many works relate. Joining it inside the subqueries would
+ * aggregate a title for every related work before `LIMIT`. The title aggregates as
+ * `MAX(STR(?relatedTitle))` — one value, the same on every call, for a work with
+ * several English titles — grouped by the subquery's projected variables, so the
+ * rows, dates, and CELEX values are the subqueries' own.
+ *
+ * The outer query carries its own `ORDER BY ?direction DESC(?relatedDateMax)
  * ?relatedWork`, the subquery order within each direction. Without it the union
- * order is implementation-defined, and the caller slices each direction to
- * `perTypeLimit` after grouping the rows by direction — so an arbitrary
- * interleaving can place the private continuation sentinel inside the kept slice
- * and drop a real relation instead.
+ * (and the regrouped rows) come back in an implementation-defined order, and the
+ * caller slices each direction to `perTypeLimit` after grouping the rows by
+ * direction — so an arbitrary interleaving can place the private continuation
+ * sentinel inside the kept slice and drop a real relation instead.
  */
 function buildRelationQuery(
   workUri: string,
@@ -179,18 +189,22 @@ function buildRelationQuery(
   const projection =
     'SELECT ?relatedWork (SAMPLE(?relatedCelex) AS ?relatedCelexSample) ?direction (MAX(STR(?relatedDate)) AS ?relatedDateMax)';
   const paging = `GROUP BY ?relatedWork ?direction ORDER BY DESC(?relatedDateMax) ?relatedWork LIMIT ${limit} OFFSET ${offset}`;
-  if (spec.direction !== 'both') {
-    return `${projection} WHERE {
-    ${relationArm(workUri, spec.predicate, spec.direction, celex)}
-} ${paging}`;
-  }
   const subquery = (direction: 'outgoing' | 'incoming') =>
     `{ ${projection} WHERE {
     ${relationArm(workUri, spec.predicate, direction, celex)}
   } ${paging} }`;
-  return `SELECT ?relatedWork ?relatedCelexSample ?direction ?relatedDateMax WHERE {
-  ${subquery('outgoing')} UNION ${subquery('incoming')}
-} ORDER BY ?direction DESC(?relatedDateMax) ?relatedWork`;
+  const page =
+    spec.direction === 'both'
+      ? `${subquery('outgoing')} UNION ${subquery('incoming')}`
+      : subquery(spec.direction);
+  return `SELECT ?relatedWork ?relatedCelexSample ?direction ?relatedDateMax (MAX(STR(?relatedTitle)) AS ?relatedTitleMax) WHERE {
+  ${page}
+  OPTIONAL {
+    ?relatedExpr cdm:expression_belongs_to_work ?relatedWork .
+    ?relatedExpr cdm:expression_uses_language <${ENG_LANGUAGE_URI}> .
+    ?relatedExpr cdm:expression_title ?relatedTitle .
+  }
+} GROUP BY ?relatedWork ?relatedCelexSample ?direction ?relatedDateMax ORDER BY ?direction DESC(?relatedDateMax) ?relatedWork`;
 }
 
 /**
@@ -376,6 +390,10 @@ SELECT ?baseWork ?currentCelex ?currentDate ?pendingCelex ?pendingDate WHERE {
  * direction. Each query requests one additional grouped row per direction, then
  * removes that private sentinel before returning. `hasMore` is true only when a
  * direction produced that additional row.
+ *
+ * Each relation carries the related work's date — the value its page is ordered
+ * by — and its English title (#119), each omitted when the work has none; no
+ * other language stands in for a missing English title.
  */
 export async function traverseRelations(
   svc: Pick<CellarSparqlService, 'queryWithContinuation'>,
@@ -427,6 +445,8 @@ export async function traverseRelations(
       const direction =
         CellarSparqlService.bindingValue(b, 'direction') === 'incoming' ? 'incoming' : 'outgoing';
       const relatedCelex = CellarSparqlService.bindingValue(b, 'relatedCelexSample');
+      const relatedDate = CellarSparqlService.bindingValue(b, 'relatedDateMax')?.slice(0, 10);
+      const relatedTitle = CellarSparqlService.bindingValue(b, 'relatedTitleMax');
 
       // Keep CELEX-constrained relation lists trustworthy at a glance. These
       // checks mirror the SPARQL filters as client-side belt-and-suspenders.
@@ -452,6 +472,8 @@ export async function traverseRelations(
         relatedWorkUri,
         ...(relatedCelex ? { relatedCelexNumber: relatedCelex } : {}),
         ...(relatedMemberState ? { relatedMemberState } : {}),
+        ...(relatedDate ? { relatedDate } : {}),
+        ...(relatedTitle ? { relatedTitle } : {}),
       });
       rowsByDirection.set(direction, rows);
     }

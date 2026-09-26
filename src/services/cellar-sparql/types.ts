@@ -60,11 +60,15 @@ export interface CaseResult {
 export interface WorkRelation {
   direction: 'outgoing' | 'incoming';
   relatedCelexNumber?: string;
+  /** The related work's document date (`YYYY-MM-DD`), the value its page is ordered by. Absent when it has none. */
+  relatedDate?: string;
   /**
    * ISO 3166-1 alpha-3 member-state code of a national implementing measure, read
    * from its sector-7 CELEX. Set on `national_transposition` relations only.
    */
   relatedMemberState?: string;
+  /** The related work's English expression title, whole. Absent when it has none in English. */
+  relatedTitle?: string;
   relatedWorkUri: string;
   relationType: string;
 }
