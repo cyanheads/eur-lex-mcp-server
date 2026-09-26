@@ -4,7 +4,7 @@
  */
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_lookup_celex } from '@/mcp-server/tools/definitions/eurlex-lookup-celex.tool.js';
 import { escapeSparqlLiteral } from '@/services/cellar-sparql/eli-resolution.js';
@@ -251,6 +251,18 @@ describe('eurlex_lookup_celex', () => {
     });
     // Should not have called the SPARQL service
     expect(mockQuery).not.toHaveBeenCalled();
+  });
+
+  it('bounds the identifier the ambiguous_identifier message echoes (#135)', async () => {
+    const ctx = createMockContext({ errors: eurlex_lookup_celex.errors });
+    const identifier = `x ${'y'.repeat(50_000)}`;
+
+    await expect(
+      eurlex_lookup_celex.handler(eurlex_lookup_celex.input.parse({ identifier }), ctx),
+    ).rejects.toMatchObject({
+      data: { reason: 'ambiguous_identifier' },
+      message: `Cannot determine format of identifier: ${identifier.slice(0, 100)}…`,
+    });
   });
 
   it('no longer advertises the "oj" identifier_type — the enum rejects it', () => {
@@ -704,7 +716,7 @@ describe('eurlex_lookup_celex', () => {
       expect(text).toContain('**CELEX:** 62012CJ0131');
     });
 
-    it('names ecli in the ambiguous_identifier recovery', async () => {
+    it('names the ECLI form in the ambiguous_identifier recovery', async () => {
       const result = await runToolContract(eurlex_lookup_celex, {
         identifier: 'not an identifier',
         identifier_type: 'auto',
@@ -713,7 +725,7 @@ describe('eurlex_lookup_celex', () => {
         error?: { data?: { reason?: string; recovery?: { hint?: string } } };
       };
       expect(structured.error?.data?.reason).toBe('ambiguous_identifier');
-      expect(structured.error?.data?.recovery?.hint).toContain('"ecli"');
+      expect(structured.error?.data?.recovery?.hint).toContain('ECLI:EU:C:2014:317');
     });
   });
 
@@ -916,6 +928,176 @@ describe('eurlex_lookup_celex', () => {
 
       expect(result.work_uri).toBe(canonicalWork('62022TJ0181'));
       expect(result.ecli).toBe('ECLI:EU:T:2024:668');
+    });
+  });
+
+  // --- #114: OJ citations under auto, and a notice on a miss ---
+
+  describe('OJ citations (#114)', () => {
+    /** CELLAR holds exactly `celex`: the typed CELEX lookup answers only for that literal. */
+    function holds(celex: string): void {
+      mockQuery.mockImplementation(async (q: string) =>
+        q.includes(`"${celex}"^^xsd:string`)
+          ? [makeBinding(celex, { type: `${RESOURCE_TYPE}REG`, canonical: true })]
+          : [],
+      );
+    }
+
+    async function resolve(identifier: string, identifierType?: 'auto' | 'celex') {
+      const ctx = createMockContext({ errors: eurlex_lookup_celex.errors });
+      const result = await eurlex_lookup_celex.handler(
+        eurlex_lookup_celex.input.parse({
+          identifier,
+          ...(identifierType ? { identifier_type: identifierType } : {}),
+        }),
+        ctx,
+      );
+      const queries = mockQuery.mock.calls.map((c) => c[0] as string);
+      return { result, ctx, queries };
+    }
+
+    it.each([
+      ['Regulation (EU) 2016/679', '32016R0679'],
+      ['Regulation (EC) No 1049/2001', '32001R1049'],
+      ['Council Regulation (EEC) No 1612/68', '31968R1612'],
+      ['Directive 95/46/EC', '31995L0046'],
+      ['Directive 2011/83/EU', '32011L0083'],
+      ['Directive (EU) 2016/680', '32016L0680'],
+      ['Council Directive 2013/59/Euratom', '32013L0059'],
+      ['Decision (EU) 2015/1814', '32015D1814'],
+      ['Decision No 1313/2013/EU', '32013D1313'],
+      ['Council Decision 2010/413/CFSP', '32010D0413'],
+      ['Framework Decision 2002/584/JHA', '32002F0584'],
+      ['Joint Action 2008/124/CFSP', '32008E0124'],
+      ['Common Position 2003/444/CFSP', '32003E0444'],
+      ['Decision No 3632/93/ECSC', '31993S3632'],
+    ])('resolves %j to %s under auto', async (citation, celex) => {
+      holds(celex);
+      const { result, queries } = await resolve(citation);
+
+      expect(result).toMatchObject({ found: true, celex_number: celex });
+      expect(queries).toHaveLength(1);
+      expect(queries[0]).toContain(`?work cdm:resource_legal_id_celex "${celex}"^^xsd:string .`);
+    });
+
+    it.each([
+      ['Regulation (EU) No 596/2014', '32014R0596'],
+      ['Regulation (EU) 2015/596', '32015R0596'],
+      ['Regulation (EC) No 46/95', '31995R0046'],
+      ['Commission Implementing Regulation (EU) No 540/2011', '32011R0540'],
+      ['Commission Delegated Regulation (EU) 2019/980', '32019R0980'],
+      ['Council Framework Decision 2002/584/JHA', '32002F0584'],
+      ['Commission Decision No 3632/93/ECSC', '31993S3632'],
+      ['directive 95/46/ec', '31995L0046'],
+      ['Regulation (EC) No. 1049/2001', '32001R1049'],
+      [
+        'Regulation (EU) 2016/679 of the European Parliament and of the Council of 27 April 2016',
+        '32016R0679',
+      ],
+    ])(
+      'orders the numbers by the No marker and ignores qualifiers: %j → %s',
+      async (citation, celex) => {
+        holds(celex);
+        const { result } = await resolve(citation);
+        expect(result).toMatchObject({ found: true, celex_number: celex });
+      },
+    );
+
+    it('reads Directive 95/46/EC as the directive, never the Commission Decision of the same number', async () => {
+      holds('31995D0046');
+      const { result, queries } = await resolve('Directive 95/46/EC');
+
+      expect(result.found).toBe(false);
+      expect(queries.join('\n')).toContain('"31995L0046"^^xsd:string');
+      expect(queries.join('\n')).not.toContain('31995D0046');
+    });
+
+    it.each([
+      'Regulation No 17',
+      'Regulation (EU) 2016/679 and Directive (EU) 2016/680',
+      'Directive 95/46/XYZ',
+      'Regulation 2016/679a',
+      'Directive 199/46/EC',
+      'Article 5 of Regulation (EU) 2016/679',
+      'Regulation (EU) 2016/679; Directive',
+    ])('raises ambiguous_identifier for %j with no CELLAR call', async (identifier) => {
+      await expect(resolve(identifier)).rejects.toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        data: { reason: 'ambiguous_identifier' },
+      });
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    it('recovers from ambiguous_identifier with the accepted forms and the search, not identifier_type', async () => {
+      const result = await runToolContract(eurlex_lookup_celex, { identifier: 'Regulation No 17' });
+      const structured = result.structuredContent as {
+        error?: { data?: { reason?: string; recovery?: { hint?: string } } };
+      };
+      const hint = structured.error?.data?.recovery?.hint ?? '';
+
+      expect(structured.error?.data?.reason).toBe('ambiguous_identifier');
+      expect(hint).not.toContain('identifier_type');
+      expect(hint).toContain('Regulation (EU) 2016/679');
+      expect(hint).toContain('eurlex_search_documents');
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    it('parses a citation only under auto', async () => {
+      mockQuery.mockResolvedValue([]);
+      const { result, queries } = await resolve('Regulation (EU) 2016/679', 'celex');
+
+      expect(result.found).toBe(false);
+      expect(queries[0]).toContain('"Regulation (EU) 2016/679"^^xsd:string');
+    });
+
+    it('returns found: false with the notice and no other field for a CELEX no work carries', async () => {
+      mockQuery.mockResolvedValue([]);
+      const result = await runToolContract(eurlex_lookup_celex, { identifier: '32016R9999' });
+
+      expect(result.isError).toBeFalsy();
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(Object.keys(structured).sort()).toEqual(['found', 'notice']);
+      expect(structured.found).toBe(false);
+      const notice = String(structured.notice);
+      expect(notice).toContain('CELEX 32016R9999');
+      expect(notice).toContain('{sector}{year}{type}{number}');
+      expect(notice).toContain('32016R0679');
+      expect(notice).toContain('eurlex_search_documents with keyword');
+      const text = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+      expect(text).toContain('CELEX 32016R9999');
+    });
+
+    it('names the parsed CELEX and the citation in the notice of a citation miss', async () => {
+      mockQuery.mockResolvedValue([]);
+      const { result, ctx } = await resolve('Regulation (EU) 2016/9999');
+
+      expect(result).toEqual({ found: false });
+      expect(getEnrichment(ctx).notice).toContain(
+        'CELEX 32016R9999 (parsed from "Regulation (EU) 2016/9999")',
+      );
+    });
+
+    it.each([
+      [
+        'http://data.europa.eu/eli/reg/9999/99999/oj',
+        'ELI http://data.europa.eu/eli/reg/9999/99999/oj',
+      ],
+      ['ECLI:EU:C:2099:1', 'ECLI ECLI:EU:C:2099:1'],
+    ])('names the identifier tried in the notice of a miss on %s', async (identifier, tried) => {
+      mockQuery.mockResolvedValue([]);
+      const { result, ctx } = await resolve(identifier);
+
+      expect(result).toEqual({ found: false });
+      expect(getEnrichment(ctx).notice).toContain(`No CELLAR work matches ${tried}.`);
+    });
+
+    it('adds no notice to a hit, so CELEX, ELI, and ECLI output is unchanged', async () => {
+      holds('32016R0679');
+      const result = await runToolContract(eurlex_lookup_celex, { identifier: '32016R0679' });
+
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured).not.toHaveProperty('notice');
+      expect(structured).toMatchObject({ found: true, celex_number: '32016R0679' });
     });
   });
 });

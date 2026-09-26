@@ -27,7 +27,7 @@ Workflow orientation:
 - Legislation vs case law: eurlex_search_documents covers legislation, treaties, and preparatory acts; eurlex_get_cases covers CJEU and General Court case law with court, case-number, and AG-opinion parameters. Both return CELEX numbers and work URIs.
 - Full text: fetch metadata and body for a CELEX, ELI, or work URI with eurlex_get_document.
 - Relationships: eurlex_get_relations returns the one-hop amendment, repeal, consolidation, legal-basis, and citation edges of an act; fetch a linked consolidated version with eurlex_get_document. For multi-hop traversal beyond the curated tools, use eurlex_query_sparql (read-only SELECT).
-- eurlex_lookup_celex confirms that a CELEX, ELI, or ECLI resolves to a real CELLAR work before you fetch or traverse it.
+- eurlex_lookup_celex confirms that a CELEX, ELI, or ECLI resolves to a real CELLAR work before you fetch or traverse it, and turns an OJ citation that names its act type and year ("Regulation (EU) 2016/679", "Directive 95/46/EC") into its CELEX.
 
 Identifiers: CELEX format {sector}{year}{type}{number} — e.g. 32016R0679 (GDPR), 62024CJ0629 (case). ELI format http://data.europa.eu/eli/{type}/{year}/{number} — the /oj suffix is optional. ECLI is the citation form of case law, e.g. ECLI:EU:C:2014:317; eurlex_get_cases returns it per case, and eurlex_lookup_celex resolves one to its CELEX.
 Document text comes from the EUR-Lex REST API; metadata and relations come from CELLAR SPARQL.`,

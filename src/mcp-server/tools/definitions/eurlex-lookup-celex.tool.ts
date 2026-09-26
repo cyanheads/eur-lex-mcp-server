@@ -1,10 +1,11 @@
 /**
- * @fileoverview eurlex_lookup_celex — Resolve an EU legal citation (CELEX number, ELI URI, or ECLI) to a canonical CELLAR work.
+ * @fileoverview eurlex_lookup_celex — Resolve an EU legal citation (CELEX number, ELI URI, ECLI, or OJ citation) to a canonical CELLAR work.
  * @module mcp-server/tools/definitions/eurlex-lookup-celex
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { echoValue } from '@/mcp-server/tools/echo-value.js';
 import {
   DERIVATIVE_RESOURCE_TYPES,
   resolveResourceTypeLabel,
@@ -38,19 +39,82 @@ function isCelex(identifier: string): boolean {
   return CELEX_PATTERN.test(identifier.trim());
 }
 
-type IdentifierType = 'celex' | 'eli' | 'ecli' | 'auto';
+/** The lookup branch an identifier takes. */
+type LookupType = 'celex' | 'eli' | 'ecli';
 
 /** Detect an ECLI by its scheme prefix, in any letter case. */
 function isEcli(identifier: string): boolean {
   return /^ecli:/i.test(identifier.trim());
 }
 
-function detectIdentifierType(identifier: string): IdentifierType | null {
+function detectIdentifierType(identifier: string): LookupType | null {
   if (isEcli(identifier)) return 'ecli';
   if (isCelex(identifier)) return 'celex';
   if (isEliUri(identifier)) return 'eli';
   return null;
 }
+
+/**
+ * The act-type word of an OJ citation, first occurrence. The two-word forms come
+ * first, so "Framework Decision" is never read as a plain Decision.
+ */
+const CITATION_ACT_TYPE =
+  /\b(framework\s+decision|joint\s+action|common\s+position|regulation|directive|decision)\b/i;
+
+/**
+ * What follows the act type: an optional `(domain)`, an optional `No` marker, the
+ * two numbers, an optional `/domain` suffix, and optionally the ` of …` that opens
+ * the act's full title. Anything else after the numbers — a second citation joined
+ * by "and", a stray character — leaves the citation unparsed.
+ */
+const CITATION_NUMBERS =
+  /^\s*(?:\((EU|EC|EEC|Euratom|CFSP|JHA|ECSC)\)\s*)?(No\.?\s*)?(\d{1,4})\/(\d{1,4})(?:\/(EU|EC|EEC|Euratom|CFSP|JHA|ECSC))?(?:\s+of\s.*)?$/i;
+
+/** CELEX type letter per act type; an ECSC Decision is `S` instead (see {@link citationCelex}). */
+const CITATION_TYPE_LETTER: Record<string, string> = {
+  regulation: 'R',
+  directive: 'L',
+  decision: 'D',
+  'framework decision': 'F',
+  'joint action': 'E',
+  'common position': 'E',
+};
+
+/**
+ * The CELEX an OJ citation names, or undefined when the identifier is no citation
+ * this tool parses (#114). A citation carrying its act type and year maps one-to-one
+ * to `3{year}{letter}{number}`, the number zero-padded to four digits:
+ *
+ * - `No` before the numbers means number/year (`Regulation (EC) No 1049/2001`, the
+ *   form used before 2015); without it the order is year/number (`Directive
+ *   95/46/EC`, `Regulation (EU) 2016/679`). The marker, not number plausibility,
+ *   sets the order: `No 596/2014` and `2015/596` are two different acts.
+ * - A two-digit year is 19YY.
+ * - The act type sets the letter; the ECSC domain turns a Decision into `S`. An
+ *   institution or an Implementing/Delegated qualifier before the act type changes
+ *   nothing, so only letters and spaces may precede it.
+ *
+ * A citation without its act type is not parsed: `95/46/EC` is both Directive
+ * 31995L0046 and Commission Decision 31995D0046. Nor is one without a year
+ * (`Regulation No 17`).
+ */
+function citationCelex(identifier: string): string | undefined {
+  const actType = CITATION_ACT_TYPE.exec(identifier);
+  if (!actType || !/^[\p{L}\s]*$/u.test(identifier.slice(0, actType.index))) return undefined;
+  const numbers = CITATION_NUMBERS.exec(identifier.slice(actType.index + actType[0].length));
+  if (!numbers) return undefined;
+  const [, domainBefore, numberMarker, first = '', second = '', domainAfter] = numbers;
+  const [yearText, number] = numberMarker ? [second, first] : [first, second];
+  if (yearText.length !== 2 && yearText.length !== 4) return undefined;
+  const year = yearText.length === 2 ? `19${yearText}` : yearText;
+  const type = actType[1]?.toLowerCase().replace(/\s+/g, ' ') ?? '';
+  const ecsc = [domainBefore, domainAfter].some((domain) => domain?.toUpperCase() === 'ECSC');
+  const letter = type === 'decision' && ecsc ? 'S' : CITATION_TYPE_LETTER[type];
+  return `3${year}${letter}${number.padStart(4, '0')}`;
+}
+
+/** The identifier a miss notice names: the CELEX, ELI, or ECLI looked up. */
+const IDENTIFIER_LABEL = { celex: 'CELEX', eli: 'ELI', ecli: 'ECLI' } as const;
 
 /**
  * ECLI lookup query. CELLAR stores `cdm:case-law_ecli` as an `xsd:string`-typed
@@ -122,27 +186,27 @@ function selectEcliCelexRows(bindings: SparqlBinding[], exactEcli: string): Spar
 export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
   title: 'Resolve EU Legal Citation',
   description:
-    'Resolve an EU legal citation — a CELEX number, ELI URI, or ECLI — to its canonical CELLAR work, confirming it exists before you fetch or traverse it. Returns the work URI, confirmed CELEX number, document type, date, and the ECLI of a case that carries one. A CELEX that CELLAR holds under several works resolves to the one the EUR-Lex content resolver serves. An ECLI shared by several records (a judgment and its abstract or extract, or a joined AG opinion) resolves to the primary record with the lowest CELEX.',
+    'Resolve an EU legal citation — a CELEX number, ELI URI, ECLI, or an OJ citation naming its act type and year (e.g. "Regulation (EU) 2016/679", "Directive 95/46/EC") — to its canonical CELLAR work, confirming it exists before you fetch or traverse it. Returns the work URI, confirmed CELEX number, document type, date, and the ECLI of a case that carries one. A CELEX that CELLAR holds under several works resolves to the one the EUR-Lex content resolver serves. An ECLI shared by several records (a judgment and its abstract or extract, or a joined AG opinion) resolves to the primary record with the lowest CELEX.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     identifier: z
       .string()
       .min(1)
       .describe(
-        'The EU legal citation to resolve: a CELEX number (e.g. 32016R0679), a work-level ELI URI (e.g. http://data.europa.eu/eli/reg/2016/679, with or without the /oj suffix), or an ECLI (e.g. ECLI:EU:C:2014:317).',
+        'The EU legal citation to resolve: a CELEX number (e.g. 32016R0679), a work-level ELI URI (e.g. http://data.europa.eu/eli/reg/2016/679, with or without the /oj suffix), an ECLI (e.g. ECLI:EU:C:2014:317), or an OJ citation that names its act type and year, resolved to the CELEX it names under identifier_type "auto": Regulation (EU) 2016/679, Regulation (EC) No 1049/2001, Directive 95/46/EC, Decision No 1313/2013/EU, Council Framework Decision 2002/584/JHA, Council Joint Action 2008/124/CFSP, Common Position 2003/444/CFSP. "No" before the numbers means number/year, otherwise year/number; a two-digit year is 19YY. A citation without its act type (95/46/EC) or year (Regulation No 17) is not parsed.',
       ),
     identifier_type: z
       .enum(['celex', 'eli', 'ecli', 'auto'])
       .default('auto')
       .describe(
-        'Format of the identifier. "auto" detects it automatically (an ECLI by its ECLI: prefix, in any letter case); supply "celex", "eli", or "ecli" explicitly if detection fails.',
+        'Format of the identifier. "auto" detects a CELEX, an ELI URI, an ECLI (by its ECLI: prefix, in any letter case), or an OJ citation; "celex", "eli", or "ecli" forces that lookup. An OJ citation is recognized only under "auto".',
       ),
   }),
   output: z.object({
     found: z
       .boolean()
       .describe(
-        'True when the identifier resolves to a CELLAR work; false when a well-formed CELEX, ELI, or ECLI matches no work in the corpus. Only an identifier_type "auto" value that, after trimming, is neither an ECLI, an ELI URI, nor CELEX-shaped (uppercase) raises ambiguous_identifier instead.',
+        'True when the identifier resolves to a CELLAR work; false when a well-formed CELEX, ELI, ECLI, or OJ citation matches no work in the corpus, with a notice naming what was tried. Only an identifier_type "auto" value that, after trimming, is neither an ECLI, an ELI URI, CELEX-shaped (uppercase), nor an OJ citation naming its act type and year raises ambiguous_identifier instead.',
       ),
     work_uri: z.string().optional().describe('CELLAR work URI (stable resource identifier).'),
     celex_number: z.string().optional().describe('Confirmed CELEX number for the resolved work.'),
@@ -161,33 +225,50 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
     date: z.string().optional().describe('Document date in ISO 8601 format (YYYY-MM-DD).'),
   }),
 
+  // A miss is a result, not an error: found false plus a notice on both surfaces.
+  enrichment: {
+    notice: z
+      .string()
+      .optional()
+      .describe(
+        'Present only when found is false: the CELEX, ELI, or ECLI looked up, the accepted forms, and the search to use instead.',
+      ),
+  },
+
   errors: [
     {
       reason: 'ambiguous_identifier',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'identifier_type is "auto" and the identifier, after trimming, is neither an ECLI (ECLI: prefix), an ELI URI, nor CELEX-shaped (uppercase), so no lookup branch applies.',
+      when: 'identifier_type is "auto" and the identifier, after trimming, is neither an ECLI (ECLI: prefix), an ELI URI, CELEX-shaped (uppercase), nor an OJ citation naming its act type and year (e.g. "Regulation No 17" names no year), so no lookup branch applies.',
       recovery:
-        'Supply identifier_type explicitly as "celex", "eli", or "ecli" to resolve the ambiguity.',
+        'Pass a CELEX (32016R0679), an ELI URI (http://data.europa.eu/eli/reg/2016/679), an ECLI (ECLI:EU:C:2014:317), or an OJ citation with its act type and year ("Regulation (EU) 2016/679", "Directive 95/46/EC"); to find an act by title words, use eurlex_search_documents with keyword.',
     },
   ],
 
   async handler(input, ctx) {
     const svc = getCellarSparqlService();
-    const identifier = input.identifier.trim();
-    let effectiveType: IdentifierType;
+    const citation = input.identifier.trim();
+    let identifier = citation;
+    let effectiveType: LookupType;
 
     if (input.identifier_type === 'auto') {
       const detected = detectIdentifierType(identifier);
-      if (!detected) {
+      // An OJ citation resolves through the CELEX branch, under the CELEX it names.
+      const citedCelex = detected ? undefined : citationCelex(identifier);
+      if (detected) {
+        effectiveType = detected;
+      } else if (citedCelex) {
+        effectiveType = 'celex';
+        identifier = citedCelex;
+      } else {
         throw ctx.fail(
           'ambiguous_identifier',
-          `Cannot determine format of identifier: ${identifier}`,
+          `Cannot determine format of identifier: ${echoValue(identifier)}`,
           {
             ...ctx.recoveryFor('ambiguous_identifier'),
           },
         );
       }
-      effectiveType = detected;
     } else {
       effectiveType = input.identifier_type;
     }
@@ -242,15 +323,23 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
 
     ctx.log.info('Citation lookup', {
       identifier,
+      ...(identifier === citation ? {} : { citation }),
       type: effectiveType,
       found: binding !== null,
     });
 
     if (!binding) {
-      // A well-formed identifier that resolves to no work is a clean negative,
-      // not an error — the documented "validate before fetch" role depends on a
-      // boolean here. Malformed/undetectable input already errored above with
-      // ambiguous_identifier.
+      /**
+       * A well-formed identifier that resolves to no work is a clean negative, not an
+       * error — the documented "validate before fetch" role depends on a boolean here.
+       * Malformed/undetectable input already errored above with ambiguous_identifier.
+       * The notice names what was tried and where to go next (#114).
+       */
+      const tried = `${IDENTIFIER_LABEL[effectiveType]} ${echoValue(identifier)}`;
+      const parsedFrom = identifier === citation ? '' : ` (parsed from "${echoValue(citation)}")`;
+      ctx.enrich.notice(
+        `No CELLAR work matches ${tried}${parsedFrom}. A CELEX reads {sector}{year}{type}{number} (e.g. 32016R0679); an OJ citation resolves when it names its act type and year (e.g. "Regulation (EU) 2016/679"). To find the act by title words or a partial CELEX, use eurlex_search_documents with keyword.`,
+      );
       return { found: false };
     }
 
