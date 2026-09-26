@@ -1,6 +1,6 @@
 # eur-lex-mcp-server - Directory Structure
 
-Generated on: 2026-09-25 23:01:44
+Generated on: 2026-09-26 00:17:30
 
 ```text
 eur-lex-mcp-server/
@@ -31,6 +31,7 @@ eur-lex-mcp-server/
 │   ├── 0.13.x/
 │   ├── 0.14.x/
 │   ├── 0.15.x/
+│   ├── 0.16.x/
 │   ├── 0.2.x/
 │   ├── 0.3.x/
 │   ├── 0.4.x/
@@ -190,7 +191,9 @@ eur-lex-mcp-server/
 │   │   ├── aws-waf-challenge.ts
 │   │   ├── cellar-consolidations.ts
 │   │   ├── cellar-works.ts
+│   │   ├── eurlex-act-headings.ts
 │   │   ├── eurlex-act-html.ts
+│   │   ├── eurlex-amending-act.ts
 │   │   └── eurlex-formex-multipart.ts
 │   ├── prompts/
 │   │   └── eurlex-comparative-analysis.prompt.test.ts

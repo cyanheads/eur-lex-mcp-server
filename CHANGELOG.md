@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.16.0](changelog/0.16.x/0.16.0.md) — 2026-09-25 · ⚠️ Breaking
+
+eurlex_get_document outlines and select read headings in all 24 EU languages, skip the headings of text an amending act quotes, and collapse the preamble's recitals into one entry by default.
+
 ## [0.15.0](changelog/0.15.x/0.15.0.md) — 2026-09-25 · ⚠️ Breaking
 
 Consolidations are found through their based-on link and is_superseded describes the text served; a consolidated text reports its base act's metadata, and an act not in force names why.
