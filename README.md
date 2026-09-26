@@ -37,7 +37,7 @@ EU legislation, CJEU case law, and treaties over the EU Publications Office's CE
 |:-----|:------------|
 | `eurlex_search_documents` | Search EU legislation, treaties, and preparatory acts by type, date, EuroVoc subject, author institution, and in-force status |
 | `eurlex_get_document` | Fetch metadata and full text (HTML, Markdown, or Formex4 XML) for an act by CELEX, ELI, or work URI |
-| `eurlex_lookup_celex` | Resolve a CELEX number, ELI URI, or ECLI to its canonical CELLAR work |
+| `eurlex_lookup_celex` | Resolve a CELEX number, ELI URI, ECLI, or OJ citation (`Regulation (EU) 2016/679`) to its canonical CELLAR work |
 | `eurlex_get_cases` | Search CJEU and General Court case law by case number, court, case type, and date range |
 | `eurlex_get_relations` | Traverse the CELLAR relationship graph — amendments, repeals, consolidations, legal basis, citations, transpositions |
 | `eurlex_browse_subjects` | Search the EuroVoc thesaurus to resolve terms to concept URIs |
@@ -64,7 +64,7 @@ All resource data is also reachable via tools.
 
 ### `eurlex_search_documents` <sub>tool</sub>
 
-- At least one filter: `keyword` (English titles, plus CELEX numbers when it holds a digit: a whole CELEX with its `(01)`–`(20)` siblings and `R(01)`–`R(20)` corrigenda by exact lookup, a partial one by substring; no body search), `document_type` (`REG`, `DIR`, `DEC`, `TREATY`, `JUDG`, `OPIN_AG`, `PROP`, `REC`, each its full CELLAR authority family), `date_from`/`date_to`, `eurovoc_concept` (from `eurlex_browse_subjects`), `author_institution`, or `in_force` (`true`/`false`; `false` covers repealed, expired, and not-yet-in-force acts)
+- At least one filter: `keyword` (English titles, plus CELEX numbers when it holds a digit: a whole CELEX with its `(01)`–`(20)` siblings and `R(01)`–`R(20)` corrigenda by exact lookup, a partial one such as `2016R0679`, `R0679`, or `J0131` through the CELEX full-text index; one opening with letters no digit follows, such as `R(01)`, by a scan of every CELEX that can take tens of seconds; a fragment opening mid-year or mid-number, such as `0679R`, matches titles only; no body search), `document_type` (`REG`, `DIR`, `DEC`, `TREATY`, `JUDG`, `OPIN_AG`, `PROP`, `REC`, each its full CELLAR authority family), `date_from`/`date_to`, `eurovoc_concept` (from `eurlex_browse_subjects`), `author_institution`, or `in_force` (`true`/`false`; `false` covers repealed, expired, and not-yet-in-force acts)
 - Pages of up to 100 via `offset`/`limit`, newest first with the CELEX breaking date ties, so a page is the same on every call; each row flags `is_consolidated` and `is_corrigendum`, and corrigenda join only under `include_corrigenda`, consolidated texts of a `document_type` only under `include_consolidated`
 - No match returns an empty page with a `notice` naming the filters and how to broaden them; typed errors: `no_filters`, `invalid_date_range`, `invalid_author_institution` and `invalid_keyword` (no letters or digits)
 
@@ -82,15 +82,16 @@ All resource data is also reachable via tools.
 
 ### `eurlex_lookup_celex` <sub>tool</sub>
 
-- A CELEX number, ELI URI, or ECLI; `identifier_type` auto-detects the format or sets it, and `ambiguous_identifier` fires when auto-detection can't classify the input
-- Returns work URI, confirmed CELEX number, resource type, date, and the case's ECLI (recorded on any work holding the CELEX); `found: false` for a well-formed identifier that matches no work
+- A CELEX number, ELI URI, ECLI, or OJ citation naming its act type and year (`Regulation (EU) 2016/679`, `Regulation (EC) No 1049/2001`, `Directive 95/46/EC`, `Council Framework Decision 2002/584/JHA`), parsed to its CELEX under `identifier_type: "auto"`: `No` before the numbers means number/year, a two-digit year is 19YY, and the act type sets the CELEX letter (an ECSC Decision is `S`, a Framework Decision `F`, a Joint Action or Common Position `E`); a citation without its act type (`95/46/EC`) or year (`Regulation No 17`) is not parsed
+- `identifier_type` auto-detects the format or sets it, and `ambiguous_identifier` fires when auto-detection can't classify the input, its recovery listing the accepted forms
+- Returns work URI, confirmed CELEX number, resource type, date, and the case's ECLI (recorded on any work holding the CELEX); `found: false` for a well-formed identifier that matches no work, with a `notice` naming the CELEX, ELI, or ECLI tried and pointing to `eurlex_search_documents`
 - A CELEX held by several works resolves to the one `owl:sameAs` its `http://publications.europa.eu/resource/celex/{CELEX}` IRI, which EUR-Lex serves the text from, else the lowest work URI, and every CELEX-taking tool and resource resolves the same way; an ECLI shared by several records resolves to the primary record with the lowest CELEX
 
 ---
 
 ### `eurlex_get_cases` <sub>tool</sub>
 
-- Filters: `case_number` (one case per value — `C-131/12`, `T-22/20`, `F-12/05`, or a pre-1989 `26/62` — reaching every judgment, order, and AG opinion filed under it), `court` (`CJEU` or `GC`, by CELEX court letter), `case_type` (`judgment`, `order`, `ag_opinion`), `keyword` (English titles, plus CELEX numbers: a whole CELEX with its `(01)`–`(20)` siblings and `_INF`/`_RES`/`_SUM`/`_EXT` records, a partial one by substring), and `date_from`/`date_to`; primary records only unless `include_derivative` adds notices, abstracts, summaries, and corrigenda
+- Filters: `case_number` (one case per value — `C-131/12`, `T-22/20`, `F-12/05`, or a pre-1989 `26/62` — reaching every judgment, order, and AG opinion filed under it), `court` (`CJEU` or `GC`, by CELEX court letter), `case_type` (`judgment`, `order`, `ag_opinion`), `keyword` (English titles, plus CELEX numbers: a whole CELEX with its `(01)`–`(20)` siblings and `_INF`/`_RES`/`_SUM`/`_EXT` records, a partial one such as `2013CJ0131` or `J0131` through the CELEX full-text index, one opening with letters no digit follows by a scan of every CELEX), and `date_from`/`date_to`; primary records only unless `include_derivative` adds notices, abstracts, summaries, and corrigenda
 - Pages of up to 100 via `offset`/`limit`, newest first with the CELEX breaking date ties, so a page is the same on every call; each case carries its ECLI where CELLAR records one, plus `display_title`, `parties`, `subject_matter`, and `case_reference` parsed from the CELLAR title
 - No match returns an empty page with a `notice` naming the filters and how to broaden them; typed errors: `invalid_case_number`, `invalid_date_range`, `invalid_keyword` (no letters or digits)
 
@@ -108,6 +109,7 @@ All resource data is also reachable via tools.
 
 - Matches preferred and alternative EuroVoc labels, so a common synonym resolves to its concept, in any EU official `language` (default English); `offset`/`limit` pagination (max 50)
 - Returns concept URI, preferred label, code, broader (parent) label, and the alternative label that matched when one did; an empty page with a `notice` when nothing matches
+- Exact label matches rank first, then label or word-start matches, then other substring matches, so `"AI"` leads with artificial intelligence
 
 ---
 
@@ -115,7 +117,8 @@ All resource data is also reachable via tools.
 
 - Read-only SELECT only — update forms and ASK/CONSTRUCT/DESCRIBE are rejected before execution; `cdm:`, `skos:`, and `xsd:` prefixes are auto-injected
 - Results capped at 100 rows; optional `timeout_hint` (1000–55000 ms) under the endpoint's 60-second hard limit
-- Typed errors: `not_read_only`, `sparql_error`, `sparql_timeout`
+- A zero-row result whose query has an untyped string literal as a triple object carries a `notice` to type it (`^^xsd:string`, `^^xsd:anyURI` for an ELI) or language-tag it; the query itself is sent unchanged
+- Typed errors: `not_read_only` (a SPARQL Update), `unsupported_query_form` (ASK, CONSTRUCT, DESCRIBE, or no SELECT), `sparql_error`, `sparql_timeout`
 
 ---
 
