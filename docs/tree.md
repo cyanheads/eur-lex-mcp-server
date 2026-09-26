@@ -1,6 +1,6 @@
 # eur-lex-mcp-server - Directory Structure
 
-Generated on: 2026-09-26 00:17:30
+Generated on: 2026-09-26 01:18:12
 
 ```text
 eur-lex-mcp-server/
@@ -184,6 +184,7 @@ eur-lex-mcp-server/
 │   │   └── eurlex-content/
 │   │       ├── act-structure.ts
 │   │       ├── eurlex-content-service.ts
+│   │       ├── formex-package.ts
 │   │       └── html-to-markdown.ts
 │   └── index.ts
 ├── tests/
@@ -194,24 +195,32 @@ eur-lex-mcp-server/
 │   │   ├── eurlex-act-headings.ts
 │   │   ├── eurlex-act-html.ts
 │   │   ├── eurlex-amending-act.ts
-│   │   └── eurlex-formex-multipart.ts
+│   │   ├── eurlex-consolidated-act.ts
+│   │   ├── eurlex-formex-multipart.ts
+│   │   ├── eurlex-legacy-act.ts
+│   │   └── formex-zip.ts
 │   ├── prompts/
 │   │   └── eurlex-comparative-analysis.prompt.test.ts
 │   ├── resources/
 │   │   ├── eurlex-document-relations.resource.test.ts
 │   │   └── eurlex-document.resource.test.ts
 │   ├── services/
+│   │   ├── __snapshots__/
+│   │   │   └── html-to-markdown.test.ts.snap
 │   │   ├── act-structure.test.ts
 │   │   ├── cdm-labels.test.ts
 │   │   ├── cellar-sparql-service.test.ts
 │   │   ├── eli-resolution.test.ts
 │   │   ├── eurlex-content-service.test.ts
+│   │   ├── formex-package.test.ts
 │   │   ├── html-to-markdown.test.ts
 │   │   ├── work-agents.test.ts
 │   │   └── work-resolution.test.ts
 │   └── tools/
 │       ├── eurlex-browse-subjects.tool.test.ts
 │       ├── eurlex-get-cases.tool.test.ts
+│       ├── eurlex-get-document.cache.test.ts
+│       ├── eurlex-get-document.formex-package.test.ts
 │       ├── eurlex-get-document.tool.test.ts
 │       ├── eurlex-get-relations.tool.test.ts
 │       ├── eurlex-lookup-celex.tool.test.ts

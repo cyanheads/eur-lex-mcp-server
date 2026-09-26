@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.16.1](changelog/0.16.x/0.16.1.md) — 2026-09-25
+
+eurlex_get_document serves Formex XML for acts CELLAR holds only as a zipped package, outlines legacy text/html acts, and caches served bodies so paging an act fetches and converts it once.
+
 ## [0.16.0](changelog/0.16.x/0.16.0.md) — 2026-09-25 · ⚠️ Breaking
 
 eurlex_get_document outlines and select read headings in all 24 EU languages, skip the headings of text an amending act quotes, and collapse the preamble's recitals into one entry by default.
