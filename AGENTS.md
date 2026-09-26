@@ -33,6 +33,7 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 - **Need input the caller didn't supply?** `return ctx.requestInput(...)` and read `ctx.inputs` when the handler is re-entered. Never `await` for user input mid-handler.
 - **Secrets in env vars only** — never hardcoded.
 - **Cut noise.** Add only what earns its place: no speculative generality, no guards for states the framework already prevents (Zod-validated params, classified errors), no abstraction until a third caller proves it, no option nothing sets.
+- **Caller values reach SPARQL only through the shared guards.** A tool or resource input enters a generated CELLAR query only through `escapeSparqlLiteral` or `celexLiteral` (a `"…"` literal), `isSafeSparqlIri` (a `<…>` IRI, checked at the schema), or `keywordTitlePhrase` (a `bif:contains` phrase), unless its schema already admits no SPARQL-significant character. `tests/sparql-lexical-safety.test.ts` enforces this in `bun run test`: it sends hostile values to every string input, nested ones included (a new input must be tested or explicitly exempted), and fails when one lands outside a well-formed literal, IRI, or phrase.
 - **Close the loop on issues.** When implementing work tracked by a GitHub issue, comment on the issue with what landed and close it. Do both — a comment without a close leaves stale issues open; a close without a comment leaves no record of what shipped. The comment is for future readers — state the concrete changes, not the conversation that produced them.
 
 ---
