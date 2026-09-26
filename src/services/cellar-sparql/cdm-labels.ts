@@ -14,6 +14,36 @@ export const LANGUAGE_AUTHORITY_URI = 'http://publications.europa.eu/resource/au
 export const ENG_LANGUAGE_URI = `${LANGUAGE_AUTHORITY_URI}ENG`;
 
 /**
+ * Namespace of actual EuroVoc concepts, the only concepts
+ * `cdm:work_is_about_concept_eurovoc` binds. CELLAR's skos:Concept space also holds
+ * other Publications Office authority concepts (class-sum-leg, fd_*, …) that no work
+ * is about under that predicate (#11), so eurlex_browse_subjects returns only this
+ * namespace and the `eurovoc_concept` filter of eurlex_search_documents accepts only
+ * this namespace.
+ */
+export const EUROVOC_CONCEPT_NAMESPACE = 'http://eurovoc.europa.eu/';
+
+/**
+ * The EuroVoc namespace as a caller may spell it: either scheme, any letter case in
+ * the scheme and host. Scheme and host are case-insensitive, and every EuroVoc object
+ * in CELLAR sits under the http form, so each spelling maps one-to-one onto
+ * {@link EUROVOC_CONCEPT_NAMESPACE}. The trailing `/` keeps a lookalike host
+ * (`eurovoc.europa.eu.example`) out.
+ */
+const EUROVOC_NAMESPACE_SPELLING = /^https?:\/\/eurovoc\.europa\.eu\//i;
+
+/**
+ * `value` with its EuroVoc namespace rewritten to the canonical
+ * {@link EUROVOC_CONCEPT_NAMESPACE}, or undefined when it is outside that namespace.
+ * The path is kept as given.
+ */
+export function canonicalEurovocConceptUri(value: string): string | undefined {
+  return EUROVOC_NAMESPACE_SPELLING.test(value)
+    ? value.replace(EUROVOC_NAMESPACE_SPELLING, EUROVOC_CONCEPT_NAMESPACE)
+    : undefined;
+}
+
+/**
  * CDM resource-type URI → human-readable short label.
  * Covers common legislation types, case law types, and preparatory acts.
  * Falls back to the last URI path segment when not in the map.

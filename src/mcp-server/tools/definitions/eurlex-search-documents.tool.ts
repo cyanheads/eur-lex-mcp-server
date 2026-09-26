@@ -7,6 +7,7 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { echoValue } from '@/mcp-server/tools/echo-value.js';
 import {
+  canonicalEurovocConceptUri,
   ENG_LANGUAGE_URI,
   resolveResourceTypeLabels,
 } from '@/services/cellar-sparql/cdm-labels.js';
@@ -154,15 +155,21 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
         z.literal(''),
         z
           .string()
-          .refine(isSafeSparqlIri, {
-            message:
-              'EuroVoc URI must be a valid http URI with no whitespace, angle brackets, or quotes.',
-          })
+          .refine(
+            (v) => {
+              const uri = canonicalEurovocConceptUri(v);
+              return uri !== undefined && isSafeSparqlIri(uri);
+            },
+            {
+              message:
+                'eurovoc_concept must be a EuroVoc concept URI under http://eurovoc.europa.eu/ (as eurlex_browse_subjects returns it; an https or upper-case host is read as that form), with no whitespace, control characters, or any of < > " { } | ^ ` \\.',
+            },
+          )
           .describe('EuroVoc concept URI (e.g. http://eurovoc.europa.eu/2828).'),
       ])
       .optional()
       .describe(
-        'EuroVoc concept URI to filter by subject (e.g. http://eurovoc.europa.eu/2828), obtained from eurlex_browse_subjects. Omit for no subject filter.',
+        'EuroVoc concept URI to filter by subject (e.g. http://eurovoc.europa.eu/2828), obtained from eurlex_browse_subjects. Only EuroVoc concept URIs are accepted; https://eurovoc.europa.eu/… and an upper-case host are read as the http://eurovoc.europa.eu/… form CELLAR stores. Omit for no subject filter.',
       ),
     author_institution: z
       .string()
@@ -253,7 +260,12 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
           ),
         date_from: z.string().optional().describe('Start date filter applied.'),
         date_to: z.string().optional().describe('End date filter applied.'),
-        eurovoc_concept: z.string().optional().describe('EuroVoc concept URI filter applied.'),
+        eurovoc_concept: z
+          .string()
+          .optional()
+          .describe(
+            'EuroVoc concept URI filter applied, in the http://eurovoc.europa.eu/ form it was matched as.',
+          ),
         author_institution: z.string().optional().describe('Author institution filter applied.'),
         in_force: z.boolean().optional().describe('In-force filter applied.'),
       })
@@ -398,8 +410,12 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
       filters.push(`FILTER NOT EXISTS { ?work cdm:work_has_resource-type <${CORRIGENDUM_URI}> . }`);
     }
 
-    const eurovocClause = input.eurovoc_concept?.trim()
-      ? `?work cdm:work_is_about_concept_eurovoc <${input.eurovoc_concept.trim()}> .`
+    // The schema admits EuroVoc URIs in any spelling of the namespace; CELLAR binds the http form.
+    const eurovocConcept = input.eurovoc_concept
+      ? canonicalEurovocConceptUri(input.eurovoc_concept)
+      : undefined;
+    const eurovocClause = eurovocConcept
+      ? `?work cdm:work_is_about_concept_eurovoc <${eurovocConcept}> .`
       : '';
 
     /**
@@ -420,12 +436,9 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
     let authorClause = '';
     const authorInput = input.author_institution?.trim();
     if (authorInput) {
-      // Keep only letters, digits, and spaces so the value cannot break out of
+      // Letters, digits, and single spaces only, so the value cannot break out of
       // the bif:contains phrase or inject full-text operators.
-      const authorPhrase = authorInput
-        .replace(/[^\p{L}\p{N}\s]+/gu, ' ')
-        .replace(/\s+/g, ' ')
-        .trim();
+      const authorPhrase = keywordTitlePhrase(authorInput);
       if (!authorPhrase) {
         throw ctx.fail(
           'invalid_author_institution',
@@ -480,7 +493,7 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
       !!input.document_type ||
       !!dateFrom ||
       !!dateTo ||
-      !!input.eurovoc_concept?.trim() ||
+      !!eurovocConcept ||
       !!authorInput ||
       input.in_force !== undefined;
     if (!hasEffectiveFilter) {
@@ -608,7 +621,7 @@ ${projection('?date')} WHERE {
       include_corrigenda: input.include_corrigenda,
       ...(input.date_from ? { date_from: input.date_from } : {}),
       ...(input.date_to ? { date_to: input.date_to } : {}),
-      ...(input.eurovoc_concept ? { eurovoc_concept: input.eurovoc_concept } : {}),
+      ...(eurovocConcept ? { eurovoc_concept: eurovocConcept } : {}),
       ...(input.author_institution ? { author_institution: input.author_institution } : {}),
       ...(input.in_force !== undefined ? { in_force: input.in_force } : {}),
     };

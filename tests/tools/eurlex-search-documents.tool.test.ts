@@ -1432,9 +1432,73 @@ describe('eurlex_search_documents', () => {
       ['an opening angle bracket', `${EUROVOC_URI}<X`],
       ['a closing angle bracket', `${EUROVOC_URI}>X`],
       ['a double quote', `${EUROVOC_URI}"X`],
-    ])('rejects a eurovoc_concept containing %s at the schema, before any query', (_label, uri) => {
-      expect(() => eurlex_search_documents.input.parse({ eurovoc_concept: uri })).toThrow();
+      // The rest of the IRIREF exclusion set, each confirmed live to leak SP030 (#140).
+      ['a brace', `${EUROVOC_URI}{X}`],
+      ['a pipe', `${EUROVOC_URI}|X`],
+      ['U+0001', `${EUROVOC_URI}\x01X`],
+      // Unicode whitespace outside U+0000–U+0020, which only the \s half of the guard catches.
+      ['a no-break space', `${EUROVOC_URI} X`],
+      ['a line separator', `${EUROVOC_URI} X`],
+    ])(
+      'rejects a eurovoc_concept containing %s at the schema, before any query',
+      async (_label, uri) => {
+        mockQuery.mockResolvedValue([]);
+        const result = await runToolContract(eurlex_search_documents, { eurovoc_concept: uri });
+        expect(result.isError).toBe(true);
+        expect(contentText(result)).toContain('control characters');
+        expect(contentText(result)).toContain('{ } | ^');
+        expect(mockQuery).not.toHaveBeenCalled();
+      },
+    );
+
+    /**
+     * `cdm:work_is_about_concept_eurovoc` binds only `http://eurovoc.europa.eu/`
+     * concepts (#11), so a URI from any other namespace — another authority table,
+     * an ELI, a CELLAR work, a lookalike host — can match no work. It is rejected
+     * with a message naming the namespace rather than answered with an empty page.
+     */
+    it.each([
+      ['a lookalike host', 'http://eurovoc.europa.eu.evil/2828'],
+      ['the host without a path', 'http://eurovoc.europa.eu'],
+      ['an ELI', 'http://data.europa.eu/eli/reg/2016/679/oj'],
+      [
+        'a CELLAR work URI',
+        'http://publications.europa.eu/resource/cellar/3e485e15-11bd-11e6-ba9a-01aa75ed71a1',
+      ],
+      [
+        'another authority concept',
+        'http://publications.europa.eu/resource/authority/subject-matter/PRIV',
+      ],
+    ])('rejects %s as eurovoc_concept, naming the EuroVoc namespace', async (_label, uri) => {
+      mockQuery.mockResolvedValue([]);
+      const result = await runToolContract(eurlex_search_documents, { eurovoc_concept: uri });
+      expect(result.isError).toBe(true);
+      expect(contentText(result)).toContain('http://eurovoc.europa.eu/');
       expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    /**
+     * Scheme and host are case-insensitive, and every EuroVoc object in CELLAR sits
+     * under `http://eurovoc.europa.eu/`, so the https form and an upper-case host name
+     * the same concept. Each is matched and echoed as the http form.
+     */
+    it.each([
+      ['the https form', 'https://eurovoc.europa.eu/2828'],
+      ['an upper-case host', 'http://EUROVOC.europa.eu/2828'],
+      ['an upper-case https scheme and host', 'HTTPS://Eurovoc.Europa.EU/2828'],
+    ])('reads %s as the canonical http EuroVoc URI', async (_label, uri) => {
+      mockQuery.mockResolvedValue([]);
+      const result = await runToolContract(eurlex_search_documents, { eurovoc_concept: uri });
+      expect(result.isError).toBeFalsy();
+      const queries = searchQueries();
+      expect(queries.length).toBeGreaterThan(0);
+      for (const q of queries) {
+        expect(q).toContain(`cdm:work_is_about_concept_eurovoc <${EUROVOC_URI}> .`);
+      }
+      for (const [q] of mockQuery.mock.calls) expect(q).not.toContain(uri);
+      const echo = (result.structuredContent as { query_echo?: { eurovoc_concept?: string } })
+        .query_echo;
+      expect(echo?.eurovoc_concept).toBe(EUROVOC_URI);
     });
 
     it('still accepts a legitimate eurovoc_concept, and "" for an omitted filter', () => {

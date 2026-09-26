@@ -5,21 +5,12 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { echoValue } from '@/mcp-server/tools/echo-value.js';
+import { EUROVOC_CONCEPT_NAMESPACE } from '@/services/cellar-sparql/cdm-labels.js';
 import {
   CellarSparqlService,
   getCellarSparqlService,
 } from '@/services/cellar-sparql/cellar-sparql-service.js';
 import { escapeSparqlLiteral } from '@/services/cellar-sparql/eli-resolution.js';
-
-/**
- * Namespace of actual EuroVoc concepts. CELLAR's skos:Concept space also holds
- * other Publications Office authority concepts (class-sum-leg, fd_*, …) whose
- * URIs the eurlex_search_documents `eurovoc_concept` filter accepts but cannot
- * match — only `http://eurovoc.europa.eu/` concepts are bound by
- * `cdm:work_is_about_concept_eurovoc`. Results are restricted to this namespace
- * so every URI returned is usable in that filter (#11).
- */
-const EUROVOC_CONCEPT_NAMESPACE = 'http://eurovoc.europa.eu/';
 
 export const eurlex_browse_subjects = tool('eurlex_browse_subjects', {
   title: 'Browse EuroVoc Subjects',
