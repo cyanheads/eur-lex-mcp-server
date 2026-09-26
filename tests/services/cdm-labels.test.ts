@@ -312,6 +312,20 @@ describe('parseCaseLawTitle — shared contract (#116)', () => {
     expect(parsed.complete).toBe(false);
   });
 
+  it('reads a referral in the parties position as the referring court of a title naming no parties', () => {
+    // Shape of CELLAR's English title of 62023CJ0002, keyword list shortened.
+    const title =
+      'Judgment of the Court (Fifth Chamber) of 30 October 2025.#Request for a preliminary ruling from the Oberlandesgericht Wien.#Reference for a preliminary ruling – Competition – Article 101 TFEU.#Case C-2/23.';
+    expect(parseCaseLawTitle(title, '2025-10-30')).toEqual({
+      formation: 'Fifth Chamber',
+      displayTitle: 'Judgment of the Court (Fifth Chamber) of 30 October 2025.',
+      referringCourt: 'Oberlandesgericht Wien',
+      subjectMatter: 'Reference for a preliminary ruling – Competition – Article 101 TFEU.',
+      caseReference: 'Case C-2/23.',
+      complete: true,
+    });
+  });
+
   it('reads a referral whose first word CELLAR misspells', () => {
     expect(parseCaseLawTitle(REQEUST_TYPO, '2015-07-15')).toMatchObject({
       referringCourt: 'Administrativen sad - Varna',

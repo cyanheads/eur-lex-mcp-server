@@ -350,11 +350,12 @@ function parseDescriptor(segment: string): TitleDescriptor | undefined {
  *   names no formation, and none is inferred. A descriptor marking publication by
  *   extracts ("… of 15 September 2016 (Extracts).") is read the same way but left
  *   unassigned, since no field says the text is an extract;
- * - the parties are the second segment;
+ * - the parties are the second segment, unless that segment is the referral, as it
+ *   is in a title that names no parties;
  * - the case reference is the trailing "Case …", "Cases …", or "Joined Cases …"
- *   segment past the parties;
- * - the referring court is the first referral segment between the parties and the
- *   case reference;
+ *   segment past the second;
+ * - the referring court is the first referral segment between the descriptor and
+ *   the case reference;
  * - the subject matter is the segment immediately before the case reference (or
  *   the trailing segment when there is none) that is not the referral.
  * Absent or empty segments are left unset, never invented.
@@ -379,15 +380,16 @@ export function parseCaseLawTitle(raw: string | undefined, date?: string): Parse
     if (descriptor.advocateGeneral) result.advocateGeneral = descriptor.advocateGeneral;
   }
 
-  // Parties: the second segment — the reliable display-name position.
+  // Parties: the second segment — the reliable display-name position — unless it is
+  // the referral, as in a title that names no parties (62023CJ0002).
   const parties = segments[1];
-  if (parties) {
+  if (parties && !REFERRAL_SEGMENT.test(parties)) {
     result.parties = parties;
     assigned.add(1);
   }
 
   // Case reference: the trailing non-empty segment, only when it has the case
-  // shape and sits past the parties (index ≥ 2). The optional "s" matches the plural
+  // shape and sits past the second segment (index ≥ 2). The optional "s" matches the plural
   // joined-case form (issue #42), and the optional "Joined" its long form.
   const lastIdx = segments.findLastIndex((s) => s !== '');
   let end = lastIdx;
@@ -398,7 +400,7 @@ export function parseCaseLawTitle(raw: string | undefined, date?: string): Parse
     end = lastIdx - 1;
   }
 
-  for (let i = 2; i <= end; i++) {
+  for (let i = result.parties ? 2 : 1; i <= end; i++) {
     const court = REFERRAL_SEGMENT.exec(segments[i] ?? '')?.[1];
     if (court) {
       result.referringCourt = court;
