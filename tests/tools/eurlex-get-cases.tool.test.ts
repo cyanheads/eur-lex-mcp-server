@@ -488,14 +488,14 @@ describe('eurlex_get_cases', () => {
     mockQuery.mockResolvedValue([]);
 
     // A CELEX-character value with a trailing tab still takes the substring
-    // fallback (#81), so the trim-then-escape order stays observable there.
-    const input = eurlex_get_cases.input.parse({ case_number: 'ZZ1\t' });
+    // scan (#81, #134), so the trim-then-escape order stays observable there.
+    const input = eurlex_get_cases.input.parse({ case_number: '0097\t' });
     await expect(eurlex_get_cases.handler(input, ctx)).resolves.toMatchObject({ total: 0 });
 
     const sparql = mockQuery.mock.calls[0]?.[0] as string;
-    expect(sparql).toContain('LCASE("ZZ1")');
+    expect(sparql).toContain('LCASE("0097")');
     // Escaping first would leave an escaped tab the trim could not remove.
-    expect(sparql).not.toContain(String.raw`ZZ1\t`);
+    expect(sparql).not.toContain(String.raw`0097\t`);
   });
 
   // --- Dedup of multi-resource-type works (issue #14) ---
@@ -1476,19 +1476,33 @@ describe('eurlex_get_cases', () => {
     });
 
     /**
-     * Characterization: a value made only of CELEX characters kept HEAD's escaped,
-     * case-insensitive substring match — every value that can return results through
-     * that fallback is one, since no sector-6 CELEX carries any other character. The
-     * FILTER line is asserted whole so any drift in the fallback is caught.
+     * Characterization: a value made only of CELEX characters whose opening could sit
+     * anywhere in a sector-6 CELEX keeps the escaped, case-insensitive substring scan
+     * of every CELEX literal (#134). The FILTER line is asserted whole so any drift in
+     * the scan is caught; `C0097` is also the tail of `62023CC0097`, so a prefix term
+     * `'C0097*'` would lose that record.
      */
-    it.each(['2023CJ0097', '62023CO0097(01)', '62023co0097', '2023CJ0097_RES'])(
-      'keeps the CELEX substring fallback byte-identical for %s',
+    it.each([
+      '12CJ0131',
+      '013CJ0131',
+      '0131',
+      '2013C',
+      'J0131',
+      'C0097',
+      'RES',
+      'cj',
+      '32016R0679',
+      '(01)',
+      '_RES',
+    ])(
+      'keeps the CELEX substring scan byte-identical for %s, whose opening could sit anywhere in a CELEX',
       async (caseNumber) => {
         const { sparql, result } = await queryFor({ case_number: caseNumber });
 
         expect(sparql).toContain(
           `FILTER(CONTAINS(LCASE(STR(?celexNumber)), LCASE("${escapeSparqlLiteral(caseNumber)}")))`,
         );
+        expect(sparql).not.toContain('?celexNumber bif:contains');
         expect(result.query_echo.celex_fragment).toBeUndefined();
         expect(result.query_echo.case_number).toBe(caseNumber);
       },
@@ -2172,12 +2186,53 @@ describe('eurlex_get_cases', () => {
       expect(included).not.toContain('FILTER NOT EXISTS');
     });
 
-    it('keeps the substring arm for a CELEX fragment no work carries whole', async () => {
+    it('takes the partial arm on the CELEX full-text index for a fragment no work carries whole (#123)', async () => {
       answer([]);
-      const sparql = await run({ keyword: '2023CJ0097' });
+      const sparql = await run({ keyword: '2014CJ0362' });
 
       expect(lookupQueries()).toHaveLength(1);
-      expect(sparql).toContain('FILTER(CONTAINS(LCASE(STR(?kwCelex)), "2023cj0097"))');
+      expect(sparql).toContain(
+        `?kwCelex bif:contains "${['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'C', 'E'].map((s) => `'${s}2014CJ0362*'`).join(' OR ')}" .`,
+      );
+      expect(sparql).toContain('FILTER(CONTAINS(STR(?kwCelex), "2014CJ0362"))');
+      expect(sparql).not.toContain('CONTAINS(LCASE(STR(?kwCelex))');
+    });
+
+    it('completes a court-letter fragment with every sector, year, and type code (#123)', async () => {
+      answer([]);
+      const sparql = await run({ keyword: 'CJ0362' });
+
+      // CELEX-shaped, so CELLAR is asked first whether a work carries it whole.
+      expect(lookupQueries()).toHaveLength(1);
+      expect(sparql).toContain(`'62014CJ0362*'`);
+      expect(sparql).toContain('FILTER(CONTAINS(STR(?kwCelex), "CJ0362"))');
+      expect(sparql).not.toContain('CONTAINS(LCASE(STR(?kwCelex))');
+    });
+
+    it('matches titles only for a fragment opening mid-number (#123)', async () => {
+      answer([]);
+      const sparql = await run({ keyword: '0362' });
+
+      expect(sparql).not.toContain('?kwCelex');
+      expect(sparql).toContain(`?kwTitle bif:contains "'0362'"`);
+    });
+
+    it('tests the partial arm in the page subquery and in the FILTER EXISTS alone (#123)', async () => {
+      answer([]);
+      const sparql = await run({ keyword: '2014CJ0362', date_from: '2014-01-01' });
+
+      const subquery = sparql.indexOf('SELECT ?celexNumber (SAMPLE(?date) AS ?pageDate)');
+      const exists = sparql.indexOf('FILTER EXISTS');
+      const pageEnd = sparql.indexOf('LIMIT 21 OFFSET 0');
+      expect(subquery).toBeGreaterThan(-1);
+      expect(exists).toBeGreaterThan(pageEnd);
+      for (const part of [sparql.slice(subquery, pageEnd), sparql.slice(exists)]) {
+        expect(part).toContain(`?kwCelex bif:contains "'02014CJ0362*'`);
+        expect(part).toContain('FILTER(CONTAINS(STR(?kwCelex), "2014CJ0362"))');
+      }
+      const outer = sparql.slice(0, subquery) + sparql.slice(pageEnd);
+      expect(withoutFilterExists(outer)).not.toContain('?kwCelex');
+      expect(sparql).not.toContain('CONTAINS(LCASE(STR(?kwCelex))');
     });
 
     it.each(['62020TJ0259_RES', '62017TN0161R(01)', '62025TO0653(01)'])(
@@ -2219,6 +2274,223 @@ describe('eurlex_get_cases', () => {
       expect(description).toMatch(/no digit/i);
       expect(description).toMatch(/no letter or digit/i);
       expect(description).toContain('case_number');
+      expect(description).toMatch(/013CJ0131[^.]*titles only/);
+    });
+  });
+
+  // --- #134: a case_number that parses as no case number narrows through the CELEX index ---
+
+  describe('case_number CELEX substring from the full-text index (#134)', () => {
+    /** Years 1951 through next year, one sector-6 term each. */
+    const YEARS_FROM_1951 = new Date().getUTCFullYear() + 1 - 1951 + 1;
+
+    /** The grouped search the handler sends for `input`. */
+    async function searchFor(input: Record<string, unknown>): Promise<string> {
+      mockQuery.mockResolvedValue([makeCaseBinding('62013CJ0131')]);
+      await eurlex_get_cases.handler(
+        eurlex_get_cases.input.parse(input),
+        createMockContext({ errors: eurlex_get_cases.errors }),
+      );
+      const search = mockQuery.mock.calls
+        .map((c) => c[0] as string)
+        .find((q) => q.includes('GROUP BY ?celexNumber'));
+      if (!search) throw new Error('No search query was sent');
+      return search;
+    }
+
+    /** Every `?celexNumber bif:contains "…"` expression in a query. */
+    function indexExpressions(sparql: string): string[] {
+      return [...sparql.matchAll(/\?celexNumber bif:contains "([^"]*)"/g)].map((m) => m[1] ?? '');
+    }
+
+    /**
+     * Whether a query's CELEX index terms and CELEX filters both admit a CELEX, the
+     * index modelled as CELLAR's: a term `'X*'` hits a literal when a word of it
+     * starts with X, words split at every character outside `[0-9A-Z]`.
+     */
+    function reaches(sparql: string, celex: string): boolean {
+      const words = celex.split(/[^0-9A-Z]+/);
+      const indexed = indexExpressions(sparql).every((expression) =>
+        [...expression.matchAll(/'([0-9A-Z]+)\*'/g)].some(([, term]) =>
+          words.some((word) => word.startsWith(term ?? '')),
+        ),
+      );
+      return indexed && admits(sparql, celex);
+    }
+
+    /** Sector-6 CELEX from live CELLAR (2026-09-25), off-pattern ones included. */
+    const SECTOR_6_CELEX = [
+      '62013CJ0131',
+      '62012CJ0131',
+      '62012CC0131',
+      '62024CJ0131_SUM',
+      '62014CJ0362',
+      '62021CO0121',
+      '62021CO0121(01)',
+      '62021CO0121(01)_SUM',
+      '62021CO0121_1',
+      '62021CO0121_SUM',
+      '62022CO0121_INF',
+      '61986CO0121(02)',
+      '62023CO0097',
+      '62023CC0097',
+      '62023CJ0097_RES',
+      '62017TN0161R(01)',
+      '62014CN00016',
+      '62011CN347',
+      '62013CV0002',
+      '61962CJ0026',
+    ];
+
+    it.each([
+      '62014CJ0362',
+      '2013CJ0131',
+      'CJ0131',
+      'CO0121',
+      '62021co0121',
+      '62021CO0121(01)',
+      '2021CO0121_1',
+      'CO0121(01)_SUM',
+      '2023CJ0097_RES',
+      '2017TN0161R',
+      '62014CN0001',
+      'CN347',
+    ])(
+      'reaches through the index exactly the CELEX the substring scan reached for %s',
+      async (caseNumber) => {
+        const sparql = await searchFor({ case_number: caseNumber, include_derivative: true });
+
+        expect(indexExpressions(sparql)).toHaveLength(1);
+        expect(sparql).not.toContain('LCASE(STR(?celexNumber))');
+        for (const celex of SECTOR_6_CELEX) {
+          expect(reaches(sparql, celex), celex).toBe(
+            celex.toLowerCase().includes(caseNumber.toLowerCase()),
+          );
+        }
+      },
+    );
+
+    it('matches a whole CELEX from its one index term, with no lookup query', async () => {
+      const sparql = await searchFor({ case_number: '62014CJ0362' });
+
+      expect(sparql).toContain(`?celexNumber bif:contains "'62014CJ0362*'" .`);
+      expect(sparql).toContain('FILTER(CONTAINS(STR(?celexNumber), "62014CJ0362"))');
+      // The search and the page's work resolution (#97); no family lookup.
+      expect(mockQuery).toHaveBeenCalledTimes(2);
+    });
+
+    it('completes a year-and-letters opening to sector 6 alone', async () => {
+      const sparql = await searchFor({ case_number: '2013CJ0131' });
+
+      expect(indexExpressions(sparql)).toEqual([`'62013CJ0131*'`]);
+      expect(sparql).toContain('FILTER(CONTAINS(STR(?celexNumber), "2013CJ0131"))');
+    });
+
+    it('completes a letters-and-number opening with every sector-6 year from 1951', async () => {
+      const sparql = await searchFor({ case_number: 'CJ0131' });
+
+      const terms = indexExpressions(sparql)[0]?.split(' OR ') ?? [];
+      expect(terms).toHaveLength(YEARS_FROM_1951);
+      expect(terms[0]).toBe(`'61951CJ0131*'`);
+      expect(terms).toContain(`'62013CJ0131*'`);
+      expect(terms.every((term) => term.startsWith(`'6`))).toBe(true);
+    });
+
+    it('uppercases the value and stops the term at the first character outside [0-9A-Z]', async () => {
+      const sparql = await searchFor({ case_number: '62023co0097(01)' });
+
+      expect(indexExpressions(sparql)).toEqual([`'62023CO0097*'`]);
+      expect(sparql).toContain('FILTER(CONTAINS(STR(?celexNumber), "62023CO0097(01)"))');
+    });
+
+    /**
+     * An indexed opening the keyword route gives no sector-6 term keeps the scan: a
+     * year past next year, letters no type code ends in, and letters only other
+     * sectors' codes end in (`XC` is a sector-5 code). No sector-6 CELEX holds any of
+     * them, so the scan answers what an index route would, without guessing.
+     */
+    it.each(['9999CJ0131', 'QQ0131', 'XC0131'])(
+      'keeps the substring scan for %s, which completes to no sector-6 CELEX start',
+      async (caseNumber) => {
+        const sparql = await searchFor({ case_number: caseNumber });
+
+        expect(indexExpressions(sparql)).toEqual([]);
+        expect(sparql).toContain(
+          `FILTER(CONTAINS(LCASE(STR(?celexNumber)), LCASE("${caseNumber}")))`,
+        );
+      },
+    );
+
+    it('narrows the page subquery and the outer query alike in the date-bounded form', async () => {
+      const sparql = await searchFor({ case_number: 'CJ0131', date_from: '2000-01-01' });
+
+      const subquery = sparql.indexOf('SELECT ?celexNumber (SAMPLE(?date) AS ?pageDate)');
+      const pageEnd = sparql.indexOf('LIMIT 21 OFFSET 0');
+      expect(subquery).toBeGreaterThan(-1);
+      for (const part of [sparql.slice(subquery, pageEnd), sparql.slice(pageEnd)]) {
+        expect(indexExpressions(part)).toHaveLength(1);
+        expect(part).toContain('FILTER(CONTAINS(STR(?celexNumber), "CJ0131"))');
+      }
+    });
+
+    /**
+     * The injection guarantee: a value reaches the index only after the CELEX-character
+     * gate, and its terms come from its leading `[0-9A-Z]` run alone, so every index
+     * expression is a list of quoted `[0-9A-Z]` prefix terms and the confirming literal
+     * holds only CELEX characters. A value carrying a quote or an operator is rejected
+     * before any query is built.
+     */
+    it.each(["2013CJ0131' OR 'x", '2013CJ0131"', 'CJ0131*', '62014CJ0362 AND 1', 'CJ0131\\'])(
+      'rejects %j before building any query',
+      async (caseNumber) => {
+        await expect(
+          eurlex_get_cases.handler(
+            eurlex_get_cases.input.parse({ case_number: caseNumber }),
+            createMockContext({ errors: eurlex_get_cases.errors }),
+          ),
+        ).rejects.toMatchObject({ data: { reason: 'invalid_case_number' } });
+        expect(mockQuery).not.toHaveBeenCalled();
+      },
+    );
+
+    it('builds index expressions only from quoted [0-9A-Z] terms over randomized values', async () => {
+      const alphabet = '0123456789ABCJOTNRcjo()_6';
+      let seed = 134;
+      const next = () => {
+        seed = (seed * 1_103_515_245 + 12_345) % 2 ** 31;
+        return seed;
+      };
+      let indexed = 0;
+      for (let i = 0; i < 300; i++) {
+        mockQuery.mockReset();
+        const length = 1 + (next() % 16);
+        const caseNumber = Array.from({ length }, () => alphabet[next() % alphabet.length]).join(
+          '',
+        );
+        const sparql = await searchFor({ case_number: caseNumber });
+        const expressions = indexExpressions(sparql);
+        indexed += expressions.length;
+        expect(expressions.length, caseNumber).toBeLessThanOrEqual(1);
+        for (const expression of expressions) {
+          expect(expression, caseNumber).toMatch(/^'[0-9A-Z]+\*'(?: OR '[0-9A-Z]+\*')*$/);
+        }
+        for (const [, literal] of sparql.matchAll(
+          /FILTER\(CONTAINS\(STR\(\?celexNumber\), "((?:[^"\\]|\\.)*)"\)\)/g,
+        )) {
+          expect(literal, caseNumber).toMatch(/^[0-9A-Z()_]+$/);
+        }
+        expect(sparql.match(/bif:contains/g)?.length ?? 0, caseNumber).toBe(expressions.length);
+      }
+      // The alphabet reaches both routes.
+      expect(indexed).toBeGreaterThan(0);
+      expect(indexed).toBeLessThan(300);
+    });
+
+    it('names the indexed openings and the slow scan in the case_number description', () => {
+      const description = eurlex_get_cases.input.shape.case_number.description ?? '';
+      expect(description).toContain('CELEX index');
+      expect(description).toMatch(/2013CJ0131[^.]*CJ0131/);
+      expect(description).toMatch(/12CJ0131[^.]*tests every CELEX/);
     });
   });
 });

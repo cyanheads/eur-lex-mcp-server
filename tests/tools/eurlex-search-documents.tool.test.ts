@@ -431,7 +431,7 @@ describe('eurlex_search_documents', () => {
     expect(sparql).not.toContain('CONTAINS(LCASE(COALESCE(STR(?title)');
   });
 
-  it('keeps CELEX-substring matching as a UNION arm for a partial CELEX (issues #17, #105)', async () => {
+  it('matches a partial CELEX in a UNION arm on the CELEX full-text index (issues #17, #105, #123)', async () => {
     const ctx = createMockContext({ errors: eurlex_search_documents.errors });
     // The exact-CELEX lookup finds no work carrying the fragment whole.
     mockQuery.mockImplementation(async (q: string) =>
@@ -446,7 +446,9 @@ describe('eurlex_search_documents', () => {
     // the outer ?celexNumber would evaluate out of scope there and match nothing.
     expect(sparql).toContain('UNION');
     expect(sparql).toContain('cdm:resource_legal_id_celex ?kwCelex');
-    expect(sparql).toContain('CONTAINS(LCASE(STR(?kwCelex)), "2016r0679")');
+    expect(sparql).toContain(`?kwCelex bif:contains "'02016R0679*' OR '12016R0679*'`);
+    expect(sparql).toContain('FILTER(CONTAINS(STR(?kwCelex), "2016R0679"))');
+    expect(sparql).not.toContain('CONTAINS(LCASE(STR(?kwCelex))');
   });
 
   it('sanitizes the keyword so it cannot break out of the full-text phrase (issue #17)', async () => {
@@ -1857,7 +1859,7 @@ describe('eurlex_search_documents', () => {
       expect(sparql).toMatch(/ORDER BY DESC\(\?docDate\) \?celexNumber LIMIT 21 OFFSET 20$/);
     });
 
-    it('matches a partial CELEX keyword as a CELEX substring alongside the title', async () => {
+    it('matches a partial CELEX keyword through the CELEX full-text index alongside the title', async () => {
       answerSearch([makeDocBinding('02016R0679-20160504'), makeDocBinding('32016R0679')]);
 
       const result = await eurlex_search_documents.handler(
@@ -1868,7 +1870,8 @@ describe('eurlex_search_documents', () => {
       const [sparql] = searchQueries();
       expect(sparql).toContain(`?kwTitle bif:contains "'2016R0679'"`);
       expect(sparql).toContain('?work cdm:resource_legal_id_celex ?kwCelex .');
-      expect(sparql).toContain('FILTER(CONTAINS(LCASE(STR(?kwCelex)), "2016r0679"))');
+      expect(sparql).toContain(`'E2016R0679*'" .`);
+      expect(sparql).toContain('FILTER(CONTAINS(STR(?kwCelex), "2016R0679"))');
       expect(result.documents.map((d) => d.celex_number)).toEqual([
         '02016R0679-20160504',
         '32016R0679',
@@ -2013,6 +2016,21 @@ describe('eurlex_search_documents', () => {
       expect(outerJoins).not.toContain('?kwBase');
     });
 
+    it('tests a partial-CELEX keyword in the page subquery and the outer FILTER EXISTS alone (#123)', async () => {
+      const { inner, outer } = splitPageFirst(
+        await searchQuery({ keyword: '2016R0679', date_from: '2016-01-01' }),
+      );
+
+      for (const part of [inner, outer]) {
+        expect(part).toContain(`?kwCelex bif:contains "'02016R0679*' OR '12016R0679*'`);
+        expect(part).toContain('FILTER(CONTAINS(STR(?kwCelex), "2016R0679"))');
+        expect(part).not.toContain('CONTAINS(LCASE(STR(?kwCelex))');
+      }
+      expect(inner).not.toContain('FILTER EXISTS');
+      expect(outer).toMatch(/FILTER EXISTS \{[\s\S]*\?kwCelex bif:contains/);
+      expect(withoutFilterExists(outer)).not.toContain('?kwCelex');
+    });
+
     it('proves continuation from the page subquery’s extra row, on both surfaces', async () => {
       mockQuery.mockImplementation(async (q: string) =>
         q.includes('GROUP BY ?celexNumber')
@@ -2155,26 +2173,55 @@ describe('eurlex_search_documents', () => {
       expect(sparql).not.toContain('CORRIGENDUM');
     });
 
-    it.each(['02016R0679', '72014L0056', '2016R0679'])(
-      'keeps the substring arm for %j, which no work carries whole',
-      async (keyword) => {
+    it.each([
+      ['02016R0679', `"'02016R0679*'"`],
+      ['72014L0056', `"'72014L0056*'"`],
+      ['2016R0679', `"'02016R0679*' OR '12016R0679*' OR`],
+    ])(
+      'takes the partial arm for %j, which no work carries whole (#123)',
+      async (keyword, terms) => {
         answer([]);
         const sparql = await run({ keyword });
 
         expect(lookupQueries()).toHaveLength(1);
-        expect(sparql).toContain(
-          `FILTER(CONTAINS(LCASE(STR(?kwCelex)), "${keyword.toLowerCase()}"))`,
-        );
+        expect(sparql).toContain(`?kwCelex bif:contains ${terms}`);
+        expect(sparql).toContain(`FILTER(CONTAINS(STR(?kwCelex), "${keyword}"))`);
+        expect(sparql).not.toContain('CONTAINS(LCASE(STR(?kwCelex))');
         expect(sparql).not.toContain('resource_legal_corrects_resource_legal');
       },
     );
 
-    it('sends no lookup for a digit keyword too short to be a whole CELEX', async () => {
+    it('completes a type-first fragment with every sector, year, and type code, sending no lookup (#123)', async () => {
+      answer([]);
+      const sparql = await run({ keyword: 'R0679' });
+
+      expect(lookupQueries()).toEqual([]);
+      expect(sparql).toContain(`?kwCelex bif:contains "'01951R0679*' OR '01952R0679*'`);
+      expect(sparql).toContain(`'32016R0679*'`);
+      expect(sparql).toContain('FILTER(CONTAINS(STR(?kwCelex), "R0679"))');
+      expect(sparql).not.toContain('CONTAINS(LCASE(STR(?kwCelex))');
+    });
+
+    it('matches titles only for a digit keyword that completes to no CELEX start (#123)', async () => {
       answer([]);
       const sparql = await run({ keyword: '0679' });
 
       expect(lookupQueries()).toEqual([]);
-      expect(sparql).toContain('FILTER(CONTAINS(LCASE(STR(?kwCelex)), "0679"))');
+      expect(sparql).not.toContain('?kwCelex');
+      expect(sparql).not.toContain('UNION');
+      expect(sparql).toContain(`?kwTitle bif:contains "'0679'"`);
+    });
+
+    it('answers a fragment whose digits are no year with the title matches, not an error (#123)', async () => {
+      answer([], [makeDocBinding('32016R0679', { title: 'A title naming 9999R0679' })]);
+      const result = await runToolContract(eurlex_search_documents, { keyword: '9999R0679' });
+
+      expect(result.isError).toBeFalsy();
+      const [sparql] = searchQueries();
+      expect(sparql).not.toContain('?kwCelex');
+      expect(sparql).toContain(`?kwTitle bif:contains "'9999R0679'"`);
+      const structured = eurlex_search_documents.output.parse(result.structuredContent);
+      expect(structured.documents.map((d) => d.celex_number)).toEqual(['32016R0679']);
     });
 
     it('runs the lookup after input validation, so a bad date sends nothing', async () => {
@@ -2255,12 +2302,13 @@ describe('eurlex_search_documents', () => {
       expect(contentText(result)).toContain('### 32016R0679R(03)');
     });
 
-    it('keeps the substring arm when CELLAR carries siblings of the keyword but not the keyword itself', async () => {
+    it('takes the partial arm when CELLAR carries siblings of the keyword but not the keyword itself', async () => {
       answer(['52002XC0903(01)', '52002XC0903(02)']);
       const sparql = await run({ keyword: '52002XC0903' });
 
       expect(lookupQueries()).toHaveLength(1);
-      expect(sparql).toContain('FILTER(CONTAINS(LCASE(STR(?kwCelex)), "52002xc0903"))');
+      expect(sparql).toContain(`?kwCelex bif:contains "'52002XC0903*'"`);
+      expect(sparql).toContain('FILTER(CONTAINS(STR(?kwCelex), "52002XC0903"))');
       expect(sparql).not.toContain('VALUES ?kwCelex');
     });
 
@@ -2283,6 +2331,9 @@ describe('eurlex_search_documents', () => {
       expect(description).toMatch(/\(01\)/);
       expect(description).toMatch(/no digit/i);
       expect(description).toMatch(/no letter or digit/i);
+      // #123: a partial CELEX is completed from its start; a mid-number fragment is not.
+      expect(description).toContain('partial CELEX');
+      expect(description).toMatch(/016R0679[^.]*titles only/);
     });
   });
 });

@@ -20,7 +20,12 @@ import {
   escapeSparqlLiteral,
   isValidCalendarDate,
 } from '@/services/cellar-sparql/eli-resolution.js';
-import { keywordMatchPattern, keywordTitlePhrase } from '@/services/cellar-sparql/keyword-match.js';
+import {
+  celexFragmentRoute,
+  celexPrefixMatch,
+  keywordMatchPattern,
+  keywordTitlePhrase,
+} from '@/services/cellar-sparql/keyword-match.js';
 import { resolveCelexWorks } from '@/services/cellar-sparql/work-resolution.js';
 
 /**
@@ -100,6 +105,38 @@ const PREFIXLESS_LAST_YEAR = 1988;
  */
 const CELEX_CHARACTERS = /^[0-9A-Za-z()_]+$/;
 
+/**
+ * Openings a CELEX-character case_number can hold at one position of a sector-6
+ * CELEX only: the sector and year (`62014CJ…`, position 1), the year and both
+ * letters (`2013CJ…`, position 2), or both letters and the number (`CJ0131`,
+ * position 6). A live check of every sector-6 CELEX (2026-09-25) found them all
+ * shaped `6{year}{court}{document}{number}` with a year from 1951, followed by
+ * `(nn)`, `R(nn)`, or an `_` suffix, and none of these openings anywhere else. So
+ * the prefix terms that complete such a value to a CELEX start reach every CELEX
+ * holding it (#134). Any other opening (`12CJ0131`, `J0131`, `C0097`, which is
+ * also the tail of `62023CC0097`) could sit elsewhere in a CELEX, so the index
+ * could miss a literal the substring holds.
+ */
+const INDEXED_CASE_CELEX_OPENING = /^(?:6\d{4}|\d{4}[A-Z]{2}|[A-Z]{2}\d)/;
+
+/**
+ * The match for a case_number made of CELEX characters that parses as no case
+ * number: every sector-6 CELEX holding it, case-insensitively. An opening in
+ * {@link INDEXED_CASE_CELEX_OPENING} is answered from the CELEX full-text index,
+ * its sector-6 prefix terms plus the confirming substring test (#134), since
+ * CELLAR stores CELEX in upper case; any other value, and one the keyword route
+ * gives no sector-6 term (a year past next year, letters no sector-6 type code
+ * ends in), keeps the substring test of every CELEX literal.
+ */
+function celexSubstringMatch(value: string): string {
+  const upper = value.toUpperCase();
+  const route = INDEXED_CASE_CELEX_OPENING.test(upper) ? celexFragmentRoute(upper) : undefined;
+  const terms = route?.kind === 'index' ? route.terms.filter((term) => term.startsWith('6')) : [];
+  return terms.length > 0
+    ? celexPrefixMatch('?celexNumber', upper, terms)
+    : `FILTER(CONTAINS(LCASE(STR(?celexNumber)), LCASE("${escapeSparqlLiteral(value)}")))`;
+}
+
 type ParsedCaseNumber =
   | { kind: 'case'; court: CaseCourtLetter; year: number; number: string }
   | { kind: 'unprefixed_out_of_range'; year: number }
@@ -152,13 +189,13 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
       .string()
       .optional()
       .describe(
-        'Number of a single case: C-{num}/{year} (Court of Justice), T-{num}/{year} (General Court), or F-{num}/{year} (Civil Service Tribunal), e.g. C-131/12. Also accepts the case_reference form ("Case C-97/23 P."), any procedural suffix after the year (P, R, PPU, …), and a pre-1989 Court of Justice number with no prefix (26/62). A value naming more than one case ("C-131/12 and C-132/12") is rejected; search each separately. Matches the judgments, orders, AG opinions, and other primary records filed under that number; derivative records (notices, abstracts, summaries, corrigenda) join only under include_derivative. Numbered Opinions and Rulings of the Court of Justice ("Opinion 2/13", "Ruling 1/78") are not reached by a case number; look one up by its CELEX (e.g. 62013CV0002). A value made only of CELEX characters (e.g. 2023CJ0097) is matched as a CELEX substring instead.',
+        'Number of a single case: C-{num}/{year} (Court of Justice), T-{num}/{year} (General Court), or F-{num}/{year} (Civil Service Tribunal), e.g. C-131/12. Also accepts the case_reference form ("Case C-97/23 P."), any procedural suffix after the year (P, R, PPU, …), and a pre-1989 Court of Justice number with no prefix (26/62). A value naming more than one case ("C-131/12 and C-132/12") is rejected; search each separately. Matches the judgments, orders, AG opinions, and other primary records filed under that number; derivative records (notices, abstracts, summaries, corrigenda) join only under include_derivative. Numbered Opinions and Rulings of the Court of Justice ("Opinion 2/13", "Ruling 1/78") are not reached by a case number; look one up by its CELEX (e.g. 62013CV0002). A value made only of CELEX characters is matched as a CELEX substring instead, case-insensitively: one opening with the sector and year (62014CJ0362), the year and both letters (2013CJ0131), or both letters and the number (CJ0131) is answered from the CELEX index; any other (12CJ0131, 0131) tests every CELEX and can take tens of seconds.',
       ),
     keyword: z
       .string()
       .optional()
       .describe(
-        'Keyword matched against English case titles via the full-text index (multi-word input is treated as a phrase), and against CELEX numbers. A keyword that is a whole CELEX (e.g. 62023CO0097) matches that record, its numbered siblings (…(01) to …(20)), its _INF, _RES, _SUM, and _EXT records, and its corrigenda, with notices, abstracts, summaries, and corrigenda still joining only under include_derivative; for every record filed under a case, use case_number. A partial CELEX (e.g. 2013CJ0131) matches every CELEX containing it. A keyword with no digit, or with a character no CELEX holds (a space, a period), matches titles only. A keyword with no letter or digit is rejected.',
+        'Keyword matched against English case titles via the full-text index (multi-word input is treated as a phrase), and against CELEX numbers. A keyword that is a whole CELEX (e.g. 62023CO0097) matches that record, its numbered siblings (…(01) to …(20)), its _INF, _RES, _SUM, and _EXT records, and its corrigenda, with notices, abstracts, summaries, and corrigenda still joining only under include_derivative; for every record filed under a case, use case_number. A partial CELEX that opens with the sector and year (62013CJ), the year and type letters (2013CJ0131), or type letters followed by the number (CJ0131, J0131) matches every CELEX containing it; one opening with letters not followed by a digit (R(01)) tests every CELEX and can take tens of seconds; a fragment opening mid-year or mid-number (013CJ0131, 0131) matches titles only. A keyword with no digit, or with a character no CELEX holds (a space, a period), matches titles only. A keyword with no letter or digit is rejected.',
       ),
     court: z
       .union([
@@ -412,8 +449,9 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
      * the set that court uses. Notice letters join only when derivative records are
      * admitted. The REGEX is unanchored, as the former CONTAINS was, so every value
      * that parsed before still reaches what it reached then. A value that parses as
-     * no case number keeps the escaped CELEX-substring match only when it is made
-     * of CELEX characters; anything else could never match and is rejected.
+     * no case number keeps the CELEX-substring match only when it is made of CELEX
+     * characters, answered from the CELEX index where its opening allows
+     * ({@link celexSubstringMatch}); anything else could never match and is rejected.
      */
     let celexFragment: string | undefined;
     const caseNumberInput = input.case_number?.trim();
@@ -428,8 +466,7 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
           `FILTER(REGEX(STR(?celexNumber), "${parsed.year}${parsed.court}[${documentLetters}]${parsed.number}"))`,
         );
       } else if (parsed.kind === 'unparsed' && CELEX_CHARACTERS.test(caseNumberInput)) {
-        const cn = escapeSparqlLiteral(caseNumberInput);
-        filters.push(`FILTER(CONTAINS(LCASE(STR(?celexNumber)), LCASE("${cn}")))`);
+        filters.push(celexSubstringMatch(caseNumberInput));
       } else {
         const quoted = echoValue(caseNumberInput);
         throw ctx.fail(
