@@ -16,7 +16,10 @@ import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { NodeHtmlMarkdown } from 'node-html-markdown';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ServerConfig } from '@/config/server-config.js';
-import { parseActStructure } from '@/services/eurlex-content/act-structure.js';
+import {
+  parseActStructure,
+  parseDocumentStructure,
+} from '@/services/eurlex-content/act-structure.js';
 import {
   type ContentFormat,
   EurLexContentService,
@@ -25,6 +28,7 @@ import { htmlToMarkdown } from '@/services/eurlex-content/html-to-markdown.js';
 import { AWS_WAF_CHALLENGE_HTML } from '../fixtures/aws-waf-challenge.js';
 import { ACT_XHTML } from '../fixtures/eurlex-act-html.js';
 import { AMENDING_HTML } from '../fixtures/eurlex-amending-act.js';
+import { JUDGMENT_CONVEX_EN } from '../fixtures/eurlex-case-law.js';
 import {
   FORMEX_DOC_1,
   FORMEX_DOC_2,
@@ -821,6 +825,48 @@ ${strip(PACKAGE_ANNEX)}
       );
       expect(result.headings).not.toEqual(parseActStructure(result.content, 'markdown', 'EN'));
       expect(result).not.toHaveProperty('sourceHtml');
+    });
+
+    it('reads a case-law Markdown body’s headings by the case-law parser, cached under its CELEX (#117)', async () => {
+      serve(JUDGMENT_CONVEX_EN);
+      const service = makeService();
+      const judgment = await service.fetchContent(
+        '62012CJ0131',
+        'EN',
+        'markdown',
+        createMockContext(),
+      );
+      // The same wire body under a legislation CELEX is an act with no act headings.
+      const act = await service.fetchContent('32016R0679', 'EN', 'markdown', createMockContext());
+      const again = await service.fetchContent(
+        '62012CJ0131',
+        'EN',
+        'markdown',
+        createMockContext(),
+      );
+
+      expect(judgment.headings?.map((h) => [h.kind, h.label])).toEqual([
+        ['heading', 'Legal context'],
+        [
+          'heading',
+          'The dispute in the main proceedings and the questions referred for a preliminary ruling',
+        ],
+        ['heading', 'Consideration of the questions referred'],
+        ['heading', 'Costs'],
+        ['operative_part', 'Operative part'],
+      ]);
+      expect(judgment.headings).toEqual(
+        parseDocumentStructure(
+          '62012CJ0131',
+          judgment.content,
+          'markdown',
+          'EN',
+          JUDGMENT_CONVEX_EN,
+        ),
+      );
+      expect(act.headings).toEqual([]);
+      expect(again).toEqual(judgment);
+      expect(mockFetch).toHaveBeenCalledTimes(2);
     });
 
     it('lists no headings behind an html or xml body', async () => {

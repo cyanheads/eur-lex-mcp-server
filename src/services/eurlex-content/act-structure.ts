@@ -32,16 +32,32 @@
  * a numbering table's cells, and a Markdown body takes the verdict of its source
  * HTML heading by heading, the two heading sequences aligned in order.
  *
- * Detection is best-effort by design: an act with no parseable structure (case
- * law, malformed conversions) yields an empty result, never an error. The paging
- * floor (`offset`/`limit`, `full`) remains the always-available escape hatch.
+ * Case law has none of an act's headings, so a sector-6 body takes its own parser
+ * (#117, {@link parseDocumentStructure}): the top-level section headings its markup
+ * marks, and a judgment's or order's operative part.
+ *
+ * Detection is best-effort by design: a body with no parseable structure
+ * (malformed conversions, case law with no heading markup) yields an empty
+ * result, never an error. The paging floor (`offset`/`limit`, `full`) remains the
+ * always-available escape hatch.
  * @module services/eurlex-content/act-structure
  */
 
 import type { ContentFormat, EurLexLanguage } from './eurlex-content-service.js';
 
-/** The structural unit kinds detected in an EU act body. */
-export type SectionKind = 'chapter' | 'section' | 'article' | 'annex' | 'recital';
+/**
+ * The structural unit kinds detected in a body: an act's chapters, sections,
+ * articles, annexes, and recitals, and a case-law record's section headings and
+ * operative part (#117).
+ */
+export type SectionKind =
+  | 'chapter'
+  | 'section'
+  | 'article'
+  | 'annex'
+  | 'recital'
+  | 'heading'
+  | 'operative_part';
 
 /** One detected heading, addressable by character offset into the content string. */
 export interface ActHeading {
@@ -50,13 +66,16 @@ export interface ActHeading {
   /**
    * Human label — "Article 17", "CHAPTER IV", "Section 1", "ANNEX I", "Recital 5" —
    * in English whatever the body's language or format. Only a Formex article with
-   * no number to read keeps its own heading text ("Final provision").
+   * no number to read keeps its own heading text ("Final provision"). A case-law
+   * heading keeps its text as served ("Legal context", "Sur les dépens"); the
+   * operative part is "Operative part".
    */
   label: string;
   /**
    * Numbering token — "17", "6A", "IV", "I", or "" for a lone unnumbered ANNEX.
    * The same in every language: Roman numerals in Latin letters, and French
-   * "premier" as "1".
+   * "premier" as "1". A case-law heading is numbered by its 1-based position, and
+   * the operative part carries "".
    */
   number: string;
   /** Character offset of the heading within the content string of the requested format. */
@@ -65,11 +84,16 @@ export interface ActHeading {
   title?: string;
 }
 
-/** Comma-separated selector strings, one optional field per addressable kind. */
+/**
+ * Comma-separated selector strings, one optional field per addressable kind; a
+ * case-law heading is addressed by its position, and the operative part by a flag.
+ */
 export interface SectionSelectors {
   annexes?: string;
   articles?: string;
   chapters?: string;
+  headings?: string;
+  operative_part?: boolean;
   recitals?: string;
 }
 
@@ -114,19 +138,25 @@ export interface SelectionResult {
  * Nesting rank — a section ends at the next heading whose rank is the same or
  * broader (numerically ≤). Chapters and annexes are top-level siblings; sections
  * nest in chapters; articles nest in sections; recitals are the finest preamble
- * unit.
+ * unit. A case-law heading and the operative part are siblings, so a headed
+ * section ends at the next heading or at the operative part, which runs to the
+ * end of the body (#117).
  */
 const RANK: Record<SectionKind, number> = {
   chapter: 1,
   annex: 1,
+  heading: 1,
+  operative_part: 1,
   section: 2,
   article: 3,
   recital: 4,
 };
 
-/** Human label for a kind + number. */
-function labelFor(kind: SectionKind, number: string): string {
+/** Human label for a kind + number. A case-law heading is labeled with its own text instead. */
+function labelFor(kind: Exclude<SectionKind, 'heading'>, number: string): string {
   switch (kind) {
+    case 'operative_part':
+      return 'Operative part';
     case 'article':
       return `Article ${number}`;
     case 'chapter':
@@ -212,8 +242,8 @@ function nestingDepth(content: string, tags: RegExp): (at: number) => number {
 
 // --- Heading vocabulary ---
 
-/** The numbered heading kinds, each written with a keyword and a number. */
-type NumberedKind = Exclude<SectionKind, 'recital'>;
+/** An act's numbered heading kinds, each written with a keyword and a number. */
+type NumberedKind = 'article' | 'chapter' | 'section' | 'annex';
 
 /**
  * How one language writes its numbered headings in the Official Journal. `#` marks
@@ -570,7 +600,7 @@ const RECITAL_RE = /^\(?(\d+)\)(?:\s|$)/;
 function classifyStructural(
   v: string,
   { lines, articleOne }: Vocabulary,
-): { kind: SectionKind; number: string; title?: string } | null {
+): { kind: NumberedKind; number: string; title?: string } | null {
   const article = lines.article.exec(v);
   if (article) {
     const number = article[1] ?? '';
@@ -886,7 +916,7 @@ function parseFormexStructure(content: string, vocabulary: Vocabulary): ActHeadi
     const tiClose = nextTiClose(headingRe.lastIndex);
     if (tiClose === -1) break; // no </TI> anywhere past here, so no later heading closes either
     const chapter = head.groups?.chapter;
-    const kind: SectionKind = chapter === undefined ? 'section' : 'chapter';
+    const kind: NumberedKind = chapter === undefined ? 'section' : 'chapter';
     const number = neutralNumber(chapter ?? head.groups?.section ?? '');
 
     FORMEX_STI_OPEN_RE.lastIndex = tiClose + '</TI>'.length;
@@ -920,6 +950,381 @@ function parseFormexStructure(content: string, vocabulary: Vocabulary): ActHeadi
 
   headings.sort((a, b) => a.offset - b.offset);
   return headings;
+}
+
+// --- Case law (#117) ---
+
+/**
+ * A work's structure, read by the parser its CELEX calls for. A sector-6 work is
+ * case law: its top-level section headings and, when the CELEX names a judgment or
+ * an order (descriptor `J` or `O`, as in `62012CJ0131` and `62023CO0141`), its
+ * operative part; an AG opinion (`62023CC0135`) has headings only. Any other work
+ * is an act, read by {@link parseActStructure}. The parser is a function of the
+ * CELEX alone, so a Markdown heading list cached under its CELEX (#129) is always
+ * the one this reads.
+ */
+export function parseDocumentStructure(
+  celex: string,
+  content: string,
+  format: ContentFormat,
+  language: EurLexLanguage,
+  sourceHtml?: string,
+): ActHeading[] {
+  if (!isCaseLawCelex(celex)) return parseActStructure(content, format, language, sourceHtml);
+  const ruling = RULING_CELEX_RE.test(celex);
+  if (format === 'xml') return formexCaseLawStructure(content, ruling);
+  const formula = operativeFormula(language);
+  return format === 'html'
+    ? htmlLandmarks(content, formula, ruling).map(({ atx: _atx, text: _text, ...h }) => h)
+    : markdownCaseLawStructure(content, sourceHtml, formula, ruling);
+}
+
+/** True for a sector-6 CELEX: case law of the EU courts. */
+export function isCaseLawCelex(celex: string): boolean {
+  return celex.startsWith('6');
+}
+
+/** A judgment's or order's CELEX: sector 6, the year, the court letter, then `J` or `O`. */
+const RULING_CELEX_RE = /^6\d{4}[A-Z][JO]/;
+
+/**
+ * How a judgment's or order's operative part opens in each language, as pattern
+ * sources matched case-insensitively at the start of a paragraph: "On those
+ * grounds, the Court (Grand Chamber) hereby rules:", "hereby:", or "hereby
+ * orders:". Dutch has no lead-in phrase, so its ruling opens with the court and
+ * the verb: "Het Hof (Vierde kamer) verklaart voor recht:", each gap bounded so a long
+ * paragraph with no period is not backtracked over quadratically. EN, FR, and DE are read
+ * from `62012CJ0131`, EN also from `62014TJ0353`, `62023CO0141`, and `62025TJ0069`,
+ * FR also from `62025TJ0069`, and ES, IT, NL, PL, SV, LT, HR, and EL from
+ * `62019CJ0311`; the rest are the Court's standard wording, best-effort.
+ */
+const OPERATIVE_FORMULAS: Record<EurLexLanguage, readonly string[]> = {
+  EN: ['On those grounds', 'On these grounds'],
+  FR: ['Par ces motifs'],
+  DE: ['Aus diesen Gründen'],
+  ES: ['En virtud de todo lo expuesto', 'Por todo lo expuesto'],
+  IT: ['Per questi motivi'],
+  PL: ['Z powyższych względów'],
+  PT: ['Pelos fundamentos expostos'],
+  NL: [
+    'Om die redenen',
+    'Het (?:Hof|Gerecht)\\b[^.]{0,100}\\b(?:verklaart|beschikt|rechtdoende)\\b[^.]{0,100}:$',
+    'De (?:vice-?)?president\\b[^.]{0,100}\\bbeschikt:$',
+  ],
+  CS: ['Z těchto důvodů'],
+  DA: ['På grundlag af disse præmisser'],
+  EL: ['Για τους λόγους αυτούς'],
+  ET: ['Esitatud põhjendustest lähtudes'],
+  FI: ['Näillä perusteilla'],
+  HU: ['A fenti indokok alapján'],
+  LT: ['Remdamasis šiais motyvais'],
+  LV: ['Ar šādu pamatojumu'],
+  MT: ['Għal dawn il-motivi'],
+  RO: ['Pentru aceste motive'],
+  SK: ['Z týchto dôvodov'],
+  SL: ['Iz teh razlogov'],
+  SV: ['Mot denna bakgrund', 'På dessa grunder'],
+  BG: ['По изложените съображения'],
+  HR: ['Slijedom navedenog'],
+  GA: ['Ar na forais sin'],
+};
+
+const formulas = new Map<EurLexLanguage, RegExp>();
+
+/** A paragraph opening with the language's operative formula, built on first use. */
+function operativeFormula(language: EurLexLanguage): RegExp {
+  const cached = formulas.get(language);
+  if (cached) return cached;
+  const formula = new RegExp(`^(?:${OPERATIVE_FORMULAS[language].join('|')})(?!\\p{L})`, 'iu');
+  formulas.set(language, formula);
+  return formula;
+}
+
+/**
+ * A case-law landmark in an HTML body, with what a Markdown rendering of the body
+ * shows for it: a heading element renders as an ATX heading line (`## Grounds`),
+ * and `text` is its visible text as {@link landmarkText} reads a line.
+ */
+interface Landmark extends ActHeading {
+  atx: boolean;
+  text: string;
+}
+
+/**
+ * The classes of a top-level section heading, one per generation of CELLAR's html:
+ * `title-grseq-2` in CONVEX xhtml, `coj-sum-title-1` in the `coj-` CONVEX xhtml
+ * (which writes the document header in it too), and `C04Titre1` in the text/html
+ * Word export of recent General Court judgments. A legacy text/html body writes its
+ * sections as `<h2>`.
+ */
+const CASE_HEADING_CLASSES = new Set(['title-grseq-2', 'coj-sum-title-1', 'C04Titre1']);
+
+/**
+ * A paragraph or `<h2>` opener, the tag in group 1 and its attributes in group 2.
+ * `[^<>]` keeps each match attempt inside one tag.
+ */
+const CASE_BLOCK_OPEN_RE = /<(p|h2)\b([^<>]*)>/gi;
+
+/** A paragraph or `<h2>` closer, the tag in group 1. */
+const CASE_BLOCK_CLOSE_RE = /<\/(p|h2)\s*>/gi;
+
+/** A block's `class` attribute value. */
+const CLASS_ATTRIBUTE_RE = /\bclass\s*=\s*"([^"]*)"/i;
+
+/**
+ * A `coj-sum-title-1` heading's content opens with a bold span. The document header
+ * lines in that class — court, date, Advocate General — do not.
+ */
+const COJ_BOLD_OPEN_RE = /^\s*<span\b[^<>]*\bclass\s*=\s*"[^"]*\bcoj-bold\b/i;
+
+/** The first numbered paragraph: `id="point1"` in CONVEX, `NAME="point1"` in the Word export. */
+const FIRST_POINT_RE = /\b(?:id|name)\s*=\s*"point1"/i;
+
+/** The legacy text/html anchor opening a judgment's operative part, `<a name="DI"/>`. */
+const LEGACY_OPERATIVE_ANCHOR_RE = /<a\s[^<>]*\bname\s*=\s*"DI"[^<>]*>/gi;
+
+/**
+ * The legacy text/html anchor opening an AG opinion's text, `<a name="OP"/>`, which
+ * the `<h2>` naming the document ("Opinion of the Advocate-General") follows.
+ */
+const LEGACY_OPINION_ANCHOR_RE = /<a\s[^<>]*\bname\s*=\s*"OP"[^<>]*>/i;
+
+/**
+ * Return a finder for the first `</p>` or `</h2>` at or after a position, for
+ * positions asked in ascending order per tag. The closers are found in one pass, and
+ * each question only reads forward.
+ */
+function blockCloser(content: string): (tag: 'p' | 'h2', from: number) => number {
+  const closers = { p: [] as number[], h2: [] as number[] };
+  for (const m of content.matchAll(CASE_BLOCK_CLOSE_RE)) {
+    closers[(m[1] ?? '').toLowerCase() === 'h2' ? 'h2' : 'p'].push(m.index);
+  }
+  const next = { p: 0, h2: 0 };
+  return (tag, from) => {
+    const list = closers[tag];
+    while ((list[next[tag]] ?? Number.POSITIVE_INFINITY) < from) next[tag]++;
+    return list[next[tag]] ?? -1;
+  };
+}
+
+/**
+ * A position moved back to the start of its line when only spaces precede it there,
+ * as an act heading's offset is: CONVEX writes one indented tag per line.
+ */
+function lineAnchored(content: string, at: number): number {
+  let start = at;
+  while (start > 0 && (content[start - 1] === ' ' || content[start - 1] === '\t')) start--;
+  return start === 0 || content[start - 1] === '\n' ? start : at;
+}
+
+/** The outermost `<table>` still open at a position, or undefined outside any table. */
+function outermostOpenTable(content: string, at: number): number | undefined {
+  const open: number[] = [];
+  for (const tag of content.matchAll(TABLE_TAG_RE)) {
+    if (tag.index >= at) break;
+    if (tag[1]) open.pop();
+    else if (!tag[0].endsWith('/>')) open.push(tag.index);
+  }
+  return open[0];
+}
+
+/**
+ * Text as a Markdown line and the HTML element it renders both read: no ATX marker,
+ * backslash escapes, or emphasis marks, and whitespace collapsed.
+ */
+function landmarkText(text: string): string {
+  return text
+    .replace(/^\s*#{1,6}\s+/, '')
+    .replace(/\\(.)/g, '$1')
+    .replace(/[*_]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** A judgment's or order's operative part, opening at `offset`. */
+function operativePart(offset: number): ActHeading {
+  return { kind: 'operative_part', number: '', label: labelFor('operative_part', ''), offset };
+}
+
+/** Headings before the operative part, numbered by position, then the operative part. */
+function sequence<T extends ActHeading>(headings: readonly T[], operative: T | undefined): T[] {
+  const kept = operative ? headings.filter((h) => h.offset < operative.offset) : [...headings];
+  kept.forEach((h, i) => {
+    h.number = String(i + 1);
+  });
+  return operative ? [...kept, operative] : kept;
+}
+
+/**
+ * The landmarks of a case-law HTML body. Each heading is a block of heading markup
+ * ({@link CASE_HEADING_CLASSES}, `<h2>`), labeled with its visible text. A `coj-`
+ * heading must open with a bold span, which leaves out the document header, and in
+ * a judgment or order the first one before paragraph 1 is the document's title
+ * ("Judgment", "Arrêt"), not a section. In an AG opinion, a first heading that is
+ * the `<h2>` directly after the legacy `<a name="OP"/>` anchor is the document's
+ * title ("Opinion of the Advocate-General") and would span the whole opinion, so it
+ * is left out too. The operative part is the legacy
+ * `<a name="DI"/>` anchor, else the last paragraph opening with the served
+ * language's formula; CONVEX lays that paragraph out in a table cell, which a
+ * quoted heading of an amending act also sits in (#106), so a table does not
+ * disqualify it here, and the part starts at the outermost table holding it. A
+ * heading after the operative part's start belongs to it, as the legacy `<h2>`
+ * after the anchor does. Every closer is found in one forward pass.
+ */
+function htmlLandmarks(content: string, formula: RegExp, ruling: boolean): Landmark[] {
+  const closerOf = blockCloser(content);
+  const headings: (Landmark & { coj: boolean })[] = [];
+  let lastFormula: number | undefined;
+  let formulaText = '';
+  for (const open of content.matchAll(CASE_BLOCK_OPEN_RE)) {
+    const tag = (open[1] ?? '').toLowerCase() === 'h2' ? 'h2' : 'p';
+    const start = open.index + open[0].length;
+    const end = closerOf(tag, start);
+    if (end === -1) continue;
+    const inner = content.slice(start, end);
+    const classes = CLASS_ATTRIBUTE_RE.exec(open[2] ?? '')?.[1]?.split(/\s+/) ?? [];
+    const coj = classes.includes('coj-sum-title-1');
+    const heading =
+      tag === 'h2' ||
+      (classes.some((c) => CASE_HEADING_CLASSES.has(c)) && (!coj || COJ_BOLD_OPEN_RE.test(inner)));
+    if (!heading && !ruling) continue;
+    const text = visibleText(inner);
+    if (heading && text) {
+      headings.push({
+        kind: 'heading',
+        number: '',
+        label: text,
+        offset: lineAnchored(content, open.index),
+        atx: tag === 'h2',
+        text: landmarkText(text),
+        coj,
+      });
+    } else if (!heading && formula.test(text)) {
+      lastFormula = open.index;
+      formulaText = text;
+    }
+  }
+
+  let operative: Landmark | undefined;
+  const anchor = ruling ? [...content.matchAll(LEGACY_OPERATIVE_ANCHOR_RE)].at(-1) : undefined;
+  if (anchor) {
+    const title = headings.find((h) => h.offset > anchor.index);
+    operative = {
+      ...operativePart(lineAnchored(content, anchor.index)),
+      atx: title?.atx ?? false,
+      text: title?.text ?? '',
+    };
+  } else if (lastFormula !== undefined) {
+    operative = {
+      ...operativePart(
+        lineAnchored(content, outermostOpenTable(content, lastFormula) ?? lastFormula),
+      ),
+      atx: false,
+      text: landmarkText(formulaText),
+    };
+  }
+
+  const pointOne = FIRST_POINT_RE.exec(content)?.index;
+  const firstCoj = headings.find((h) => h.coj);
+  const [first] = headings;
+  const opinionAnchor = ruling ? undefined : LEGACY_OPINION_ANCHOR_RE.exec(content);
+  const opinionTextStart = opinionAnchor ? opinionAnchor.index + opinionAnchor[0].length : -1;
+  const documentTitle =
+    ruling && firstCoj && pointOne !== undefined && firstCoj.offset < pointOne
+      ? firstCoj
+      : first?.atx &&
+          opinionTextStart !== -1 &&
+          first.offset >= opinionTextStart &&
+          content.slice(opinionTextStart, first.offset).trim() === ''
+        ? first
+        : undefined;
+  const sections = headings
+    .filter((h) => h !== documentTitle)
+    .map(({ coj: _coj, ...h }): Landmark => h);
+  return sequence(sections, operative);
+}
+
+/** An ATX heading line in Markdown. */
+const ATX_LINE_RE = /^\s*#{1,6}\s/;
+
+/**
+ * The landmarks of a case-law Markdown body. Conversion drops the markup that marks
+ * them, so they are read from the HTML the Markdown was rendered from and found in
+ * the Markdown in order, each at the next line after the previous one that reads
+ * the same (an ATX heading line for an HTML heading element); an in-order match
+ * passes over a table of contents listing the same words, as legacy bodies carry
+ * one. Numbers are the HTML's, so `select` names the same heading in either format;
+ * a landmark with no such line is left out. Without the HTML, or when the operative
+ * part was not found that way, it is the last line opening with the formula.
+ */
+function markdownCaseLawStructure(
+  markdown: string,
+  sourceHtml: string | undefined,
+  formula: RegExp,
+  ruling: boolean,
+): ActHeading[] {
+  const lines: { atx: boolean; offset: number; text: string }[] = [];
+  let offset = 0;
+  for (const line of markdown.split('\n')) {
+    lines.push({ atx: ATX_LINE_RE.test(line), offset, text: landmarkText(line) });
+    offset += line.length + 1;
+  }
+  const byText = Map.groupBy(lines.keys(), (i) => lines[i]?.text ?? '');
+
+  const found: ActHeading[] = [];
+  let cursor = -1;
+  for (const landmark of sourceHtml === undefined
+    ? []
+    : htmlLandmarks(sourceHtml, formula, ruling)) {
+    if (!landmark.text) continue;
+    const index = byText
+      .get(landmark.text)
+      ?.find((i) => i > cursor && (!landmark.atx || lines[i]?.atx));
+    const line = index === undefined ? undefined : lines[index];
+    if (index === undefined || !line) continue;
+    cursor = index;
+    found.push({
+      kind: landmark.kind,
+      number: landmark.number,
+      label: landmark.label,
+      offset: line.offset,
+    });
+  }
+  if (!ruling || found.some((h) => h.kind === 'operative_part')) return found;
+
+  const formulaLine = lines.findLast((l) => formula.test(l.text));
+  if (!formulaLine) return found;
+  return [...found.filter((h) => h.offset < formulaLine.offset), operativePart(formulaLine.offset)];
+}
+
+/** A Formex top-level section, `<GR.SEQ LEVEL="2">`. */
+const FORMEX_SECTION_OPEN_RE = /<GR\.SEQ\b[^<>]*\bLEVEL="2"[^<>]*>/g;
+
+/** The `<TITLE><TI>` directly opening a Formex section. Sticky. */
+const FORMEX_SECTION_TITLE_RE = /\s*<TITLE>\s*<TI>/y;
+
+/** A Formex judgment's or order's operative part, `<JURISDICTION>`. */
+const FORMEX_JURISDICTION_RE = /<JURISDICTION\b[^<>]*>/g;
+
+/**
+ * The landmarks of a case-law Formex body: each `<GR.SEQ LEVEL="2">` labeled by its
+ * `<TITLE><TI>` text, the document's own `LEVEL="1"` "Judgment" left out, and a
+ * judgment's or order's `<JURISDICTION>`. Each title runs to the first `</TI>` after
+ * it, through a forward-only finder.
+ */
+function formexCaseLawStructure(content: string, ruling: boolean): ActHeading[] {
+  const nextTiClose = forwardFinder(content, '</TI>');
+  const headings: ActHeading[] = [];
+  for (const open of content.matchAll(FORMEX_SECTION_OPEN_RE)) {
+    FORMEX_SECTION_TITLE_RE.lastIndex = open.index + open[0].length;
+    if (!FORMEX_SECTION_TITLE_RE.exec(content)) continue;
+    const close = nextTiClose(FORMEX_SECTION_TITLE_RE.lastIndex);
+    if (close === -1) break;
+    const label = formexText(content.slice(FORMEX_SECTION_TITLE_RE.lastIndex, close));
+    if (label) headings.push({ kind: 'heading', number: '', label, offset: open.index });
+  }
+  const jurisdiction = ruling ? [...content.matchAll(FORMEX_JURISDICTION_RE)].at(-1) : undefined;
+  return sequence(headings, jurisdiction && operativePart(jurisdiction.index));
 }
 
 // --- Selection ---
@@ -1031,6 +1436,14 @@ export function extractSections(
   add('chapter', selectors.chapters, 'CHAPTER');
   add('recital', selectors.recitals, 'Recital');
   add('annex', selectors.annexes, 'ANNEX');
+  add('heading', selectors.headings, 'Heading');
+  if (selectors.operative_part) {
+    requests.push({
+      kind: 'operative_part',
+      token: '',
+      descriptor: labelFor('operative_part', ''),
+    });
+  }
 
   const matched: { descriptor: string; offset: number; end: number }[] = [];
   const missed: string[] = [];

@@ -41,7 +41,7 @@ import { serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { withRetry } from '@cyanheads/mcp-ts-core/utils';
 import type { ServerConfig } from '@/config/server-config.js';
-import { type ActHeading, parseActStructure } from './act-structure.js';
+import { type ActHeading, parseDocumentStructure } from './act-structure.js';
 import { readFormexPackage } from './formex-package.js';
 import { htmlToMarkdown } from './html-to-markdown.js';
 
@@ -97,9 +97,11 @@ export type ContentUnavailabilityReason =
  * Map EUR-Lex two-letter language codes to the ISO 639-2/T (terminological,
  * three-letter) codes CELLAR's content-negotiation resolver accepts in
  * `Accept-Language`. CELLAR rejects bibliographic 639-2/B codes (`ger`, `fre`,
- * `dut`, …), so the terminological forms (`deu`, `fra`, `nld`, …) are used.
+ * `dut`, …), so the terminological forms (`deu`, `fra`, `nld`, …) are used. Upper-
+ * cased, each is also the code of CELLAR's language authority table (`FRA`), which
+ * eurlex_get_document reads an expression title by.
  */
-const LANGUAGE_TO_ISO_639_2: Record<EurLexLanguage, string> = {
+export const LANGUAGE_TO_ISO_639_2: Record<EurLexLanguage, string> = {
   EN: 'eng',
   FR: 'fra',
   DE: 'deu',
@@ -168,9 +170,12 @@ interface ServedBody {
  * Render a fetched wire body into the requested output format. `html`/`xml` pass
  * through verbatim; `markdown` is converted server-side from the HTML body, and its
  * headings are parsed then, while the HTML is at hand to tell an act's own
- * headings from the ones it quotes (#106).
+ * headings from the ones it quotes (#106) and to find a case-law body's section
+ * headings, whose markup the conversion drops (#117). The CELEX picks the parser,
+ * and it keys the cache entry, so a cached heading list is always that parser's.
  */
 function renderBody(
+  celexNumber: string,
   wire: string,
   format: ContentFormat,
   language: EurLexLanguage,
@@ -179,7 +184,7 @@ function renderBody(
   const fallback = languageFallback ? { languageFallback } : {};
   if (format !== 'markdown') return { content: wire, language, ...fallback };
   const content = htmlToMarkdown(wire);
-  const headings = parseActStructure(content, 'markdown', language, wire);
+  const headings = parseDocumentStructure(celexNumber, content, 'markdown', language, wire);
   return { content, headings, language, ...fallback };
 }
 
@@ -386,7 +391,8 @@ export interface FetchContentResult {
   /**
    * Headings of an available `markdown` body, parsed against the wire HTML it was
    * rendered from: the conversion drops the table layout that tells an act's own
-   * headings from the ones it quotes (#106), and that HTML is not kept (#127).
+   * headings from the ones it quotes (#106) and the markup that marks a case-law
+   * body's sections (#117), and that HTML is not kept (#127).
    */
   headings?: ActHeading[];
   language: EurLexLanguage;
@@ -441,7 +447,7 @@ export class EurLexContentService {
     // returned `format` still reports `markdown` and `renderBody` converts.
     const wireFormat: WireFormat = format === 'markdown' ? 'html' : format;
     const serve = (text: string, served: EurLexLanguage, languageFallback?: string) => {
-      const body = renderBody(text, format, served, languageFallback);
+      const body = renderBody(celexNumber, text, format, served, languageFallback);
       if (!ctx.signal.aborted) this.cache.set(key, body);
       return servedResult(body, format);
     };
