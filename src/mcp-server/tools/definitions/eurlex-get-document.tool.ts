@@ -25,6 +25,7 @@ import { fetchWorkAgents } from '@/services/cellar-sparql/work-agents.js';
 import { resolveCelexWorks } from '@/services/cellar-sparql/work-resolution.js';
 import {
   type ActHeading,
+  collapseRecitals,
   extractSections,
   outermostSections,
   parseActStructure,
@@ -163,13 +164,19 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .max(MAX_CONTENT_LIMIT)
       .default(DEFAULT_CONTENT_LIMIT)
       .describe(
-        `Maximum characters to return in this window ("paged" mode only). Default ${DEFAULT_CONTENT_LIMIT}, max ${MAX_CONTENT_LIMIT}. Follow has_more and the returned offsets until false to reconstruct the complete body.`,
+        `Maximum characters to return in this window ("paged" mode only; select ignores it). Default ${DEFAULT_CONTENT_LIMIT}, max ${MAX_CONTENT_LIMIT}. Follow has_more and the returned offsets until false to reconstruct the complete body.`,
       ),
     outline: z
       .boolean()
       .default(false)
       .describe(
-        'Return a structural outline of the act — chapters, sections, articles, annexes, and recitals as a heading list, each with its character offset — instead of body text. Read a section by paging with its offset, keeping the same format: outline offsets are measured in the requested format\'s body and land in the wrong place under any other format. Ignores offset/limit and select; no detectable structure returns an empty outline. Not applied in content_mode "metadata_only".',
+        'Return a structural outline of the act — chapters, sections, articles, annexes, and the preamble\'s recitals as a heading list, each with its character offset — instead of body text. The recitals appear as one entry spanning the run (e.g. "Recitals 1–173") at the first recital\'s offset unless include_recitals is true. Headings of text an amending act inserts into another act are not listed. Read a section by paging with its offset, keeping the same format: outline offsets are measured in the requested format\'s body and land in the wrong place under any other format. Ignores offset/limit and select; no detectable structure returns an empty outline. Not applied in content_mode "metadata_only".',
+      ),
+    include_recitals: z
+      .boolean()
+      .default(false)
+      .describe(
+        'List every recital as its own outline entry, with its own offset, instead of one entry for the run. Applies only when outline is true; select reaches a single recital either way.',
       ),
     select: z
       .object({
@@ -186,7 +193,7 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       })
       .optional()
       .describe(
-        'Return only the text of specific sections by type and number, instead of a raw character window (Roman and Arabic numbers are equivalent). Sections are located in the body of the requested format, so pair select with the same format used for any outline. A section inside another selected section (an article in a selected chapter) is returned once, within the enclosing one. A section that cannot be located is reported in selection.missed with no wrong text returned. Ignored when outline is true or in content_mode "metadata_only".',
+        `Return only the text of specific sections by type and number, instead of a raw character window (Roman and Arabic numbers are equivalent; a number may carry an English kind word or one in the language served, e.g. "Article 5", "Artikel 5", "5. cikk"). Sections are located in the body of the requested format, so pair select with the same format used for any outline. A section inside another selected section (an article in a selected chapter) is returned once, within the enclosing one. A section that cannot be located — including a number that appears only in text an amending act inserts into another act — is reported in selection.missed with no wrong text returned. offset and limit do not apply: the joined sections are capped at ${MAX_CONTENT_LIMIT} characters with no continuation, and each section stays readable on its own from its offset and chars in selected_sections. Ignored when outline is true or in content_mode "metadata_only".`,
       ),
   }),
   output: z.object({
@@ -400,9 +407,13 @@ export const eurlex_get_document = tool('eurlex_get_document', {
             number: z
               .string()
               .describe(
-                'Numbering token as rendered (e.g. "17", "IV"); empty for a lone unnumbered annex.',
+                'Numbering token, the same in every language (e.g. "17", "6A", "IV" — Roman numerals in Latin letters, French "premier" as "1"); empty for a lone unnumbered annex. A recital entry covering a run reads as a range, first–last (e.g. "1–173"), unless include_recitals is true.',
               ),
-            label: z.string().describe('Human label, e.g. "Article 17", "CHAPTER IV".'),
+            label: z
+              .string()
+              .describe(
+                'Human label in English whatever the language and format, e.g. "Article 17", "CHAPTER IV", "Recitals 1–173" — the form selection.matched reports; only an xml article with no number to read keeps its own heading text.',
+              ),
             title: z.string().optional().describe('Descriptive title where the act supplies one.'),
             offset: z
               .number()
@@ -421,10 +432,14 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .object({
         requested: z
           .array(z.string())
-          .describe('Section descriptors requested, e.g. ["Article 17", "CHAPTER IV"].'),
+          .describe(
+            'Section descriptors requested, in English whatever the language, e.g. ["Article 17", "CHAPTER IV"].',
+          ),
         matched: z
           .array(z.string())
-          .describe('Section descriptors located in the body, in document order.'),
+          .describe(
+            'Labels of the sections located in the body, in document order — in English whatever the language and format, as in the outline.',
+          ),
         missed: z
           .array(z.string())
           .describe('Requested section descriptors that could not be located.'),
@@ -437,7 +452,11 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .array(
         z
           .object({
-            label: z.string().describe('Section descriptor, e.g. "Article 17".'),
+            label: z
+              .string()
+              .describe(
+                'Section label in English whatever the language and format, e.g. "Article 17".',
+              ),
             offset: z
               .number()
               .int()
@@ -895,8 +914,13 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
           // Structure-only view: the detected headings and their offsets into the
           // same body the floor pages, no body text. Ignores offset/limit/select.
           // No parseable structure yields an empty outline, never an error.
-          const headings = parseActStructure(full, format);
-          result.outline = headings;
+          // Headings are read in the language served, after any English
+          // fallback (#107), and a Markdown body's quoted headings are told
+          // from its source HTML (#106); select below does the same. The
+          // preamble's recitals collapse into one entry unless asked for one by
+          // one (#118); select keeps resolving against every heading.
+          const headings = parseActStructure(full, format, body.language, body.sourceHtml);
+          result.outline = input.include_recitals ? headings : collapseRecitals(headings);
           result.structure_detected = headings.length > 0;
           result.content_chars_returned = 0;
           result.has_more = false;
@@ -913,9 +937,14 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
           // truncated enrichment, and selected_sections carries each section's own
           // source address so every one stays individually reachable through the
           // paging floor (#12).
-          const headings = parseActStructure(full, format);
+          const headings = parseActStructure(full, format, body.language, body.sourceHtml);
           result.structure_detected = headings.length > 0;
-          const selection = extractSections(full, headings, input.select as SectionSelectors);
+          const selection = extractSections(
+            full,
+            headings,
+            input.select as SectionSelectors,
+            body.language,
+          );
           result.selection = {
             requested: selection.requested,
             matched: selection.matched,

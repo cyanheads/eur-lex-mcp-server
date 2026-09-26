@@ -9,6 +9,7 @@ import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mc
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_get_document } from '@/mcp-server/tools/definitions/eurlex-get-document.tool.js';
 import { EURLEX_LANGUAGES } from '@/services/eurlex-content/eurlex-content-service.js';
+import { htmlToMarkdown } from '@/services/eurlex-content/html-to-markdown.js';
 import {
   ACTS,
   fakeConsolidationCellar,
@@ -25,6 +26,8 @@ import {
   isResolutionQuery,
   resolutionRows,
 } from '../fixtures/cellar-works.js';
+import { AI_ACT_HEADINGS, actHtml } from '../fixtures/eurlex-act-headings.js';
+import { AMENDING_FORMEX, AMENDING_HTML } from '../fixtures/eurlex-amending-act.js';
 
 // --- Service mocks ---
 const mockSparqlQuery = vi.fn();
@@ -1527,6 +1530,350 @@ describe('eurlex_get_document', () => {
       expect(text).toContain('Selection');
       expect(text).toContain('Not found: Article 99');
       expect(text).toContain('content_mode "full"');
+    });
+  });
+
+  // --- #107: headings are read in the language the body is served in ---
+
+  describe('outline and select in the served language (#107)', () => {
+    /** Mock one body served in `language`, whatever was requested. */
+    const serve = (content: string, language: string, format = 'html') => {
+      mockSparqlQuery.mockImplementation(async (q: string) =>
+        isResolutionQuery(q) ? resolutionRows(q) : [makeMetaBinding({ celex: '32024R1689' })],
+      );
+      mockFetchContent.mockResolvedValue({ content, contentAvailable: true, format, language });
+    };
+    const call = async (args: Record<string, unknown>) => {
+      const ctx = createMockContext({ errors: eurlex_get_document.errors });
+      const result = await eurlex_get_document.handler(
+        eurlex_get_document.input.parse({ celex_number: '32024R1689', ...args }),
+        ctx,
+      );
+      const text = (eurlex_get_document.format!(result)[0] as { text: string }).text;
+      return { result, text, enrichment: getEnrichment(ctx) };
+    };
+
+    it('outlines a French act, "Article premier" as article 1, on both surfaces', async () => {
+      serve(actHtml(AI_ACT_HEADINGS.FR), 'FR');
+      const { result, text } = await call({ language: 'fr', outline: true });
+
+      expect(result.structure_detected).toBe(true);
+      // The recitals collapse into one English-labelled entry by default (#118).
+      expect(result.outline?.map((h) => `${h.kind} ${h.number}`)).toEqual([
+        'recital 1–2',
+        'chapter I',
+        'section 1',
+        'article 1',
+        'article 2',
+        'chapter IV',
+        'annex I',
+      ]);
+      expect(text).toContain('7 sections detected');
+      expect(text).toContain('[recital 1–2] Recitals 1–2');
+      expect(text).toContain('[article 1] Article 1: Subject matter');
+      expect(text).toContain('[annex I] ANNEX I: List of legislation');
+    });
+
+    it('selects sections of a German act on both surfaces', async () => {
+      const body = actHtml(AI_ACT_HEADINGS.DE);
+      serve(body, 'DE');
+      const { result, text } = await call({
+        language: 'DE',
+        select: { articles: '1', chapters: '4', annexes: 'I' },
+      });
+
+      expect(result.selection).toEqual({
+        requested: ['Article 1', 'CHAPTER 4', 'ANNEX I'],
+        matched: ['Article 1', 'CHAPTER IV', 'ANNEX I'],
+        missed: [],
+      });
+      expect(result.content).toContain('Artikel 1');
+      expect(result.content).not.toContain('Artikel 2');
+      // The annex runs to the end of the body; its address stops there.
+      const annex = result.selected_sections?.at(-1);
+      expect(annex!.offset + annex!.chars).toBe(body.length);
+      expect(text).toContain('Returned: Article 1, CHAPTER IV, ANNEX I.');
+      expect(text).toContain('Section addresses');
+    });
+
+    it('reads the headings of the English fallback when the requested language is unavailable', async () => {
+      // French and English share "Article", not "CHAPTER": read as French, the
+      // English chapter and annex would be lost.
+      serve(actHtml(AI_ACT_HEADINGS.EN), 'EN');
+      const { result } = await call({ language: 'FR', outline: true });
+
+      expect(result.requested_language).toBe('FR');
+      expect(result.outline?.filter((h) => h.kind !== 'recital').map((h) => h.label)).toEqual([
+        'CHAPTER I',
+        'Section 1',
+        'Article 1',
+        'Article 2',
+        'CHAPTER IV',
+        'ANNEX I',
+      ]);
+    });
+
+    it('selects "Article premier" by number in a French Formex body', async () => {
+      const formex =
+        '<ARTICLE IDENTIFIER="001"><TI.ART>Article premier</TI.ART><ALINEA>Un.</ALINEA></ARTICLE><ARTICLE IDENTIFIER="002"><TI.ART>Article 2</TI.ART><ALINEA>Deux.</ALINEA></ARTICLE>';
+      serve(formex, 'FR', 'xml');
+      const { result, text } = await call({
+        language: 'FR',
+        format: 'xml',
+        select: { articles: '1' },
+      });
+
+      // Labelled in English, as in html and markdown, whatever the heading text.
+      expect(result.selection?.matched).toEqual(['Article 1']);
+      expect(result.selected_sections?.map((s) => s.label)).toEqual(['Article 1']);
+      expect(result.content).toContain('Article premier');
+      expect(result.content).toContain('Un.');
+      expect(result.content).not.toContain('Deux.');
+      expect(text).toContain('Returned: Article 1.');
+    });
+
+    it('reads a selector written with the served language’s kind words, on both surfaces', async () => {
+      serve(actHtml(AI_ACT_HEADINGS.DE), 'DE');
+      const { result, text } = await call({
+        language: 'DE',
+        select: { articles: 'Artikel 2', chapters: 'Kapitel IV' },
+      });
+      expect(result.selection).toEqual({
+        requested: ['Article 2', 'CHAPTER IV'],
+        matched: ['Article 2', 'CHAPTER IV'],
+        missed: [],
+      });
+      expect(result.content).toContain('Artikel 2');
+      expect(result.content).not.toContain('Artikel 1');
+      expect(text).toContain('Returned: Article 2, CHAPTER IV.');
+    });
+
+    it('reports an unstructured body and unknown sections as misses, with no body', async () => {
+      serve('<p>URTEIL DES GERICHTSHOFS</p>\n<p>Die Klage wird abgewiesen.</p>', 'DE');
+      const outline = await call({ language: 'DE', outline: true });
+      expect(outline.result.outline).toEqual([]);
+      expect(outline.result.structure_detected).toBe(false);
+      expect(outline.text).toContain('No act structure detected');
+
+      serve(actHtml(AI_ACT_HEADINGS.DE), 'DE');
+      // Another language's kind word is not read, so the token is no number here.
+      const { result, text } = await call({
+        language: 'DE',
+        select: { articles: '99,cikk 1' },
+      });
+      expect(result.selection?.missed).toEqual(['Article 99', 'Article CIKK 1']);
+      expect(result.content).toBeUndefined();
+      expect(text).toContain('no such section in this act');
+    });
+
+    it('caps a selection in any language at the body ceiling', async () => {
+      const body = actHtml(AI_ACT_HEADINGS.HU).replace(
+        'Body one.',
+        `Body one. ${'x'.repeat(120_000)}`,
+      );
+      serve(body, 'HU');
+      const { result, enrichment } = await call({ language: 'HU', select: { chapters: 'I' } });
+
+      expect(result.selection?.matched).toEqual(['CHAPTER I']);
+      expect(result.content_chars_returned).toBe(100_000);
+      expect(enrichment).toMatchObject({ truncated: true, cap: 100_000 });
+    });
+  });
+
+  // --- #106 quoted amending text, #118 collapsed recitals ---
+
+  describe('quoted amending text (#106) and the recital run (#118)', () => {
+    /** Mock one body; a Markdown body carries the HTML it was rendered from. */
+    const serve = (content: string, format = 'html', sourceHtml?: string) => {
+      mockSparqlQuery.mockImplementation(async (q: string) =>
+        isResolutionQuery(q) ? resolutionRows(q) : [makeMetaBinding({ celex: '32015R2120' })],
+      );
+      mockFetchContent.mockResolvedValue({
+        content,
+        contentAvailable: true,
+        format,
+        language: 'EN',
+        ...(sourceHtml ? { sourceHtml } : {}),
+      });
+    };
+    /** Run through the full contract, returning both surfaces and the enrichment. */
+    const call = async (args: Record<string, unknown>) => {
+      const response = await runToolContract(eurlex_get_document, {
+        celex_number: '32015R2120',
+        ...args,
+      });
+      expect(response.isError).toBeFalsy();
+      const text = response.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+      return { result: eurlex_get_document.output.parse(response.structuredContent), text };
+    };
+    const AMENDING_MD = htmlToMarkdown(AMENDING_HTML);
+    const OWN = ['Recitals 1–2', 'Article 1', 'Article 2', 'Article 3', 'ANNEX'];
+
+    it.each([
+      ['html', AMENDING_HTML, undefined, OWN],
+      ['markdown', AMENDING_MD, AMENDING_HTML, OWN],
+      ['xml', AMENDING_FORMEX, undefined, OWN.slice(0, -1)],
+    ] as const)(
+      '%s: outlines only the act’s own headings, on both surfaces',
+      async (format, content, html, own) => {
+        serve(content, format, html);
+        const { result, text } = await call({ format, outline: true });
+
+        expect(result.outline?.map((h) => h.label)).toEqual(own);
+        for (const h of result.outline ?? []) {
+          expect(text).toContain(`\`offset ${h.offset}\` — [${h.kind} ${h.number}] ${h.label}`);
+        }
+        expect(text).not.toMatch(/Article 6B|Article 19|Section 4|ANNEX II/i);
+      },
+    );
+
+    it('markdown: the amending article spans its quoted text and a quoted-only number misses', async () => {
+      serve(AMENDING_MD, 'markdown', AMENDING_HTML);
+      const { result, text } = await call({
+        format: 'markdown',
+        select: { articles: '2,19' },
+      });
+
+      expect(result.selection).toEqual({
+        requested: ['Article 2', 'Article 19'],
+        matched: ['Article 2'],
+        missed: ['Article 19'],
+      });
+      expect(result.content).toContain('Quoted nineteen.');
+      expect(result.content).toContain('Amending article tail.');
+      expect(result.content).not.toContain('Body three.');
+      // The address runs to the act's own Article 3.
+      const [section] = result.selected_sections ?? [];
+      expect(AMENDING_MD.slice(section!.offset + section!.chars)).toMatch(/^Article 3\n/);
+      expect(text).toContain('Not found: Article 19 — no such section in this act');
+    });
+
+    it('caps an amending article widened past the body ceiling, addressing it whole', async () => {
+      const long = AMENDING_HTML.replace('Quoted six a.', `Quoted six a. ${'q'.repeat(120_000)}`);
+      serve(long);
+      const { result, text } = await call({ select: { articles: '2' } });
+
+      expect(result.content_chars_returned).toBe(100_000);
+      expect(result.has_more).toBe(false);
+      const [section] = result.selected_sections ?? [];
+      expect(section!.chars).toBeGreaterThan(120_000);
+      expect(long.slice(section!.offset + section!.chars)).toMatch(
+        /^<p class="oj-ti-art">Article 3/,
+      );
+      expect(text).toContain('Capped at 100000 characters');
+    });
+
+    /** A preamble of `n` recitals in CONVEX numbering tables, then one chapter and article. */
+    const withRecitals = (n: number) =>
+      [
+        '<p class="oj-doc-ti">REGULATION (EU) 2016/679</p>',
+        ...Array.from({ length: n }, (_, i) =>
+          [
+            '<table width="100%" border="0"><col width="4%"/><col width="96%"/><tbody><tr>',
+            `<td valign="top"><p class="oj-normal">(${i + 1})</p></td>`,
+            `<td valign="top"><p class="oj-normal">Recital body ${i + 1}.</p></td>`,
+            '</tr></tbody></table>',
+          ].join('\n'),
+        ),
+        '<p class="oj-ti-section-1">CHAPTER I</p>',
+        '<p class="oj-ti-section-2">General provisions</p>',
+        '<p class="oj-ti-art">Article 1</p>',
+        '<p class="oj-sti-art">Subject-matter</p>',
+        '<p class="oj-normal">Article body.</p>',
+      ].join('\n');
+
+    it('collapses the recital run into one entry at recital 1, on both surfaces', async () => {
+      const body = withRecitals(5);
+      serve(body);
+      const { result, text } = await call({ outline: true });
+
+      const [run, ...rest] = result.outline ?? [];
+      expect(run).toEqual({
+        kind: 'recital',
+        number: '1–5',
+        label: 'Recitals 1–5',
+        offset: body.indexOf('<td valign="top"><p class="oj-normal">(1)</p>'),
+      });
+      expect(rest.map((h) => h.label)).toEqual(['CHAPTER I', 'Article 1']);
+      expect(text).toContain(`\`offset ${run!.offset}\` — [recital 1–5] Recitals 1–5`);
+      expect(text).toContain('3 sections detected');
+    });
+
+    it('lists every recital with include_recitals: true', async () => {
+      serve(withRecitals(5));
+      const { result, text } = await call({ outline: true, include_recitals: true });
+
+      expect(result.outline?.map((h) => h.label)).toEqual([
+        'Recital 1',
+        'Recital 2',
+        'Recital 3',
+        'Recital 4',
+        'Recital 5',
+        'CHAPTER I',
+        'Article 1',
+      ]);
+      expect(text).toContain('[recital 3] Recital 3');
+      expect(text).not.toContain('Recitals 1–5');
+    });
+
+    it('keeps a lone recital as its own entry, and an outline without recitals unchanged', async () => {
+      serve(withRecitals(1));
+      expect((await call({ outline: true })).result.outline?.[0]).toMatchObject({
+        number: '1',
+        label: 'Recital 1',
+      });
+
+      serve(withRecitals(0));
+      const without = (await call({ outline: true })).result.outline;
+      serve(withRecitals(0));
+      expect((await call({ outline: true, include_recitals: true })).result.outline).toEqual(
+        without,
+      );
+      expect(without?.map((h) => h.label)).toEqual(['CHAPTER I', 'Article 1']);
+    });
+
+    it('select still reaches a single recital while the outline collapses them', async () => {
+      const body = withRecitals(5);
+      serve(body);
+      const { result } = await call({ select: { recitals: '5' } });
+
+      expect(result.selection?.matched).toEqual(['Recital 5']);
+      expect(result.content).toContain('Recital body 5.');
+      expect(result.content).not.toContain('Recital body 4.');
+      expect(result.content).not.toContain('CHAPTER I');
+    });
+
+    it('returns an empty outline for an unstructured body either way', async () => {
+      serve('<p>JUDGMENT OF THE COURT</p>\n<p>(1) The action is dismissed.</p>');
+      const { result, text } = await call({ outline: true, include_recitals: true });
+      expect(result.outline).toEqual([]);
+      expect(text).toContain('No act structure detected');
+    });
+
+    it('ignores include_recitals outside outline mode, even past the end of the body', async () => {
+      const body = withRecitals(3);
+      serve(body);
+      const { result, text } = await call({ include_recitals: true, offset: body.length + 10 });
+
+      expect(result.outline).toBeUndefined();
+      expect(result.content).toBeUndefined();
+      expect(result.content_offset).toBe(body.length);
+      expect(result.has_more).toBe(false);
+      expect(text).toContain('past the end');
+    });
+
+    it('rejects a non-boolean include_recitals', () => {
+      expect(() =>
+        eurlex_get_document.input.parse({ celex_number: '32016R0679', include_recitals: 'yes' }),
+      ).toThrow();
+    });
+
+    it('states that select ignores offset/limit and is capped', () => {
+      const shape = eurlex_get_document.input.shape;
+      expect(shape.select.description).toContain('offset and limit do not apply');
+      expect(shape.select.description).toContain('capped at 100000 characters');
+      expect(shape.select.description).toContain('selected_sections');
+      expect(shape.limit.description).toContain('select ignores it');
     });
   });
 
