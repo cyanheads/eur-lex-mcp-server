@@ -285,6 +285,16 @@ describe('case-law outline (#117)', () => {
     );
   });
 
+  it.each([
+    'Slijedom navedenoga, Sud (veliko vijeće) odlučuje:',
+    'Slijedom navedenog, Sud (deseto vijeće) odlučuje:',
+  ])('takes the Croatian ruling with or without the final vowel: %s', (ruling) => {
+    const html = `<p class="coj-sum-title-1"><span class="coj-bold">Troškovi</span></p>\n<p>${ruling}</p>`;
+    expect(entries(parseDocumentStructure('62018CJ0311', html, 'html', 'HR'))).toEqual(
+      outline(['Troškovi'], true),
+    );
+  });
+
   it('bounds the Dutch formula on a long paragraph with no period', { timeout: 30_000 }, () => {
     // A quadratic pattern takes ~1.9 s on this paragraph; the bound is over 10x below that.
     const paragraph = `<p>Het Hof ${'verklaart '.repeat(12_600)}</p>`;

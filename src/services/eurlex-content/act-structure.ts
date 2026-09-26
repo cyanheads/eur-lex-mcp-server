@@ -995,8 +995,10 @@ const RULING_CELEX_RE = /^6\d{4}[A-Z][JO]/;
  * the verb: "Het Hof (Vierde kamer) verklaart voor recht:", each gap bounded so a long
  * paragraph with no period is not backtracked over quadratically. EN, FR, and DE are read
  * from `62012CJ0131`, EN also from `62014TJ0353`, `62023CO0141`, and `62025TJ0069`,
- * FR also from `62025TJ0069`, and ES, IT, NL, PL, SV, LT, HR, and EL from
- * `62019CJ0311`; the rest are the Court's standard wording, best-effort.
+ * FR also from `62025TJ0069`, ES, IT, NL, PL, SV, LT, HR, and EL from
+ * `62019CJ0311`, and PT, DA, FI, HU, ET, BG, and HR again from `62018CJ0311`. Croatian
+ * writes the formula both as "Slijedom navedenog" and "Slijedom navedenoga"
+ * (`62018CJ0311`). The rest are the Court's standard wording, best-effort.
  */
 const OPERATIVE_FORMULAS: Record<EurLexLanguage, readonly string[]> = {
   EN: ['On those grounds', 'On these grounds'],
@@ -1025,7 +1027,7 @@ const OPERATIVE_FORMULAS: Record<EurLexLanguage, readonly string[]> = {
   SL: ['Iz teh razlogov'],
   SV: ['Mot denna bakgrund', 'På dessa grunder'],
   BG: ['По изложените съображения'],
-  HR: ['Slijedom navedenog'],
+  HR: ['Slijedom navedenoga?'],
   GA: ['Ar na forais sin'],
 };
 
