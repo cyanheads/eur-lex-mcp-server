@@ -23,6 +23,7 @@ import {
 import {
   celexFragmentRoute,
   celexPrefixMatch,
+  celexPrefixTerms,
   keywordMatchPattern,
   keywordTitlePhrase,
 } from '@/services/cellar-sparql/keyword-match.js';
@@ -137,6 +138,28 @@ function celexSubstringMatch(value: string): string {
     : `FILTER(CONTAINS(LCASE(STR(?celexNumber)), LCASE("${escapeSparqlLiteral(value)}")))`;
 }
 
+/**
+ * The match for a parsed case number: `{year}{court}[{document letters}]{number}` as
+ * an unanchored `REGEX` behind one CELEX full-text prefix term per
+ * document letter (`'62014CJ0443*' OR '62014CO0443*' OR …`), so CELLAR tests the
+ * index hits rather than every sector-6 CELEX (#138). The terms reach every CELEX the
+ * `REGEX` admits: a four-digit year followed by two letters sits only at position 2
+ * of a sector-6 CELEX (the #134 survey), so the match opens its first word. Each
+ * term is built from the parsed digits, the court letter, and a document letter
+ * from {@link CASE_NUMBER_DOCUMENT_LETTERS}, never from caller text. A year written
+ * with fewer than four digits (`C-131/012`, read as 12) keeps the `REGEX` alone,
+ * which reaches that year's digits at the end of a four-digit year.
+ */
+function caseNumberMatch(
+  { court, year, number }: { court: CaseCourtLetter; year: number; number: string },
+  documentLetters: string,
+): string {
+  const regex = `FILTER(REGEX(STR(?celexNumber), "${year}${court}[${documentLetters}]${number}"))`;
+  if (year < 1000) return regex;
+  const terms = [...documentLetters].map((letter) => `6${year}${court}${letter}${number}`);
+  return `${celexPrefixTerms('?celexNumber', terms)}\n    ${regex}`;
+}
+
 type ParsedCaseNumber =
   | { kind: 'case'; court: CaseCourtLetter; year: number; number: string }
   | { kind: 'unprefixed_out_of_range'; year: number }
@@ -182,7 +205,7 @@ function parseCaseNumber(value: string): ParsedCaseNumber {
 export const eurlex_get_cases = tool('eurlex_get_cases', {
   title: 'Search CJEU/GC Case Law',
   description:
-    'Search CJEU and General Court case law — judgments, orders, and Advocate General opinions — by case number, court, case type, keyword, and date range. A case number reaches every judgment, order, and AG opinion filed under it. By default only these primary records are returned; derivative judicial information notices, case abstracts, summaries, and corrigenda are excluded so distinct cases fill the page (set include_derivative to include them). Keyword matches English case titles (which carry party names) and CELEX strings; there is no full-text body search. Returns each case with its CELEX number (whose sixth character names the court: C, T, or F), work URI, ECLI, date, and type, plus — parsed from the title where present — the parties, subject matter, and case reference.',
+    'Search CJEU and General Court case law — judgments, orders, and Advocate General opinions — by case number, court, case type, keyword, and date range. A case number reaches every judgment, order, and AG opinion filed under it. By default only these primary records are returned; derivative judicial information notices, case abstracts, summaries, and corrigenda are excluded so distinct cases fill the page (set include_derivative to include them). Keyword matches English case titles (which carry party names) and CELEX strings; there is no full-text body search. Returns each case with its CELEX number (whose sixth character names the court: C, T, or F), work URI, ECLI, date, and type, plus — parsed from the title where present — the formation, Advocate General, parties, referring court, subject matter, and case reference. The raw CELLAR title is returned only when those fields do not capture all of it.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
     case_number: z
@@ -295,19 +318,37 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
               .string()
               .optional()
               .describe(
-                'Raw English expression title as stored in CELLAR — a "#"-delimited string (court+date, parties, subject-matter, case reference) whose segments are surfaced in display_title, parties, subject_matter, and case_reference. Absent for many older cases.',
+                'Raw English expression title as stored in CELLAR, a "#"-delimited string (court, formation and date; parties; referral; subject matter; case reference). Present only when the parsed fields do not capture all of it: a segment the parser could not place, a judgment or order published by extracts ("(Extracts)"), a leading date that differs from date, or a title with no "#". Absent when the parse is complete, and for records with no English title.',
+              ),
+            formation: z
+              .string()
+              .optional()
+              .describe(
+                'Formation that decided, from the title\'s leading segment, verbatim (e.g. "Grand Chamber", "Full Court", "Fourth Chamber, Extended Composition"), or "President", "Vice-President", or "President of the Second Chamber" for an order issued by that office. Absent when the title names none, as older "Judgment of the Court of …" titles do.',
+              ),
+            advocate_general: z
+              .string()
+              .optional()
+              .describe(
+                'Advocate General who delivered the opinion, from an AG opinion title (e.g. "Jääskinen"). Absent on judgments and orders.',
               ),
             display_title: z
               .string()
               .optional()
               .describe(
-                'Clean human-readable title for display — the parties for a contested case (e.g. "Google Spain SL v AEPD"), or the court/AG descriptor when a case has no named parties. Parsed from title; absent when title is.',
+                'Clean human-readable title for display — the parties for a contested case (e.g. "Google Spain SL v AEPD"), or the court/AG descriptor when a case has no named parties. Parsed from the English title; absent when the record has none or its title carries no "#" segments.',
               ),
             parties: z
               .string()
               .optional()
               .describe(
                 'Parties to the case, parsed from the title (e.g. "WhatsApp Ireland Ltd v European Data Protection Board."). Absent when the title carries no parties segment (e.g. AG opinions).',
+              ),
+            referring_court: z
+              .string()
+              .optional()
+              .describe(
+                'National court that referred a preliminary ruling, from the title\'s referral segment (e.g. "Audiencia Nacional", or "Tariefcommissie - Netherlands" in older titles). Absent on direct actions and appeals.',
               ),
             subject_matter: z
               .string()
@@ -448,10 +489,12 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
      * fixes year, court letter, and number and lets the document letter vary over
      * the set that court uses. Notice letters join only when derivative records are
      * admitted. The REGEX is unanchored, as the former CONTAINS was, so every value
-     * that parsed before still reaches what it reached then. A value that parses as
-     * no case number keeps the CELEX-substring match only when it is made of CELEX
-     * characters, answered from the CELEX index where its opening allows
-     * ({@link celexSubstringMatch}); anything else could never match and is rejected.
+     * that parsed before still reaches what it reached then; it confirms the CELEX
+     * index hits of one prefix term per letter ({@link caseNumberMatch}). A value
+     * that parses as no case number keeps the CELEX-substring match only when it is
+     * made of CELEX characters, answered from the CELEX index where its opening
+     * allows ({@link celexSubstringMatch}); anything else could never match and is
+     * rejected.
      */
     let celexFragment: string | undefined;
     const caseNumberInput = input.case_number?.trim();
@@ -462,9 +505,7 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
         const admitsNotices = !input.case_type && input.include_derivative;
         const documentLetters = letters.primary + (admitsNotices ? letters.notices : '');
         celexFragment = `${parsed.year}${parsed.court}*${parsed.number}`;
-        filters.push(
-          `FILTER(REGEX(STR(?celexNumber), "${parsed.year}${parsed.court}[${documentLetters}]${parsed.number}"))`,
-        );
+        filters.push(caseNumberMatch(parsed, documentLetters));
       } else if (parsed.kind === 'unparsed' && CELEX_CHARACTERS.test(caseNumberInput)) {
         filters.push(celexSubstringMatch(caseNumberInput));
       } else {
@@ -703,8 +744,11 @@ ${projection('?date')} WHERE {
         resource_type?: string;
         date?: string;
         title?: string;
+        formation?: string;
+        advocate_general?: string;
         display_title?: string;
         parties?: string;
+        referring_court?: string;
         subject_matter?: string;
         case_reference?: string;
       } = {
@@ -721,16 +765,22 @@ ${projection('?date')} WHERE {
       if (resourceType) c.resource_type = resourceType;
       const date = CellarSparqlService.bindingValue(b, 'docDate');
       if (date) c.date = date;
-      // Preserve the raw title verbatim, then surface the parsed case-law segments
-      // (parties/subject-matter/case-reference and a clean display title) alongside
-      // it — nothing is dropped, and a sparse or malformed title just leaves the
-      // structured fields unset (issue #40).
+      /**
+       * Surface the parsed case-law segments, and the raw title only when the parse
+       * is incomplete (#116). A complete parse places every segment in a field and
+       * dates the title as the row is dated, so dropping the raw string loses nothing
+       * while it would otherwise repeat the row; an incomplete one keeps it, so
+       * nothing the fields miss is dropped (#40).
+       */
       const title = CellarSparqlService.bindingValue(b, 'docTitle');
       if (title) {
-        c.title = title;
-        const parsed = parseCaseLawTitle(title);
+        const parsed = parseCaseLawTitle(title, date);
+        if (!parsed.complete) c.title = title;
+        if (parsed.formation) c.formation = parsed.formation;
+        if (parsed.advocateGeneral) c.advocate_general = parsed.advocateGeneral;
         if (parsed.displayTitle) c.display_title = parsed.displayTitle;
         if (parsed.parties) c.parties = parsed.parties;
+        if (parsed.referringCourt) c.referring_court = parsed.referringCourt;
         if (parsed.subjectMatter) c.subject_matter = parsed.subjectMatter;
         if (parsed.caseReference) c.case_reference = parsed.caseReference;
       }
@@ -776,11 +826,14 @@ ${projection('?date')} WHERE {
       if (c.date) lines.push(`**Date:** ${c.date}`);
       if (c.ecli) lines.push(`**ECLI:** ${c.ecli}`);
       if (c.resource_type) lines.push(`**Type:** ${c.resource_type}`);
-      if (c.parties) lines.push(`**Parties:** ${c.parties}`);
+      if (c.formation) lines.push(`**Formation:** ${c.formation}`);
+      if (c.advocate_general) lines.push(`**Advocate General:** ${c.advocate_general}`);
+      // The heading already shows the parties when they are the display title.
+      if (c.parties && c.parties !== heading) lines.push(`**Parties:** ${c.parties}`);
+      if (c.referring_court) lines.push(`**Referring court:** ${c.referring_court}`);
       if (c.subject_matter) lines.push(`**Subject matter:** ${c.subject_matter}`);
       if (c.case_reference) lines.push(`**Case reference:** ${c.case_reference}`);
-      // Full raw CELLAR title — carries the court/chamber/date descriptor the parsed
-      // fields omit, and keeps the original string available to the reader.
+      // Raw CELLAR title, present only when the parsed fields miss part of it.
       if (c.title) lines.push(`**Full title:** ${c.title}`);
       lines.push(`**Work URI:** ${c.work_uri}`);
       lines.push('');

@@ -122,6 +122,26 @@ function admits(sparql: string, celex: string): boolean {
   );
 }
 
+/** Every `?celexNumber bif:contains "…"` expression in a query. */
+function indexExpressions(sparql: string): string[] {
+  return [...sparql.matchAll(/\?celexNumber bif:contains "([^"]*)"/g)].map((m) => m[1] ?? '');
+}
+
+/**
+ * Whether a query's CELEX index terms and CELEX filters both admit a CELEX, the
+ * index modelled as CELLAR's: a term `'X*'` hits a literal when a word of it starts
+ * with X, words split at every character outside `[0-9A-Z]`.
+ */
+function reaches(sparql: string, celex: string): boolean {
+  const words = celex.split(/[^0-9A-Z]+/);
+  const indexed = indexExpressions(sparql).every((expression) =>
+    [...expression.matchAll(/'([0-9A-Z]+)\*'/g)].some(([, term]) =>
+      words.some((word) => word.startsWith(term ?? '')),
+    ),
+  );
+  return indexed && admits(sparql, celex);
+}
+
 /** Every record CELLAR holds under C-97/23 and T-97/23 (live, 2026-09-25). */
 const C_97_23_PRIMARY = [
   '62023CJ0097',
@@ -980,7 +1000,7 @@ describe('eurlex_get_cases', () => {
 
   // --- #40: case title parsed into structured fields ---
 
-  it('parses a #-delimited case title into structured fields, preserving the raw title', async () => {
+  it('parses a #-delimited case title into structured fields, dropping the raw title on a complete parse', async () => {
     const ctx = createMockContext({ errors: eurlex_get_cases.errors });
     const rawTitle =
       'Judgment of the Court (Grand Chamber) of 10 February 2026.#WhatsApp Ireland Ltd v European Data Protection Board.#Appeal – Protection of natural persons – Regulation (EU) 2016/679.#Case C-97/23 P.';
@@ -996,9 +1016,9 @@ describe('eurlex_get_cases', () => {
     const result = await eurlex_get_cases.handler(input, ctx);
 
     const c = result.cases[0];
-    // Raw title preserved verbatim — nothing dropped (issue #40 is additive).
-    expect(c?.title).toBe(rawTitle);
-    // Parsed segments surfaced alongside it.
+    // Every segment landed in a field and the title is dated as the row is (#116).
+    expect(c).not.toHaveProperty('title');
+    expect(c?.formation).toBe('Grand Chamber');
     expect(c?.display_title).toBe('WhatsApp Ireland Ltd v European Data Protection Board.');
     expect(c?.parties).toBe('WhatsApp Ireland Ltd v European Data Protection Board.');
     expect(c?.case_reference).toBe('Case C-97/23 P.');
@@ -1020,7 +1040,9 @@ describe('eurlex_get_cases', () => {
     const result = await eurlex_get_cases.handler(input, ctx);
 
     const c = result.cases[0];
-    expect(c?.title).toBe(rawTitle);
+    // The descriptor is the only segment, and it parses: the raw title adds nothing.
+    expect(c).not.toHaveProperty('title');
+    expect(c?.advocate_general).toBe('Kokott');
     // The parties/subject/reference segments are empty — none is fabricated.
     expect(c?.parties).toBeUndefined();
     expect(c?.subject_matter).toBeUndefined();
@@ -1072,11 +1094,168 @@ describe('eurlex_get_cases', () => {
     expect(text).toContain('62023CJ0097 — WhatsApp Ireland Ltd v European Data Protection Board.');
     const headingLine = text.split('\n').find((l) => l.startsWith('### '));
     expect(headingLine).not.toContain('#Appeal');
-    expect(text).toContain('**Parties:** WhatsApp Ireland Ltd v European Data Protection Board.');
+    // The parties are the heading, so no Parties line repeats them (#116).
+    expect(text).not.toContain('**Parties:**');
     expect(text).toContain('**Subject matter:** Appeal – Protection of natural persons.');
     expect(text).toContain('**Case reference:** Case C-97/23 P.');
     // The full raw title stays available as a labelled line (format parity).
     expect(text).toContain('**Full title:** Judgment of the Court of 10 February 2026.#WhatsApp');
+  });
+
+  // --- #116: formation, referring court, AG; raw title only when unparsed ---
+
+  describe('parsed case fields and the complete-parse title rule (#116)', () => {
+    const JUDG = 'http://publications.europa.eu/resource/authority/resource-type/JUDG';
+    const OPIN_AG = 'http://publications.europa.eu/resource/authority/resource-type/OPIN_AG';
+    const PARTIES =
+      'Google Spain SL and Google Inc. v Agencia Española de Protección de Datos (AEPD) and Mario Costeja González.';
+    const SUBJECT =
+      'Personal data — Protection of individuals with regard to the processing of such data — Directive 95/46/EC — Articles 7 and 8.';
+    const TAIL = `#${PARTIES}#Request for a preliminary ruling from the Audiencia Nacional.#${SUBJECT}#Case C‑131/12.`;
+    const USDAW =
+      'Advocate General’s Opinion - 5 February 2015#USDAW and Wilson#Case C-80/14#Advocate General: Wahl';
+    const SPACENET =
+      'Judgment of the Court (Grand Chamber) of 20 September 2022.#Bundesrepublik Deutschland v SpaceNet AG.#Requests for a preliminary ruling from the Bundesverwaltungsgericht.#Reference for a preliminary ruling – Processing of personal data.#Joined Cases C-793/19 and C-794/19.';
+    const PLAIN = 'Opinion of Advocate General Cruz Villalón delivered on 8 September 2015.';
+    const EXTRACTS =
+      'Judgment of the General Court (Eighth Chamber) of 15 September 2016 (Extracts).#Italian Republic v European Commission.#Rules on languages — Notices of open competition.#Cases T-353/14 and T-17/15.';
+
+    /** The C-131/12 page as CELLAR returns it: the judgment and the AG opinion. */
+    const googleSpainPage = () => [
+      makeCaseBinding('62012CJ0131', {
+        date: '2014-05-13',
+        ecli: 'ECLI:EU:C:2014:317',
+        types: JUDG,
+        title: `Judgment of the Court (Grand Chamber), 13 May 2014.${TAIL}`,
+      }),
+      makeCaseBinding('62012CC0131', {
+        date: '2013-06-25',
+        ecli: 'ECLI:EU:C:2013:424',
+        types: OPIN_AG,
+        title: `Opinion of Advocate General Jääskinen delivered on 25 June 2013.${TAIL}`,
+      }),
+    ];
+
+    it('returns the C-131/12 judgment row as parsed fields with no raw title, on both surfaces', async () => {
+      mockQuery.mockImplementation(async (q: string) =>
+        q.includes('GROUP BY ?celexNumber') ? googleSpainPage() : celexWorkRows(q),
+      );
+
+      const result = await runToolContract(eurlex_get_cases, { case_number: 'C-131/12' });
+
+      expect(result.isError).toBeFalsy();
+      const structured = eurlex_get_cases.output.parse(result.structuredContent);
+      const [judgment, opinion] = structured.cases;
+      const { work_uri: _workUri, ...judgmentFields } = judgment ?? { work_uri: '' };
+      expect(judgmentFields).toEqual({
+        celex_number: '62012CJ0131',
+        ecli: 'ECLI:EU:C:2014:317',
+        resource_type: 'Judgment',
+        date: '2014-05-13',
+        formation: 'Grand Chamber',
+        display_title: PARTIES,
+        parties: PARTIES,
+        referring_court: 'Audiencia Nacional',
+        subject_matter: SUBJECT,
+        case_reference: 'Case C‑131/12.',
+      });
+      expect(opinion).toMatchObject({
+        advocate_general: 'Jääskinen',
+        referring_court: 'Audiencia Nacional',
+      });
+      expect(opinion).not.toHaveProperty('title');
+      expect(opinion).not.toHaveProperty('formation');
+
+      const text = contentText(result);
+      expect(text).toContain(`### 62012CJ0131 — ${PARTIES}`);
+      expect(text).toContain('**Formation:** Grand Chamber');
+      expect(text).toContain('**Advocate General:** Jääskinen');
+      expect(text).toContain('**Referring court:** Audiencia Nacional');
+      expect(text).toContain(`**Subject matter:** ${SUBJECT}`);
+      expect(text).not.toContain('**Full title:**');
+      expect(text).not.toContain('**Parties:**');
+    });
+
+    it.each([
+      ['a leading segment of no known shape', '62014CC0080', '2015-02-05', USDAW],
+      ['a leading date that differs from the row date', '62019CJ0793', '2022-10-27', SPACENET],
+      ['a title with no "#"', '62014CC0489', '2015-09-08', PLAIN],
+      ['a judgment published by extracts', '62014TJ0353', '2016-09-15', EXTRACTS],
+    ])('keeps the raw title on both surfaces for %s', async (_label, celex, date, title) => {
+      mockQuery.mockImplementation(async (q: string) =>
+        q.includes('GROUP BY ?celexNumber')
+          ? [makeCaseBinding(celex, { date, title })]
+          : celexWorkRows(q),
+      );
+
+      const result = await runToolContract(eurlex_get_cases, { keyword: 'test' });
+
+      const structured = eurlex_get_cases.output.parse(result.structuredContent);
+      expect(structured.cases[0]?.title).toBe(title);
+      expect(contentText(result)).toContain(`**Full title:** ${title}`);
+    });
+
+    it('reads a joined-case reference and keeps the keyword segment as subject matter', async () => {
+      mockQuery.mockResolvedValue([
+        makeCaseBinding('62019CJ0793', { date: '2022-09-20', title: SPACENET, types: JUDG }),
+      ]);
+
+      const result = await eurlex_get_cases.handler(
+        eurlex_get_cases.input.parse({ keyword: 'SpaceNet' }),
+        createMockContext({ errors: eurlex_get_cases.errors }),
+      );
+
+      expect(result.cases[0]).toMatchObject({
+        case_reference: 'Joined Cases C-793/19 and C-794/19.',
+        referring_court: 'Bundesverwaltungsgericht',
+        subject_matter: 'Reference for a preliminary ruling – Processing of personal data.',
+      });
+      expect(result.cases[0]).not.toHaveProperty('title');
+    });
+
+    it('keeps the Parties line when the heading is not the parties', () => {
+      const blocks = eurlex_get_cases.format!({
+        cases: [
+          {
+            work_uri: 'http://publications.europa.eu/resource/cellar/usdaw',
+            celex_number: '62014CC0080',
+            title: USDAW,
+            parties: 'USDAW and Wilson',
+          },
+        ],
+        total: 1,
+        offset: 0,
+        has_more: false,
+        query_echo: { include_derivative: false },
+      });
+      const text = (blocks[0] as { text: string }).text;
+      expect(text).toContain(`### 62014CC0080 — ${USDAW}`);
+      expect(text).toContain('**Parties:** USDAW and Wilson');
+    });
+
+    it('adds formation, referring_court, and advocate_general as the only new optional row fields', () => {
+      const row = eurlex_get_cases.output.shape.cases.element;
+      expect(Object.keys(row.shape).sort()).toEqual(
+        [
+          'advocate_general',
+          'case_reference',
+          'celex_number',
+          'date',
+          'display_title',
+          'ecli',
+          'formation',
+          'parties',
+          'referring_court',
+          'resource_type',
+          'subject_matter',
+          'title',
+          'work_uri',
+        ].sort(),
+      );
+      for (const field of ['formation', 'referring_court', 'advocate_general', 'title'] as const) {
+        expect(row.shape[field].safeParse(undefined).success).toBe(true);
+      }
+    });
   });
 
   // --- #77: impossible calendar dates and inverted ranges ---
@@ -2298,26 +2477,6 @@ describe('eurlex_get_cases', () => {
       return search;
     }
 
-    /** Every `?celexNumber bif:contains "…"` expression in a query. */
-    function indexExpressions(sparql: string): string[] {
-      return [...sparql.matchAll(/\?celexNumber bif:contains "([^"]*)"/g)].map((m) => m[1] ?? '');
-    }
-
-    /**
-     * Whether a query's CELEX index terms and CELEX filters both admit a CELEX, the
-     * index modelled as CELLAR's: a term `'X*'` hits a literal when a word of it
-     * starts with X, words split at every character outside `[0-9A-Z]`.
-     */
-    function reaches(sparql: string, celex: string): boolean {
-      const words = celex.split(/[^0-9A-Z]+/);
-      const indexed = indexExpressions(sparql).every((expression) =>
-        [...expression.matchAll(/'([0-9A-Z]+)\*'/g)].some(([, term]) =>
-          words.some((word) => word.startsWith(term ?? '')),
-        ),
-      );
-      return indexed && admits(sparql, celex);
-    }
-
     /** Sector-6 CELEX from live CELLAR (2026-09-25), off-pattern ones included. */
     const SECTOR_6_CELEX = [
       '62013CJ0131',
@@ -2491,6 +2650,199 @@ describe('eurlex_get_cases', () => {
       expect(description).toContain('CELEX index');
       expect(description).toMatch(/2013CJ0131[^.]*CJ0131/);
       expect(description).toMatch(/12CJ0131[^.]*tests every CELEX/);
+    });
+  });
+
+  // --- #138: a parsed case_number narrows through the CELEX index, REGEX confirming ---
+
+  describe('parsed case_number through the CELEX full-text index (#138)', () => {
+    /** The grouped search the handler sends for `input`. */
+    async function searchFor(input: Record<string, unknown>): Promise<string> {
+      mockQuery.mockReset();
+      mockQuery.mockResolvedValue([makeCaseBinding('62014CJ0443')]);
+      await eurlex_get_cases.handler(
+        eurlex_get_cases.input.parse(input),
+        createMockContext({ errors: eurlex_get_cases.errors }),
+      );
+      const search = mockQuery.mock.calls
+        .map((c) => c[0] as string)
+        .find((q) => q.includes('GROUP BY ?celexNumber'));
+      if (!search) throw new Error('No search query was sent');
+      return search;
+    }
+
+    const terms = (prefix: string, letters: string, number: string) =>
+      [...letters].map((letter) => `'${prefix}${letter}${number}*'`).join(' OR ');
+
+    it.each([
+      ['C-443/14', {}, terms('62014C', 'JOCPSTD', '0443'), '2014C[JOCPSTD]0443'],
+      ['82/85', {}, terms('61985C', 'JOCPSTD', '0082'), '1985C[JOCPSTD]0082'],
+      [
+        'C-131/12',
+        { include_derivative: true },
+        terms('62012C', 'JOCPSTDABN', '0131'),
+        '2012C[JOCPSTDABN]0131',
+      ],
+      [
+        'C-131/12',
+        { include_derivative: true, case_type: 'judgment' },
+        terms('62012C', 'JOCPSTD', '0131'),
+        '2012C[JOCPSTD]0131',
+      ],
+      ['T-97/23 P', {}, terms('62023T', 'JOCT', '0097'), '2023T[JOCT]0097'],
+      [
+        'F-12/05',
+        { include_derivative: true },
+        terms('62005F', 'JOABN', '0012'),
+        '2005F[JOABN]0012',
+      ],
+    ])(
+      'narrows %s %j with one prefix term per admitted document letter, keeping the REGEX',
+      async (caseNumber, options, expression, pattern) => {
+        const sparql = await searchFor({ case_number: caseNumber, ...options });
+
+        expect(indexExpressions(sparql)).toEqual([expression]);
+        expect(sparql).toContain(`FILTER(REGEX(STR(?celexNumber), "${pattern}"))`);
+        expect(sparql).not.toContain('LCASE(STR(?celexNumber))');
+      },
+    );
+
+    /**
+     * Parity with the REGEX alone over live sector-6 CELEX (2026-09-25), siblings,
+     * corrigenda, suffixed records, and off-pattern values included: `admits` reads
+     * only the FILTER lines, so it is the match the tool made before the index terms.
+     */
+    const LIVE_SECTOR_6 = [
+      '62014CJ0443',
+      '62014CC0443',
+      '61985CO0082',
+      '61985CO0082(01)',
+      '62012CJ0131',
+      '62012CC0131',
+      '62012CA0131',
+      '62012CN0131',
+      '62024CJ0131_SUM',
+      '62013CJ0131',
+      ...C_97_23_PRIMARY,
+      ...C_97_23_DERIVATIVE,
+      ...T_97_23_RECORDS,
+      '62021CO0121',
+      '62021CO0121(01)',
+      '62021CO0121(01)_SUM',
+      '62021CO0121_1',
+      '62021CO0121_SUM',
+      '62022CO0121_INF',
+      '62017TN0161R(01)',
+      '62014CN00016',
+      '62011CN347',
+      '62013CV0002',
+      '61962CJ0026',
+    ];
+
+    it.each([
+      ['C-443/14', false],
+      ['82/85', false],
+      ['C-131/12', true],
+      ['C-131/12', false],
+      ['C-97/23', true],
+      ['T-97/23', true],
+      ['C-121/21', true],
+      ['T-161/17', true],
+      ['C-1/14', true],
+      ['C-347/11', true],
+      ['C-2/13', false],
+    ])(
+      'reaches through the index exactly the CELEX the REGEX admits for %s (include_derivative %s)',
+      async (caseNumber, includeDerivative) => {
+        const sparql = await searchFor({
+          case_number: caseNumber,
+          include_derivative: includeDerivative,
+        });
+
+        expect(indexExpressions(sparql)).toHaveLength(1);
+        for (const celex of LIVE_SECTOR_6) {
+          expect(reaches(sparql, celex), celex).toBe(admits(sparql, celex));
+        }
+      },
+    );
+
+    it('reaches the corrigendum, suffixed records, and five-digit number the REGEX reaches', async () => {
+      const sparql = await searchFor({ case_number: 'C-121/21', include_derivative: true });
+      for (const celex of ['62021CO0121(01)_SUM', '62021CO0121_1', '62021CO0121_SUM']) {
+        expect(reaches(sparql, celex), celex).toBe(true);
+      }
+      expect(
+        reaches(
+          await searchFor({ case_number: 'T-161/17', include_derivative: true }),
+          '62017TN0161R(01)',
+        ),
+      ).toBe(true);
+      expect(
+        reaches(
+          await searchFor({ case_number: 'C-1/14', include_derivative: true }),
+          '62014CN00016',
+        ),
+      ).toBe(true);
+    });
+
+    it('keeps the REGEX alone for a year written with fewer than four digits', async () => {
+      const sparql = await searchFor({ case_number: 'C-131/012' });
+
+      expect(indexExpressions(sparql)).toEqual([]);
+      expect(sparql).toContain('FILTER(REGEX(STR(?celexNumber), "12C[JOCPSTD]0131"))');
+    });
+
+    it('narrows the page subquery and the outer query alike in the date-bounded form', async () => {
+      const sparql = await searchFor({ case_number: 'C-443/14', date_from: '2015-01-01' });
+
+      const subquery = sparql.indexOf('SELECT ?celexNumber (SAMPLE(?date) AS ?pageDate)');
+      const pageEnd = sparql.indexOf('LIMIT 21 OFFSET 0');
+      expect(subquery).toBeGreaterThan(-1);
+      for (const part of [sparql.slice(subquery, pageEnd), sparql.slice(pageEnd)]) {
+        expect(indexExpressions(part)).toEqual([terms('62014C', 'JOCPSTD', '0443')]);
+        expect(part).toContain('FILTER(REGEX(STR(?celexNumber), "2014C[JOCPSTD]0443"))');
+      }
+    });
+
+    /**
+     * The injection guarantee: the terms come from the parsed digits, the court
+     * letter, and the document-letter table, never from caller text. Text after the
+     * year is ignored as a procedural suffix, so a payload there parses and must stay
+     * out of the query.
+     */
+    it.each([
+      "C-443/14' OR 'x",
+      'C-443/14 P" } ; DROP',
+      "Case C-443/14 *' AND 'Z",
+      'C-443/14\\',
+      'c-443/14 x"y',
+    ])('keeps the text after the year of %j out of the query', async (caseNumber) => {
+      const sparql = await searchFor({ case_number: caseNumber });
+
+      expect(indexExpressions(sparql)).toEqual([terms('62014C', 'JOCPSTD', '0443')]);
+      expect(sparql).toContain('FILTER(REGEX(STR(?celexNumber), "2014C[JOCPSTD]0443"))');
+      const suffix = caseNumber.slice(caseNumber.indexOf('/14') + 3);
+      expect(sparql).not.toContain(suffix);
+    });
+
+    it('builds index expressions only from quoted [0-9A-Z] terms over randomized suffixes', async () => {
+      const alphabet = `ABCPRTjo()'"*\\ {}.;\n\tORAND-_`;
+      let seed = 138;
+      const next = () => {
+        seed = (seed * 1_103_515_245 + 12_345) % 2 ** 31;
+        return seed;
+      };
+      for (let i = 0; i < 200; i++) {
+        const length = 1 + (next() % 16);
+        const suffix = Array.from({ length }, () => alphabet[next() % alphabet.length]).join('');
+        const sparql = await searchFor({ case_number: `C-${1 + (next() % 999)}/14${suffix}` });
+        const expressions = indexExpressions(sparql);
+        expect(expressions, suffix).toHaveLength(1);
+        expect(expressions[0], suffix).toMatch(
+          /^'62014C[JOCPSTD]\d{4}\*'(?: OR '62014C[JOCPSTD]\d{4}\*'){6}$/,
+        );
+        expect(sparql.match(/bif:contains/g)?.length, suffix).toBe(1);
+      }
     });
   });
 });
