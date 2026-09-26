@@ -11,9 +11,9 @@
  *
  * The archive is untrusted input, read with a central-directory reader over
  * `node:zlib` so the same code runs on Bun and Node. Anything malformed or
- * unsafe — no end record, a truncated or overlapping layout, an encrypted
- * entry, a method other than stored or deflated, a duplicate or path-traversal
- * name, a declared size over {@link FORMEX_PACKAGE_MAX_BYTES}, an entry that
+ * unsafe — no end record, a central directory or entry running past the
+ * archive, an encrypted entry, a method other than stored or deflated, a
+ * duplicate or path-traversal name, a declared size over {@link FORMEX_PACKAGE_MAX_BYTES}, an entry that
  * inflates to anything but its declared size, or one whose bytes fail its
  * CRC-32 — reads as no package, never a throw. Inflation is bounded by each
  * entry's declared size and stops there, so a lying central directory cannot
