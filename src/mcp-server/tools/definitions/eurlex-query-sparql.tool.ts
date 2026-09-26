@@ -5,6 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { echoValue } from '@/mcp-server/tools/echo-value.js';
 import { getCellarSparqlService } from '@/services/cellar-sparql/cellar-sparql-service.js';
 import type { SparqlBinding, SparqlTerm } from '@/services/cellar-sparql/types.js';
 
@@ -22,11 +23,19 @@ function formatDatatype(datatype: string): string {
     : `<${datatype}>`;
 }
 
+/** A letter or digit — the only neighbours that keep a `_` from delimiting emphasis. */
+const WORD_CHAR = /[\p{L}\p{N}]/u;
+
 /**
  * Encode a literal lexical form for the Markdown layer after applying the
  * SPARQL string escapes that preserve its term identity. Only lexical content
  * is encoded; term delimiters, datatype suffixes, and language tags are added
  * afterward and remain ordinary SPARQL/Turtle syntax.
+ *
+ * A `_` with a letter or digit on both sides is left bare: CommonMark (§6.2)
+ * lets such an underscore neither open nor close emphasis, so a backslash there
+ * only corrupts identifiers agents copy (`72022L2555ROU_202405184`). Every other
+ * `_` — beside punctuation, whitespace, or a string edge — stays escaped (#76).
  */
 function formatLiteralLexical(value: string): string {
   const sparqlEscaped = value
@@ -39,7 +48,11 @@ function formatLiteralLexical(value: string): string {
   return sparqlEscaped
     .replace(/\\/g, '\\\\')
     .replace(/\|/g, '\\|')
-    .replace(/([<>&*_[\]`~])/g, '\\$1');
+    .replace(/[<>&*_[\]`~]/g, (ch, offset: number, text: string) =>
+      ch === '_' && WORD_CHAR.test(text[offset - 1] ?? '') && WORD_CHAR.test(text[offset + 1] ?? '')
+        ? ch
+        : `\\${ch}`,
+    );
 }
 
 /**
@@ -71,10 +84,10 @@ function formatSparqlTerm(term: SparqlTerm | undefined): string {
  * declarations. Returns `undefined` for an empty or prologue-only query.
  *
  * Enforces the tool's read-only contract: only a leading `SELECT` is accepted;
- * update forms (DELETE/INSERT/…) and other query forms (ASK/CONSTRUCT/DESCRIBE)
- * are rejected before any request reaches CELLAR. IRIs in PREFIX/BASE (which
- * routinely contain `#`, e.g. the cdm: namespace) are consumed whole, so their
- * `#` is never mistaken for the start of a comment.
+ * update operations (`not_read_only`) and every other query form or keyword
+ * (`unsupported_query_form`) are rejected before any request reaches CELLAR.
+ * IRIs in PREFIX/BASE (which routinely contain `#`, e.g. the cdm: namespace) are
+ * consumed whole, so their `#` is never mistaken for the start of a comment.
  */
 function leadingSparqlKeyword(query: string): string | undefined {
   let rest = query;
@@ -100,6 +113,128 @@ function leadingSparqlKeyword(query: string): string | undefined {
   }
 }
 
+/** The SPARQL 1.1 Update operations — the only keywords `not_read_only` covers. */
+const UPDATE_KEYWORDS = new Set([
+  'INSERT',
+  'DELETE',
+  'WITH',
+  'LOAD',
+  'CLEAR',
+  'CREATE',
+  'DROP',
+  'COPY',
+  'MOVE',
+  'ADD',
+]);
+
+/** `keyword` behind the indefinite article its spoken form takes ("an ASK", "a DROP"). */
+function withArticle(keyword: string): string {
+  return `${/^[AEIO]/.test(keyword) ? 'an' : 'a'} ${keyword}`;
+}
+
+/** Punctuation that ends a term: braces, parentheses, and the triple separators. */
+const PUNCTUATION = '{}().,;';
+
+/** A run of characters no other token rule claims — a prefixed name, variable, path, number, or operator. */
+const WORD = /[^\s{}().,;"'<#]+/y;
+
+/** Whitespace then `^^` or `@`: the literal just closed carries a datatype or language tag. */
+const ANNOTATION = /\s*(?:\^\^|@)/y;
+
+/** An IRIREF — `<` then no whitespace or delimiter before `>`. A bare `<` is the less-than operator. */
+const IRIREF = /<[^\s<>"{}|\\^`]*>/y;
+
+/**
+ * Lexical forms of the plain string literals — no datatype, no language tag —
+ * that stand as the object of a triple pattern in `query`.
+ *
+ * CELLAR stores its identifiers typed (CELEX, ECLI, and `cdm:work_id_document`
+ * as `xsd:string`, ELI as `xsd:anyURI`), and Virtuoso does not match a plain
+ * literal against a typed one, so such a pattern returns zero rows with no
+ * other signal (#115). The scan skips comments, IRIs, and the contents of every
+ * literal, so text inside them never counts. A literal counts only outside
+ * parentheses — a function argument such as `FILTER(LANG(?l) = "en")` is
+ * legitimate — and only after a predicate, or after the `,` of an object list
+ * whose predicate it inherits. A `bif:contains` phrase is a plain literal by
+ * design and is excluded. `VALUES` data and `FILTER` equality stay out of scope.
+ */
+function plainTripleObjectLiterals(query: string): string[] {
+  const found: string[] = [];
+  let depth = 0;
+  /** The previous token: a term's text, a punctuation character, or `"` for a literal. */
+  let prev = '';
+  /** The predicate of the object list being read, for objects that follow a `,`. */
+  let listPredicate = '';
+  const isTerm = (token: string) => token !== '' && token !== '"' && !PUNCTUATION.includes(token);
+
+  const n = query.length;
+  let i = 0;
+  while (i < n) {
+    const ch = query[i] ?? '';
+    if (/\s/.test(ch)) {
+      i += 1;
+      continue;
+    }
+    if (ch === '#') {
+      const newline = query.indexOf('\n', i);
+      i = newline === -1 ? n : newline + 1;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      const close = query[i + 1] === ch && query[i + 2] === ch ? ch.repeat(3) : ch;
+      const start = i + close.length;
+      let end = n;
+      i = start;
+      while (i < n) {
+        if (query[i] === '\\') {
+          i += 2;
+          continue;
+        }
+        if (query.startsWith(close, i)) {
+          end = i;
+          i += close.length;
+          break;
+        }
+        i += 1;
+      }
+      ANNOTATION.lastIndex = i;
+      if (depth === 0) {
+        if (isTerm(prev)) listPredicate = prev;
+        const predicate = prev === ',' || isTerm(prev) ? listPredicate : '';
+        const plain = !ANNOTATION.test(query);
+        if (plain && predicate !== '' && predicate.toLowerCase() !== 'bif:contains') {
+          found.push(query.slice(start, end));
+        }
+      }
+      prev = '"';
+      continue;
+    }
+    if (ch === '<') {
+      IRIREF.lastIndex = i;
+      const iri = IRIREF.exec(query);
+      if (iri) {
+        if (depth === 0 && isTerm(prev)) listPredicate = prev;
+        prev = iri[0];
+        i += iri[0].length;
+        continue;
+      }
+    }
+    if (PUNCTUATION.includes(ch)) {
+      if (ch === '(') depth += 1;
+      else if (ch === ')') depth = Math.max(0, depth - 1);
+      prev = ch;
+      i += 1;
+      continue;
+    }
+    WORD.lastIndex = i;
+    const word = WORD.exec(query)?.[0] ?? ch;
+    if (depth === 0 && isTerm(prev)) listPredicate = prev;
+    prev = word;
+    i += word.length;
+  }
+  return found;
+}
+
 export const eurlex_query_sparql = tool('eurlex_query_sparql', {
   title: 'Raw CELLAR SPARQL Query',
   description:
@@ -110,7 +245,7 @@ export const eurlex_query_sparql = tool('eurlex_query_sparql', {
       .string()
       .min(10)
       .describe(
-        'A read-only SPARQL SELECT query. Leading comments and PREFIX/BASE declarations are allowed; the cdm:, skos:, and xsd: prefixes are auto-injected. LIMIT is injected at 100 if absent, or capped to 100. Key CDM predicates: cdm:resource_legal_id_celex (CELEX), cdm:work_date_document (date), cdm:work_has_resource-type (type), cdm:work_is_about_concept_eurovoc (EuroVoc subject), cdm:work_cites_work (citation). CELEX is an xsd:string literal — match it as a typed triple, ?work cdm:resource_legal_id_celex "32016R0679"^^xsd:string (an untyped literal matches nothing, and a FILTER(STR(…)) comparison scans every CELEX). For text, use bif:contains with a single-quoted phrase.',
+        'A read-only SPARQL SELECT query. Leading comments and PREFIX/BASE declarations are allowed; the cdm:, skos:, and xsd: prefixes are auto-injected. LIMIT is injected at 100 if absent, or capped to 100. Key CDM predicates: cdm:resource_legal_id_celex (CELEX), cdm:work_date_document (date), cdm:work_has_resource-type (type), cdm:work_is_about_concept_eurovoc (EuroVoc subject), cdm:work_cites_work (citation). CELEX is an xsd:string literal — match it as a typed triple, ?work cdm:resource_legal_id_celex "32016R0679"^^xsd:string (an untyped literal matches nothing, in a triple or in FILTER(?celex = "…"), and a FILTER(STR(…)) comparison scans every CELEX). For text, use bif:contains with a single-quoted phrase.',
       ),
     timeout_hint: z
       .number()
@@ -150,15 +285,28 @@ export const eurlex_query_sparql = tool('eurlex_query_sparql', {
       ),
     shown: z.number().optional().describe('Number of binding rows returned in this response.'),
     cap: z.number().optional().describe('The server-enforced result ceiling that was applied.'),
+    notice: z
+      .string()
+      .optional()
+      .describe(
+        'On a zero-row result whose query has an untyped string literal as a triple object: how to type or language-tag it, since CELLAR stores identifiers as typed literals that an untyped one never matches.',
+      ),
   },
 
   errors: [
     {
       reason: 'not_read_only',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'The query is not a read-only SELECT — an update or non-SELECT query form was supplied.',
+      when: 'The query is a SPARQL Update operation (INSERT, DELETE, WITH, LOAD, CLEAR, CREATE, DROP, COPY, MOVE, or ADD).',
       recovery:
-        'Rewrite the request as a SPARQL SELECT query; this tool is read-only and does not run updates (DELETE/INSERT) or other query forms (ASK/CONSTRUCT/DESCRIBE).',
+        'Rewrite the request as a read-only SPARQL SELECT query; this tool never runs updates such as INSERT or DELETE.',
+    },
+    {
+      reason: 'unsupported_query_form',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'The query is not a SELECT: an ASK, CONSTRUCT, or DESCRIBE form, an unrecognized keyword, or no query keyword after the prologue.',
+      recovery:
+        'Rewrite it as a SPARQL SELECT that projects the variables you need, placed after any PREFIX or BASE declarations.',
     },
     {
       reason: 'sparql_error',
@@ -180,13 +328,20 @@ export const eurlex_query_sparql = tool('eurlex_query_sparql', {
 
   async handler(input, ctx) {
     const keyword = leadingSparqlKeyword(input.sparql_query);
-    if (keyword !== 'SELECT') {
+    if (keyword !== undefined && UPDATE_KEYWORDS.has(keyword)) {
       throw ctx.fail(
         'not_read_only',
-        keyword
-          ? `Only read-only SELECT queries are accepted; received a ${keyword} query.`
-          : 'Only read-only SELECT queries are accepted; no SELECT keyword was found.',
+        `This tool is read-only; received ${withArticle(keyword)} request, a SPARQL Update it never runs.`,
         { ...ctx.recoveryFor('not_read_only') },
+      );
+    }
+    if (keyword !== 'SELECT') {
+      throw ctx.fail(
+        'unsupported_query_form',
+        keyword
+          ? `Only SELECT queries are accepted; received ${withArticle(keyword)} query. Rewrite it as SELECT.`
+          : 'Only SELECT queries are accepted; no query keyword follows the prologue. Rewrite it as SELECT.',
+        { ...ctx.recoveryFor('unsupported_query_form') },
       );
     }
 
@@ -218,6 +373,21 @@ export const eurlex_query_sparql = tool('eurlex_query_sparql', {
      */
     if (limitEnforced && bindings.length === svc.maxResults) {
       ctx.enrich.truncated({ shown: bindings.length, cap: svc.maxResults });
+    }
+
+    /**
+     * The query is forwarded as written, never auto-typed: the datatype depends on
+     * the predicate (`xsd:anyURI` for an ELI), and a rewrite would silently change
+     * what the escape hatch runs. A zero-row result is the only point where the
+     * untyped-literal trap is both likely and invisible, so that is where it is named.
+     */
+    const untyped = bindings.length === 0 ? plainTripleObjectLiterals(input.sparql_query) : [];
+    const [firstUntyped] = untyped;
+    if (firstUntyped !== undefined) {
+      const others = untyped.length > 1 ? ` and ${untyped.length - 1} more` : '';
+      ctx.enrich.notice(
+        `No rows matched, and the query has an untyped string literal ("${echoValue(firstUntyped)}"${others}) as a triple object. CELLAR stores identifiers as typed literals that an untyped one never matches: write "…"^^xsd:string for a CELEX, ECLI, or cdm:work_id_document, "…"^^xsd:anyURI for an ELI, or "…"@en for a label.`,
+      );
     }
 
     return {

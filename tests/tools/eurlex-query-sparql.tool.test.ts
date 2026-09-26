@@ -4,7 +4,7 @@
  */
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_query_sparql } from '@/mcp-server/tools/definitions/eurlex-query-sparql.tool.js';
 
@@ -23,6 +23,30 @@ function workRows(n: number) {
   return Array.from({ length: n }, (_, i) => ({
     work: { type: 'uri', value: `http://work/${i}` },
   }));
+}
+
+/** Every text block of a tool result's content[], joined. */
+function contentText(result: { content: unknown[] }): string {
+  return result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+}
+
+/** The text of the first content[] block format() renders for `output`. */
+function formatText(output: {
+  bindings: Record<string, unknown>[];
+  variables: string[];
+  total: number;
+}): string {
+  return (eurlex_query_sparql.format!(output)[0] as { text: string }).text;
+}
+
+/** The error a handler call rejects with; fails the test if it resolves. */
+async function rejectionOf(run: () => unknown): Promise<Error & { code?: number; data?: unknown }> {
+  try {
+    await run();
+  } catch (error) {
+    return error as Error & { code?: number; data?: unknown };
+  }
+  throw new Error('Expected the handler to reject');
 }
 
 describe('eurlex_query_sparql', () => {
@@ -127,19 +151,91 @@ describe('eurlex_query_sparql', () => {
 
   it.each([
     'INSERT DATA { <urn:s> <urn:p> <urn:o> }',
-    'CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }',
-    'DESCRIBE <http://publications.europa.eu/resource/cellar/gdpr>',
-    'ASK WHERE { ?s ?p ?o }',
+    'DELETE DATA { <urn:s> <urn:p> <urn:o> }',
+    'WITH <http://example.org/g> DELETE { ?s ?p ?o } WHERE { ?s ?p ?o }',
     'LOAD <http://example.org/data.rdf>',
+    'CLEAR GRAPH <http://example.org/g>',
+    'CREATE GRAPH <http://example.org/g>',
     'DROP GRAPH <http://example.org/g>',
-  ])('rejects non-SELECT form locally without calling the service: %s', async (query) => {
+    'COPY <http://example.org/a> TO <http://example.org/b>',
+    'MOVE <http://example.org/a> TO <http://example.org/b>',
+    'ADD <http://example.org/a> TO <http://example.org/b>',
+  ])(
+    'rejects a SPARQL Update as "not_read_only" without calling the service: %s',
+    async (query) => {
+      const ctx = createMockContext({ errors: eurlex_query_sparql.errors });
+
+      const input = eurlex_query_sparql.input.parse({ sparql_query: query });
+      await expect(eurlex_query_sparql.handler(input, ctx)).rejects.toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        data: { reason: 'not_read_only' },
+      });
+      expect(mockQueryWithVars).not.toHaveBeenCalled();
+    },
+  );
+
+  it('names an Update keyword with the right article (#115)', async () => {
     const ctx = createMockContext({ errors: eurlex_query_sparql.errors });
 
-    const input = eurlex_query_sparql.input.parse({ sparql_query: query });
-    await expect(eurlex_query_sparql.handler(input, ctx)).rejects.toMatchObject({
-      code: JsonRpcErrorCode.ValidationError,
-      data: { reason: 'not_read_only' },
+    const input = eurlex_query_sparql.input.parse({
+      sparql_query: 'INSERT DATA { <urn:s> <urn:p> <urn:o> }',
     });
+    const error = await rejectionOf(() => eurlex_query_sparql.handler(input, ctx));
+    expect(error.message).toContain('an INSERT');
+    expect(error.message).not.toContain('a INSERT');
+  });
+
+  // --- #115: read-only query forms other than SELECT are unsupported, not updates ---
+
+  it.each([
+    ['ASK WHERE { ?w cdm:resource_legal_id_celex "32016R0679"^^xsd:string }', 'an ASK query'],
+    ['CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }', 'a CONSTRUCT query'],
+    ['DESCRIBE <http://publications.europa.eu/resource/cellar/gdpr>', 'a DESCRIBE query'],
+    ['SELCT ?w WHERE { ?w ?p ?o }', 'a SELCT query'],
+    ['# only a prologue\nPREFIX ex: <http://example.org/ns#>', 'no query keyword'],
+  ])(
+    'rejects %j as "unsupported_query_form" without calling the service',
+    async (query, phrase) => {
+      const ctx = createMockContext({ errors: eurlex_query_sparql.errors });
+
+      const input = eurlex_query_sparql.input.parse({ sparql_query: query });
+      const error = await rejectionOf(() => eurlex_query_sparql.handler(input, ctx));
+      expect(error).toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        data: {
+          reason: 'unsupported_query_form',
+          recovery: { hint: expect.stringContaining('SELECT') },
+        },
+      });
+      expect(error.message).toContain(phrase);
+      expect(error.message).toContain('Rewrite it as SELECT');
+      expect(mockQueryWithVars).not.toHaveBeenCalled();
+    },
+  );
+
+  it('keeps ASK, CONSTRUCT, and DESCRIBE out of the not_read_only contract text (#115)', () => {
+    const contract = eurlex_query_sparql.errors?.find((e) => e.reason === 'not_read_only');
+    const text = `${contract?.when} ${contract?.recovery}`;
+    for (const form of ['ASK', 'CONSTRUCT', 'DESCRIBE']) expect(text).not.toContain(form);
+    expect(eurlex_query_sparql.errors?.map((e) => e.reason)).toContain('unsupported_query_form');
+  });
+
+  it('forwards the unsupported_query_form recovery to both surfaces (#115)', async () => {
+    const recovery = eurlex_query_sparql.errors?.find(
+      (e) => e.reason === 'unsupported_query_form',
+    )?.recovery;
+
+    const result = await runToolContract(eurlex_query_sparql, {
+      sparql_query: 'ASK { ?w cdm:resource_legal_id_celex "32016R0679"^^xsd:string }',
+    });
+
+    expect(result.isError).toBe(true);
+    const structured = result.structuredContent as {
+      error?: { data?: { reason?: string; recovery?: { hint?: string } } };
+    };
+    expect(structured.error?.data?.reason).toBe('unsupported_query_form');
+    expect(structured.error?.data?.recovery?.hint).toBe(recovery);
+    expect(contentText(result)).toContain(recovery ?? '<missing>');
     expect(mockQueryWithVars).not.toHaveBeenCalled();
   });
 
@@ -481,5 +577,170 @@ describe('eurlex_query_sparql', () => {
     const guidance = eurlex_query_sparql.input.shape.sparql_query.description ?? '';
     expect(guidance).toContain('?work cdm:resource_legal_id_celex "32016R0679"^^xsd:string');
     expect(guidance).not.toContain('FILTER(STR(?celex) = "…")');
+  });
+
+  it('warns that FILTER equality against an untyped literal has the same trap', () => {
+    const guidance = eurlex_query_sparql.input.shape.sparql_query.description ?? '';
+    expect(guidance).toContain('FILTER(?celex = "…")');
+  });
+
+  // --- #115: zero rows from an untyped triple-object literal carry a notice ---
+
+  describe('untyped triple-object literal notice (#115)', () => {
+    const UNTYPED = 'SELECT ?w WHERE { ?w cdm:resource_legal_id_celex "32016R0679" }';
+
+    it('returns zero rows with a notice on both surfaces, sending the query unchanged', async () => {
+      mockQueryWithVars.mockResolvedValue({ variables: ['w'], bindings: [] });
+
+      const result = await runToolContract(eurlex_query_sparql, { sparql_query: UNTYPED });
+
+      expect(result.isError).toBeFalsy();
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured).toMatchObject({ bindings: [], total: 0 });
+      const notice = structured.notice as string;
+      expect(notice).toContain('"32016R0679"');
+      expect(notice).toContain('^^xsd:string');
+      expect(notice).toContain('^^xsd:anyURI');
+      expect(notice).toContain('@en');
+      expect(contentText(result)).toContain(`> ${notice}`);
+      // Byte-identical: the literal is named, never auto-typed.
+      expect(mockQueryWithVars).toHaveBeenCalledWith(UNTYPED, expect.anything(), undefined);
+    });
+
+    it('carries no notice for the typed form, which returns its row', async () => {
+      const ctx = createMockContext({ errors: eurlex_query_sparql.errors });
+      mockQueryWithVars.mockResolvedValue({ variables: ['w'], bindings: workRows(1) });
+
+      const input = eurlex_query_sparql.input.parse({
+        sparql_query: 'SELECT ?w WHERE { ?w cdm:resource_legal_id_celex "32016R0679"^^xsd:string }',
+      });
+      const result = await eurlex_query_sparql.handler(input, ctx);
+
+      expect(result.total).toBe(1);
+      expect(getEnrichment(ctx).notice).toBeUndefined();
+    });
+
+    it('carries no notice when an untyped-literal query returns rows', async () => {
+      const ctx = createMockContext({ errors: eurlex_query_sparql.errors });
+      mockQueryWithVars.mockResolvedValue({ variables: ['w'], bindings: workRows(2) });
+
+      await eurlex_query_sparql.handler(
+        eurlex_query_sparql.input.parse({ sparql_query: UNTYPED }),
+        ctx,
+      );
+
+      expect(getEnrichment(ctx).notice).toBeUndefined();
+    });
+
+    it.each([
+      ['a typed literal', 'SELECT ?w WHERE { ?w cdm:resource_legal_id_celex "x"^^xsd:string }'],
+      ['a language-tagged literal', 'SELECT ?c WHERE { ?c skos:prefLabel "data protection"@en }'],
+      ['an IRI object', 'SELECT ?w WHERE { ?w cdm:work_cites_work <http://example.org/w> }'],
+      [
+        'a bif:contains phrase',
+        'SELECT ?t WHERE { ?e cdm:expression_title ?t . ?t bif:contains "\'data protection\'" }',
+      ],
+      ['a function argument', 'SELECT ?l WHERE { ?c skos:prefLabel ?l . FILTER(LANG(?l) = "en") }'],
+      [
+        'FILTER equality',
+        'SELECT ?w WHERE { ?w cdm:resource_legal_id_celex ?c . FILTER(?c = "32016R0679") }',
+      ],
+      [
+        'text inside a comment',
+        'SELECT ?w WHERE {\n  # ?w cdm:resource_legal_id_celex "32016R0679"\n  ?w cdm:resource_legal_id_celex ?c\n}',
+      ],
+      ['text inside an IRI', "SELECT ?w WHERE { ?w cdm:work_cites_work <urn:a'32016R0679'> }"],
+      [
+        'text inside another literal',
+        'SELECT ?w WHERE { ?w cdm:p "cdm:q \\"32016R0679\\""^^xsd:string }',
+      ],
+      [
+        'VALUES data',
+        'SELECT ?c WHERE { VALUES ?c { "32016R0679" } ?w cdm:resource_legal_id_celex ?c }',
+      ],
+    ])('carries no notice on zero rows for %s', async (_label, query) => {
+      const ctx = createMockContext({ errors: eurlex_query_sparql.errors });
+      mockQueryWithVars.mockResolvedValue({ variables: ['w'], bindings: [] });
+
+      await eurlex_query_sparql.handler(
+        eurlex_query_sparql.input.parse({ sparql_query: query }),
+        ctx,
+      );
+
+      expect(getEnrichment(ctx).notice).toBeUndefined();
+    });
+
+    it.each([
+      ['a variable predicate', 'SELECT ?w WHERE { ?w ?p "32016R0679" }'],
+      ['a full IRI predicate', 'SELECT ?w WHERE { ?w <http://example.org/p> "32016R0679" }'],
+      ['a property path', 'SELECT ?w WHERE { ?w cdm:a/cdm:b "32016R0679" }'],
+      ['an object list', 'SELECT ?w WHERE { ?w cdm:p "a"^^xsd:string, "32016R0679" }'],
+      ['a predicate list', 'SELECT ?w WHERE { ?w cdm:p ?x ; cdm:q "32016R0679" . }'],
+      ['a long literal', 'SELECT ?w WHERE { ?w cdm:p """32016R0679""" }'],
+      ['a single-quoted literal', "SELECT ?w WHERE { ?w cdm:p '32016R0679' }"],
+    ])('names the literal for %s', async (_label, query) => {
+      const ctx = createMockContext({ errors: eurlex_query_sparql.errors });
+      mockQueryWithVars.mockResolvedValue({ variables: ['w'], bindings: [] });
+
+      await eurlex_query_sparql.handler(
+        eurlex_query_sparql.input.parse({ sparql_query: query }),
+        ctx,
+      );
+
+      expect(getEnrichment(ctx).notice).toContain('"32016R0679"');
+    });
+
+    it('counts further untyped literals and bounds the echoed one', async () => {
+      const ctx = createMockContext({ errors: eurlex_query_sparql.errors });
+      mockQueryWithVars.mockResolvedValue({ variables: ['w'], bindings: [] });
+      const long = 'x'.repeat(300);
+
+      await eurlex_query_sparql.handler(
+        eurlex_query_sparql.input.parse({
+          sparql_query: `SELECT ?w WHERE { ?w cdm:p "${long}" ; cdm:q "b" ; cdm:r "c" }`,
+        }),
+        ctx,
+      );
+
+      const notice = getEnrichment(ctx).notice as string;
+      expect(notice).toContain(`"${'x'.repeat(100)}…" and 2 more`);
+      expect(notice).not.toContain('x'.repeat(101));
+    });
+  });
+
+  // --- #115: an underscore between two letters or digits is left bare ---
+
+  it('leaves an intraword underscore unescaped in an identifier literal', () => {
+    const text = formatText({
+      bindings: [
+        {
+          c: {
+            type: 'literal',
+            datatype: 'http://www.w3.org/2001/XMLSchema#string',
+            value: '72022L2555ROU_202405184',
+          },
+        },
+      ],
+      variables: ['c'],
+      total: 1,
+    });
+
+    expect(text).toContain('| "72022L2555ROU_202405184"^^xsd:string |');
+  });
+
+  it.each([
+    ['_x_', String.raw`"\_x\_"`],
+    ['a_ b', String.raw`"a\_ b"`],
+    ['a _b', String.raw`"a \_b"`],
+    ['a__b', String.raw`"a\_\_b"`],
+    ['é_ü 1_2', '"é_ü 1_2"'],
+  ])('escapes an underscore unless both neighbours are letters or digits: %j', (value, cell) => {
+    const text = formatText({
+      bindings: [{ v: { type: 'literal', value } }],
+      variables: ['v'],
+      total: 1,
+    });
+
+    expect(text).toContain(`| ${cell} |`);
   });
 });
