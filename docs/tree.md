@@ -1,6 +1,6 @@
 # eur-lex-mcp-server - Directory Structure
 
-Generated on: 2026-09-26 06:29:17
+Generated on: 2026-10-07 11:54:35
 
 ```text
 eur-lex-mcp-server/
@@ -144,9 +144,11 @@ eur-lex-mcp-server/
 │   ├── clean-mcpb.ts
 │   ├── clean.ts
 │   ├── devcheck.ts
+│   ├── install-otel.ts
 │   ├── lint-mcp.ts
 │   ├── lint-packaging.ts
 │   ├── list-skills.ts
+│   ├── prune-musl-packages.ts
 │   ├── release-github.ts
 │   └── tree.ts
 ├── src/
@@ -202,6 +204,8 @@ eur-lex-mcp-server/
 │   │   ├── eurlex-formex-multipart.ts
 │   │   ├── eurlex-legacy-act.ts
 │   │   └── formex-zip.ts
+│   ├── helpers/
+│   │   └── cpu-time.ts
 │   ├── prompts/
 │   │   └── eurlex-comparative-analysis.prompt.test.ts
 │   ├── resources/

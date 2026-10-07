@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.18.2](changelog/0.18.x/0.18.2.md) — 2026-10-07
+
+Moves to mcp-ts-core 0.13.13: tool errors carry a request id, integer and stringified-object arguments are repaired before validation, the Docker image installs dependencies on the build platform, and the linear-time tests measure CPU time.
+
 ## [0.18.1](changelog/0.18.x/0.18.1.md) — 2026-09-26 · 🛡️ Security
 
 Caller URIs are checked against the full SPARQL IRI exclusion set before any CELLAR query is built, eurovoc_concept accepts only EuroVoc concept URIs and reads https and upper-case forms as the http form, and a lexical-safety test gates every caller value that reaches generated SPARQL.
