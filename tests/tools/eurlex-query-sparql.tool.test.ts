@@ -136,10 +136,12 @@ describe('eurlex_query_sparql', () => {
   // --- Read-only guard (#9): reject non-SELECT queries before forwarding ---
 
   it('rejects DELETE WHERE locally with reason "not_read_only" and does not call the service', async () => {
-    const ctx = createMockContext({ errors: eurlex_query_sparql.errors });
-
-    const input = eurlex_query_sparql.input.parse({ sparql_query: 'DELETE WHERE { ?s ?p ?o }' });
-    await expect(eurlex_query_sparql.handler(input, ctx)).rejects.toMatchObject({
+    // runToolContract applies the declared recovery hint, as production does.
+    const result = await runToolContract(eurlex_query_sparql, {
+      sparql_query: 'DELETE WHERE { ?s ?p ?o }',
+    });
+    expect(result.isError).toBe(true);
+    expect((result.structuredContent as { error?: unknown }).error).toMatchObject({
       code: JsonRpcErrorCode.ValidationError,
       data: {
         reason: 'not_read_only',
@@ -196,10 +198,10 @@ describe('eurlex_query_sparql', () => {
   ])(
     'rejects %j as "unsupported_query_form" without calling the service',
     async (query, phrase) => {
-      const ctx = createMockContext({ errors: eurlex_query_sparql.errors });
-
-      const input = eurlex_query_sparql.input.parse({ sparql_query: query });
-      const error = await rejectionOf(() => eurlex_query_sparql.handler(input, ctx));
+      // runToolContract applies the declared recovery hint, as production does.
+      const result = await runToolContract(eurlex_query_sparql, { sparql_query: query });
+      expect(result.isError).toBe(true);
+      const { error } = result.structuredContent as { error: { message: string } };
       expect(error).toMatchObject({
         code: JsonRpcErrorCode.ValidationError,
         data: {

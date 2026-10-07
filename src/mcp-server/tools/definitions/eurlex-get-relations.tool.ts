@@ -255,9 +255,7 @@ SELECT ?sourceCelex WHERE {
       // traversal never runs on a copy that lacks edges.
       const resolved = (await resolveCelexWorks(svc, [celexNumber], ctx)).get(celexNumber);
       if (!resolved) {
-        throw ctx.fail('not_found', `No CELLAR work found for CELEX: ${echoValue(celexNumber)}`, {
-          ...ctx.recoveryFor('not_found'),
-        });
+        throw ctx.fail('not_found', `No CELLAR work found for CELEX: ${echoValue(celexNumber)}`);
       }
       workUri = resolved;
     } else {
@@ -266,7 +264,6 @@ SELECT ?sourceCelex WHERE {
         celexNumber
           ? 'Provide only one of celex_number or work_uri, not both.'
           : 'Provide either celex_number or work_uri.',
-        { ...ctx.recoveryFor('invalid_identifier_args') },
       );
     }
 

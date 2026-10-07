@@ -462,20 +462,15 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
     const dateFrom = input.date_from?.trim();
     const dateTo = input.date_to?.trim();
     if (dateFrom && !isValidCalendarDate(dateFrom)) {
-      throw ctx.fail('invalid_date_range', `date_from "${dateFrom}" is not a real calendar date.`, {
-        ...ctx.recoveryFor('invalid_date_range'),
-      });
+      throw ctx.fail('invalid_date_range', `date_from "${dateFrom}" is not a real calendar date.`);
     }
     if (dateTo && !isValidCalendarDate(dateTo)) {
-      throw ctx.fail('invalid_date_range', `date_to "${dateTo}" is not a real calendar date.`, {
-        ...ctx.recoveryFor('invalid_date_range'),
-      });
+      throw ctx.fail('invalid_date_range', `date_to "${dateTo}" is not a real calendar date.`);
     }
     if (dateFrom && dateTo && dateFrom > dateTo) {
       throw ctx.fail(
         'invalid_date_range',
         `Date range is inverted: date_from "${dateFrom}" falls after date_to "${dateTo}".`,
-        { ...ctx.recoveryFor('invalid_date_range') },
       );
     }
 
@@ -517,7 +512,6 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
             : parsed.kind === 'several'
               ? `Case number "${quoted}" names more than one case.`
               : `Case number "${quoted}" is not a recognizable case number.`,
-          { ...ctx.recoveryFor('invalid_case_number') },
         );
       }
     }
@@ -532,7 +526,6 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
       throw ctx.fail(
         'invalid_keyword',
         `keyword "${echoValue(keywordInput)}" holds no letters or digits.`,
-        { ...ctx.recoveryFor('invalid_keyword') },
       );
     }
 

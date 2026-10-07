@@ -332,7 +332,6 @@ export const eurlex_query_sparql = tool('eurlex_query_sparql', {
       throw ctx.fail(
         'not_read_only',
         `This tool is read-only; received ${withArticle(keyword)} request, a SPARQL Update it never runs.`,
-        { ...ctx.recoveryFor('not_read_only') },
       );
     }
     if (keyword !== 'SELECT') {
@@ -341,7 +340,6 @@ export const eurlex_query_sparql = tool('eurlex_query_sparql', {
         keyword
           ? `Only SELECT queries are accepted; received ${withArticle(keyword)} query. Rewrite it as SELECT.`
           : 'Only SELECT queries are accepted; no query keyword follows the prologue. Rewrite it as SELECT.',
-        { ...ctx.recoveryFor('unsupported_query_form') },
       );
     }
 

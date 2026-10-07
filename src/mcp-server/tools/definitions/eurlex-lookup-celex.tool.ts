@@ -264,9 +264,6 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
         throw ctx.fail(
           'ambiguous_identifier',
           `Cannot determine format of identifier: ${echoValue(identifier)}`,
-          {
-            ...ctx.recoveryFor('ambiguous_identifier'),
-          },
         );
       }
     } else {

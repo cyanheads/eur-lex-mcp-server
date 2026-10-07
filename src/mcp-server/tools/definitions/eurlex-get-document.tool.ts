@@ -619,7 +619,6 @@ export const eurlex_get_document = tool('eurlex_get_document', {
         providedCount === 0
           ? 'Provide one of celex_number, eli_uri, or work_uri.'
           : 'Provide only one of celex_number, eli_uri, or work_uri, not multiple.',
-        { ...ctx.recoveryFor('invalid_identifier_args') },
       );
     } else if (celexInput) {
       requestedCelex = celexInput;
@@ -627,9 +626,7 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       const binding = await resolveEliToWork(sparqlSvc, eliInput, ctx);
       const resolvedCelex = binding && CellarSparqlService.bindingValue(binding, 'celexNumber');
       if (!resolvedCelex) {
-        throw ctx.fail('not_found', `No CELLAR work found for ELI: ${eliInput}`, {
-          ...ctx.recoveryFor('not_found'),
-        });
+        throw ctx.fail('not_found', `No CELLAR work found for ELI: ${eliInput}`);
       }
       requestedCelex = resolvedCelex;
     } else {
@@ -652,7 +649,6 @@ export const eurlex_get_document = tool('eurlex_get_document', {
         throw ctx.fail(
           'not_found',
           `This CELLAR work carries no CELEX number and cannot be fetched as a document: ${safeWorkUri}`,
-          { ...ctx.recoveryFor('not_found') },
         );
       }
       requestedCelex = resolvedCelex;
@@ -872,9 +868,7 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
     });
 
     if (!metaResult) {
-      throw ctx.fail('not_found', `No CELLAR work found for CELEX: ${servedCelex}`, {
-        ...ctx.recoveryFor('not_found'),
-      });
+      throw ctx.fail('not_found', `No CELLAR work found for CELEX: ${servedCelex}`);
     }
 
     // Step 2: assemble metadata, then shape the body per content_mode. The body

@@ -9,7 +9,7 @@
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
-import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
+import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_get_document } from '@/mcp-server/tools/definitions/eurlex-get-document.tool.js';
 import { initEurLexContentService } from '@/services/eurlex-content/eurlex-content-service.js';
@@ -127,10 +127,10 @@ describe('eurlex_get_document paging through the body cache (#127, #129)', () =>
   it('makes no request for invalid input', async () => {
     expect(() => eurlex_get_document.input.parse({ celex_number: CELEX, offset: -1 })).toThrow();
     expect(() => eurlex_get_document.input.parse({ celex_number: CELEX, limit: 0 })).toThrow();
-    const input = eurlex_get_document.input.parse({ format: 'markdown' });
-    await expect(
-      eurlex_get_document.handler(input, createMockContext({ errors: eurlex_get_document.errors })),
-    ).rejects.toMatchObject({
+    // runToolContract applies the declared recovery hint, as production does.
+    const response = await runToolContract(eurlex_get_document, { format: 'markdown' });
+    expect(response.isError).toBe(true);
+    expect((response.structuredContent as { error?: unknown }).error).toMatchObject({
       code: JsonRpcErrorCode.ValidationError,
       data: {
         reason: 'invalid_identifier_args',
