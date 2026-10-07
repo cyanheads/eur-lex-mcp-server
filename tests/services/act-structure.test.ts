@@ -33,6 +33,7 @@ import {
   LEGACY_FINNISH_ACT_HTML,
   LEGACY_TWO_CHAPTER_ACT_HTML,
 } from '../fixtures/eurlex-legacy-act.js';
+import { bestCpuMs, CPU_TIMED_TEST_TIMEOUT_MS, expectLinearScaling } from '../helpers/cpu-time.js';
 
 /** A structured act: two preamble recitals, two chapters, three articles, one annex. */
 const STRUCTURED_HTML = [
@@ -430,22 +431,15 @@ describe('parseActStructure', () => {
   const fill = (unit: string, n: number) => unit.repeat(Math.ceil(n / unit.length)).slice(0, n);
 
   /**
-   * A 120k-character parse must finish in under 20 ms on its best of five rounds.
-   * The linear scan takes under 3 ms there even with every core busy; the lazy
-   * regexes it replaced took 60–380 ms on these shapes, re-reading the rest of the
-   * document once per unclosed opener. The best round discards
-   * scheduler and GC stalls, and a single absolute bound avoids timing a sub-0.1 ms
-   * small input, whose ratio one stall could swing past any threshold.
+   * A 120k-character parse must take under 20 ms of CPU time on its best of five
+   * rounds. The linear scan takes 2 ms or less there; the lazy regexes it replaced
+   * took 60–380 ms on these shapes, re-reading the rest of the document once per
+   * unclosed opener. CPU time leaves out the time the thread waits for a core, so
+   * the bound holds however loaded the machine is.
    */
-  const expectLinearParse = (build: (n: number) => string) => {
+  const expectLinearParse = async (build: (n: number) => string) => {
     const text = build(120_000);
-    let best = Number.POSITIVE_INFINITY;
-    for (let round = 0; round < 5; round++) {
-      const start = performance.now();
-      parseActStructure(text, 'xml', 'EN');
-      best = Math.min(best, performance.now() - start);
-    }
-    expect(best).toBeLessThan(20);
+    expect(await bestCpuMs(() => parseActStructure(text, 'xml', 'EN'))).toBeLessThan(20);
   };
 
   describe('Formex heading scan stays linear on adversarial input (#90)', () => {
@@ -458,7 +452,11 @@ describe('parseActStructure', () => {
       'an unclosed <STI> subtitle, repeated': (n) => fill('<TI><P>CHAPTER I</P></TI><STI><P>xx', n),
     };
 
-    it.each(Object.entries(ADVERSARIAL))('%s', (_label, build) => expectLinearParse(build));
+    it.each(Object.entries(ADVERSARIAL))(
+      '%s',
+      (_label, build) => expectLinearParse(build),
+      CPU_TIMED_TEST_TIMEOUT_MS,
+    );
   });
 
   describe('Formex article headings (#94)', () => {
@@ -531,8 +529,10 @@ describe('parseActStructure', () => {
         `<TI.ART>${fill('<QUOT.START CODE="2018">', n - 17)}</TI.ART>`,
     };
 
-    it.each(Object.entries(ADVERSARIAL_ARTICLES))('stays linear on %s', (_label, build) =>
-      expectLinearParse(build),
+    it.each(Object.entries(ADVERSARIAL_ARTICLES))(
+      'stays linear on %s',
+      (_label, build) => expectLinearParse(build),
+      CPU_TIMED_TEST_TIMEOUT_MS,
     );
   });
 });
@@ -915,28 +915,19 @@ describe('headings in every EUR-Lex language (#107)', () => {
       (n: number) => `1${' '.repeat(n - 5)}cikk`,
     ],
     ['kind-word tokens repeated', (n: number) => '1. cikk,'.repeat(Math.ceil(n / 8)).slice(0, n)],
-  ])('reads a caller-sized selector in linear time: %s', (_label, build) => {
-    // Best of seven at 5k, 20k, and 80k characters: linear grows ~16×, quadratic
-    // ~256×, so the 80k/5k ratio stays under 64 (5k floored at 0.1 ms), and the 80k
-    // read stays under an absolute bound.
-    const hu = actHtml(AI_ACT_HEADINGS.HU);
-    const headings = parseActStructure(hu, 'html', 'HU');
-    const time = (n: number) => {
-      const articles = build(n);
-      let best = Number.POSITIVE_INFINITY;
-      for (let round = 0; round < 7; round++) {
-        const start = performance.now();
-        extractSections(hu, headings, { articles }, 'HU');
-        best = Math.min(best, performance.now() - start);
-      }
-      return best;
-    };
-    const t5k = time(5_000);
-    time(20_000);
-    const t80k = time(80_000);
-    expect(t80k / Math.max(t5k, 0.1)).toBeLessThan(64);
-    expect(t80k).toBeLessThan(40);
-  });
+  ])(
+    'reads a caller-sized selector in linear time: %s',
+    (_label, build) => {
+      const hu = actHtml(AI_ACT_HEADINGS.HU);
+      const headings = parseActStructure(hu, 'html', 'HU');
+      // CPU time: the 80k/5k ratio under 64, and the 80k read under 40 ms.
+      return expectLinearScaling((n) => {
+        const articles = build(n);
+        return () => extractSections(hu, headings, { articles }, 'HU');
+      }, 40);
+    },
+    CPU_TIMED_TEST_TIMEOUT_MS,
+  );
 
   it('reads Greek capital iota and chi as the Roman numerals they stand in for', () => {
     const html = [
@@ -1108,34 +1099,6 @@ describe('headings in every EUR-Lex language (#107)', () => {
   /** Build a string of exactly `n` characters by repeating `unit`. */
   const fill = (unit: string, n: number) => unit.repeat(Math.ceil(n / unit.length)).slice(0, n);
 
-  /**
-   * Best-of-seven parse time at 5k, 20k, and 80k characters. A linear scan grows
-   * about 16× from 5k to 80k and a quadratic one about 256×, so the 80k/5k ratio
-   * must stay under 64 — with the 5k time floored at 0.1 ms, so a sub-timer-noise
-   * small input cannot inflate it — and the 80k parse under an absolute bound.
-   */
-  const expectLinearScaling = (
-    build: (n: number) => string,
-    format: 'html' | 'markdown' | 'xml',
-    language: (typeof EURLEX_LANGUAGES)[number],
-  ) => {
-    const time = (n: number) => {
-      const text = build(n);
-      let best = Number.POSITIVE_INFINITY;
-      for (let round = 0; round < 7; round++) {
-        const start = performance.now();
-        parseActStructure(text, format, language);
-        best = Math.min(best, performance.now() - start);
-      }
-      return best;
-    };
-    const t5k = time(5_000);
-    time(20_000);
-    const t80k = time(80_000);
-    expect(t80k / Math.max(t5k, 0.1)).toBeLessThan(64);
-    expect(t80k).toBeLessThan(40);
-  };
-
   const ADVERSARIAL: [
     string,
     (n: number) => string,
@@ -1193,8 +1156,15 @@ describe('headings in every EUR-Lex language (#107)', () => {
     ],
   ];
 
-  it.each(ADVERSARIAL)('stays linear on %s', (_label, build, format, language) =>
-    expectLinearScaling(build, format, language),
+  // CPU time: the 80k/5k ratio under 64, and the 80k parse under 40 ms.
+  it.each(ADVERSARIAL)(
+    'stays linear on %s',
+    (_label, build, format, language) =>
+      expectLinearScaling((n) => {
+        const text = build(n);
+        return () => parseActStructure(text, format, language);
+      }, 40),
+    CPU_TIMED_TEST_TIMEOUT_MS,
   );
 });
 
@@ -1401,35 +1371,6 @@ describe('quoted amending text is not the act’s own structure (#106)', () => {
   /** Build a string of exactly `n` characters by repeating `unit`. */
   const fill = (unit: string, n: number) => unit.repeat(Math.ceil(n / unit.length)).slice(0, n);
 
-  /**
-   * Best-of-seven parse time at 5k, 20k, and 80k characters: the 80k/5k ratio stays
-   * under 64 (linear grows ~16×, quadratic ~256×), the 5k time floored at 0.1 ms,
-   * and the 80k parse under an absolute bound. A Markdown case parses its source
-   * HTML too, built at the same size.
-   */
-  const expectLinearScaling = (
-    build: (n: number) => string,
-    format: 'html' | 'markdown' | 'xml',
-    buildHtml?: (n: number) => string,
-  ) => {
-    const time = (n: number) => {
-      const text = build(n);
-      const html = buildHtml?.(n);
-      let best = Number.POSITIVE_INFINITY;
-      for (let round = 0; round < 7; round++) {
-        const start = performance.now();
-        parseActStructure(text, format, 'EN', html);
-        best = Math.min(best, performance.now() - start);
-      }
-      return best;
-    };
-    const t5k = time(5_000);
-    time(20_000);
-    const t80k = time(80_000);
-    expect(t80k / Math.max(t5k, 0.1)).toBeLessThan(64);
-    expect(t80k).toBeLessThan(40);
-  };
-
   const ADVERSARIAL: [
     string,
     (n: number) => string,
@@ -1487,8 +1428,17 @@ describe('quoted amending text is not the act’s own structure (#106)', () => {
     ],
   ];
 
-  it.each(ADVERSARIAL)('stays linear on %s', (_label, build, format, buildHtml) =>
-    expectLinearScaling(build, format, buildHtml),
+  // CPU time: the 80k/5k ratio under 64, and the 80k parse under 40 ms. A Markdown
+  // case parses its source HTML too, built at the same size.
+  it.each(ADVERSARIAL)(
+    'stays linear on %s',
+    (_label, build, format, buildHtml) =>
+      expectLinearScaling((n) => {
+        const text = build(n);
+        const html = buildHtml?.(n);
+        return () => parseActStructure(text, format, 'EN', html);
+      }, 40),
+    CPU_TIMED_TEST_TIMEOUT_MS,
   );
 
   it('applies in the served language (#107): a German amending act', () => {
@@ -1664,26 +1614,16 @@ describe('html bodies written on one line (#126)', () => {
       (n: number) => `${' '.repeat(n / 2)}${fill('<br>', n / 2)}`,
     ],
     ['heading paragraphs on one line', (n: number) => fill('<p>Article 1 </p><p>Title</p>', n)],
-  ])('splits a one-line html body in linear time: %s', (_label, build) => {
-    // Best of seven at 5k, 20k, and 80k characters: linear grows ~16×, quadratic
-    // ~256×, so the 80k/5k ratio stays under 64 (5k floored at 0.1 ms), and the 80k
-    // parse stays under an absolute bound.
-    const time = (n: number) => {
-      const text = build(n);
-      let best = Number.POSITIVE_INFINITY;
-      for (let round = 0; round < 7; round++) {
-        const start = performance.now();
-        parseActStructure(text, 'html', 'EN');
-        best = Math.min(best, performance.now() - start);
-      }
-      return best;
-    };
-    const t5k = time(5_000);
-    time(20_000);
-    const t80k = time(80_000);
-    expect(t80k / Math.max(t5k, 0.1)).toBeLessThan(64);
-    expect(t80k).toBeLessThan(40);
-  });
+  ])(
+    'splits a one-line html body in linear time: %s',
+    // CPU time: the 80k/5k ratio under 64, and the 80k parse under 40 ms.
+    (_label, build) =>
+      expectLinearScaling((n) => {
+        const text = build(n);
+        return () => parseActStructure(text, 'html', 'EN');
+      }, 40),
+    CPU_TIMED_TEST_TIMEOUT_MS,
+  );
 });
 
 describe('chapter and section headings with an inline title in capitals (#130)', () => {

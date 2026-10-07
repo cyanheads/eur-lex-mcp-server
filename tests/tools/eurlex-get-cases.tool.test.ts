@@ -9,6 +9,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_get_cases } from '@/mcp-server/tools/definitions/eurlex-get-cases.tool.js';
 import { escapeSparqlLiteral } from '@/services/cellar-sparql/eli-resolution.js';
 import { canonicalWork, celexWorkRows, fixtureWork } from '../fixtures/cellar-works.js';
+import { bestCpuMs, CPU_TIMED_TEST_TIMEOUT_MS } from '../helpers/cpu-time.js';
 
 // --- Service mock ---
 const mockQuery = vi.fn();
@@ -1695,25 +1696,12 @@ describe('eurlex_get_cases', () => {
 
     /**
      * The parser runs over caller-sized text, so its cost must stay linear. Each
-     * adversarial shape is timed at 80k characters (best of five) against an
-     * absolute ceiling a linear parse clears by orders of magnitude and a
-     * quadratic one (billions of steps at this size) cannot. No small-input ratio:
-     * its sub-millisecond denominator turns one scheduler stall into a failure.
+     * adversarial shape is timed at 80k characters (best of five, in CPU time, so
+     * a loaded machine cannot fail it) against an absolute ceiling a linear parse
+     * clears by orders of magnitude and a quadratic one (billions of steps at this
+     * size) cannot.
      */
-    describe('parser cost on adversarial input', () => {
-      async function bestOfFive(caseNumber: string): Promise<number> {
-        let best = Number.POSITIVE_INFINITY;
-        for (let i = 0; i < 5; i++) {
-          mockQuery.mockResolvedValue([makeCaseBinding('62023CJ0097')]);
-          const ctx = createMockContext({ errors: eurlex_get_cases.errors });
-          const input = eurlex_get_cases.input.parse({ case_number: caseNumber });
-          const start = performance.now();
-          await Promise.resolve(eurlex_get_cases.handler(input, ctx)).catch(() => undefined);
-          best = Math.min(best, performance.now() - start);
-        }
-        return best;
-      }
-
+    describe('parser cost on adversarial input', { timeout: CPU_TIMED_TEST_TIMEOUT_MS }, () => {
       it.each([
         ['a repeated prefix', (n: number) => 'Case C-'.repeat(Math.ceil(n / 7)).slice(0, n)],
         ['digits with no year', (n: number) => `C-${'1'.repeat(n)}`],
@@ -1728,7 +1716,14 @@ describe('eurlex_get_cases', () => {
           (n: number) => `C-97/23 ${'1 '.repeat(Math.ceil(n / 2))}`,
         ],
       ])('stays linear for %s', async (_label, build) => {
-        expect(await bestOfFive(build(80_000))).toBeLessThan(250);
+        mockQuery.mockResolvedValue([makeCaseBinding('62023CJ0097')]);
+        const input = eurlex_get_cases.input.parse({ case_number: build(80_000) });
+        const best = await bestCpuMs(() =>
+          Promise.resolve(
+            eurlex_get_cases.handler(input, createMockContext({ errors: eurlex_get_cases.errors })),
+          ).catch(() => undefined),
+        );
+        expect(best).toBeLessThan(250);
       });
     });
   });

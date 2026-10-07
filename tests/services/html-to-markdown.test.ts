@@ -16,6 +16,7 @@ import { ACT_XHTML, NESTED_TABLE_XHTML } from '../fixtures/eurlex-act-html.js';
 import { AMENDING_HTML, CRR2_EXCERPT_HTML } from '../fixtures/eurlex-amending-act.js';
 import { CONSOLIDATED_ACT_HTML } from '../fixtures/eurlex-consolidated-act.js';
 import { LEGACY_ACT_HTML } from '../fixtures/eurlex-legacy-act.js';
+import { CPU_TIMED_TEST_TIMEOUT_MS, expectLinearScaling } from '../helpers/cpu-time.js';
 
 describe('htmlToMarkdown', () => {
   const md = htmlToMarkdown(ACT_XHTML);
@@ -264,24 +265,14 @@ describe('consolidated-text point labels (#120)', () => {
         return ROW_OPEN.repeat(depth) + '</div></div>'.repeat(depth);
       },
     ],
-  ])('joins labels in linear time: %s', (_label, build) => {
-    // Best of seven at 5k, 20k, and 80k characters: linear grows ~16×, quadratic
-    // ~256×, so the 80k/5k ratio stays under 64 (5k floored at 0.1 ms), and the 80k
-    // conversion stays under an absolute bound.
-    const time = (n: number) => {
-      const html = build(n);
-      let best = Number.POSITIVE_INFINITY;
-      for (let round = 0; round < 7; round++) {
-        const start = performance.now();
-        htmlToMarkdown(html);
-        best = Math.min(best, performance.now() - start);
-      }
-      return best;
-    };
-    const t5k = time(5_000);
-    time(20_000);
-    const t80k = time(80_000);
-    expect(t80k / Math.max(t5k, 0.1)).toBeLessThan(64);
-    expect(t80k).toBeLessThan(100);
-  });
+  ])(
+    'joins labels in linear time: %s',
+    // CPU time: the 80k/5k ratio under 64, and the 80k conversion under 100 ms.
+    (_label, build) =>
+      expectLinearScaling((n) => {
+        const html = build(n);
+        return () => htmlToMarkdown(html);
+      }, 100),
+    CPU_TIMED_TEST_TIMEOUT_MS,
+  );
 });
