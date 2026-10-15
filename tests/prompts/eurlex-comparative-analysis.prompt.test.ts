@@ -111,6 +111,69 @@ describe('eurlex_comparative_analysis', () => {
     expect(text).not.toContain('undefined');
   });
 
+  // --- #152: the EU search runs in EU legal vocabulary ---
+
+  describe('EU research steps (#152)', () => {
+    /** The text of one numbered research step. */
+    const step = (text: string, n: number) =>
+      new RegExp(`^${n}\\. [\\s\\S]*?(?=^\\d+\\. |^### |^## )`, 'm').exec(text)?.[0] ?? '';
+
+    it.each(['cybersecurity', 'data privacy'])(
+      'step 1 has "%s" restated in EU vocabulary, then browsed by each restated term',
+      async (domain) => {
+        const text = await renderText(eurlex_comparative_analysis.args!.parse({ domain }));
+        const first = step(text, 1);
+
+        expect(first.startsWith(`1. Restate "${domain}" in the vocabulary of EU law`)).toBe(true);
+        for (const mapping of [
+          '"AI regulation" → "artificial intelligence"',
+          '"data privacy" → "data protection"',
+          '"antitrust" → "competition law"',
+        ]) {
+          expect(first).toContain(mapping);
+        }
+        expect(first).toContain(
+          '**eurlex_browse_subjects** with each restated term, as a whole phrase',
+        );
+      },
+    );
+
+    it('step 2 searches by eurovoc_concept and by a title keyword, one document_type per call', async () => {
+      const text = await renderText(
+        eurlex_comparative_analysis.args!.parse({ domain: 'antitrust' }),
+      );
+      const second = step(text, 2);
+
+      expect(second).toContain('eurlex_search_documents');
+      expect(second).toContain('`eurovoc_concept`');
+      expect(second).toContain('`keyword`');
+      expect(second).toMatch(/one `document_type` per call/);
+      expect(second).not.toContain('REG or DIR');
+      for (const phrase of ['personal data', 'rules on competition', 'food law']) {
+        expect(second).toContain(`"${phrase}"`);
+      }
+      expect(second).toMatch(/no concept[^.]*keyword search alone/i);
+    });
+
+    it('names eurlex_lookup_celex for a landmark citation the reader already knows', async () => {
+      const text = await renderText(
+        eurlex_comparative_analysis.args!.parse({ domain: 'data privacy' }),
+      );
+
+      const second = step(text, 2);
+      expect(second).toMatch(/eurlex_lookup_celex[^.]*CELEX/);
+      expect(second).toContain('"Regulation (EU) 2016/679"');
+    });
+
+    it('still sends the domain verbatim to the US search', async () => {
+      const text = await renderText(
+        eurlex_comparative_analysis.args!.parse({ domain: 'antitrust' }),
+      );
+
+      expect(step(text, 5)).toContain('**courtlistener_search_opinions** with query "antitrust"');
+    });
+  });
+
   it('message structure conforms to MCP message shape', async () => {
     const args = eurlex_comparative_analysis.args!.parse({ domain: 'food safety' });
     const messages = await eurlex_comparative_analysis.generate(args);

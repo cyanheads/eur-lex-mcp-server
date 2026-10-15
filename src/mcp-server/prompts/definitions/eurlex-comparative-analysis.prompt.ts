@@ -127,8 +127,11 @@ export const eurlex_comparative_analysis = prompt('eurlex_comparative_analysis',
 ## Research Plan
 
 ### EU Side
-1. Call **eurlex_browse_subjects** with keyword "${domain}" to identify relevant EuroVoc concept URIs.
-2. Call **eurlex_search_documents** filtered by the EuroVoc concept(s) found, document_type REG or DIR, to find key legislative acts.
+1. Restate "${domain}" in the vocabulary of EU law first: EuroVoc labels and act titles name the legal field, not the everyday or US term. For example, "AI regulation" → "artificial intelligence", "data privacy" → "data protection" or "personal data", "antitrust" → "competition law" or "rules on competition", "food safety" → "food safety" or "food law". Call **eurlex_browse_subjects** with each restated term, as a whole phrase, to identify relevant EuroVoc concept URIs.
+2. Call **eurlex_search_documents** to find key legislative acts, with one \`document_type\` per call (\`REG\`, then \`DIR\`):
+   - \`eurovoc_concept\` set to a concept URI from step 1, for breadth. Results run newest first, so a foundational act can fall past the first page.
+   - \`keyword\` set to a phrase an act's title would carry, such as "personal data", "rules on competition", "food law", or "artificial intelligence", to reach the foundational acts. When step 1 finds no concept, run this keyword search alone.
+   - For a landmark act you already know by citation (e.g. "Regulation (EU) 2016/679"), call **eurlex_lookup_celex** to resolve it to its CELEX number.
 3. Call **eurlex_get_document** on the most significant act(s) to retrieve full text and metadata.
 4. Call **eurlex_get_relations** on key acts to understand the legislative history and amendments.
 
