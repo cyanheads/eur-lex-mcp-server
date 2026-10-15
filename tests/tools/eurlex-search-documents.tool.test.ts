@@ -3,11 +3,16 @@
  * @module tests/tools/eurlex-search-documents.tool.test
  */
 
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import {
+  JsonRpcErrorCode,
+  serviceUnavailable,
+  validationError,
+} from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_search_documents } from '@/mcp-server/tools/definitions/eurlex-search-documents.tool.js';
 import { canonicalWork, celexWorkRows, fixtureWork } from '../fixtures/cellar-works.js';
+import { assertInSortWindow, pageSpan, pagingClauses } from '../helpers/sort-window.js';
 
 const RESOURCE_TYPE_BASE = 'http://publications.europa.eu/resource/authority/resource-type/';
 
@@ -269,13 +274,13 @@ describe('eurlex_search_documents', () => {
     const ctx = createMockContext({ errors: eurlex_search_documents.errors });
     mockQuery.mockResolvedValue([]);
 
-    const input = eurlex_search_documents.input.parse({ keyword: 'data', offset: 10_000 });
+    const input = eurlex_search_documents.input.parse({ keyword: 'data', offset: 9_000 });
     const result = await eurlex_search_documents.handler(input, ctx);
 
     expect(result).toMatchObject({
       documents: [],
       total: 0,
-      offset: 10_000,
+      offset: 9_000,
       has_more: false,
       query_echo: { keyword: 'data', include_consolidated: false },
     });
@@ -284,7 +289,7 @@ describe('eurlex_search_documents', () => {
     expect((eurlex_search_documents.format!(result)[0] as { text: string }).text).toContain(
       '**Has more:** false',
     );
-    expect(mockQuery.mock.calls[0]?.[0]).toContain('OFFSET 10000');
+    expect(mockQuery.mock.calls[0]?.[0]).toContain('OFFSET 9000');
   });
 
   it('carries no notice on either surface for a page past the end (#112)', async () => {
@@ -292,20 +297,46 @@ describe('eurlex_search_documents', () => {
 
     const result = await runToolContract(eurlex_search_documents, {
       keyword: 'data',
-      offset: 10_000,
+      offset: 9_000,
     });
 
     expect(result.isError).toBeFalsy();
     expect(result.structuredContent).toMatchObject({
       documents: [],
       total: 0,
-      offset: 10_000,
+      offset: 9_000,
       has_more: false,
       query_echo: { keyword: 'data' },
     });
     expect(result.structuredContent).not.toHaveProperty('notice');
     expect(result.structuredContent).not.toHaveProperty('next_offset');
     expect(contentText(result)).not.toMatch(/^> /m);
+  });
+
+  // --- #143: document_type case variants ---
+
+  it.each([
+    ['reg', 'REG'],
+    ['Dir', 'DIR'],
+    [' opin-ag ', 'OPIN_AG'],
+    ['Opin_Ag', 'OPIN_AG'],
+  ])('serves document_type %j as %s and filters on it (#143)', async (value, member) => {
+    mockQuery.mockResolvedValue([makeDocBinding('32016R0679')]);
+    const result = await runToolContract(eurlex_search_documents, {
+      keyword: 'privacy',
+      document_type: value,
+    });
+    expect(result.isError).toBeFalsy();
+    const structured = eurlex_search_documents.output.parse(result.structuredContent);
+    expect(structured.query_echo.document_type).toBe(member);
+    expect(mockQuery.mock.calls[0]?.[0] as string).toContain(`resource-type/${member}>`);
+  });
+
+  it('still reads "" as unset and rejects a document_type naming no category (#143)', () => {
+    expect(eurlex_search_documents.input.parse({ document_type: '' }).document_type).toBe('');
+    expect(eurlex_search_documents.input.safeParse({ document_type: 'regulation' }).success).toBe(
+      false,
+    );
   });
 
   it('includes query_echo in the response', async () => {
@@ -731,7 +762,7 @@ describe('eurlex_search_documents', () => {
     expect(() => eurlex_search_documents.input.parse({ eurovoc_concept: 'not-a-uri' })).toThrow();
     expect(() => eurlex_search_documents.input.parse({ date_from: '2016' })).toThrow();
     expect(() => eurlex_search_documents.input.parse({ document_type: 'NOPE' })).toThrow();
-    expect(() => eurlex_search_documents.input.parse({ keyword: 'data', limit: 101 })).toThrow();
+    expect(() => eurlex_search_documents.input.parse({ keyword: 'data', limit: 10_001 })).toThrow();
     expect(() => eurlex_search_documents.input.parse({ keyword: 'data', offset: -1 })).toThrow();
   });
 
@@ -1097,7 +1128,7 @@ describe('eurlex_search_documents', () => {
 
       const input = eurlex_search_documents.input.parse({
         document_type: 'REG',
-        offset: 10_000,
+        offset: 9_000,
       });
       const result = await eurlex_search_documents.handler(input, ctx);
 
@@ -1630,7 +1661,11 @@ describe('eurlex_search_documents', () => {
 
       const sparql = mockQuery.mock.calls[0]?.[0] as string;
       expect(sparql).toContain('FILTER(?date <= "2020-01-01"^^xsd:date)');
-      expect(sparql).not.toContain('FILTER(?date >= ');
+      // Its only lower bound is the floor under every stored date (#159).
+      expect(sparql.match(/FILTER\(\?date >= "([^"]+)"/g)).toEqual([
+        'FILTER(?date >= "1000-01-01"',
+        'FILTER(?date >= "1000-01-01"',
+      ]);
       expect(result.query_echo.date_to).toBe('2020-01-01');
       expect(result.query_echo.date_from).toBeUndefined();
     });
@@ -1993,6 +2028,46 @@ describe('eurlex_search_documents', () => {
       expect(sparql).not.toMatch(/MAX\(\?(?:date|pageDate)\)/);
     });
 
+    // #159: CELLAR drops full-text matches under an open-below date range, so a
+    // date_to-only search gains a lower bound below every stored date.
+    const FLOOR = 'FILTER(?date >= "1000-01-01"^^xsd:date)';
+
+    it('bounds a date_to-only search below at both levels, ahead of date_to (#159)', async () => {
+      mockQuery.mockImplementation(async (q: string) =>
+        q.includes('GROUP BY ?celexNumber')
+          ? [makeDocBinding('31997L0066', { date: '1997-12-15' })]
+          : [],
+      );
+      const result = await runToolContract(eurlex_search_documents, {
+        keyword: 'privacy',
+        author_institution: 'Council',
+        date_to: '2005-12-31',
+      });
+      const { inner, outer } = splitPageFirst(searchQueries()[0] ?? '');
+
+      for (const part of [inner, outer]) {
+        expect(part.match(/FILTER\(\?date >= /g)).toHaveLength(1);
+        expect(part).toContain(FLOOR);
+        expect(part.indexOf(FLOOR)).toBeLessThan(
+          part.indexOf('FILTER(?date <= "2005-12-31"^^xsd:date)'),
+        );
+      }
+      // The floor is the server's, not the caller's: query_echo reports date_to alone.
+      const { query_echo } = eurlex_search_documents.output.parse(result.structuredContent);
+      expect(query_echo).not.toHaveProperty('date_from');
+      expect(query_echo.date_to).toBe('2005-12-31');
+    });
+
+    it.each([
+      ['date_from alone', { date_from: '2015-01-01' }],
+      ['a closed range', { date_from: '2004-01-01', date_to: '2005-12-31' }],
+    ])('adds no floor with %s (#159)', async (_label, dates) => {
+      const sparql = await searchQuery({ keyword: 'privacy', ...dates });
+
+      expect(sparql).not.toContain('1000-01-01');
+      expect(sparql).toContain(`FILTER(?date >= "${dates.date_from}"^^xsd:date)`);
+    });
+
     it('gathers types and titles in the outer query only', async () => {
       const { inner, outer } = splitPageFirst(
         await searchQuery({ date_from: '2024-03-01', date_to: '2024-03-31' }),
@@ -2046,9 +2121,13 @@ describe('eurlex_search_documents', () => {
         );
       }
       expect(inner).not.toContain('FILTER EXISTS');
-      expect(outer).toMatch(/FILTER EXISTS \{\s*\?work cdm:work_created_by_agent \?agent/);
-      expect(outer).toMatch(/FILTER EXISTS \{\s*\{\s*\?kwExpr cdm:expression_title \?kwTitle/);
-      // Outside those tests the outer query never joins the author or the keyword again.
+      // One FILTER EXISTS holds both patterns (#144): two separate blocks, the
+      // keyword's a lone title arm, fail to compile on CELLAR (SQ156).
+      expect(outer.match(/FILTER EXISTS \{/g)).toHaveLength(1);
+      expect(outer).toMatch(
+        /FILTER EXISTS \{\s*\?work cdm:work_created_by_agent \?agent[\s\S]*FILTER\(LANG\(\?agentLabel\) = "en"\)\s*\{\s*\?kwExpr cdm:expression_title \?kwTitle/,
+      );
+      // Outside that test the outer query never joins the author or the keyword again.
       const outerJoins = withoutFilterExists(outer);
       for (const joined of [
         'cdm:work_created_by_agent',
@@ -2058,6 +2137,64 @@ describe('eurlex_search_documents', () => {
       ]) {
         expect(outerJoins).not.toContain(joined);
       }
+    });
+
+    it.each([
+      [
+        'author_institution alone',
+        { author_institution: 'Council' },
+        '?work cdm:work_created_by_agent',
+      ],
+      ['keyword alone', { keyword: 'privacy' }, '{\n    ?kwExpr cdm:expression_title ?kwTitle'],
+    ])('keeps its own outer FILTER EXISTS for %s (#144)', async (_label, filter, opening) => {
+      const { outer } = splitPageFirst(await searchQuery({ ...filter, date_from: '2015-01-01' }));
+
+      expect(outer.match(/FILTER EXISTS \{/g)).toHaveLength(1);
+      expect(outer).toContain(`FILTER EXISTS {\n    ${opening}`);
+    });
+
+    it('merges author and title keyword into one outer FILTER EXISTS at offset 20 with document_type (#144)', async () => {
+      const sparql = await searchQuery({
+        keyword: 'data protection',
+        author_institution: 'European Parliament',
+        document_type: 'REG',
+        date_from: '2015-01-01',
+        date_to: '2020-12-31',
+        offset: 20,
+      });
+      const { inner, outer } = splitPageFirst(sparql);
+
+      expect(inner).toContain('LIMIT 21 OFFSET 20');
+      expect(outer.match(/FILTER EXISTS \{/g)).toHaveLength(1);
+      const [block] = outer.slice(outer.indexOf('FILTER EXISTS {')).split('\n  }\n');
+      expect(block).toContain(`?agentLabel bif:contains "'European Parliament'" .`);
+      expect(block).toContain(`?kwTitle bif:contains "'data protection'"`);
+      expect(withoutFilterExists(outer)).not.toMatch(/agentLabel|kwTitle/);
+    });
+
+    it('merges author and a whole-CELEX keyword, its CELEX arm inside the one block (#144)', async () => {
+      mockQuery.mockImplementation(async (q: string) => {
+        if (q.includes('GROUP BY ?celexNumber')) return [makeDocBinding('32016R0679')];
+        return q.includes('VALUES ?kwCelex {')
+          ? [{ kwCelex: { type: 'literal', value: '32016R0679' } }]
+          : [];
+      });
+      await eurlex_search_documents.handler(
+        eurlex_search_documents.input.parse({
+          keyword: '32016R0679',
+          author_institution: 'European Parliament',
+          include_corrigenda: true,
+          date_from: '2015-01-01',
+        }),
+        createMockContext({ errors: eurlex_search_documents.errors }),
+      );
+      const { outer } = splitPageFirst(searchQueries()[0] ?? '');
+
+      expect(outer.match(/FILTER EXISTS \{/g)).toHaveLength(1);
+      expect(outer).toMatch(
+        /FILTER EXISTS \{\s*\?work cdm:work_created_by_agent[\s\S]*\?work cdm:resource_legal_id_celex \?kwCelex \./,
+      );
+      expect(withoutFilterExists(outer)).not.toMatch(/agentLabel|kwCelex/);
     });
 
     it('tests a whole-CELEX keyword on the page’s works alone, never joining it in the outer query', async () => {
@@ -2404,5 +2541,368 @@ describe('eurlex_search_documents', () => {
       expect(description).toMatch(/2024\/01469[^;]*matches every CELEX holding it/);
       expect(description).toMatch(/2017\/111[^;]*tests every CELEX/);
     });
+  });
+});
+
+// --- #145: CELLAR's typed failures reach the wire with this tool's own recovery ---
+
+describe('eurlex_search_documents CELLAR failure contract (#145)', () => {
+  beforeEach(() => {
+    mockQuery.mockReset();
+  });
+
+  /*
+   * The service throws these without a recovery hint (its own test pins that), so
+   * the hint on the wire is the one this tool's contract declares.
+   */
+  it.each([
+    [
+      'sparql_error',
+      JsonRpcErrorCode.ValidationError,
+      () =>
+        validationError(
+          'CELLAR SPARQL error: Virtuoso 37000 Error SQ156: Internal Optimized compiler error',
+          {
+            reason: 'sparql_error',
+            retryable: false,
+          },
+        ),
+    ],
+    [
+      'sparql_timeout',
+      JsonRpcErrorCode.ServiceUnavailable,
+      () =>
+        serviceUnavailable('CELLAR SPARQL query timed out on Virtuoso', {
+          reason: 'sparql_timeout',
+          retryable: false,
+        }),
+    ],
+  ] as const)(
+    'reports %s with its declared code and the tool’s recovery',
+    async (reason, code, error) => {
+      mockQuery.mockRejectedValue(error());
+      const declared = eurlex_search_documents.errors?.find((e) => e.reason === reason);
+
+      const result = await runToolContract(eurlex_search_documents, {
+        keyword: 'data protection',
+        author_institution: 'European Parliament',
+        date_from: '2015-01-01',
+      });
+
+      expect(result.isError).toBe(true);
+      const structured = result.structuredContent as {
+        error?: { code?: number; data?: { reason?: string; recovery?: { hint?: string } } };
+      };
+      expect(declared?.code).toBe(code);
+      expect(structured.error?.code).toBe(code);
+      expect(structured.error?.data?.reason).toBe(reason);
+      expect(structured.error?.data?.recovery?.hint).toBe(declared?.recovery);
+      expect(contentText(result)).toContain(declared?.recovery ?? '<missing>');
+      // The hint names this tool's levers, never the raw-SPARQL tool's.
+      expect(declared?.recovery).not.toMatch(/timeout_hint|cdm: prefix|SPARQL query syntax/);
+    },
+  );
+});
+
+// --- #154: pages stop at CELLAR's 10,000-row sort window ---
+
+describe('eurlex_search_documents CELLAR sort window (#154)', () => {
+  beforeEach(() => {
+    mockQuery.mockReset();
+    mockMaxResults = 100;
+  });
+
+  /** The date of the document at sorted position `i`: one per day, newest first. */
+  const dateAt = (i: number) =>
+    new Date(Date.UTC(2026, 0, 1) - i * 86_400_000).toISOString().slice(0, 10);
+
+  /**
+   * CELLAR over `total` documents in the search's order: refuses a page past row
+   * 10,000 with SR353, and answers the page's work resolution with no rows.
+   */
+  function windowedDocuments(total: number) {
+    return async (q: string) => {
+      assertInSortWindow(q);
+      const [clause] = pagingClauses(q);
+      if (!clause) return [];
+      const { start, end } = pageSpan(clause, total);
+      return Array.from({ length: end - start }, (_, i) =>
+        makeDocBinding(`3${String(start + i).padStart(9, '0')}`, { date: dateAt(start + i) }),
+      );
+    };
+  }
+
+  const FORMS = [
+    ['flat', { document_type: 'REG' }],
+    ['date-bounded page-first', { document_type: 'REG', date_from: '1990-01-01' }],
+  ] as const;
+
+  describe.each(FORMS)('%s form', (_form, filters) => {
+    it('keeps the sentinel while the page and its sentinel fit (offset 9,899)', async () => {
+      mockQuery.mockImplementation(windowedDocuments(14_567));
+
+      const result = await runToolContract(eurlex_search_documents, {
+        ...filters,
+        limit: 100,
+        offset: 9_899,
+      });
+
+      expect(searchQueries()[0]).toContain('LIMIT 101 OFFSET 9899');
+      expect(result.structuredContent).toMatchObject({
+        total: 100,
+        has_more: true,
+        next_offset: 9_999,
+      });
+    });
+
+    it.each([
+      [9_900, 100],
+      [9_949, 51],
+      [9_950, 50],
+      [9_999, 1],
+    ])(
+      'serves the rows left in the window at offset %i (LIMIT %i), with no next_offset past it',
+      async (offset, limit) => {
+        mockQuery.mockImplementation(windowedDocuments(14_567));
+
+        const result = await runToolContract(eurlex_search_documents, {
+          ...filters,
+          limit: 100,
+          offset,
+        });
+
+        expect(result.isError).toBeFalsy();
+        expect(searchQueries()[0]).toContain(`LIMIT ${limit} OFFSET ${offset}`);
+        const structured = result.structuredContent as Record<string, unknown>;
+        expect(structured).toMatchObject({ total: 10_000 - offset, offset, has_more: false });
+        expect(structured).not.toHaveProperty('next_offset');
+        expect(structured).not.toHaveProperty('truncated');
+        const lastDate = dateAt(9_999);
+        const notice = structured.notice as string;
+        expect(notice).toContain('row 10,000');
+        expect(notice).toContain(`date_to=${lastDate}`);
+        expect(notice).not.toContain('offset=');
+        const text = contentText(result);
+        expect(text).toContain(`> ${notice}`);
+        expect(text).toContain('**Has more:** false');
+        expect(text).not.toContain('**Next offset:**');
+      },
+    );
+
+    it('continues past the window through a closed date window, on both surfaces', async () => {
+      mockQuery.mockImplementation(windowedDocuments(14_567));
+
+      const result = await runToolContract(eurlex_search_documents, {
+        ...filters,
+        limit: 100,
+        offset: 9_900,
+      });
+
+      const lastDate = dateAt(9_999);
+      const year = Number(lastDate.slice(0, 4));
+      const notice = (result.structuredContent as { notice?: string }).notice ?? '';
+      if ('date_from' in filters) {
+        // The caller's own date_from closes the window; no earlier years to step through.
+        expect(notice).toContain(`date_from=${filters.date_from}, date_to=${lastDate}`);
+        expect(notice).not.toContain('calendar year');
+      } else {
+        expect(notice).toContain(`date_from=${year}-01-01, date_to=${lastDate}`);
+        expect(notice).toContain(`date_from=${year - 1}-01-01, date_to=${year - 1}-12-31`);
+      }
+      expect(contentText(result)).toContain(`> ${notice}`);
+    });
+
+    it('reads a short page inside the cut window as the end of the matches', async () => {
+      mockQuery.mockImplementation(windowedDocuments(9_920));
+
+      const result = await runToolContract(eurlex_search_documents, {
+        ...filters,
+        limit: 100,
+        offset: 9_900,
+      });
+
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured).toMatchObject({ total: 20, has_more: false });
+      expect(structured).not.toHaveProperty('notice');
+    });
+
+    it('rejects offset 10,000 with a typed error and sends no query', async () => {
+      mockQuery.mockImplementation(windowedDocuments(14_567));
+      const declared = eurlex_search_documents.errors?.find(
+        (e) => e.reason === 'offset_past_window',
+      );
+
+      const result = await runToolContract(eurlex_search_documents, {
+        ...filters,
+        limit: 100,
+        offset: 10_000,
+      });
+
+      expect(result.isError).toBe(true);
+      const error = (
+        result.structuredContent as {
+          error?: { code?: number; data?: { reason?: string; recovery?: { hint?: string } } };
+        }
+      ).error;
+      expect(error?.code).toBe(JsonRpcErrorCode.ValidationError);
+      expect(error?.data?.reason).toBe('offset_past_window');
+      expect(error?.data?.recovery?.hint).toBe(declared?.recovery);
+      expect(declared?.recovery).toContain('date_to');
+      expect(contentText(result)).toContain('10,000');
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+  });
+
+  it('walks next_offset to row 10,000 and promises nothing past it', async () => {
+    mockQuery.mockImplementation(windowedDocuments(14_567));
+    const offsets: number[] = [];
+    let offset: number | undefined = 9_700;
+    let last: Record<string, unknown> = {};
+    while (offset !== undefined) {
+      offsets.push(offset);
+      const result = await runToolContract(eurlex_search_documents, {
+        document_type: 'REG',
+        limit: 100,
+        offset,
+      });
+      expect(result.isError).toBeFalsy();
+      last = result.structuredContent as Record<string, unknown>;
+      offset = last.next_offset as number | undefined;
+    }
+
+    expect(offsets).toEqual([9_700, 9_800, 9_900]);
+    expect(last).toMatchObject({ total: 100, has_more: false });
+    expect(last.notice).toContain('row 10,000');
+  });
+
+  it('states the bound in the offset and has_more descriptions', () => {
+    expect(eurlex_search_documents.input.shape.offset.description).toContain('10,000');
+    expect(eurlex_search_documents.output.shape.has_more.description).toContain('10,000');
+    expect(
+      eurlex_search_documents.input.parse({ document_type: 'REG', offset: 10_000 }).offset,
+    ).toBe(10_000);
+  });
+});
+
+// --- #151: an over-maximum limit is served at the maximum and disclosed ---
+
+describe('eurlex_search_documents over-maximum limit (#151)', () => {
+  beforeEach(() => {
+    mockQuery.mockReset();
+    mockMaxResults = 100;
+  });
+
+  /** CELLAR over `total` documents: serves each page's slice, inside the sort window. */
+  function documentsOf(total: number) {
+    return async (q: string) => {
+      assertInSortWindow(q);
+      const [clause] = pagingClauses(q);
+      if (!clause) return [];
+      const { start, end } = pageSpan(clause, total);
+      return Array.from({ length: end - start }, (_, i) =>
+        makeDocBinding(`3${String(start + i).padStart(9, '0')}`, { date: '2020-01-01' }),
+      );
+    };
+  }
+
+  const CLAMP_LINE = '**Limit clamped:** 150 → 100 (per-call maximum)';
+
+  it('serves limit 150 at 100 and reports the clamp on both surfaces', async () => {
+    mockQuery.mockImplementation(documentsOf(500));
+
+    const result = await runToolContract(eurlex_search_documents, { keyword: 'data', limit: 150 });
+
+    expect(result.isError).toBeFalsy();
+    expect(searchQueries()[0]).toContain('LIMIT 101 OFFSET 0');
+    expect(result.structuredContent).toMatchObject({
+      total: 100,
+      has_more: true,
+      next_offset: 100,
+      cap: 100,
+      limit_clamp: { requested: 150, applied: 100 },
+    });
+    expect(contentText(result)).toContain(CLAMP_LINE);
+  });
+
+  it('reports the clamp on a short page and on an empty first page', async () => {
+    mockQuery.mockImplementation(documentsOf(3));
+    const short = await runToolContract(eurlex_search_documents, { keyword: 'data', limit: 150 });
+    expect(short.structuredContent).toMatchObject({
+      total: 3,
+      has_more: false,
+      limit_clamp: { requested: 150, applied: 100 },
+    });
+    expect(short.structuredContent).not.toHaveProperty('truncated');
+    expect(contentText(short)).toContain(CLAMP_LINE);
+
+    mockQuery.mockReset();
+    mockQuery.mockImplementation(documentsOf(0));
+    const empty = await runToolContract(eurlex_search_documents, { keyword: 'data', limit: 150 });
+    const structured = empty.structuredContent as Record<string, unknown>;
+    expect(structured).toMatchObject({ total: 0, limit_clamp: { requested: 150, applied: 100 } });
+    expect(structured.notice).toContain('No documents matched');
+    expect(contentText(empty)).toContain(CLAMP_LINE);
+    expect(contentText(empty)).toContain(`> ${structured.notice as string}`);
+  });
+
+  it('reports the operator ceiling as the applied value', async () => {
+    mockMaxResults = 50;
+    mockQuery.mockImplementation(documentsOf(500));
+
+    const result = await runToolContract(eurlex_search_documents, { keyword: 'data', limit: 80 });
+
+    expect(searchQueries()[0]).toContain('LIMIT 51 OFFSET 0');
+    expect(result.structuredContent).toMatchObject({
+      total: 50,
+      next_offset: 50,
+      cap: 50,
+      limit_clamp: { requested: 80, applied: 50 },
+    });
+    expect(contentText(result)).toContain('**Limit clamped:** 80 → 50 (per-call maximum)');
+  });
+
+  it.each([20, 100])('adds no clamp at limit %i, within the maximum', async (limit) => {
+    mockQuery.mockImplementation(documentsOf(500));
+
+    const result = await runToolContract(eurlex_search_documents, { keyword: 'data', limit });
+
+    expect(result.structuredContent).toMatchObject({ total: limit, cap: limit });
+    expect(result.structuredContent).not.toHaveProperty('limit_clamp');
+    expect(contentText(result)).not.toContain('Limit clamped');
+  });
+
+  it('rejects limit 0 and 10,001 and accepts 10,000', () => {
+    expect(() => eurlex_search_documents.input.parse({ keyword: 'data', limit: 0 })).toThrow();
+    expect(() => eurlex_search_documents.input.parse({ keyword: 'data', limit: 10_001 })).toThrow();
+    expect(eurlex_search_documents.input.parse({ keyword: 'data', limit: 10_000 }).limit).toBe(
+      10_000,
+    );
+    expect(eurlex_search_documents.input.shape.limit.description).toContain(
+      'served up to 100 per call',
+    );
+  });
+
+  it('discloses both the clamp and the window when they meet (offset 9,950, limit 150)', async () => {
+    mockQuery.mockImplementation(documentsOf(14_567));
+
+    const result = await runToolContract(eurlex_search_documents, {
+      document_type: 'REG',
+      limit: 150,
+      offset: 9_950,
+    });
+
+    expect(searchQueries()[0]).toContain('LIMIT 50 OFFSET 9950');
+    const structured = result.structuredContent as Record<string, unknown>;
+    expect(structured).toMatchObject({
+      total: 50,
+      has_more: false,
+      limit_clamp: { requested: 150, applied: 100 },
+    });
+    expect(structured).not.toHaveProperty('next_offset');
+    const notice = structured.notice as string;
+    expect(notice).toContain('row 10,000');
+    const text = contentText(result);
+    expect(text).toContain(CLAMP_LINE);
+    expect(text).toContain(`> ${notice}`);
   });
 });

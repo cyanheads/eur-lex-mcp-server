@@ -6,6 +6,13 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { echoValue } from '@/mcp-server/tools/echo-value.js';
+import { enumInput } from '@/mcp-server/tools/enum-input.js';
+import {
+  clampLimit,
+  limitClampEnrichment,
+  limitClampTrailer,
+  ROW_LIMIT_CEILING,
+} from '@/mcp-server/tools/limit-clamp.js';
 import {
   canonicalEurovocConceptUri,
   ENG_LANGUAGE_URI,
@@ -18,9 +25,19 @@ import {
 import { isSafeSparqlIri, isValidCalendarDate } from '@/services/cellar-sparql/eli-resolution.js';
 import { keywordMatchPattern, keywordTitlePhrase } from '@/services/cellar-sparql/keyword-match.js';
 import { isConsolidatedCelex } from '@/services/cellar-sparql/relation-traversal.js';
+import {
+  dateRangeFilters,
+  isPastSortWindow,
+  readWindowedPage,
+  windowEndRoute,
+  windowedLimit,
+} from '@/services/cellar-sparql/sort-window.js';
 import { resolveCelexWorks } from '@/services/cellar-sparql/work-resolution.js';
 
 const RESOURCE_TYPE_BASE = 'http://publications.europa.eu/resource/authority/resource-type/';
+
+/** Documents served per call; a larger `limit` is clamped to it. */
+const MAX_PAGE_SIZE = 100;
 
 const DOCUMENT_TYPES = ['REG', 'DIR', 'DEC', 'TREATY', 'JUDG', 'OPIN_AG', 'PROP', 'REC'] as const;
 type DocumentType = (typeof DOCUMENT_TYPES)[number];
@@ -95,19 +112,22 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
       .describe(
         'Keyword matched against English document titles via the full-text index (multi-word input is treated as a phrase), and against CELEX numbers. A keyword that is a whole CELEX (e.g. 32016R0679) matches that document, its numbered siblings (…(01) to …(20)), and for case law its _INF, _RES, _SUM, and _EXT records, plus its corrigenda (…R(01) to …R(20), and any work recorded as correcting it) when include_corrigenda is set. A partial CELEX that opens with the sector and year (02016R0679), the year and type letters (2016R0679), or type letters followed by the number (R0679, J0131) matches every CELEX that holds it at that position, consolidated versions included; an OJ C fragment of a year, a slash, and at least four characters of the number (2024/01469, C/2024/0146) matches every CELEX holding it; one with a shorter number (2017/111) or opening with letters not followed by a digit (R(01), ROU_2024) tests every CELEX and can take tens of seconds; a bare year (2016) or a fragment opening mid-year or mid-number (016R0679, 0679, 0679R) matches titles only. A keyword with no digit, or with a character no CELEX holds (a space, a period), matches titles only. A keyword with no letter or digit is rejected.',
       ),
-    document_type: z
-      .union([
-        z.literal(''),
-        z
-          .enum(DOCUMENT_TYPES)
-          .describe(
-            'Document type: REG=Regulation, DIR=Directive, DEC=Decision, TREATY=Treaty, JUDG=Judgment, OPIN_AG=AG Opinion, PROP=Proposal, REC=Recommendation.',
-          ),
-      ])
-      .optional()
-      .describe(
-        'Document category: REG=Regulations, DIR=Directives, DEC=Decisions, TREATY=Treaties, JUDG=Judgments, OPIN_AG=AG Opinions, PROP=Proposals, REC=Recommendations. Each category includes its explicit CELLAR authority variants (for example, delegated and implementing regulations). Omit to search all types. Consolidated texts are excluded unless include_consolidated is true.',
-      ),
+    document_type: enumInput(
+      DOCUMENT_TYPES,
+      z
+        .union([
+          z.literal(''),
+          z
+            .enum(DOCUMENT_TYPES)
+            .describe(
+              'Document type: REG=Regulation, DIR=Directive, DEC=Decision, TREATY=Treaty, JUDG=Judgment, OPIN_AG=AG Opinion, PROP=Proposal, REC=Recommendation.',
+            ),
+        ])
+        .optional()
+        .describe(
+          'Document category: REG=Regulations, DIR=Directives, DEC=Decisions, TREATY=Treaties, JUDG=Judgments, OPIN_AG=AG Opinions, PROP=Proposals, REC=Recommendations. Each category includes its explicit CELLAR authority variants (for example, delegated and implementing regulations). Omit to search all types. Consolidated texts are excluded unless include_consolidated is true.',
+        ),
+    ),
     include_consolidated: z
       .boolean()
       .default(false)
@@ -188,14 +208,18 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
       .int()
       .min(0)
       .default(0)
-      .describe('Pagination offset — number of results to skip. Defaults to 0.'),
+      .describe(
+        'Pagination offset — number of results to skip. Defaults to 0. Must be below 10,000: CELLAR sorts at most 10,000 matches for one search, so pages stop at row 10,000; narrow with a date_from/date_to window to reach older documents.',
+      ),
     limit: z
       .number()
       .int()
       .min(1)
-      .max(100)
+      .max(ROW_LIMIT_CEILING)
       .default(20)
-      .describe('Maximum number of results to return (1–100). Defaults to 20.'),
+      .describe(
+        'Maximum number of results to return, served up to 100 per call; a larger value (up to 10,000) is served at 100 and reported in limit_clamp. Defaults to 20.',
+      ),
   }),
   output: z.object({
     documents: z
@@ -239,7 +263,9 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
     offset: z.number().describe('Pagination offset used for this response.'),
     has_more: z
       .boolean()
-      .describe('True only when CELLAR returned an additional valid row beyond this page.'),
+      .describe(
+        'True only when CELLAR returned an additional valid row beyond this page. False on a page that ends at row 10,000, the last one CELLAR sorts; its notice says whether more may match.',
+      ),
     next_offset: z
       .number()
       .optional()
@@ -283,11 +309,20 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
       .string()
       .optional()
       .describe(
-        'Guidance for the next call: on an empty first page, the filters that matched nothing and how to broaden them; on a page with more rows, the offset to continue from.',
+        'Guidance for the next call: on an empty first page, the filters that matched nothing and how to broaden them; on a page with more rows, the offset to continue from; on a page ending at row 10,000, that no later page can be read and the closed date_from/date_to window that continues past it.',
       ),
+    limit_clamp: limitClampEnrichment,
   },
+  enrichmentTrailer: { limit_clamp: limitClampTrailer },
 
   errors: [
+    {
+      reason: 'offset_past_window',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'offset is 10,000 or more, past the last row CELLAR sorts for one search.',
+      recovery:
+        'Narrow the search below 10,000 matches — search a date_from/date_to window ending at the date of the last document reached (results run newest first), or add document_type, eurovoc_concept, author_institution, or keyword — then page from offset 0.',
+    },
     {
       reason: 'no_filters',
       code: JsonRpcErrorCode.ValidationError,
@@ -318,16 +353,31 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
     },
     {
       reason: 'sparql_error',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'CELLAR rejected the search it was sent: a filter combination its query planner cannot compile. The same call fails the same way again.',
+      recovery:
+        'Drop one of the combined filters (author_institution, keyword, eurovoc_concept, document_type), then search again.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'sparql_timeout',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'Virtuoso returned HTTP 200 with an error body — query malformed or timed out.',
-      recovery: 'Simplify the query or reduce the date range and retry.',
+      when: 'The search ran past the client timeout, or CELLAR refused it as too costly to run. It is not retried.',
+      recovery:
+        'Narrow the search with a closer date_from/date_to range, a document_type, or a more specific keyword, then search again.',
       thrownBy: 'service',
     },
   ],
 
   async handler(input, ctx) {
+    if (isPastSortWindow(input.offset)) {
+      throw ctx.fail(
+        'offset_past_window',
+        `offset ${input.offset} is past row 10,000, the last row CELLAR sorts for one search, so no page starts there.`,
+      );
+    }
     const svc = getCellarSparqlService();
-    const pageLimit = Math.min(input.limit, svc.maxResults);
+    const pageLimit = clampLimit(ctx, input.limit, Math.min(MAX_PAGE_SIZE, svc.maxResults));
 
     /**
      * Date-range validity, checked before any clause is built and before the
@@ -374,12 +424,7 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
       : '?work cdm:work_has_resource-type ?selectedType .'
   }`;
     }
-    if (dateFrom) {
-      filters.push(`FILTER(?date >= "${dateFrom}"^^xsd:date)`);
-    }
-    if (dateTo) {
-      filters.push(`FILTER(?date <= "${dateTo}"^^xsd:date)`);
-    }
+    filters.push(...dateRangeFilters(dateFrom, dateTo));
     /**
      * In-force filter, applied for either polarity. CELLAR expresses the negative:
      * Virtuoso serialises `cdm:resource_legal_in-force` as an xsd:integer `0`/`1`,
@@ -553,8 +598,12 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
   ${keywordPart}
   ${inForceClause}
   ${filters.join('\n  ')}`;
-    const paging = `LIMIT ${pageLimit + 1} OFFSET ${input.offset}`;
-    const onPageWorks = (pattern: string) => pattern && `FILTER EXISTS {\n    ${pattern}\n  }`;
+    // One sentinel row past the page, cut to CELLAR's sort window.
+    const paging = `LIMIT ${windowedLimit(input.offset, pageLimit)} OFFSET ${input.offset}`;
+    const onPageWorks = (...patterns: string[]) => {
+      const pattern = patterns.filter(Boolean).join('\n  ');
+      return pattern && `FILTER EXISTS {\n    ${pattern}\n  }`;
+    };
 
     // The keyword's one CELLAR lookup runs only once the input has passed validation.
     const keywordClause = keywordInput ? await keywordMatchPattern(svc, keywordInput, ctx) : '';
@@ -575,7 +624,10 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
      * The outer query tests the author and the keyword as FILTER EXISTS rather than
      * joining them again: the grouped works are the same, but a join re-drives their
      * full-text and CELEX arms over the whole corpus. With ?work already bound,
-     * EXISTS checks the page's works alone.
+     * EXISTS checks the page's works alone. When both are set they share one FILTER
+     * EXISTS (#144): two separate blocks, the keyword's a lone title arm, fail to
+     * compile on CELLAR (SQ156). The two patterns share only ?work, so one block
+     * admits exactly the works the two did.
      *
      * A date-less search keeps the flat form: finding a broad browse's page keys
      * costs about as much as the whole query, and a keyword-only search ran faster
@@ -597,7 +649,11 @@ ${projection('?pageDate')} WHERE {
       ${filters.join('\n      ')}
     } GROUP BY ?celexNumber ORDER BY DESC(?pageDate) ?celexNumber ${paging}
   }
-  ${rowPattern(onPageWorks(authorClause), onPageWorks(keywordClause))}
+  ${
+    authorClause && keywordClause
+      ? rowPattern(onPageWorks(authorClause, keywordClause), '')
+      : rowPattern(onPageWorks(authorClause), onPageWorks(keywordClause))
+  }
 } GROUP BY ?celexNumber ORDER BY DESC(?docDate) ?celexNumber`
         : `
 ${projection('?date')} WHERE {
@@ -641,7 +697,7 @@ ${projection('?date')} WHERE {
       );
     }
 
-    const hasMore = bindings.length > pageLimit;
+    const { hasMore, atWindowEnd } = readWindowedPage(bindings.length, input.offset, pageLimit);
     const page = bindings.slice(0, pageLimit);
     // A CELEX held by several works resolves to its canonical work (#97), in one
     // follow-up query for the page — the alias match never binds inside the
@@ -691,6 +747,12 @@ ${projection('?date')} WHERE {
         cap: pageLimit,
         guidance: `More documents match beyond this page; call again with offset=${input.offset + pageLimit}.`,
       });
+    } else if (atWindowEnd) {
+      // Rows run newest first, so the last row's date continues the search past the
+      // window; documents of that date are read again.
+      ctx.enrich.notice(
+        `This page ends at row 10,000, the last row CELLAR sorts for one search, so no later page can be read and more documents may match. ${windowEndRoute('documents', documents.at(-1)?.date, dateFrom)}`,
+      );
     }
 
     return {
