@@ -3,7 +3,11 @@
  * @module tests/tools/eurlex-lookup-celex.tool.test
  */
 
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import {
+  JsonRpcErrorCode,
+  serviceUnavailable,
+  validationError,
+} from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_lookup_celex } from '@/mcp-server/tools/definitions/eurlex-lookup-celex.tool.js';
@@ -269,6 +273,45 @@ describe('eurlex_lookup_celex', () => {
     expect(() =>
       eurlex_lookup_celex.input.parse({ identifier: 'OJ L 119', identifier_type: 'oj' }),
     ).toThrow();
+  });
+
+  // --- #143: identifier_type case and separator variants ---
+
+  it.each([
+    ['CELEX', 'celex'],
+    ['Eli', 'eli'],
+    [' ECLI ', 'ecli'],
+    ['AUTO', 'auto'],
+  ])('serves identifier_type %j as %s (#143)', (value, member) => {
+    expect(
+      eurlex_lookup_celex.input.parse({ identifier: '32016R0679', identifier_type: value })
+        .identifier_type,
+    ).toBe(member);
+  });
+
+  it('forces the CELEX branch for identifier_type "CELEX" (#143)', async () => {
+    // Under auto this citation resolves to 32016R0679; forced, it is read as a CELEX.
+    mockQuery.mockImplementation(async (q: string) =>
+      q.includes('"32016R0679"^^xsd:string')
+        ? [makeBinding('32016R0679', { canonical: true })]
+        : [],
+    );
+    const result = await runToolContract(eurlex_lookup_celex, {
+      identifier: 'Regulation (EU) 2016/679',
+      identifier_type: 'CELEX',
+    });
+    expect(result.structuredContent).toMatchObject({ found: false });
+    expect((result.structuredContent as { notice?: string }).notice).toContain(
+      'No CELLAR work matches CELEX REGULATION (EU) 2016/679 (parsed from "Regulation (EU) 2016/679")',
+    );
+  });
+
+  it('keeps the auto default and the enum rejection (#143)', () => {
+    expect(eurlex_lookup_celex.input.parse({ identifier: 'x' }).identifier_type).toBe('auto');
+    const result = eurlex_lookup_celex.input.safeParse({ identifier: 'x', identifier_type: 'url' });
+    expect(result.error?.issues[0]?.message).toBe(
+      'Invalid option: expected one of "celex"|"eli"|"ecli"|"auto"',
+    );
   });
 
   // --- #22: well-formed-but-nonexistent identifiers return found: false (no throw) ---
@@ -1043,11 +1086,14 @@ describe('eurlex_lookup_celex', () => {
     });
 
     it('parses a citation only under auto', async () => {
-      mockQuery.mockResolvedValue([]);
-      const { result, queries } = await resolve('Regulation (EU) 2016/679', 'celex');
+      holds('32016R0679');
+      const { result, ctx } = await resolve('Regulation (EU) 2016/679', 'celex');
 
+      // A forced CELEX is normalized as a CELEX — uppercased — never parsed as a citation.
       expect(result.found).toBe(false);
-      expect(queries[0]).toContain('"Regulation (EU) 2016/679"^^xsd:string');
+      expect(getEnrichment(ctx).notice).toContain(
+        'No CELLAR work matches CELEX REGULATION (EU) 2016/679 (parsed from "Regulation (EU) 2016/679")',
+      );
     });
 
     it('returns found: false with the notice and no other field for a CELEX no work carries', async () => {
@@ -1099,5 +1145,222 @@ describe('eurlex_lookup_celex', () => {
       expect(structured).not.toHaveProperty('notice');
       expect(structured).toMatchObject({ found: true, celex_number: '32016R0679' });
     });
+  });
+
+  // --- #147: pasted citation forms ---
+
+  describe('pasted citation forms (#147)', () => {
+    const GDPR_OJ_ELI = 'http://data.europa.eu/eli/reg/2016/679/oj';
+    const GDPR_PIT_ELI = 'http://data.europa.eu/eli/reg/2016/679/2016-05-04';
+
+    /**
+     * CELLAR holds exactly these CELEX and ELI literals: a typed CELEX lookup or an
+     * ELI exact match answers only for its own literal.
+     */
+    function holds(): void {
+      mockQuery.mockImplementation(async (q: string) => {
+        for (const celex of [
+          '32016R0679',
+          '02016R0679-20160504',
+          '32016R0679R(02)',
+          '31995L0046',
+        ]) {
+          if (q.includes(`"${celex}"^^xsd:string`)) {
+            return [makeBinding(celex, { type: `${RESOURCE_TYPE}REG`, canonical: true })];
+          }
+        }
+        if (q.includes(`"${GDPR_OJ_ELI}"^^xsd:anyURI`)) return [makeBinding('32016R0679')];
+        if (q.includes(`"${GDPR_PIT_ELI}"^^xsd:anyURI`))
+          return [makeBinding('02016R0679-20160504')];
+        return [];
+      });
+    }
+
+    async function lookup(identifier: string, identifierType?: 'auto' | 'celex' | 'eli') {
+      const result = await runToolContract(eurlex_lookup_celex, {
+        identifier,
+        ...(identifierType ? { identifier_type: identifierType } : {}),
+      });
+      const structured = result.structuredContent as Record<string, unknown> & {
+        error?: { data?: { reason?: string } };
+      };
+      const text = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+      const queries = mockQuery.mock.calls.map((c) => c[0] as string);
+      return { structured, text, queries };
+    }
+
+    beforeEach(holds);
+
+    it.each([
+      ['a lowercase CELEX', '32016r0679', '32016R0679'],
+      ['a lowercase consolidated CELEX', '02016r0679-20160504', '02016R0679-20160504'],
+      ['a lowercase corrigendum', '32016r0679r(02)', '32016R0679R(02)'],
+      ['a CELEX: prefix', 'CELEX:32016R0679', '32016R0679'],
+      ['a celex: prefix', 'celex:32016R0679', '32016R0679'],
+      ['an encoded prefix', 'CELEX%3A32016R0679', '32016R0679'],
+      [
+        'a legal-content URL',
+        'https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX:32016R0679',
+        '32016R0679',
+      ],
+      [
+        'a TXT/HTML URL with parameters and a fragment',
+        'https://eur-lex.europa.eu/legal-content/FR/TXT/HTML/?uri=CELEX%3A32016R0679&qid=1#d1e40',
+        '32016R0679',
+      ],
+      [
+        'a URL naming an encoded corrigendum',
+        'https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX:32016R0679R%2802%29',
+        '32016R0679R(02)',
+      ],
+      [
+        'the legacy LexUriServ URL',
+        'https://eur-lex.europa.eu/LexUriServ/LexUriServ.do?uri=CELEX:31995L0046:EN:HTML',
+        '31995L0046',
+      ],
+      [
+        'a resource/celex alias URI',
+        'http://publications.europa.eu/resource/celex/32016R0679',
+        '32016R0679',
+      ],
+      ['an https ELI', 'https://data.europa.eu/eli/reg/2016/679/oj', '32016R0679'],
+      ['an https bare work ELI', 'https://data.europa.eu/eli/reg/2016/679', '32016R0679'],
+      ['an eur-lex ELI', 'https://eur-lex.europa.eu/eli/reg/2016/679/oj', '32016R0679'],
+      ['a scheme-less ELI', 'data.europa.eu/eli/reg/2016/679/oj', '32016R0679'],
+      ['an upper-case-host ELI', 'HTTP://DATA.EUROPA.EU/eli/reg/2016/679/oj', '32016R0679'],
+      ['a trailing-slash ELI', 'http://data.europa.eu/eli/reg/2016/679/oj/', '32016R0679'],
+      ['a language-suffixed ELI', 'http://data.europa.eu/eli/reg/2016/679/oj/eng', '32016R0679'],
+      [
+        'a point-in-time ELI with a language',
+        'http://data.europa.eu/eli/reg/2016/679/2016-05-04/eng',
+        '02016R0679-20160504',
+      ],
+    ])('resolves %s under auto', async (_label, identifier, celex) => {
+      const { structured, text } = await lookup(identifier);
+
+      expect(structured).toMatchObject({ found: true, celex_number: celex });
+      expect(text).toContain(`**CELEX:** ${celex}`);
+    });
+
+    it.each([
+      ['a lowercase CELEX', '32016r0679', '32016R0679'],
+      ['a CELEX: prefix', 'CELEX:32016R0679', '32016R0679'],
+      [
+        'a legal-content URL',
+        'https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX:32016R0679',
+        '32016R0679',
+      ],
+    ])('resolves %s under identifier_type "celex"', async (_label, identifier, celex) => {
+      const { structured } = await lookup(identifier, 'celex');
+      expect(structured).toMatchObject({ found: true, celex_number: celex });
+    });
+
+    it.each([
+      ['an https ELI', 'https://data.europa.eu/eli/reg/2016/679/oj'],
+      ['a language-suffixed eur-lex ELI', 'https://eur-lex.europa.eu/eli/reg/2016/679/oj/fra'],
+      ['a trailing-slash ELI', 'http://data.europa.eu/eli/reg/2016/679/oj/'],
+    ])('resolves %s under identifier_type "eli"', async (_label, identifier) => {
+      const { structured } = await lookup(identifier, 'eli');
+      expect(structured).toMatchObject({ found: true, celex_number: '32016R0679' });
+    });
+
+    it('echoes the normalized CELEX and the pasted form in the notice of a miss', async () => {
+      const { structured, text } = await lookup('celex:32016r9999');
+
+      expect(structured.found).toBe(false);
+      expect(structured.notice).toContain('CELEX 32016R9999 (parsed from "celex:32016r9999")');
+      expect(text).toContain('CELEX 32016R9999 (parsed from "celex:32016r9999")');
+    });
+
+    it.each([
+      ['C-131/12', undefined],
+      ['Case C-131/12', undefined],
+      ['T-1/99 P', undefined],
+      ['C-131/12', 'celex' as const],
+    ])(
+      'answers the case number %s (identifier_type %s) with found: false and the eurlex_get_cases route, no CELLAR call',
+      async (identifier, identifierType) => {
+        const { structured, text, queries } = await lookup(identifier, identifierType);
+
+        expect(structured.error).toBeUndefined();
+        expect(structured.found).toBe(false);
+        expect(structured.notice).toContain('eurlex_get_cases');
+        expect(structured.notice).toContain('case_number');
+        expect(structured.notice).toContain(`"${identifier}"`);
+        expect(text).toContain(structured.notice as string);
+        expect(queries).toEqual([]);
+      },
+    );
+
+    it.each([
+      ['a word', 'privacy'],
+      ['a bare EuroVoc code', '3030'],
+      ['a prefixed EuroVoc code', 'eurovoc:3030'],
+      ['a prefix-less case number', '26/62'],
+      [
+        'a EUR-Lex URL naming no CELEX',
+        'https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=OJ:L:2016:119:TOC',
+      ],
+    ])('keeps ambiguous_identifier for %s, with no CELLAR call', async (_label, identifier) => {
+      const { structured, queries } = await lookup(identifier);
+
+      expect(structured.error?.data?.reason).toBe('ambiguous_identifier');
+      expect(queries).toEqual([]);
+    });
+
+    it('keeps an ELI format segment as given: a miss on that literal', async () => {
+      const eli = 'http://data.europa.eu/eli/reg/2016/679/oj/eng/pdf';
+      const { structured } = await lookup(eli);
+
+      expect(structured.found).toBe(false);
+      expect(structured.notice).toContain(`No CELLAR work matches ELI ${eli}.`);
+    });
+  });
+});
+
+// --- CELLAR failures carry this tool's own recovery ---
+
+describe('eurlex_lookup_celex CELLAR failures', () => {
+  beforeEach(() => {
+    mockQuery.mockReset();
+  });
+
+  it.each([
+    [
+      'sparql_error',
+      JsonRpcErrorCode.ValidationError,
+      () =>
+        validationError('CELLAR SPARQL error: Virtuoso 37000 Error SQ156: compiler error', {
+          reason: 'sparql_error',
+          retryable: false,
+        }),
+    ],
+    [
+      'sparql_timeout',
+      JsonRpcErrorCode.ServiceUnavailable,
+      () =>
+        serviceUnavailable('CELLAR SPARQL query timed out on Virtuoso', {
+          reason: 'sparql_timeout',
+          retryable: false,
+        }),
+    ],
+  ])('fails %s with recovery naming identifier_type', async (reason, code, failure) => {
+    mockQuery.mockRejectedValue(failure());
+
+    const result = await runToolContract(eurlex_lookup_celex, { identifier: 'ECLI:EU:C:2014:317' });
+
+    expect(result.isError).toBe(true);
+    const error = (
+      result.structuredContent as {
+        error: { code: number; data: { reason: string; recovery?: { hint?: string } } };
+      }
+    ).error;
+    expect(error.code).toBe(code);
+    expect(error.data.reason).toBe(reason);
+    const hint = error.data.recovery?.hint ?? '';
+    expect(hint).toContain('identifier_type');
+    expect(hint).toBe(eurlex_lookup_celex.errors?.find((e) => e.reason === reason)?.recovery);
+    const text = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+    expect(text).toContain(hint);
   });
 });

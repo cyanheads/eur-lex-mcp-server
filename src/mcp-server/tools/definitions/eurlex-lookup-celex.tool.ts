@@ -6,6 +6,7 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { echoValue } from '@/mcp-server/tools/echo-value.js';
+import { enumInput } from '@/mcp-server/tools/enum-input.js';
 import {
   DERIVATIVE_RESOURCE_TYPES,
   resolveResourceTypeLabel,
@@ -18,7 +19,11 @@ import {
   CELEX_PATTERN,
   celexLiteral,
   escapeSparqlLiteral,
+  extractCelex,
   isEliUri,
+  isPrefixedCaseNumber,
+  normalizeCelex,
+  normalizeEli,
   resolveEliToWork,
 } from '@/services/cellar-sparql/eli-resolution.js';
 import type { SparqlBinding } from '@/services/cellar-sparql/types.js';
@@ -39,8 +44,11 @@ function isCelex(identifier: string): boolean {
   return CELEX_PATTERN.test(identifier.trim());
 }
 
+/** The identifier_type members: a forced lookup branch, or auto-detection. */
+const IDENTIFIER_TYPES = ['celex', 'eli', 'ecli', 'auto'] as const;
+
 /** The lookup branch an identifier takes. */
-type LookupType = 'celex' | 'eli' | 'ecli';
+type LookupType = Exclude<(typeof IDENTIFIER_TYPES)[number], 'auto'>;
 
 /** Detect an ECLI by its scheme prefix, in any letter case. */
 function isEcli(identifier: string): boolean {
@@ -52,6 +60,32 @@ function detectIdentifierType(identifier: string): LookupType | null {
   if (isCelex(identifier)) return 'celex';
   if (isEliUri(identifier)) return 'eli';
   return null;
+}
+
+/**
+ * The canonical form of a pasted citation (#147), for the lookup branch it will
+ * take: a forced type normalizes as that type; under auto, a wrapped CELEX
+ * (`CELEX:` prefix, EUR-Lex URL, `resource/celex` alias) and an ELI in any accepted
+ * form are recognized first, and a bare value is uppercased only when it then reads
+ * as a CELEX and holds a digit — `CELEX_PATTERN` admits an all-letter word, so
+ * `privacy` must stay as given and keep raising ambiguous_identifier.
+ */
+function normalizeIdentifier(identifier: string, identifierType: LookupType | 'auto'): string {
+  switch (identifierType) {
+    case 'celex':
+      return normalizeCelex(identifier);
+    case 'eli':
+      return normalizeEli(identifier);
+    case 'ecli':
+      return identifier;
+  }
+  const celex = extractCelex(identifier);
+  if (celex) return celex;
+  const eli = normalizeEli(identifier);
+  if (isEliUri(eli)) return eli;
+  if (isEcli(identifier)) return identifier;
+  const upper = identifier.toUpperCase();
+  return /\d/.test(identifier) && isCelex(upper) ? upper : identifier;
 }
 
 /**
@@ -193,20 +227,23 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
       .string()
       .min(1)
       .describe(
-        'The EU legal citation to resolve: a CELEX number (e.g. 32016R0679), a work-level ELI URI (e.g. http://data.europa.eu/eli/reg/2016/679, with or without the /oj suffix), an ECLI (e.g. ECLI:EU:C:2014:317), or an OJ citation that names its act type and year, resolved to the CELEX it names under identifier_type "auto": Regulation (EU) 2016/679, Regulation (EC) No 1049/2001, Directive 95/46/EC, Decision No 1313/2013/EU, Council Framework Decision 2002/584/JHA, Council Joint Action 2008/124/CFSP, Common Position 2003/444/CFSP. "No" before the numbers means number/year, otherwise year/number; a two-digit year is 19YY. A citation without its act type (95/46/EC) or year (Regulation No 17) is not parsed.',
+        'The EU legal citation to resolve: a CELEX number (e.g. 32016R0679), a work-level ELI URI (e.g. http://data.europa.eu/eli/reg/2016/679, with or without the /oj suffix), an ECLI (e.g. ECLI:EU:C:2014:317), or an OJ citation that names its act type and year, resolved to the CELEX it names under identifier_type "auto": Regulation (EU) 2016/679, Regulation (EC) No 1049/2001, Directive 95/46/EC, Decision No 1313/2013/EU, Council Framework Decision 2002/584/JHA, Council Joint Action 2008/124/CFSP, Common Position 2003/444/CFSP. "No" before the numbers means number/year, otherwise year/number; a two-digit year is 19YY. A citation without its act type (95/46/EC) or year (Regulation No 17) is not parsed. A CELEX is also read in lowercase, after a CELEX: prefix, from a EUR-Lex page URL carrying uri=CELEX:… (e.g. https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX:32016R0679), or from a publications.europa.eu/resource/celex/ URI; an ELI over https, on the eur-lex.europa.eu host, without a scheme, with a trailing slash, or with a language segment after /oj or a date (…/oj/eng). A case number (C-131/12) names several records rather than one work and returns found false with a pointer to eurlex_get_cases.',
       ),
-    identifier_type: z
-      .enum(['celex', 'eli', 'ecli', 'auto'])
-      .default('auto')
-      .describe(
-        'Format of the identifier. "auto" detects a CELEX, an ELI URI, an ECLI (by its ECLI: prefix, in any letter case), or an OJ citation; "celex", "eli", or "ecli" forces that lookup. An OJ citation is recognized only under "auto".',
-      ),
+    identifier_type: enumInput(
+      IDENTIFIER_TYPES,
+      z
+        .enum(IDENTIFIER_TYPES)
+        .default('auto')
+        .describe(
+          'Format of the identifier. "auto" detects a CELEX, an ELI URI, an ECLI (by its ECLI: prefix, in any letter case), or an OJ citation; "celex", "eli", or "ecli" forces that lookup. An OJ citation is recognized only under "auto".',
+        ),
+    ),
   }),
   output: z.object({
     found: z
       .boolean()
       .describe(
-        'True when the identifier resolves to a CELLAR work; false when a well-formed CELEX, ELI, ECLI, or OJ citation matches no work in the corpus, with a notice naming what was tried. Only an identifier_type "auto" value that, after trimming, is neither an ECLI, an ELI URI, CELEX-shaped (uppercase), nor an OJ citation naming its act type and year raises ambiguous_identifier instead.',
+        'True when the identifier resolves to a CELLAR work; false when a well-formed CELEX, ELI, ECLI, or OJ citation matches no work in the corpus, or the identifier is a case number, with a notice naming what was tried. Only an identifier_type "auto" value that, after trimming, is neither an ECLI, an ELI, a CELEX in any accepted form, nor an OJ citation naming its act type and year raises ambiguous_identifier instead.',
       ),
     work_uri: z.string().optional().describe('CELLAR work URI (stable resource identifier).'),
     celex_number: z.string().optional().describe('Confirmed CELEX number for the resolved work.'),
@@ -239,16 +276,42 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
     {
       reason: 'ambiguous_identifier',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'identifier_type is "auto" and the identifier, after trimming, is neither an ECLI (ECLI: prefix), an ELI URI, CELEX-shaped (uppercase), nor an OJ citation naming its act type and year (e.g. "Regulation No 17" names no year), so no lookup branch applies.',
+      when: 'identifier_type is "auto" and the identifier, after trimming, is neither an ECLI (ECLI: prefix), an ELI, a CELEX (bare, after a CELEX: prefix, or in a EUR-Lex URL), a prefixed case number, nor an OJ citation naming its act type and year (e.g. "Regulation No 17" names no year), so no lookup branch applies.',
       recovery:
         'Pass a CELEX (32016R0679), an ELI URI (http://data.europa.eu/eli/reg/2016/679), an ECLI (ECLI:EU:C:2014:317), or an OJ citation with its act type and year ("Regulation (EU) 2016/679", "Directive 95/46/EC"); to find an act by title words, use eurlex_search_documents with keyword.',
+    },
+    {
+      reason: 'sparql_error',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'CELLAR rejected the lookup query this call sent. The same call fails the same way again.',
+      recovery:
+        'Pass the identifier in another of its forms (its bare CELEX in place of an ELI, ECLI, or OJ citation), or set identifier_type to the form it is.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'sparql_timeout',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'The lookup query ran past the client timeout, or CELLAR refused it as too costly to run. It is not retried.',
+      recovery:
+        'Look the identifier up again shortly, or pass its bare CELEX with identifier_type "celex" for a single exact match.',
+      thrownBy: 'service',
     },
   ],
 
   async handler(input, ctx) {
     const svc = getCellarSparqlService();
     const citation = input.identifier.trim();
-    let identifier = citation;
+
+    // A prefixed case number is never a CELEX and names several records (the
+    // judgment, the AG opinion, orders), so no single work answers it (#147).
+    if (isPrefixedCaseNumber(citation)) {
+      ctx.enrich.notice(
+        `"${echoValue(citation)}" is a case number, which names every record filed under the case (the judgment, the Advocate General's opinion, orders) rather than one work. List them with eurlex_get_cases case_number, then pass the CELEX of the record you want here or to eurlex_get_document.`,
+      );
+      return { found: false };
+    }
+
+    let identifier = normalizeIdentifier(citation, input.identifier_type);
     let effectiveType: LookupType;
 
     if (input.identifier_type === 'auto') {
