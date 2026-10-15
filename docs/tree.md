@@ -1,6 +1,6 @@
 # eur-lex-mcp-server - Directory Structure
 
-Generated on: 2026-10-07 11:54:35
+Generated on: 2026-10-15 03:53:08
 
 ```text
 eur-lex-mcp-server/
@@ -34,6 +34,7 @@ eur-lex-mcp-server/
 │   ├── 0.16.x/
 │   ├── 0.17.x/
 │   ├── 0.18.x/
+│   ├── 0.19.x/
 │   ├── 0.2.x/
 │   ├── 0.3.x/
 │   ├── 0.4.x/
@@ -174,7 +175,9 @@ eur-lex-mcp-server/
 │   │       │   ├── eurlex-query-sparql.tool.ts
 │   │       │   ├── eurlex-search-documents.tool.ts
 │   │       │   └── index.ts
-│   │       └── echo-value.ts
+│   │       ├── echo-value.ts
+│   │       ├── enum-input.ts
+│   │       └── limit-clamp.ts
 │   ├── services/
 │   │   ├── cellar-sparql/
 │   │   │   ├── cdm-labels.ts
@@ -182,6 +185,7 @@ eur-lex-mcp-server/
 │   │   │   ├── eli-resolution.ts
 │   │   │   ├── keyword-match.ts
 │   │   │   ├── relation-traversal.ts
+│   │   │   ├── sort-window.ts
 │   │   │   ├── types.ts
 │   │   │   ├── work-agents.ts
 │   │   │   └── work-resolution.ts
@@ -196,6 +200,7 @@ eur-lex-mcp-server/
 │   │   ├── aws-waf-challenge.ts
 │   │   ├── cellar-consolidations.ts
 │   │   ├── cellar-works.ts
+│   │   ├── eurlex-act-boundaries.ts
 │   │   ├── eurlex-act-headings.ts
 │   │   ├── eurlex-act-html.ts
 │   │   ├── eurlex-amending-act.ts
@@ -205,7 +210,8 @@ eur-lex-mcp-server/
 │   │   ├── eurlex-legacy-act.ts
 │   │   └── formex-zip.ts
 │   ├── helpers/
-│   │   └── cpu-time.ts
+│   │   ├── cpu-time.ts
+│   │   └── sort-window.ts
 │   ├── prompts/
 │   │   └── eurlex-comparative-analysis.prompt.test.ts
 │   ├── resources/
@@ -223,9 +229,11 @@ eur-lex-mcp-server/
 │   │   ├── formex-package.test.ts
 │   │   ├── html-to-markdown.test.ts
 │   │   ├── keyword-match.test.ts
+│   │   ├── sort-window.test.ts
 │   │   ├── work-agents.test.ts
 │   │   └── work-resolution.test.ts
 │   ├── tools/
+│   │   ├── enum-input.test.ts
 │   │   ├── eurlex-browse-subjects.tool.test.ts
 │   │   ├── eurlex-get-cases.tool.test.ts
 │   │   ├── eurlex-get-document.cache.test.ts

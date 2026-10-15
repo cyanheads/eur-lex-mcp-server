@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.19.0](changelog/0.19.x/0.19.0.md) — 2026-10-14
+
+eurlex_get_relations gains the basis_for, interpreted_by, and interprets relation types and a member_states filter; identifiers pasted as CELEX prefixes, EUR-Lex URLs, and https ELIs resolve; sorted searches page to CELLAR's 10,000-row window; case-law rows, annex selection, and CELLAR error handling are fixed.
+
 ## [0.18.2](changelog/0.18.x/0.18.2.md) — 2026-10-07
 
 Moves to mcp-ts-core 0.13.13: tool errors carry a request id, integer and stringified-object arguments are repaired before validation, the Docker image installs dependencies on the build platform, and the linear-time tests measure CPU time.
