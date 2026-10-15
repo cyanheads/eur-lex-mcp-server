@@ -238,14 +238,14 @@ function plainTripleObjectLiterals(query: string): string[] {
 export const eurlex_query_sparql = tool('eurlex_query_sparql', {
   title: 'Raw CELLAR SPARQL Query',
   description:
-    'Run a raw, read-only SPARQL SELECT against the CELLAR Virtuoso endpoint — an escape hatch for CDM ontology traversals the curated tools do not cover. Only SELECT is accepted; update forms and ASK/CONSTRUCT/DESCRIBE are rejected before execution, and results are capped at 100. The cdm:, skos:, and xsd: prefixes are auto-injected.',
+    'Run a raw, read-only SPARQL SELECT against the CELLAR Virtuoso endpoint — an escape hatch for CDM ontology traversals the curated tools do not cover. Only SELECT is accepted; update forms and ASK/CONSTRUCT/DESCRIBE are rejected before execution, and results are capped at the server row cap (100 by default). The cdm:, skos:, and xsd: prefixes are auto-injected.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
     sparql_query: z
       .string()
       .min(10)
       .describe(
-        'A read-only SPARQL SELECT query. Leading comments and PREFIX/BASE declarations are allowed; the cdm:, skos:, and xsd: prefixes are auto-injected. LIMIT is injected at 100 if absent, or capped to 100. Key CDM predicates: cdm:resource_legal_id_celex (CELEX), cdm:work_date_document (date), cdm:work_has_resource-type (type), cdm:work_is_about_concept_eurovoc (EuroVoc subject), cdm:work_cites_work (citation). CELEX is an xsd:string literal — match it as a typed triple, ?work cdm:resource_legal_id_celex "32016R0679"^^xsd:string (an untyped literal matches nothing, in a triple or in FILTER(?celex = "…"), and a FILTER(STR(…)) comparison scans every CELEX). For text, use bif:contains with a single-quoted phrase.',
+        'A read-only SPARQL SELECT query. Leading comments and PREFIX/BASE declarations are allowed; the cdm:, skos:, and xsd: prefixes are auto-injected. LIMIT is injected at the server row cap (100 unless the deployment configures a lower one) if absent, or capped to it; to read past the cap, add ORDER BY and repeat the query with OFFSET raised by the cap (a sorted query reaches row 10,000 at most). Key CDM predicates: cdm:resource_legal_id_celex (CELEX), cdm:work_date_document (date), cdm:work_has_resource-type (type), cdm:work_is_about_concept_eurovoc (EuroVoc subject), cdm:work_cites_work (citation). CELEX is an xsd:string literal — match it as a typed triple, ?work cdm:resource_legal_id_celex "32016R0679"^^xsd:string (an untyped literal matches nothing, in a triple or in FILTER(?celex = "…"), and a FILTER(STR(…)) comparison scans every CELEX). For text, use bif:contains with a single-quoted phrase.',
       ),
     timeout_hint: z
       .number()
@@ -254,7 +254,7 @@ export const eurlex_query_sparql = tool('eurlex_query_sparql', {
       .max(55000)
       .optional()
       .describe(
-        'Optional client-side timeout in milliseconds (1000–55000). Defaults apply when omitted; the endpoint hard limit is 60 seconds.',
+        'Optional client-side timeout in milliseconds (1000–55000). The server default (55000 unless the deployment configures another value) applies when omitted.',
       ),
   }),
   output: z.object({
@@ -273,7 +273,9 @@ export const eurlex_query_sparql = tool('eurlex_query_sparql', {
     variables: z
       .array(z.string().describe('A SELECT variable name, in the order declared in the query.'))
       .describe('Variable names from the SELECT head, in query order.'),
-    total: z.number().describe('Number of binding rows returned (capped at 100 by the server).'),
+    total: z
+      .number()
+      .describe("Number of binding rows returned (at most the server's row cap, 100 by default)."),
   }),
 
   enrichment: {
@@ -281,7 +283,7 @@ export const eurlex_query_sparql = tool('eurlex_query_sparql', {
       .boolean()
       .optional()
       .describe(
-        'True when the server-enforced result ceiling capped the rows and more may exist upstream — narrow the query with FILTERs to see the rest.',
+        "True when the server's row cap (the deployment's configured cap, 100 by default; cap gives the value applied) limited the rows and more may exist upstream — page on with ORDER BY in the query and OFFSET raised by the cap per call (sorted queries reach row 10,000 at most), or narrow the query with FILTERs.",
       ),
     shown: z.number().optional().describe('Number of binding rows returned in this response.'),
     cap: z.number().optional().describe('The server-enforced result ceiling that was applied.'),
@@ -289,7 +291,7 @@ export const eurlex_query_sparql = tool('eurlex_query_sparql', {
       .string()
       .optional()
       .describe(
-        'On a zero-row result whose query has an untyped string literal as a triple object: how to type or language-tag it, since CELLAR stores identifiers as typed literals that an untyped one never matches.',
+        'On a truncated result: how to page past the row cap with ORDER BY and OFFSET, and the 10,000-row limit on a sorted query. On a zero-row result whose query has an untyped string literal as a triple object: how to type or language-tag it, since CELLAR stores identifiers as typed literals that an untyped one never matches.',
       ),
   },
 
@@ -311,7 +313,7 @@ export const eurlex_query_sparql = tool('eurlex_query_sparql', {
     {
       reason: 'sparql_error',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'Virtuoso returned a syntax or semantic error — the query is malformed.',
+      when: 'CELLAR rejected the query: a syntax or semantic error, a compile error, or a sorted query whose OFFSET + LIMIT passes row 10,000 (SR353, answered with its own recovery: lower OFFSET or narrow the query). The same query fails the same way again.',
       recovery:
         'Fix the SPARQL query syntax, ensure predicates use the cdm: prefix, and verify variable names.',
       thrownBy: 'service',
@@ -319,7 +321,7 @@ export const eurlex_query_sparql = tool('eurlex_query_sparql', {
     {
       reason: 'sparql_timeout',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'The query exceeded the client-side timeout (timeout_hint, default 55 s) or the 60-second Virtuoso execution limit. Neither is retried: the call fails inside the configured bound.',
+      when: 'The query ran past the client-side timeout (timeout_hint, default 55 s), or Virtuoso refused it as over its estimated-cost limit. Neither is retried: the call fails inside the configured bound.',
       recovery:
         'Narrow the query with more specific FILTER conditions or a smaller LIMIT, or raise timeout_hint.',
       thrownBy: 'service',
@@ -370,7 +372,13 @@ export const eurlex_query_sparql = tool('eurlex_query_sparql', {
      * equality is the only count a sound ceiling produces when it truncates.
      */
     if (limitEnforced && bindings.length === svc.maxResults) {
-      ctx.enrich.truncated({ shown: bindings.length, cap: svc.maxResults });
+      // No input raises the ceiling; the query's own ORDER BY + OFFSET pages past
+      // it, up to Virtuoso's 10,000-row sorted window (SR353 beyond, #150).
+      ctx.enrich.truncated({
+        shown: bindings.length,
+        cap: svc.maxResults,
+        guidance: `The ${svc.maxResults}-row cap is fixed. To read further, add ORDER BY to the query for a stable order and repeat it with OFFSET raised by ${svc.maxResults} each call. A sorted query reaches at most row 10,000 (OFFSET + LIMIT); narrow it with FILTERs to reach the rest.`,
+      });
     }
 
     /**

@@ -501,6 +501,58 @@ describe('eurlex_query_sparql', () => {
     expect(getEnrichment(ctx)).toMatchObject({ truncated: true, shown: 100, cap: 100 });
   });
 
+  // --- #150: the truncation notice names the continuation that works ---
+
+  it('names the ORDER BY + OFFSET continuation and the 10,000-row window on both surfaces (#150)', async () => {
+    mockQueryWithVars.mockResolvedValue({
+      variables: ['w', 'c'],
+      bindings: workRows(100),
+      limitEnforced: true,
+    });
+
+    const result = await runToolContract(eurlex_query_sparql, {
+      sparql_query: 'SELECT ?w ?c WHERE { ?w cdm:resource_legal_id_celex ?c } LIMIT 500',
+    });
+
+    const structured = result.structuredContent as Record<string, unknown>;
+    expect(structured).toMatchObject({ truncated: true, shown: 100, cap: 100, total: 100 });
+    const notice = structured.notice as string;
+    expect(notice).toMatch(/100-row cap is fixed/);
+    expect(notice).toContain('ORDER BY');
+    expect(notice).toMatch(/OFFSET[^.]*by 100/);
+    expect(notice).toContain('10,000');
+    expect(notice).toContain('FILTER');
+    expect(contentText(result)).toContain(notice);
+    expect(JSON.stringify(structured)).not.toContain('Raise the cap');
+    expect(contentText(result)).not.toContain('Raise the cap');
+  });
+
+  it.each([
+    ['the ceiling fired without filling', workRows(76), true],
+    ['the caller’s own LIMIT bound a full page', workRows(100), false],
+  ])(
+    'carries no truncation guidance when %s (#52, #150)',
+    async (_label, bindings, limitEnforced) => {
+      mockQueryWithVars.mockResolvedValue({ variables: ['work'], bindings, limitEnforced });
+
+      const result = await runToolContract(eurlex_query_sparql, {
+        sparql_query: 'SELECT ?work WHERE { ?work cdm:resource_legal_id_celex ?celex . } LIMIT 100',
+      });
+
+      expect(result.structuredContent).not.toHaveProperty('truncated');
+      expect(result.structuredContent).not.toHaveProperty('notice');
+      expect(contentText(result)).not.toMatch(/OFFSET|Raise the cap/);
+    },
+  );
+
+  it('describes the continuation on the truncated and notice enrichment fields (#150)', () => {
+    const shape = eurlex_query_sparql.enrichment as Record<string, { description?: string }>;
+    expect(shape.truncated?.description).toMatch(/ORDER BY[^.]*OFFSET/);
+    expect(shape.notice?.description).toMatch(/truncat/i);
+    expect(shape.notice?.description).toMatch(/untyped string literal/);
+    expect(eurlex_query_sparql.input.shape.sparql_query.description).toMatch(/ORDER BY[^.]*OFFSET/);
+  });
+
   it('does not disclose truncation when the ceiling fired but did not fill', async () => {
     const ctx = createMockContext({ errors: eurlex_query_sparql.errors });
     mockQueryWithVars.mockResolvedValue({
