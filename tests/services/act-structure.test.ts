@@ -15,12 +15,31 @@ import {
   extractSections,
   outermostSections,
   parseActStructure,
+  readActStructure,
+  readDocumentStructure,
+  type SectionSelectors,
 } from '@/services/eurlex-content/act-structure.js';
 import {
+  type ContentFormat,
   EURLEX_LANGUAGES,
   type EurLexLanguage,
 } from '@/services/eurlex-content/eurlex-content-service.js';
 import { htmlToMarkdown } from '@/services/eurlex-content/html-to-markdown.js';
+import {
+  AI_ACT_ANNEX_HTML,
+  AI_ACT_FORMEX,
+  DIRECTIVE_FORMEX,
+  DIRECTIVE_OJ_HTML,
+  DRONES_CONSOLIDATED_FORMEX,
+  DRONES_CONSOLIDATED_HTML,
+  GDPR_ARTICLE_99_DE,
+  GDPR_ARTICLE_99_EN,
+  GDPR_ARTICLE_99_ET,
+  GDPR_ARTICLE_99_FI,
+  GDPR_ARTICLE_99_LV,
+  GDPR_CONSOLIDATED_HTML,
+  WHISTLEBLOWER_CONSOLIDATED_HTML,
+} from '../fixtures/eurlex-act-boundaries.js';
 import { AI_ACT_HEADINGS, actHtml } from '../fixtures/eurlex-act-headings.js';
 import {
   AMENDING_FORMEX,
@@ -1856,4 +1875,535 @@ describe('legacy recitals numbered N) and inflected article keywords (#131)', ()
     expect(parseActStructure(`<p>${line}</p>`, 'html', language)).toEqual([]);
     expect(parseActStructure(line, 'markdown', language)).toEqual([]);
   });
+});
+
+describe('where an act’s sections stop (#153)', () => {
+  const FINAL_PART = '<div class="eli-subdivision" id="fnp_1">';
+  const NOTES_RULE = '<hr class="separator-short"/>';
+  const GDPR: [EurLexLanguage, string, string][] = [
+    ['EN', GDPR_ARTICLE_99_EN, 'This Regulation shall be binding'],
+    ['DE', GDPR_ARTICLE_99_DE, 'Diese Verordnung ist in allen'],
+    ['FI', GDPR_ARTICLE_99_FI, 'Tämä asetus on kaikilta'],
+    ['ET', GDPR_ARTICLE_99_ET, 'Käesolev määrus on tervikuna'],
+    ['LV', GDPR_ARTICLE_99_LV, 'Šī regula uzliek'],
+  ];
+
+  describe('readActStructure', () => {
+    it('html: the final part’s div and the trailing notes’ rule', () => {
+      expect(readActStructure(DIRECTIVE_OJ_HTML, 'html', 'EN').boundaries).toEqual([
+        DIRECTIVE_OJ_HTML.indexOf(FINAL_PART),
+      ]);
+      expect(readActStructure(GDPR_CONSOLIDATED_HTML, 'html', 'EN').boundaries).toEqual([
+        GDPR_CONSOLIDATED_HTML.indexOf(FINAL_PART),
+        GDPR_CONSOLIDATED_HTML.indexOf(NOTES_RULE),
+      ]);
+      expect(readActStructure(WHISTLEBLOWER_CONSOLIDATED_HTML, 'html', 'EN').boundaries).toEqual([
+        WHISTLEBLOWER_CONSOLIDATED_HTML.indexOf(NOTES_RULE),
+      ]);
+    });
+
+    it.each(GDPR)('html %s: the same div in every language', (language, html) => {
+      const { boundaries, headings } = readActStructure(html, 'html', language);
+      expect(boundaries).toEqual([html.indexOf(FINAL_PART)]);
+      expect(headings).toEqual(parseActStructure(html, 'html', language));
+    });
+
+    it('xml: each </ENACTING.TERMS>', () => {
+      expect(readActStructure(DIRECTIVE_FORMEX, 'xml', 'EN').boundaries).toEqual([
+        DIRECTIVE_FORMEX.indexOf('</ENACTING.TERMS>'),
+      ]);
+      const annexOnly =
+        '<ANNEX><TITLE><TI><P>ANNEX</P></TI></TITLE><CONTENTS><P>Text.</P></CONTENTS></ANNEX>';
+      expect(readActStructure(annexOnly, 'xml', 'EN').boundaries).toEqual([]);
+    });
+
+    it.each(GDPR)(
+      'markdown %s: the line the source HTML opens its final part with',
+      (language, html, bindingFormula) => {
+        const md = htmlToMarkdown(html);
+        const { boundaries, headings } = readActStructure(md, 'markdown', language, html);
+        expect(boundaries).toEqual([md.indexOf(bindingFormula)]);
+        expect(headings).toEqual(parseActStructure(md, 'markdown', language, html));
+      },
+    );
+
+    it('markdown: a consolidated text’s final part and its first trailing note', () => {
+      const md = htmlToMarkdown(GDPR_CONSOLIDATED_HTML);
+      expect(readActStructure(md, 'markdown', 'EN', GDPR_CONSOLIDATED_HTML).boundaries).toEqual([
+        md.indexOf('This Regulation shall be binding'),
+        md.indexOf('( 1 ) Directive (EU) 2015/1535'),
+      ]);
+    });
+
+    it('markdown: the notes after the last annex, past every heading', () => {
+      const md = htmlToMarkdown(WHISTLEBLOWER_CONSOLIDATED_HTML);
+      const { boundaries, headings } = readActStructure(
+        md,
+        'markdown',
+        'EN',
+        WHISTLEBLOWER_CONSOLIDATED_HTML,
+      );
+      expect(headings.at(-1)?.label).toBe('ANNEX');
+      expect(boundaries).toEqual([md.indexOf('( 1 ) Directive 2008/52/EC')]);
+    });
+
+    it('markdown: no boundary without the source HTML, or where its words are not found', () => {
+      const md = htmlToMarkdown(DIRECTIVE_OJ_HTML);
+      expect(readActStructure(md, 'markdown', 'EN').boundaries).toEqual([]);
+      const reworded = md.replace('Done at Strasbourg', 'Signed in Strasbourg');
+      expect(readActStructure(reworded, 'markdown', 'EN', DIRECTIVE_OJ_HTML).boundaries).toEqual(
+        [],
+      );
+    });
+
+    it('markdown: only between the act’s own headings around the html boundary', () => {
+      // The final part's words moved past the ANNEX heading, the next of the act's own
+      // headings after the boundary, so they no longer stand where the final part does.
+      const md = htmlToMarkdown(DIRECTIVE_OJ_HTML);
+      const doneAt = md.split('\n').find((line) => line.startsWith('Done at Strasbourg')) ?? '';
+      const moved = `${md.replace(doneAt, 'Signed.')}\n\n${doneAt}`;
+      expect(moved.lastIndexOf(doneAt)).toBeGreaterThan(moved.indexOf('ANNEX'));
+      expect(readActStructure(moved, 'markdown', 'EN', DIRECTIVE_OJ_HTML).boundaries).toEqual([]);
+    });
+
+    it('a body with no markup for either has none: legacy text/html and its Markdown', () => {
+      expect(readActStructure(LEGACY_ACT_HTML, 'html', 'EN').boundaries).toEqual([]);
+      const md = htmlToMarkdown(LEGACY_ACT_HTML);
+      expect(readActStructure(md, 'markdown', 'EN', LEGACY_ACT_HTML).boundaries).toEqual([]);
+      expect(readActStructure(STRUCTURED_HTML, 'html', 'EN').boundaries).toEqual([]);
+    });
+
+    it('a body with no act headings has none, whatever its markup', () => {
+      const unstructured = `${UNSTRUCTURED_HTML}\n${FINAL_PART}<p>Done at Brussels.</p></div>`;
+      expect(readActStructure(unstructured, 'html', 'EN')).toEqual({
+        headings: [],
+        boundaries: [],
+      });
+    });
+  });
+
+  describe('readDocumentStructure', () => {
+    it('reads an act’s boundaries and none for case law', () => {
+      expect(readDocumentStructure('32019L1937', DIRECTIVE_OJ_HTML, 'html', 'EN')).toEqual(
+        readActStructure(DIRECTIVE_OJ_HTML, 'html', 'EN'),
+      );
+      const judgment = readDocumentStructure('62012CJ0131', DIRECTIVE_OJ_HTML, 'html', 'EN');
+      expect(judgment.boundaries).toEqual([]);
+    });
+  });
+
+  describe('extractSections with boundaries', () => {
+    const select = (
+      content: string,
+      selectors: SectionSelectors,
+      language: EurLexLanguage = 'EN',
+    ) => {
+      const { headings, boundaries } = readActStructure(content, 'html', language);
+      return extractSections(content, headings, selectors, language, boundaries);
+    };
+
+    it('ends the last article and the chapter holding it at the same boundary, one slice (#88)', () => {
+      const end = DIRECTIVE_OJ_HTML.indexOf(FINAL_PART);
+      const result = select(DIRECTIVE_OJ_HTML, { chapters: 'VII', articles: '28,29' });
+      expect(result.matched).toEqual(['CHAPTER VII', 'Article 28', 'Article 29']);
+      const [chapter, article28, article29] = result.sections;
+      expect((chapter?.offset ?? 0) + (chapter?.chars ?? 0)).toBe(end);
+      expect((article29?.offset ?? 0) + (article29?.chars ?? 0)).toBe(end);
+      // Article 28 still ends at Article 29, the next heading, before the boundary.
+      expect((article28?.offset ?? 0) + (article28?.chars ?? 0)).toBe(article29?.offset);
+      expect(outermostSections(result.sections)).toEqual([chapter]);
+      expect(result.text).toBe(DIRECTIVE_OJ_HTML.slice(chapter?.offset, end).trim());
+      expect(result.text).not.toContain('Done at Strasbourg');
+    });
+
+    it('leaves a section opening past the boundary to its next heading', () => {
+      // The ANNEX opens after the final part; with no heading after it, it runs to the end.
+      const numbered = DIRECTIVE_OJ_HTML.replace('>ANNEX</p>', '>ANNEX I</p>');
+      const result = select(numbered, { annexes: 'I' });
+      const [annex] = result.sections;
+      expect((annex?.offset ?? 0) + (annex?.chars ?? 0)).toBe(numbered.length);
+    });
+
+    it('ends a consolidated text’s last annex at its trailing notes', () => {
+      const numbered = WHISTLEBLOWER_CONSOLIDATED_HTML.replace('>ANNEX</p>', '>ANNEX I</p>');
+      const result = select(numbered, { annexes: 'I', articles: '29' });
+      const [article, annex] = result.sections;
+      expect((article?.offset ?? 0) + (article?.chars ?? 0)).toBe(annex?.offset);
+      expect((annex?.offset ?? 0) + (annex?.chars ?? 0)).toBe(numbered.indexOf(NOTES_RULE));
+      expect(result.text).not.toContain('Directive 2008/52/EC');
+    });
+
+    it('takes the first boundary past the heading, and none leaves the old end', () => {
+      const content = 'Article 1\nOne.\nX\nY\nArticle 2\nTwo.';
+      const headings = parseActStructure(content, 'markdown', 'EN');
+      const span = (boundaries: number[]) =>
+        extractSections(content, headings, { articles: '1' }, 'EN', boundaries).sections[0];
+      const x = content.indexOf('X');
+      const y = content.indexOf('Y');
+      expect(span([])?.chars).toBe(content.indexOf('Article 2'));
+      expect(span([0, x, y])?.chars).toBe(x);
+      expect(span([content.length - 1])?.chars).toBe(content.indexOf('Article 2'));
+    });
+
+    it.each(GDPR)('%s: Article 99 and CHAPTER XI end at the final part', (language, html) => {
+      const result = select(html, { chapters: 'XI', articles: '99' }, language);
+      for (const section of result.sections) {
+        expect(section.offset + section.chars).toBe(html.indexOf(FINAL_PART));
+      }
+    });
+  });
+
+  it(
+    'reads the boundaries in linear time on unclosed and empty markup',
+    async () => {
+      // Each size is read ten times per round, so the 5k reading stands well above the
+      // clock's resolution. A linear read takes about 64x as long at 320k as at 5k, a
+      // quadratic one about 4096x; the cap is 256x, and 100 ms per 320k read.
+      const span = async (body: (n: number) => [string, ContentFormat, string?]) => {
+        const timed = (n: number) => {
+          const [content, format, source] = body(n);
+          return () => {
+            for (let round = 0; round < 10; round++)
+              readActStructure(content, format, 'EN', source);
+          };
+        };
+        const tSmall = await bestCpuMs(timed(5_000));
+        const tLarge = await bestCpuMs(timed(320_000));
+        const timings = `${tLarge.toFixed(3)} ms at 320k, ${tSmall.toFixed(3)} ms at 5k`;
+        expect(tLarge / tSmall, timings).toBeLessThan(256);
+        expect(tLarge, timings).toBeLessThan(1_000);
+      };
+      const head = '<p>Article 1</p>\n';
+      // Openers with no closer: a final-part div and a notes rule that never finish.
+      await span((n) => [`${head}${'<div id="fnp_'.repeat(n / 13)}`, 'html']);
+      await span((n) => [`${head}${'<hr class="separator-'.repeat(n / 21)}`, 'html']);
+      await span((n) => [`${head}<div ${'a'.repeat(n)}`, 'html']);
+      // A final part followed by nothing but empty or unclosed paragraphs.
+      const empty = (n: number) => `${head}<div id="fnp_1">${'<p><p></p>'.repeat(n / 10)}`;
+      await span((n) => [empty(n), 'html']);
+      // A Markdown body whose lines never open with the final part's words.
+      await span((n) => [
+        `Article 1\n\n${'Signed.\n'.repeat(n / 8)}`,
+        'markdown',
+        `${head}<div id="fnp_1"><p>Done at Brussels.</p></div>`,
+      ]);
+      await span((n) => [`${'<ENACTING.TERMS></ENACTING.TERMS'.repeat(n / 32)}`, 'xml']);
+    },
+    CPU_TIMED_TEST_TIMEOUT_MS,
+  );
+});
+
+describe('headings inside an annex are not the act’s own (#157)', () => {
+  const labels = (headings: readonly ActHeading[]) => headings.map((h) => h.label);
+
+  describe('Formex', () => {
+    it('skips the titles of an <ANNEX> part: "Section C" is not section 100', () => {
+      expect(labels(parseActStructure(AI_ACT_FORMEX, 'xml', 'EN'))).toEqual([
+        'CHAPTER XIII',
+        'Article 113',
+      ]);
+    });
+
+    it('skips the chapters of a consolidated appendix nested in its <CONS.ANNEX>', () => {
+      expect(labels(parseActStructure(DRONES_CONSOLIDATED_FORMEX, 'xml', 'EN'))).toEqual([
+        'Article 23',
+      ]);
+    });
+
+    it('reads the depth past the first level: inside the outer annex after an inner one closes, and outside both', () => {
+      const xml = [
+        '<ACT><ENACTING.TERMS><ARTICLE IDENTIFIER="001"><TI.ART>Article 1</TI.ART><ALINEA>Text.</ALINEA></ARTICLE></ENACTING.TERMS></ACT>',
+        '<CONS.ANNEX><TITLE><TI><P>ANNEX</P></TI></TITLE>',
+        '<CONS.ANNEX><TITLE><TI><P>Appendix 1</P></TI></TITLE><CONTENTS><GR.SEQ LEVEL="1"><TITLE><TI><P>CHAPTER I</P></TI></TITLE></GR.SEQ></CONTENTS></CONS.ANNEX>',
+        '<GR.SEQ LEVEL="1"><TITLE><TI><P>CHAPTER IX</P></TI></TITLE></GR.SEQ>',
+        '<ARTICLE IDENTIFIER="002"><TI.ART>Article 2</TI.ART><ALINEA>An agreement’s article.</ALINEA></ARTICLE>',
+        '</CONS.ANNEX>',
+        '<ACT><ENACTING.TERMS><DIVISION><TITLE><TI><P>CHAPTER II</P></TI></TITLE><ARTICLE IDENTIFIER="003"><TI.ART>Article 3</TI.ART></ARTICLE></DIVISION></ENACTING.TERMS></ACT>',
+      ].join('');
+      expect(labels(parseActStructure(xml, 'xml', 'EN'))).toEqual([
+        'Article 1',
+        'CHAPTER II',
+        'Article 3',
+      ]);
+    });
+
+    it('leaves an act with no annex part unchanged', () => {
+      expect(labels(parseActStructure(DIRECTIVE_FORMEX, 'xml', 'EN'))).toEqual([
+        'CHAPTER VII',
+        'Article 28',
+        'Article 29',
+      ]);
+    });
+  });
+
+  describe('html and Markdown', () => {
+    it.each([
+      ['an OJ annex’s sections', AI_ACT_ANNEX_HTML, ['Article 113', 'ANNEX XI']],
+      ['a consolidated appendix’s chapters', DRONES_CONSOLIDATED_HTML, ['Article 23', 'ANNEX']],
+    ] as const)('skips %s past the annex container, in html and Markdown', (_, html, expected) => {
+      expect(labels(parseActStructure(html, 'html', 'EN'))).toEqual(expected);
+      const md = htmlToMarkdown(html);
+      expect(labels(parseActStructure(md, 'markdown', 'EN', html))).toEqual(expected);
+    });
+
+    it('keeps them in Markdown read without its source HTML, which carries no container', () => {
+      const md = htmlToMarkdown(DRONES_CONSOLIDATED_HTML);
+      expect(labels(parseActStructure(md, 'markdown', 'EN'))).toEqual([
+        'Article 23',
+        'ANNEX',
+        'CHAPTER I',
+        'CHAPTER II',
+      ]);
+    });
+
+    it('ends the annex span at the next annex, never at a heading inside it', () => {
+      const html = DRONES_CONSOLIDATED_HTML.replace('>ANNEX</p>', '>ANNEX I</p>');
+      const { headings, boundaries } = readActStructure(html, 'html', 'EN');
+      const result = extractSections(html, headings, { annexes: 'I' }, 'EN', boundaries);
+      expect(result.text).toContain('CHAPTER II');
+      expect(result.sections[0]?.chars).toBe(
+        html.indexOf('<hr class="separator-short"/>') - (result.sections[0]?.offset ?? 0),
+      );
+    });
+
+    it('reads a link to an annex as no container', () => {
+      const html = [
+        '<p class="oj-ti-art">Article 1</p>',
+        '<p>See <a href="#anx_I">Annex I</a>.</p>',
+        '<p class="oj-ti-art">Article 2</p>',
+        '<div class="eli-container" id="anx_I">',
+        '<p class="oj-doc-ti">ANNEX I</p>',
+        '<p class="oj-ti-grseq-1">CHAPTER I</p>',
+        '</div>',
+      ].join('\n');
+      expect(labels(parseActStructure(html, 'html', 'EN'))).toEqual([
+        'Article 1',
+        'Article 2',
+        'ANNEX I',
+      ]);
+    });
+
+    it('leaves a body with no annex container unchanged: a legacy act keeps every heading', () => {
+      // With no container to mark where the annexes start, a heading after ANNEX stays.
+      const html = `${LEGACY_TWO_CHAPTER_ACT_HTML}<p>Section 1</p><p>Annex text.</p>`;
+      expect(labels(parseActStructure(html, 'html', 'EN'))).toEqual([
+        'Recital 1',
+        'Recital 2',
+        'CHAPTER I',
+        'Article 1',
+        'Article 2',
+        'Section I',
+        'Article 6',
+        'CHAPTER II',
+        'Article 7',
+        'ANNEX',
+        'Section 1',
+      ]);
+    });
+  });
+
+  it(
+    'finds the annex container and Formex annex parts in linear time on unclosed markup',
+    async () => {
+      const span = async (body: (n: number) => [string, ContentFormat]) => {
+        const timed = (n: number) => {
+          const [content, format] = body(n);
+          return () => {
+            for (let round = 0; round < 10; round++) parseActStructure(content, format, 'EN');
+          };
+        };
+        const tSmall = await bestCpuMs(timed(5_000));
+        const tLarge = await bestCpuMs(timed(320_000));
+        const timings = `${tLarge.toFixed(3)} ms at 320k, ${tSmall.toFixed(3)} ms at 5k`;
+        expect(tLarge / tSmall, timings).toBeLessThan(256);
+        expect(tLarge, timings).toBeLessThan(1_000);
+      };
+      const head = '<p>Article 1</p>\n';
+      await span((n) => [`${head}${'<div id="anx'.repeat(n / 12)}`, 'html']);
+      await span((n) => [`${head}<div ${'a'.repeat(n)}`, 'html']);
+      const article = '<TI.ART>Article 1</TI.ART>';
+      await span((n) => [`${article}${'<CONS.ANNEX '.repeat(n / 12)}`, 'xml']);
+      await span((n) => [`${'<ANNEX><TI><P>CHAPTER I</P></TI>'.repeat(n / 31)}`, 'xml']);
+    },
+    CPU_TIMED_TEST_TIMEOUT_MS,
+  );
+});
+
+describe('a lone unnumbered annex is selected as "ANNEX" (#156)', () => {
+  const NOTES_RULE = '<hr class="separator-short"/>';
+  const FINAL_PART = '<div class="eli-subdivision" id="fnp_1">';
+
+  /** A one-article act in `language` with a single unnumbered annex headed `annex`. */
+  const loneAnnexAct = (article: string, annex: string) =>
+    [
+      `<p class="oj-ti-art">${article}</p>`,
+      '<p class="oj-normal">Article text.</p>',
+      `<p class="oj-doc-ti">${annex}</p>`,
+      '<p class="oj-normal">Annex text.</p>',
+    ].join('\n');
+
+  const select = (
+    content: string,
+    selectors: SectionSelectors,
+    language: EurLexLanguage = 'EN',
+  ) => {
+    const { headings, boundaries } = readActStructure(content, 'html', language);
+    return extractSections(content, headings, selectors, language, boundaries);
+  };
+
+  it.each(['ANNEX', 'annex', ' Annex '])(
+    '%j selects the lone ANNEX of an OJ act, past its final part, to the end of the body',
+    (annexes) => {
+      const annex = parseActStructure(DIRECTIVE_OJ_HTML, 'html', 'EN').find(
+        (h) => h.kind === 'annex',
+      );
+      expect(annex).toMatchObject({ number: '', label: 'ANNEX' });
+      const offset = annex?.offset ?? -1;
+
+      const result = select(DIRECTIVE_OJ_HTML, { annexes });
+      expect(result).toMatchObject({ requested: ['ANNEX'], matched: ['ANNEX'], missed: [] });
+      expect(result.sections).toEqual([
+        { label: 'ANNEX', offset, chars: DIRECTIVE_OJ_HTML.length - offset },
+      ]);
+      expect(result.text).toBe(DIRECTIVE_OJ_HTML.slice(offset).trim());
+      expect(result.text).toContain('Part I');
+    },
+  );
+
+  it('selects it beside the last article, each ending at its own boundary, in two slices', () => {
+    const result = select(DIRECTIVE_OJ_HTML, { articles: '29', annexes: 'ANNEX' });
+    expect(result.matched).toEqual(['Article 29', 'ANNEX']);
+    const [article, annex] = result.sections;
+    expect((article?.offset ?? 0) + (article?.chars ?? 0)).toBe(
+      DIRECTIVE_OJ_HTML.indexOf(FINAL_PART),
+    );
+    expect((annex?.offset ?? 0) + (annex?.chars ?? 0)).toBe(DIRECTIVE_OJ_HTML.length);
+    expect(outermostSections(result.sections)).toEqual([article, annex]);
+    expect(result.text).toContain('This Directive is addressed to the Member States.');
+    expect(result.text).toContain('Part I');
+    expect(result.text).not.toContain('Done at Strasbourg');
+  });
+
+  it('ends a consolidated text’s lone annex at its trailing notes, in html and Markdown', () => {
+    const html = WHISTLEBLOWER_CONSOLIDATED_HTML;
+    const inHtml = select(html, { annexes: 'annex' });
+    expect(inHtml.matched).toEqual(['ANNEX']);
+    const [htmlAnnex] = inHtml.sections;
+    expect((htmlAnnex?.offset ?? 0) + (htmlAnnex?.chars ?? 0)).toBe(html.indexOf(NOTES_RULE));
+
+    const md = htmlToMarkdown(html);
+    const { headings, boundaries } = readActStructure(md, 'markdown', 'EN', html);
+    const inMd = extractSections(md, headings, { annexes: 'ANNEX' }, 'EN', boundaries);
+    expect(inMd.matched).toEqual(['ANNEX']);
+    const [mdAnnex] = inMd.sections;
+    expect((mdAnnex?.offset ?? 0) + (mdAnnex?.chars ?? 0)).toBe(
+      md.indexOf('( 1 ) Directive 2008/52/EC'),
+    );
+    for (const result of [inHtml, inMd]) {
+      expect(result.text).toContain('Part I');
+      expect(result.text).not.toContain('Directive 2008/52/EC');
+    }
+  });
+
+  it.each([
+    ['DE', 'Artikel 1', 'ANHANG', 'Anhang'],
+    ['FI', '1 artikla', 'LIITE', 'liite'],
+    ['ET', 'Artikkel 1', 'LISA', 'Lisa'],
+    ['EL', 'Άρθρο 1', 'ΠΑΡΑΡΤΗΜΑ', 'Παράρτημα'],
+  ] as const)(
+    '%s: the served language’s annex word selects it, in any case, as English "ANNEX" does',
+    (language, article, heading, word) => {
+      const html = loneAnnexAct(article, heading);
+      const headings = parseActStructure(html, 'html', language);
+      expect(headings.map((h) => [h.kind, h.number])).toEqual([
+        ['article', '1'],
+        ['annex', ''],
+      ]);
+      for (const annexes of [word, heading, 'ANNEX', 'annex']) {
+        const result = extractSections(html, headings, { annexes }, language);
+        expect(result).toMatchObject({ requested: ['ANNEX'], matched: ['ANNEX'], missed: [] });
+        expect(result.text).toBe(html.slice(html.indexOf(`<p class="oj-doc-ti">`)).trim());
+      }
+      const md = htmlToMarkdown(html);
+      const inMd = extractSections(
+        md,
+        parseActStructure(md, 'markdown', language),
+        { annexes: word },
+        language,
+      );
+      expect(inMd.matched).toEqual(['ANNEX']);
+      expect(inMd.text).toContain('Annex text.');
+      expect(inMd.text).not.toContain('Article text.');
+    },
+  );
+
+  it('reads another language’s annex word as a number, which misses', () => {
+    const html = loneAnnexAct('Artikel 1', 'ANHANG');
+    const result = extractSections(
+      html,
+      parseActStructure(html, 'html', 'DE'),
+      { annexes: 'LIITE' },
+      'DE',
+    );
+    expect(result).toMatchObject({
+      requested: ['ANNEX LIITE'],
+      matched: [],
+      missed: ['ANNEX LIITE'],
+    });
+  });
+
+  it('misses "ANNEX" on an act whose annexes are numbered, reported as "ANNEX"', () => {
+    const headings = parseActStructure(STRUCTURED_HTML, 'html', 'EN');
+    expect(extractSections(STRUCTURED_HTML, headings, { annexes: 'ANNEX' }, 'EN')).toMatchObject({
+      requested: ['ANNEX'],
+      matched: [],
+      missed: ['ANNEX'],
+      text: '',
+      sections: [],
+    });
+    expect(
+      extractSections(STRUCTURED_HTML, headings, { annexes: 'annex, Annex I' }, 'EN'),
+    ).toMatchObject({
+      requested: ['ANNEX', 'ANNEX I'],
+      matched: ['ANNEX I'],
+      missed: ['ANNEX'],
+    });
+  });
+
+  it('addresses the lone annex once however many times it is named, and still drops blank tokens', () => {
+    const result = select(DIRECTIVE_OJ_HTML, { annexes: ' , ANNEX,annex, ,Annex' });
+    expect(result.requested).toEqual(['ANNEX', 'ANNEX', 'ANNEX']);
+    expect(result.sections).toHaveLength(1);
+    expect(select(DIRECTIVE_OJ_HTML, { annexes: ' , ' }).requested).toEqual([]);
+    expect(select(DIRECTIVE_OJ_HTML, { annexes: '.' }).requested).toEqual([]);
+  });
+
+  it(
+    'reads a caller-sized annexes selector in linear time',
+    async () => {
+      const html = loneAnnexAct('Artikel 1', 'ANHANG');
+      const headings = parseActStructure(html, 'html', 'DE');
+      const span = async (build: (n: number) => string) => {
+        const timed = (n: number) => {
+          const annexes = build(n);
+          return () => {
+            for (let round = 0; round < 10; round++) {
+              extractSections(html, headings, { annexes }, 'DE');
+            }
+          };
+        };
+        const tSmall = await bestCpuMs(timed(5_000));
+        const tLarge = await bestCpuMs(timed(320_000));
+        const timings = `${tLarge.toFixed(3)} ms at 320k, ${tSmall.toFixed(3)} ms at 5k`;
+        expect(tLarge / tSmall, timings).toBeLessThan(256);
+        expect(tLarge, timings).toBeLessThan(1_000);
+      };
+      // One keyword behind a whitespace run, the keyword repeated with no separator,
+      // and keyword tokens repeated.
+      await span((n) => `${' '.repeat(n - 6)}anhang`);
+      await span((n) => 'annex'.repeat(n / 5));
+      await span((n) => 'annex,'.repeat(n / 6));
+    },
+    CPU_TIMED_TEST_TIMEOUT_MS,
+  );
 });

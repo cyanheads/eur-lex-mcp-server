@@ -41,7 +41,7 @@ import { serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { withRetry } from '@cyanheads/mcp-ts-core/utils';
 import type { ServerConfig } from '@/config/server-config.js';
-import { type ActHeading, parseDocumentStructure } from './act-structure.js';
+import { type ActHeading, readDocumentStructure } from './act-structure.js';
 import { readFormexPackage } from './formex-package.js';
 import { htmlToMarkdown } from './html-to-markdown.js';
 
@@ -156,10 +156,11 @@ const BODY_CACHE_MAX_CHARS = 16_000_000;
 
 /**
  * An available body as a call serves it: the text in the requested format, the
- * language it was served in, and for Markdown the heading list read once against
- * the HTML it was rendered from. The HTML itself is never kept.
+ * language it was served in, and for Markdown the heading list and boundaries read
+ * once against the HTML it was rendered from. The HTML itself is never kept.
  */
 interface ServedBody {
+  boundaries?: number[];
   content: string;
   headings?: ActHeading[];
   language: EurLexLanguage;
@@ -169,10 +170,11 @@ interface ServedBody {
 /**
  * Render a fetched wire body into the requested output format. `html`/`xml` pass
  * through verbatim; `markdown` is converted server-side from the HTML body, and its
- * headings are parsed then, while the HTML is at hand to tell an act's own
- * headings from the ones it quotes (#106) and to find a case-law body's section
- * headings, whose markup the conversion drops (#117). The CELEX picks the parser,
- * and it keys the cache entry, so a cached heading list is always that parser's.
+ * structure is read then, while the HTML is at hand to tell an act's own headings
+ * from the ones it quotes (#106), to find a case-law body's section headings
+ * (#117), and to find where an act's sections stop (#153) — markup the conversion
+ * drops. The CELEX picks the parser, and it keys the cache entry, so a cached
+ * structure is always that parser's.
  */
 function renderBody(
   celexNumber: string,
@@ -184,8 +186,14 @@ function renderBody(
   const fallback = languageFallback ? { languageFallback } : {};
   if (format !== 'markdown') return { content: wire, language, ...fallback };
   const content = htmlToMarkdown(wire);
-  const headings = parseDocumentStructure(celexNumber, content, 'markdown', language, wire);
-  return { content, headings, language, ...fallback };
+  const { headings, boundaries } = readDocumentStructure(
+    celexNumber,
+    content,
+    'markdown',
+    language,
+    wire,
+  );
+  return { content, headings, boundaries, language, ...fallback };
 }
 
 /** Characters an entry retains: its text, fallback note, and heading strings. */
@@ -246,7 +254,10 @@ class BodyCache {
   }
 }
 
-/** A call's result from a served body, its heading list copied so no caller shares the cached one. */
+/**
+ * A call's result from a served body, its heading list and boundaries copied so no
+ * caller shares the cached ones.
+ */
 function servedResult(body: ServedBody, format: ContentFormat): FetchContentResult {
   return {
     content: body.content,
@@ -255,6 +266,7 @@ function servedResult(body: ServedBody, format: ContentFormat): FetchContentResu
     language: body.language,
     ...(body.languageFallback ? { languageFallback: body.languageFallback } : {}),
     ...(body.headings ? { headings: body.headings.map((h) => ({ ...h })) } : {}),
+    ...(body.boundaries ? { boundaries: [...body.boundaries] } : {}),
   };
 }
 
@@ -385,6 +397,13 @@ function combineUnavailabilityReasons(
 }
 
 export interface FetchContentResult {
+  /**
+   * Where an available `markdown` body's sections stop short of the next heading
+   * (#153), read with {@link headings} against the wire HTML: the markup marking
+   * the end of an act's enacting terms and the start of a consolidated text's
+   * trailing notes does not survive the conversion.
+   */
+  boundaries?: number[];
   content: string;
   contentAvailable: boolean;
   format: ContentFormat;
@@ -415,9 +434,16 @@ export class EurLexContentService {
   /**
    * Build the CELLAR content-negotiation URL for a CELEX number.
    * Pattern: /resource/celex/{CELEX} (format + language come from request headers).
+   * The segment is encoded the way SPARQL `ENCODE_FOR_URI` encodes it, `(` and `)`
+   * included: CELLAR 404s the literal corrigendum path `…R(02)` and serves
+   * `…R%2802%29`. `encodeURIComponent` alone leaves `!'()*` literal.
    */
   buildContentUrl(celexNumber: string): string {
-    return `${this.baseUrl}/resource/celex/${encodeURIComponent(celexNumber)}`;
+    const segment = encodeURIComponent(celexNumber).replace(
+      /[!'()*]/g,
+      (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`,
+    );
+    return `${this.baseUrl}/resource/celex/${segment}`;
   }
 
   /**

@@ -30,7 +30,15 @@
  * An amending act's quoted text — the articles it inserts into another act — is
  * not its own structure (#106): Formex marks it `<QUOT.S>`, CONVEX HTML puts it in
  * a numbering table's cells, and a Markdown body takes the verdict of its source
- * HTML heading by heading, the two heading sequences aligned in order.
+ * HTML heading by heading, the two heading sequences aligned in order. Likewise an
+ * annex's own subdivisions are not the act's chapters, sections, or articles
+ * (#157): Formex marks the annex part `<ANNEX>` or `<CONS.ANNEX>`, and CONVEX HTML
+ * opens the annexes with a `<div id="anx_…">` container.
+ *
+ * A section ends at the next heading of its rank or broader, and no later than
+ * where the markup ends the act's enacting terms or begins a consolidated text's
+ * trailing notes (#153): the final part, notes, and Formex annex parts past that
+ * point belong to no article, section, or chapter.
  *
  * Case law has none of an act's headings, so a sector-6 body takes its own parser
  * (#117, {@link parseDocumentStructure}): the top-level section headings its markup
@@ -135,8 +143,26 @@ export interface SelectionResult {
 }
 
 /**
+ * A body's structure: its headings in document order, and where its sections stop
+ * short of the next heading (#153).
+ */
+export interface DocumentStructure {
+  /**
+   * Ascending offsets past which no section runs: where an act's enacting terms
+   * end, leaving its final part (binding formula, "Done at …", signatories) and the
+   * notes after it outside its last article, section, and chapter — and, in Formex,
+   * every annex part — and where a consolidated text's trailing notes begin, which
+   * belong to no section. Empty for case law and for a body whose markup marks
+   * neither, a legacy `text/html` act among them.
+   */
+  boundaries: number[];
+  headings: ActHeading[];
+}
+
+/**
  * Nesting rank — a section ends at the next heading whose rank is the same or
- * broader (numerically ≤). Chapters and annexes are top-level siblings; sections
+ * broader (numerically ≤), or at the next of the body's boundaries (#153),
+ * whichever comes first. Chapters and annexes are top-level siblings; sections
  * nest in chapters; articles nest in sections; recitals are the finest preamble
  * unit. A case-law heading and the operative part are siblings, so a headed
  * section ends at the next heading or at the operative part, which runs to the
@@ -188,8 +214,29 @@ export function parseActStructure(
   language: EurLexLanguage,
   sourceHtml?: string,
 ): ActHeading[] {
+  return readActStructure(content, format, language, sourceHtml).headings;
+}
+
+/**
+ * An act body's headings, as {@link parseActStructure} reads them, and its
+ * boundaries (#153): in html the final part's `<div id="fnp_1">` and a
+ * consolidated text's `<hr class="separator-short"/>`, in Formex each
+ * `</ENACTING.TERMS>`, and in Markdown the line the source HTML puts at each html
+ * boundary. A Markdown body without `sourceHtml` has none.
+ */
+export function readActStructure(
+  content: string,
+  format: ContentFormat,
+  language: EurLexLanguage,
+  sourceHtml?: string,
+): DocumentStructure {
   const vocabulary = vocabularyFor(language);
-  if (format === 'xml') return parseFormexStructure(content, vocabulary);
+  if (format === 'xml') {
+    return {
+      headings: parseFormexStructure(content, vocabulary),
+      boundaries: formexBoundaries(content),
+    };
+  }
   return format === 'markdown'
     ? parseTextStructure(content, vocabulary, false, sourceHtml)
     : parseTextStructure(content, vocabulary, true, undefined);
@@ -318,6 +365,8 @@ const HEADING_FORMS: Record<EurLexLanguage, HeadingForms> = {
 
 /** One language's heading patterns, compiled from its {@link HEADING_FORMS}. */
 interface Vocabulary {
+  /** English "annex" or the language's annex keyword alone, naming a lone unnumbered annex. */
+  annexWord: RegExp;
   /** The word for one (French "premier"), read as article number 1. */
   articleOne: string | undefined;
   /** Sticky Formex chapter/section matcher; see {@link formexHeadingPattern}. */
@@ -467,6 +516,7 @@ function vocabularyFor(language: EurLexLanguage): Vocabulary {
     .map((kind) => keywordSource(splitForm(forms[kind]).keyword))
     .join('|');
   const vocabulary: Vocabulary = {
+    annexWord: new RegExp(`^(?:annex|${keywordSource(splitForm(forms.annex).keyword)})$`, 'iu'),
     articleOne: forms.articleOne,
     formexHeading: formexHeadingPattern(forms),
     selectorWord: new RegExp(`^(?:${words})$`, 'iu'),
@@ -625,30 +675,48 @@ function classifyStructural(
   return null;
 }
 
-/** A structural heading line, flagged when its text sits inside an HTML `<table>`. */
-type HeadingLine = ActHeading & { inTable: boolean; lineIndex: number };
+/**
+ * A structural heading line, flagged `foreign` when it is not one of the act's own
+ * headings: its text sits inside an HTML `<table>`, quoted amending text (#106), or
+ * it is a chapter, section, or article heading inside an annex (#157).
+ */
+type HeadingLine = ActHeading & { foreign: boolean; lineIndex: number };
+
+/**
+ * The opener of the first CONVEX annex container, `<div … id="anx_…">` — an OJ
+ * annex (`anx_I`) or a consolidated one (`anx_1`), its appendices nested inside.
+ * Annexes follow the enacting terms and the final part, so every heading from
+ * there on sits in an annex. The lazy run stays inside one tag.
+ */
+const ANNEX_CONTAINER_RE = /<div\b[^<>]*?\bid="anx_/i;
 
 /**
  * Every structural (non-recital) heading line, in document order. CONVEX lays an
  * amending point out as a numbering table and puts the headings it quotes in the
- * table's cells, while the act's own headings never sit in one, so `inTable` marks
- * a quoted heading. The depth is read where the line's visible text starts.
+ * table's cells, while the act's own headings never sit in one, so a heading whose
+ * text sits in a table is foreign; the depth is read where the line's visible text
+ * starts. An annex's own subdivisions read like the act's chapters and sections
+ * (an appendix's "CHAPTER I", Annex XI's "Section 1"), so a heading past the first
+ * annex container is foreign too, unless it heads an annex. A body with no such
+ * container — a legacy `text/html` act, and any Markdown — keeps them.
  */
 function headingLines(content: string, lines: readonly RawLine[], vocabulary: Vocabulary) {
   const tableDepth = nestingDepth(content, TABLE_TAG_RE);
+  const annexStart = content.search(ANNEX_CONTAINER_RE);
   const found: HeadingLine[] = [];
   lines.forEach((ln, i) => {
     const c = classifyStructural(ln.visible, vocabulary);
     if (!c) return;
     LEADING_MARKUP_RE.lastIndex = 0;
     LEADING_MARKUP_RE.exec(ln.raw);
+    const inAnnex = annexStart !== -1 && ln.offset >= annexStart && c.kind !== 'annex';
     found.push({
       kind: c.kind,
       number: c.number,
       label: labelFor(c.kind, c.number),
       offset: ln.offset,
       lineIndex: i,
-      inTable: tableDepth(ln.offset + LEADING_MARKUP_RE.lastIndex) > 0,
+      foreign: inAnnex || tableDepth(ln.offset + LEADING_MARKUP_RE.lastIndex) > 0,
       ...(c.title ? { title: c.title } : {}),
     });
   });
@@ -656,21 +724,21 @@ function headingLines(content: string, lines: readonly RawLine[], vocabulary: Vo
 }
 
 /**
- * Which Markdown headings are quoted, read from the HTML the Markdown was rendered
- * from. The conversion flattens the numbering tables, and it can also lose an
+ * Which Markdown headings are foreign, read from the HTML the Markdown was
+ * rendered from: the conversion flattens the numbering tables that hold quoted
+ * headings (#106) and drops the annex containers (#157). It can also lose an
  * in-table heading the HTML detects: a quoted heading whose opening `‘` sits on a
  * line of its own renders as `‘ Section 3`, and a genuine table's cells render as
  * a GFM row. So the two sequences are aligned in order, each Markdown heading
  * taking the verdict of the next HTML heading of the same kind and number, and an
- * HTML heading may be passed over only when it sits in a table. When a Markdown
- * heading has no counterpart, or an HTML heading outside any table would be passed
- * over, the verdicts cannot be placed and every Markdown heading is kept, as it was
+ * HTML heading may be passed over only when it is foreign. When a Markdown heading
+ * has no counterpart, or one of the act's own HTML headings would be passed over,
+ * the verdicts cannot be placed and every Markdown heading is kept, as it was
  * before quoted text was recognized. Both sequences are read once, forward only.
  */
-function markdownQuoted(found: readonly HeadingLine[], html: string, vocabulary: Vocabulary) {
-  const source = headingLines(html, splitLines(html, true), vocabulary);
+function markdownForeign(found: readonly HeadingLine[], source: readonly HeadingLine[]) {
   const keepAll = () => found.map(() => false);
-  const quoted: boolean[] = [];
+  const foreign: boolean[] = [];
   let next = 0;
   for (const heading of found) {
     let counterpart = source[next];
@@ -678,14 +746,14 @@ function markdownQuoted(found: readonly HeadingLine[], html: string, vocabulary:
       counterpart &&
       (counterpart.kind !== heading.kind || counterpart.number !== heading.number)
     ) {
-      if (!counterpart.inTable) return keepAll();
+      if (!counterpart.foreign) return keepAll();
       counterpart = source[++next];
     }
     if (!counterpart) return keepAll();
-    quoted.push(counterpart.inTable);
+    foreign.push(counterpart.foreign);
     next++;
   }
-  return source.slice(next).every((h) => h.inTable) ? quoted : keepAll();
+  return source.slice(next).every((h) => h.foreign) ? foreign : keepAll();
 }
 
 function parseTextStructure(
@@ -693,19 +761,20 @@ function parseTextStructure(
   vocabulary: Vocabulary,
   html: boolean,
   sourceHtml: string | undefined,
-): ActHeading[] {
+): DocumentStructure {
   const lines = splitLines(content, html);
   const found = headingLines(content, lines, vocabulary);
-  const quoted =
+  const source =
     sourceHtml === undefined
-      ? found.map((h) => h.inTable)
-      : markdownQuoted(found, sourceHtml, vocabulary);
-  const structural = found.filter((_, i) => !quoted[i]);
+      ? undefined
+      : headingLines(sourceHtml, splitLines(sourceHtml, true), vocabulary);
+  const foreign = source ? markdownForeign(found, source) : found.map((h) => h.foreign);
+  const structural = found.filter((_, i) => !foreign[i]);
 
   // No chapter/section/article/annex heading anywhere → not a structured act
   // (e.g. case law). Bare recital-looking markers alone don't constitute
   // detectable structure, so return nothing and let the caller degrade.
-  if (structural.length === 0) return [];
+  if (structural.length === 0) return { headings: [], boundaries: [] };
 
   // Titles: the OJ layout puts an article's subtitle / a chapter's title on the
   // line after the heading. Take the first following non-empty line that isn't
@@ -743,11 +812,116 @@ function parseTextStructure(
   }
 
   const all: ActHeading[] = [
-    ...structural.map(({ lineIndex: _lineIndex, inTable: _inTable, ...h }) => h),
+    ...structural.map(({ lineIndex: _lineIndex, foreign: _foreign, ...h }) => h),
     ...recitals,
   ];
   all.sort((a, b) => a.offset - b.offset);
-  return all;
+  let boundaries: number[] = [];
+  if (html) boundaries = htmlBoundaries(content);
+  else if (sourceHtml !== undefined && source) {
+    boundaries = markdownBoundaries(lines, structural, sourceHtml, source);
+  }
+  return { headings: all, boundaries };
+}
+
+// --- Where an act's sections stop (#153) ---
+
+/**
+ * The opener of the `<div>` CONVEX gives an act's final part — `id="fnp_1"`, after
+ * the enacting terms in an OJ text (binding formula, "Done at …", signatories) and
+ * in a consolidated one (the binding formula). The lazy run stays inside one tag,
+ * so a run of unclosed openers costs one pass.
+ */
+const FINAL_PART_RE = /<div\b[^<>]*?\bid="fnp_\d+"/i;
+
+/** The rule a consolidated text puts before the notes it gathers at its end. */
+const TRAILING_NOTES_RE = /<hr\b[^<>]*?\bclass="separator-short"/i;
+
+/** Where an html body's final part opens and where its trailing notes begin, ascending. */
+function htmlBoundaries(html: string): number[] {
+  return [html.search(FINAL_PART_RE), html.search(TRAILING_NOTES_RE)]
+    .filter((at) => at !== -1)
+    .sort((a, b) => a - b);
+}
+
+/** Where a Formex body's enacting terms end: each `</ENACTING.TERMS>`. */
+function formexBoundaries(content: string): number[] {
+  return Array.from(content.matchAll(/<\/ENACTING\.TERMS>/g), (m) => m.index);
+}
+
+/** A paragraph opener. `[^<>]` keeps each match attempt inside one tag. */
+const PARAGRAPH_OPEN_RE = /<p\b[^<>]*>/gi;
+
+/**
+ * Most source characters of one paragraph read for its opening words: they lead
+ * with the markup of a note reference or two, then the text.
+ */
+const PARAGRAPH_PROBE_CHARS = 2_000;
+
+/** Visible characters a Markdown line must open with to stand for an html paragraph. */
+const OPENING_WORDS_CHARS = 40;
+
+/**
+ * The opening words of the first paragraph with visible text at or after `at`, or
+ * "" when none follows. A paragraph is read up to its closer or the next paragraph
+ * opener, and for at most {@link PARAGRAPH_PROBE_CHARS}, both found by forward-only
+ * finders, so a run of empty or unclosed paragraphs costs one pass.
+ */
+function openingWords(html: string, at: number): string {
+  const nextClose = forwardFinder(html, '</p>');
+  const nextOpen = forwardFinder(html, '<p');
+  PARAGRAPH_OPEN_RE.lastIndex = at;
+  for (let open = PARAGRAPH_OPEN_RE.exec(html); open; open = PARAGRAPH_OPEN_RE.exec(html)) {
+    const start = PARAGRAPH_OPEN_RE.lastIndex;
+    const end = Math.min(
+      ...[nextClose(start), nextOpen(start)].filter((i) => i !== -1),
+      start + PARAGRAPH_PROBE_CHARS,
+    );
+    const text = visibleText(html.slice(start, end));
+    if (text) return text.slice(0, OPENING_WORDS_CHARS);
+  }
+  return '';
+}
+
+/** A Markdown line's visible text with its backslash escapes removed. */
+function unescapedMarkdown(visible: string): string {
+  return visible.replace(/\\([!-/:-@[-`{-~])/g, '$1');
+}
+
+/**
+ * Where a Markdown body's sections stop, read from the HTML it was rendered from
+ * (#153). The conversion drops the markup that marks each html boundary, but keeps
+ * the text after it: the binding formula or "Done at …" that opens the final part,
+ * the first note after the notes rule. So each html boundary maps to the first
+ * Markdown line opening with the same words, searched between the Markdown
+ * counterparts of the act's own headings around it — the act's own headings align
+ * one to one with the source's ({@link markdownForeign}). A boundary whose words are
+ * not found there is dropped, and its sections run on as before.
+ */
+function markdownBoundaries(
+  lines: readonly RawLine[],
+  structural: readonly HeadingLine[],
+  html: string,
+  source: readonly HeadingLine[],
+): number[] {
+  const own = source.filter((h) => !h.foreign);
+  const boundaries: number[] = [];
+  for (const at of htmlBoundaries(html)) {
+    const before = own.filter((h) => h.offset < at).length;
+    const from = structural[before - 1];
+    const words = openingWords(html, at);
+    if (!from || !words) continue;
+    const until = structural[before]?.offset ?? Number.POSITIVE_INFINITY;
+    for (let i = from.lineIndex + 1; i < lines.length; i++) {
+      const line = lines[i] as RawLine;
+      if (line.offset >= until) break;
+      if (unescapedMarkdown(line.visible).startsWith(words)) {
+        boundaries.push(line.offset);
+        break;
+      }
+    }
+  }
+  return boundaries;
 }
 
 // --- Formex 4 XML: element matching ---
@@ -851,6 +1025,12 @@ function forwardFinder(text: string, needle: string): (from: number) => number {
  */
 const FORMEX_QUOT_S_TAG_RE = /<(\/?)QUOT\.S(?=[\s/>])[^<>]*>/g;
 
+/**
+ * A Formex annex part's root, `<ANNEX>` or a consolidated text's `<CONS.ANNEX>`
+ * (which nests its appendices), open or close, with the closing slash in group 1.
+ */
+const FORMEX_ANNEX_TAG_RE = /<(\/?)(?:CONS\.)?ANNEX(?=[\s/>])[^<>]*>/g;
+
 function parseFormexStructure(content: string, vocabulary: Vocabulary): ActHeading[] {
   const headings: ActHeading[] = [];
 
@@ -861,14 +1041,22 @@ function parseFormexStructure(content: string, vocabulary: Vocabulary): ActHeadi
   // one, so the scan resumes past the span the previous heading consumed. The
   // number comes from the enclosing <ARTICLE IDENTIFIER> where it names one (#107).
   // An opener inside <QUOT.S> heads text the act quotes into another act, not
-  // one of its own articles, and is skipped (#106).
+  // one of its own articles, and is skipped (#106); so is one inside an annex part,
+  // which heads the annex's own text (#157).
   const articleNumbers = formexArticleNumbers(content);
   const nextTiArtClose = forwardFinder(content, '</TI.ART>');
   const nextStiArtClose = forwardFinder(content, '</STI.ART>');
   const articleQuoteDepth = nestingDepth(content, FORMEX_QUOT_S_TAG_RE);
+  const articleAnnexDepth = nestingDepth(content, FORMEX_ANNEX_TAG_RE);
   let consumedTo = 0;
   for (const open of content.matchAll(FORMEX_TI_ART_OPEN_RE)) {
-    if (open.index < consumedTo || articleQuoteDepth(open.index) > 0) continue;
+    if (
+      open.index < consumedTo ||
+      articleQuoteDepth(open.index) > 0 ||
+      articleAnnexDepth(open.index) > 0
+    ) {
+      continue;
+    }
     const labelStart = open.index + open[0].length;
     const tiClose = nextTiArtClose(labelStart);
     if (tiClose === -1) break; // no </TI.ART> anywhere past here, so no later heading closes either
@@ -903,13 +1091,16 @@ function parseFormexStructure(content: string, vocabulary: Vocabulary): ActHeadi
   // its text isn't a chapter/section heading, so it's skipped.) Each heading is
   // bounded by its own </TI> and </STI> through forward-only finders rather than a
   // lazy scan to the closer, which re-read the rest of the document once per
-  // unclosed opener. A title inside <QUOT.S> is quoted, like a quoted article.
+  // unclosed opener. A title inside <QUOT.S> is quoted, like a quoted article, and
+  // one inside an annex part titles the annex's own subdivisions (#157): Annex
+  // VIII's "Section C", an appendix's "CHAPTER I".
   const headingRe = vocabulary.formexHeading;
   const nextTiClose = forwardFinder(content, '</TI>');
   const nextStiClose = forwardFinder(content, '</STI>');
   const titleQuoteDepth = nestingDepth(content, FORMEX_QUOT_S_TAG_RE);
+  const titleAnnexDepth = nestingDepth(content, FORMEX_ANNEX_TAG_RE);
   for (const open of content.matchAll(FORMEX_TI_OPEN_RE)) {
-    if (titleQuoteDepth(open.index) > 0) continue;
+    if (titleQuoteDepth(open.index) > 0 || titleAnnexDepth(open.index) > 0) continue;
     headingRe.lastIndex = open.index + open[0].length;
     const head = headingRe.exec(content);
     if (!head) continue;
@@ -970,13 +1161,33 @@ export function parseDocumentStructure(
   language: EurLexLanguage,
   sourceHtml?: string,
 ): ActHeading[] {
-  if (!isCaseLawCelex(celex)) return parseActStructure(content, format, language, sourceHtml);
+  return readDocumentStructure(celex, content, format, language, sourceHtml).headings;
+}
+
+/**
+ * A work's headings, as {@link parseDocumentStructure} reads them, with an act's
+ * boundaries ({@link readActStructure}). Case law has none: an operative part runs
+ * to the end of the body (#117).
+ */
+export function readDocumentStructure(
+  celex: string,
+  content: string,
+  format: ContentFormat,
+  language: EurLexLanguage,
+  sourceHtml?: string,
+): DocumentStructure {
+  if (!isCaseLawCelex(celex)) return readActStructure(content, format, language, sourceHtml);
   const ruling = RULING_CELEX_RE.test(celex);
-  if (format === 'xml') return formexCaseLawStructure(content, ruling);
-  const formula = operativeFormula(language);
-  return format === 'html'
-    ? htmlLandmarks(content, formula, ruling).map(({ atx: _atx, text: _text, ...h }) => h)
-    : markdownCaseLawStructure(content, sourceHtml, formula, ruling);
+  let headings: ActHeading[];
+  if (format === 'xml') headings = formexCaseLawStructure(content, ruling);
+  else {
+    const formula = operativeFormula(language);
+    headings =
+      format === 'html'
+        ? htmlLandmarks(content, formula, ruling).map(({ atx: _atx, text: _text, ...h }) => h)
+        : markdownCaseLawStructure(content, sourceHtml, formula, ruling);
+  }
+  return { headings, boundaries: [] };
 }
 
 /** True for a sector-6 CELEX: case law of the EU courts. */
@@ -1381,13 +1592,24 @@ function numbersEquivalent(a: string, b: string): boolean {
   return na !== null && nb !== null && na === nb;
 }
 
-/** Split a comma-separated selector string into normalized tokens. */
+/**
+ * Split a comma-separated selector string into normalized tokens. An annex token
+ * that is only the annex keyword, English or the served language's, in any case,
+ * names the act's lone unnumbered annex and becomes the empty number that annex
+ * carries (#156); any other token left empty is dropped.
+ */
 function parseTokens(raw: string | undefined, kind: SectionKind, vocabulary: Vocabulary): string[] {
   if (!raw) return [];
-  return raw
-    .split(',')
-    .map((t) => normalizeToken(t, kind, vocabulary))
-    .filter(Boolean);
+  const tokens: string[] = [];
+  for (const token of raw.split(',')) {
+    if (kind === 'annex' && vocabulary.annexWord.test(token.trim())) {
+      tokens.push('');
+      continue;
+    }
+    const number = normalizeToken(token, kind, vocabulary);
+    if (number) tokens.push(number);
+  }
+  return tokens;
 }
 
 /**
@@ -1395,10 +1617,12 @@ function parseTokens(raw: string | undefined, kind: SectionKind, vocabulary: Voc
  * selection's text is built from. `sections` must be in document order.
  *
  * A section spans from its heading to the next heading of the same or broader
- * rank, so any two spans are nested or disjoint, never partially overlapping:
- * every heading between a section's start and its end is narrower, so its own
- * span closes no later. Containment is therefore the whole test, and one pass that
- * tracks the furthest end seen so far finds it (#88).
+ * rank or the next boundary, whichever comes first, so any two spans are nested or
+ * disjoint, never partially overlapping: every heading between a section's start
+ * and its end is narrower, so its own span closes no later, and a boundary that
+ * cuts one span cuts every span open across it at the same point (#153).
+ * Containment is therefore the whole test, and one pass that tracks the furthest
+ * end seen so far finds it (#88).
  */
 export function outermostSections<T extends { chars: number; offset: number }>(
   sections: readonly T[],
@@ -1416,7 +1640,8 @@ export function outermostSections<T extends { chars: number; offset: number }>(
 
 /**
  * Extract the requested sections from the content, in document order. For each
- * requested section, slices from its heading to the next same-or-broader heading.
+ * requested section, slices from its heading to the next same-or-broader heading,
+ * or to the first of `boundaries` past the heading when that comes first (#153).
  * Reports which requests matched and which missed — a miss is never an error.
  * `language` is the language the body was served in, whose kind words a selector
  * may use alongside the English ones; every descriptor is reported in English.
@@ -1426,12 +1651,13 @@ export function extractSections(
   headings: readonly ActHeading[],
   selectors: SectionSelectors,
   language: EurLexLanguage,
+  boundaries: readonly number[] = [],
 ): SelectionResult {
   const vocabulary = vocabularyFor(language);
   const requests: { kind: SectionKind; token: string; descriptor: string }[] = [];
   const add = (kind: SectionKind, raw: string | undefined, wordLabel: string) => {
     for (const token of parseTokens(raw, kind, vocabulary)) {
-      requests.push({ kind, token, descriptor: `${wordLabel} ${token}` });
+      requests.push({ kind, token, descriptor: token ? `${wordLabel} ${token}` : wordLabel });
     }
   };
   add('article', selectors.articles, 'Article');
@@ -1461,11 +1687,11 @@ export function extractSections(
     }
     const start = heading.offset;
     const rank = RANK[req.kind];
-    let end = content.length;
+    let end = boundaries.find((at) => at > start) ?? content.length;
     for (let j = idx + 1; j < headings.length; j++) {
       const next = headings[j];
       if (next && RANK[next.kind] <= rank) {
-        end = next.offset;
+        end = Math.min(end, next.offset);
         break;
       }
     }

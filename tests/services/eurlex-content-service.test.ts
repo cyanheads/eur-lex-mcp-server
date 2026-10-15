@@ -26,6 +26,15 @@ import {
 } from '@/services/eurlex-content/eurlex-content-service.js';
 import { htmlToMarkdown } from '@/services/eurlex-content/html-to-markdown.js';
 import { AWS_WAF_CHALLENGE_HTML } from '../fixtures/aws-waf-challenge.js';
+import {
+  DIRECTIVE_OJ_HTML,
+  DRONES_CONSOLIDATED_HTML,
+  GDPR_ARTICLE_99_DE,
+  GDPR_ARTICLE_99_EN,
+  GDPR_ARTICLE_99_ET,
+  GDPR_ARTICLE_99_FI,
+  GDPR_ARTICLE_99_LV,
+} from '../fixtures/eurlex-act-boundaries.js';
 import { ACT_XHTML } from '../fixtures/eurlex-act-html.js';
 import { AMENDING_HTML } from '../fixtures/eurlex-amending-act.js';
 import { JUDGMENT_CONVEX_EN } from '../fixtures/eurlex-case-law.js';
@@ -124,6 +133,50 @@ describe('EurLexContentService', () => {
     );
     expect(headersOf(mockFetch.mock.calls[0]).Accept).toBe('application/xhtml+xml');
     expect(headersOf(mockFetch.mock.calls[0])['Accept-Language']).toBe('eng');
+  });
+
+  describe('CELEX path segment encoding (#155)', () => {
+    it.each([
+      ['32016R0679', 'http://publications.europa.eu/resource/celex/32016R0679'],
+      ['02016R0679-20160504', 'http://publications.europa.eu/resource/celex/02016R0679-20160504'],
+      ['62024CJ0629', 'http://publications.europa.eu/resource/celex/62024CJ0629'],
+      ['32016R0679R(02)', 'http://publications.europa.eu/resource/celex/32016R0679R%2802%29'],
+      ['62015TO0235(01)', 'http://publications.europa.eu/resource/celex/62015TO0235%2801%29'],
+    ])('builds the content URL for %s as %s', (celex, url) => {
+      expect(makeService().buildContentUrl(celex)).toBe(url);
+    });
+
+    /** CELLAR's answer: the percent-encoded corrigendum path serves the body, the literal one 404s. */
+    const corrigendumHost = (url: string) =>
+      Promise.resolve(
+        new URL(url).pathname === '/resource/celex/32016R0679R%2802%29'
+          ? new Response(GDPR_XHTML, { status: 200 })
+          : new Response('not found', { status: 404 }),
+      );
+
+    it('fetches a corrigendum body through the percent-encoded path', async () => {
+      mockFetch.mockImplementation(corrigendumHost);
+      const result = await makeService().fetchContent(
+        '32016R0679R(02)',
+        'EN',
+        'html',
+        createMockContext(),
+      );
+      expect(result.contentAvailable).toBe(true);
+      expect(result.content).toContain('personal data');
+    });
+
+    it('requests every xml variant and the zipped package for a corrigendum through the encoded path', async () => {
+      mockFetch.mockImplementation(() =>
+        Promise.resolve(new Response('not found', { status: 404 })),
+      );
+      await makeService().fetchContent('32016R0679R(02)', 'EN', 'xml', createMockContext());
+      const urls = new Set(mockFetch.mock.calls.map((call) => String(call[0])));
+      expect([...urls]).toEqual([
+        'http://publications.europa.eu/resource/celex/32016R0679R%2802%29',
+      ]);
+      expect(mockFetch.mock.calls.length).toBeGreaterThan(1);
+    });
   });
 
   it('maps the EUR-Lex 2-letter code to its ISO 639-2/T form (DE → deu)', async () => {
@@ -827,6 +880,61 @@ ${strip(PACKAGE_ANNEX)}
       expect(result).not.toHaveProperty('sourceHtml');
     });
 
+    it.each([
+      ['EN', GDPR_ARTICLE_99_EN, 'This Regulation shall be binding'],
+      ['DE', GDPR_ARTICLE_99_DE, 'Diese Verordnung ist in allen'],
+      ['FI', GDPR_ARTICLE_99_FI, 'Tämä asetus on kaikilta'],
+      ['ET', GDPR_ARTICLE_99_ET, 'Käesolev määrus on tervikuna'],
+      ['LV', GDPR_ARTICLE_99_LV, 'Šī regula uzliek'],
+    ] as const)(
+      'returns %s Markdown with where its enacting terms end, read against the source HTML (#153)',
+      async (language, html, bindingFormula) => {
+        serve(html);
+        const result = await makeService().fetchContent(
+          '32016R0679',
+          language,
+          'markdown',
+          createMockContext(),
+        );
+
+        expect(result.boundaries).toEqual([result.content.indexOf(bindingFormula)]);
+        // The line before it is Article 99's last paragraph, "It shall apply from 25 May 2018."
+        const lastLine = result.content
+          .slice(0, result.boundaries?.[0])
+          .trimEnd()
+          .split('\n')
+          .at(-1);
+        expect(lastLine).toContain('2018');
+      },
+    );
+
+    it('returns a consolidated Markdown body with its final part and its trailing notes (#153)', async () => {
+      serve(DRONES_CONSOLIDATED_HTML);
+      const result = await makeService().fetchContent(
+        '02019R0947-20250501',
+        'EN',
+        'markdown',
+        createMockContext(),
+      );
+
+      expect(result.boundaries).toEqual([
+        result.content.indexOf('This Regulation shall be binding'),
+        result.content.indexOf('( 1 ) Commission Implementing Regulation'),
+      ]);
+    });
+
+    it('returns no boundary for a Markdown body without final-part markup (#153)', async () => {
+      serve(AMENDING_HTML);
+      const result = await makeService().fetchContent(
+        '32015R2120',
+        'EN',
+        'markdown',
+        createMockContext(),
+      );
+
+      expect(result.boundaries).toEqual([]);
+    });
+
     it('reads a case-law Markdown body’s headings by the case-law parser, cached under its CELEX (#117)', async () => {
       serve(JUDGMENT_CONVEX_EN);
       const service = makeService();
@@ -878,6 +986,26 @@ ${strip(PACKAGE_ANNEX)}
         createMockContext(),
       );
       expect(html).not.toHaveProperty('headings');
+      expect(html).not.toHaveProperty('boundaries');
+    });
+
+    it('keeps each caller’s boundaries apart from the cached entry (#153)', async () => {
+      serve(DIRECTIVE_OJ_HTML);
+      const service = makeService();
+      const first = await service.fetchContent('32019L1937', 'EN', 'markdown', createMockContext());
+      const pristine = structuredClone(first);
+      expect(first.boundaries).toEqual([first.content.indexOf('Done at Strasbourg')]);
+
+      first.boundaries?.splice(0, 1, 0, 1);
+
+      const second = await service.fetchContent(
+        '32019L1937',
+        'EN',
+        'markdown',
+        createMockContext(),
+      );
+      expect(second).toEqual(pristine);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
     });
 
     it('keeps each caller’s result apart from the cached entry', async () => {
