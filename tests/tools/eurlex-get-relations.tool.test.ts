@@ -3,7 +3,11 @@
  * @module tests/tools/eurlex-get-relations.tool.test
  */
 
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import {
+  JsonRpcErrorCode,
+  serviceUnavailable,
+  validationError,
+} from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_get_relations } from '@/mcp-server/tools/definitions/eurlex-get-relations.tool.js';
@@ -15,6 +19,8 @@ import {
   isResolutionQuery,
   requestedCelex,
 } from '../fixtures/cellar-works.js';
+import { CPU_TIMED_TEST_TIMEOUT_MS, expectLinearScaling } from '../helpers/cpu-time.js';
+import { assertInSortWindow, pageSpan, pagingClauses } from '../helpers/sort-window.js';
 
 // --- Service mock ---
 const mockQuery = vi.fn();
@@ -94,6 +100,9 @@ function routeQuery(handlers: {
   implicitlyRepeals?: Row[];
   implicitlyRepealedBy?: Row[];
   legalBasis?: Row[];
+  basisFor?: Row[];
+  interprets?: Row[];
+  interpretedBy?: Row[];
   consolidated?: Row[];
   nationalTransposition?: Row[];
 }) {
@@ -108,7 +117,18 @@ function routeQuery(handlers: {
       return handlers.consolidated ?? [];
     if (q.includes('cdm:measure_national_implementing_implements_resource_legal'))
       return handlers.nationalTransposition ?? [];
-    if (q.includes('cdm:resource_legal_based_on_resource_legal')) return handlers.legalBasis ?? [];
+    // legal_basis/basis_for and interprets/interpreted_by share a predicate each and
+    // differ by which side of the triple binds the source work.
+    if (q.includes('cdm:resource_legal_based_on_resource_legal')) {
+      return q.includes('?relatedWork cdm:resource_legal_based_on_resource_legal <')
+        ? (handlers.basisFor ?? [])
+        : (handlers.legalBasis ?? []);
+    }
+    if (q.includes('cdm:case-law_interpretes_resource_legal')) {
+      return q.includes('?relatedWork cdm:case-law_interpretes_resource_legal <')
+        ? (handlers.interpretedBy ?? [])
+        : (handlers.interprets ?? []);
+    }
     // Implicit repeal must be checked before explicit — same shared-predicate,
     // direction-by-triple-side pattern as amends/amended_by.
     if (q.includes('cdm:resource_legal_implicitly_repeals_resource_legal')) {
@@ -143,7 +163,7 @@ describe('eurlex_get_relations', () => {
 
   it('rejects pagination values outside the public boundary', () => {
     expect(() =>
-      eurlex_get_relations.input.parse({ celex_number: '32016R0679', limit: 101 }),
+      eurlex_get_relations.input.parse({ celex_number: '32016R0679', limit: 10_001 }),
     ).toThrow();
     expect(() =>
       eurlex_get_relations.input.parse({ celex_number: '32016R0679', offset: -1 }),
@@ -437,6 +457,47 @@ describe('eurlex_get_relations', () => {
     expect(relSparql).toContain(
       `?relatedWork cdm:resource_legal_implicitly_repeals_resource_legal <${GDPR_WORK_URI}>`,
     );
+  });
+
+  it('legal_basis is outgoing-only on cdm:resource_legal_based_on_resource_legal (GDPR → 12012E016)', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_relations.errors });
+    mockQuery.mockImplementation(
+      routeQuery({
+        resolve: [makeResolveBinding(GDPR_WORK_URI)],
+        legalBasis: [
+          makeRelationBinding({
+            relatedWork: `${CELLAR}tfeu-16`,
+            direction: 'outgoing',
+            relatedCelex: '12012E016',
+          }),
+        ],
+        // A work adopted under the GDPR: the incoming side, which legal_basis never reads.
+        basisFor: [
+          makeRelationBinding({
+            relatedWork: `${CELLAR}adequacy`,
+            direction: 'incoming',
+            relatedCelex: '32023D1795',
+          }),
+        ],
+      }),
+    );
+
+    const result = await eurlex_get_relations.handler(
+      eurlex_get_relations.input.parse({
+        celex_number: '32016R0679',
+        relation_types: ['legal_basis'],
+      }),
+      ctx,
+    );
+
+    expect(result.relations).toEqual([
+      {
+        relation_type: 'legal_basis',
+        direction: 'outgoing',
+        related_work_uri: `${CELLAR}tfeu-16`,
+        related_celex_number: '12012E016',
+      },
+    ]);
   });
 
   // --- #32: consolidated_version keeps only fetchable (CELEX-bearing) consolidations ---
@@ -1939,6 +2000,133 @@ describe('eurlex_get_relations', () => {
     });
   });
 
+  // --- #147: pasted identifier forms ---
+
+  describe('pasted identifier forms (#147)', () => {
+    const AMENDER = makeRelationBinding({
+      relatedWork: `${CELLAR}amender`,
+      direction: 'incoming',
+      relatedCelex: '32022R0000',
+    });
+
+    const traverse = async (args: Record<string, unknown>) => {
+      mockQuery.mockImplementation(
+        routeQuery({ resolve: [makeResolveBinding(GDPR_WORK_URI)], amendedBy: [AMENDER] }),
+      );
+      const result = await runToolContract(eurlex_get_relations, {
+        relation_types: ['amended_by'],
+        ...args,
+      });
+      expect(result.isError).toBeFalsy();
+      const structured = eurlex_get_relations.output.parse(result.structuredContent);
+      const queries = mockQuery.mock.calls.map((c) => c[0] as string);
+      return { structured, queries };
+    };
+
+    it.each([
+      ['a CELEX: prefix', 'CELEX:32016R0679', '32016R0679'],
+      ['an encoded prefix', 'CELEX%3A32016r0679', '32016R0679'],
+      [
+        'a legal-content URL',
+        'https://eur-lex.europa.eu/legal-content/EN/ALL/?uri=CELEX:32016R0679',
+        '32016R0679',
+      ],
+    ])('reads celex_number given as %s', async (_label, value, celex) => {
+      const { structured, queries } = await traverse({ celex_number: value });
+
+      expect(structured.celex_number).toBe(celex);
+      expect(structured.work_uri).toBe(GDPR_WORK_URI);
+      expect(structured.relations).toHaveLength(1);
+      expect(queries[0]).toContain(`VALUES ?celexNumber { "${celex}"^^xsd:string }`);
+    });
+
+    it('still rejects a celex_number URL naming no CELEX at the schema', () => {
+      expect(() =>
+        eurlex_get_relations.input.parse({
+          celex_number: 'https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=OJ:L:2016:119:TOC',
+        }),
+      ).toThrow(/celex_number must be a CELEX identifier/);
+    });
+
+    it('traverses an https work_uri as its http form', async () => {
+      const { structured, queries } = await traverse({
+        work_uri: GDPR_WORK_URI.replace('http:', 'https:'),
+      });
+
+      expect(structured.work_uri).toBe(GDPR_WORK_URI);
+      expect(structured.relations).toHaveLength(1);
+      expect(queries.some((q) => q.includes(`<${GDPR_WORK_URI}>`))).toBe(true);
+      expect(queries.some((q) => q.includes('https://publications'))).toBe(false);
+    });
+
+    it.each([
+      ['http', 'http://publications.europa.eu/resource/celex/32016R0679'],
+      ['https', 'https://publications.europa.eu/resource/celex/32016R0679'],
+    ])('traverses a resource/celex alias work_uri over %s as its CELEX', async (_label, uri) => {
+      const { structured, queries } = await traverse({ work_uri: uri });
+
+      expect(structured.celex_number).toBe('32016R0679');
+      expect(structured.work_uri).toBe(GDPR_WORK_URI);
+      expect(structured.relations).toHaveLength(1);
+      expect(queries.some((q) => q.includes('/resource/celex/32016R0679>'))).toBe(false);
+    });
+
+    it('still refuses a celex_number and an alias work_uri together', async () => {
+      const result = await runToolContract(eurlex_get_relations, {
+        celex_number: '32016R0679',
+        work_uri: 'http://publications.europa.eu/resource/celex/32016R0679',
+      });
+      expect(
+        (result.structuredContent as { error: { data: { reason: string } } }).error.data.reason,
+      ).toBe('invalid_identifier_args');
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+  });
+
+  // --- #143: relation_types case and separator variants, per item ---
+
+  describe('relation_types variants (#143)', () => {
+    it('serves each item of relation_types as its canonical member', () => {
+      expect(
+        eurlex_get_relations.input.parse({
+          celex_number: '32016R0679',
+          relation_types: ['Cites', 'AMENDED-BY', ' national_Transposition '],
+        }).relation_types,
+      ).toEqual(['cites', 'amended_by', 'national_transposition']);
+    });
+
+    it('traverses the canonical type a variant names', async () => {
+      mockQuery.mockImplementation(
+        routeQuery({
+          resolve: [makeResolveBinding(GDPR_WORK_URI)],
+          amendedBy: [
+            makeRelationBinding({
+              relatedWork: `${CELLAR}amender`,
+              direction: 'incoming',
+              relatedCelex: '32022R0000',
+            }),
+          ],
+        }),
+      );
+      const result = await runToolContract(eurlex_get_relations, {
+        celex_number: '32016R0679',
+        relation_types: ['Amended_By'],
+      });
+      const structured = eurlex_get_relations.output.parse(result.structuredContent);
+      expect(structured.requested_relation_types).toEqual(['amended_by']);
+      expect(structured.relations.map((r) => r.relation_type)).toEqual(['amended_by']);
+    });
+
+    it('still rejects an item naming no relation type', () => {
+      const result = eurlex_get_relations.input.safeParse({
+        celex_number: '32016R0679',
+        relation_types: ['Cites', 'quotes'],
+      });
+      expect(result.success).toBe(false);
+      expect(result.error?.issues[0]?.path).toEqual(['relation_types', 1]);
+    });
+  });
+
   // --- #73: ambiguous source identity on the work_uri path ---
 
   describe('multi-CELEX source work (#73)', () => {
@@ -2795,5 +2983,1096 @@ describe('eurlex_get_relations', () => {
       expect(relSparql).not.toContain('act_consolidated_consolidates');
       expect(relSparql).not.toContain('REGEX');
     });
+  });
+
+  // --- #148: works adopted under an act, and the rulings interpreting it ---
+
+  describe('basis_for, interprets, and interpreted_by (#148)', () => {
+    const SCHREMS_WORK_URI = `${CELLAR}schrems-62014CJ0362`;
+    /** A case-law title as CELLAR stores it: `#`-joined parts, about 1 KB, returned whole. */
+    const RULING_TITLE =
+      'Judgment of the Court (Fifth Chamber) of 4 June 2026.#CL v Prokuratura na Republika Bulgaria.#Request for a preliminary ruling from the Sofiyski rayonen sad.#Reference for a preliminary ruling – Protection of natural persons with regard to the processing of personal data in criminal matters – Regulation (EU) 2016/679 – Directive (EU) 2016/680 – Scope.#Case C-312/24.';
+
+    /** A dated, titled relation row as the per-type query projects it. */
+    const datedRow = (opts: {
+      relatedWork: string;
+      direction: 'outgoing' | 'incoming';
+      relatedCelex?: string;
+      date?: string;
+      title?: string;
+    }): Row => ({
+      ...makeRelationBinding(opts),
+      ...(opts.date ? { relatedDateMax: { type: 'literal', value: opts.date } } : {}),
+      ...(opts.title ? { relatedTitleMax: { type: 'literal', value: opts.title } } : {}),
+    });
+
+    const relationQueries = () =>
+      mockQuery.mock.calls
+        .map((c) => c[0] as string)
+        .filter((q) => !isResolutionQuery(q) && !q.includes('SELECT ?sourceCelex WHERE'));
+
+    it.each([
+      {
+        type: 'basis_for',
+        handler: 'basisFor',
+        predicate: 'cdm:resource_legal_based_on_resource_legal',
+        direction: 'incoming',
+        sourceWork: GDPR_WORK_URI,
+        sourceCelex: '32016R0679',
+        relatedCelex: '32026D1942',
+        date: '2026-07-30',
+        title:
+          'Decision (EU) 2026/1942 of the European Central Bank of 30 July 2026 on the processing of personal data in the context of the prudential supervision of credit institutions (ECB/2026/18)',
+      },
+      {
+        type: 'interpreted_by',
+        handler: 'interpretedBy',
+        predicate: 'cdm:case-law_interpretes_resource_legal',
+        direction: 'incoming',
+        sourceWork: GDPR_WORK_URI,
+        sourceCelex: '32016R0679',
+        relatedCelex: '62024CJ0312',
+        date: '2026-06-04',
+        title: RULING_TITLE,
+      },
+      {
+        type: 'interprets',
+        handler: 'interprets',
+        predicate: 'cdm:case-law_interpretes_resource_legal',
+        direction: 'outgoing',
+        sourceWork: SCHREMS_WORK_URI,
+        sourceCelex: '62014CJ0362',
+        relatedCelex: '31995L0046',
+        date: '1995-10-24',
+        title:
+          'Directive 95/46/EC of the European Parliament and of the Council of 24 October 1995 on the protection of individuals with regard to the processing of personal data and on the free movement of such data',
+      },
+    ] as const)(
+      '$type follows $predicate $direction and returns the row on both surfaces',
+      async ({
+        type,
+        handler,
+        predicate,
+        direction,
+        sourceWork,
+        sourceCelex,
+        relatedCelex,
+        date,
+        title,
+      }) => {
+        const relatedWork = `${CELLAR}${type}-related`;
+        mockQuery.mockImplementation(
+          routeQuery({
+            resolve: [makeResolveBinding(sourceWork)],
+            [handler]: [datedRow({ relatedWork, direction, relatedCelex, date, title })],
+          }),
+        );
+
+        const result = await runToolContract(eurlex_get_relations, {
+          celex_number: sourceCelex,
+          relation_types: [type],
+        });
+
+        expect(result.isError).toBeFalsy();
+        const structured = eurlex_get_relations.output.parse(result.structuredContent);
+        expect(structured.relations).toEqual([
+          {
+            relation_type: type,
+            direction,
+            related_work_uri: relatedWork,
+            related_celex_number: relatedCelex,
+            related_date: date,
+            related_title: title,
+          },
+        ]);
+        expect(structured.requested_relation_types).toEqual([type]);
+        expect(structured.empty_relation_types).toEqual([]);
+
+        const [sparql, ...rest] = relationQueries();
+        expect(rest).toEqual([]);
+        const incomingEdge = `?relatedWork ${predicate} <${sourceWork}>`;
+        const outgoingEdge = `<${sourceWork}> ${predicate} ?relatedWork`;
+        expect(sparql).toContain(direction === 'incoming' ? incomingEdge : outgoingEdge);
+        expect(sparql).not.toContain(direction === 'incoming' ? outgoingEdge : incomingEdge);
+        expect(sparql).toContain(`BIND("${direction}" AS ?direction)`);
+        // Unfiltered: CELEX-less related works return, and no CELEX pattern applies.
+        expect(sparql).toContain(
+          'OPTIONAL { ?relatedWork cdm:resource_legal_id_celex ?relatedCelex . }',
+        );
+        expect(sparql).not.toContain('REGEX');
+
+        const text = contentText(result);
+        expect(text).toContain(`### ${type} (${direction})`);
+        expect(text).toContain(`- ${relatedCelex} (${relatedWork}) · ${date} · ${title}`);
+      },
+    );
+
+    it('returns an empty page listing a direction the work has none of (interpreted_by on a judgment, interprets on an act)', async () => {
+      mockQuery.mockImplementation(
+        routeQuery({
+          resolve: [makeResolveBinding(SCHREMS_WORK_URI)],
+          interprets: [
+            datedRow({
+              relatedWork: `${CELLAR}dp-directive`,
+              direction: 'outgoing',
+              relatedCelex: '31995L0046',
+            }),
+          ],
+        }),
+      );
+      const judgment = await runToolContract(eurlex_get_relations, {
+        celex_number: '62014CJ0362',
+        relation_types: ['interprets', 'interpreted_by'],
+      });
+      const judgmentResult = eurlex_get_relations.output.parse(judgment.structuredContent);
+      expect(judgmentResult.relations.map((r) => r.relation_type)).toEqual(['interprets']);
+      expect(judgmentResult.empty_relation_types).toEqual(['interpreted_by']);
+      expect(contentText(judgment)).toContain('**Empty types (this page):** interpreted_by');
+
+      mockQuery.mockReset();
+      mockQuery.mockImplementation(routeQuery({ resolve: [makeResolveBinding(GDPR_WORK_URI)] }));
+      const act = await runToolContract(eurlex_get_relations, {
+        celex_number: '32016R0679',
+        relation_types: ['interprets'],
+      });
+      const actResult = eurlex_get_relations.output.parse(act.structuredContent);
+      expect(actResult).toMatchObject({
+        relations: [],
+        has_more: false,
+        empty_relation_types: ['interprets'],
+      });
+      expect(contentText(act)).toContain('**Empty types (this page):** interprets');
+    });
+
+    it('pages basis_for newest-first without overlap or gaps, behind the private sentinel row', async () => {
+      // 150 works adopted under the act, newest first, as CELLAR orders them.
+      const all = Array.from({ length: 150 }, (_, i) =>
+        datedRow({
+          relatedWork: `${CELLAR}based-${String(i).padStart(3, '0')}`,
+          direction: 'incoming',
+          relatedCelex: `52026M${String(9000 - i).padStart(4, '0')}`,
+          date: `2026-${String(12 - Math.floor(i / 15)).padStart(2, '0')}-01`,
+        }),
+      );
+      mockQuery.mockImplementation(async (q: string) => {
+        if (isResolutionQuery(q)) return resolveRowsFor(q, [makeResolveBinding(GDPR_WORK_URI)]);
+        if (
+          !q.includes(`?relatedWork cdm:resource_legal_based_on_resource_legal <${GDPR_WORK_URI}>`)
+        )
+          return [];
+        const limit = Number(/LIMIT (\d+)/.exec(q)?.[1]);
+        const offset = Number(/OFFSET (\d+)/.exec(q)?.[1]);
+        return all.slice(offset, offset + limit);
+      });
+
+      const first = await runToolContract(eurlex_get_relations, {
+        celex_number: '32004R0139',
+        relation_types: ['basis_for'],
+      });
+      const page1 = eurlex_get_relations.output.parse(first.structuredContent);
+      expect(page1).toMatchObject({ total: 100, has_more: true, next_offset: 100 });
+      expect(relationQueries()[0]).toContain('LIMIT 101 OFFSET 0');
+      expect(contentText(first)).toContain('**Next offset:** 100');
+
+      const second = await runToolContract(eurlex_get_relations, {
+        celex_number: '32004R0139',
+        relation_types: ['basis_for'],
+        offset: page1.next_offset,
+      });
+      const page2 = eurlex_get_relations.output.parse(second.structuredContent);
+      expect(page2).toMatchObject({ total: 50, has_more: false });
+      expect(page2.next_offset).toBeUndefined();
+
+      const uris = [...page1.relations, ...page2.relations].map((r) => r.related_work_uri);
+      expect(uris).toEqual(all.map((row) => row.relatedWork?.value));
+    });
+
+    it('traverses all thirteen types, the new three included, when relation_types is omitted', async () => {
+      mockQuery.mockImplementation(
+        routeQuery({
+          resolve: [makeResolveBinding(GDPR_WORK_URI)],
+          basisFor: [
+            datedRow({
+              relatedWork: `${CELLAR}adequacy`,
+              direction: 'incoming',
+              relatedCelex: '32023D1795',
+            }),
+          ],
+          interpretedBy: [
+            datedRow({
+              relatedWork: `${CELLAR}ruling`,
+              direction: 'incoming',
+              relatedCelex: '62024CJ0312',
+            }),
+          ],
+        }),
+      );
+
+      const result = await runToolContract(eurlex_get_relations, { celex_number: '32016R0679' });
+      const structured = eurlex_get_relations.output.parse(result.structuredContent);
+
+      expect(RELATION_TYPES).toHaveLength(13);
+      expect(structured.requested_relation_types).toEqual([...RELATION_TYPES]);
+      expect(structured.requested_relation_types).toEqual(
+        expect.arrayContaining(['basis_for', 'interprets', 'interpreted_by']),
+      );
+      expect(
+        structured.relations.map((r) => `${r.relation_type}:${r.related_celex_number}`).sort(),
+      ).toEqual(['basis_for:32023D1795', 'interpreted_by:62024CJ0312']);
+      expect(structured.empty_relation_types).toContain('interprets');
+      expect(structured.empty_relation_types).not.toContain('basis_for');
+
+      // One query per type: the based-on and interpretes predicates each run in both directions.
+      const queries = relationQueries();
+      expect(queries).toHaveLength(13);
+      for (const edge of [
+        `<${GDPR_WORK_URI}> cdm:resource_legal_based_on_resource_legal ?relatedWork`,
+        `?relatedWork cdm:resource_legal_based_on_resource_legal <${GDPR_WORK_URI}>`,
+        `<${GDPR_WORK_URI}> cdm:case-law_interpretes_resource_legal ?relatedWork`,
+        `?relatedWork cdm:case-law_interpretes_resource_legal <${GDPR_WORK_URI}>`,
+      ]) {
+        expect(queries.filter((q) => q.includes(edge))).toHaveLength(1);
+      }
+      const text = contentText(result);
+      expect(text).toContain('### basis_for (incoming)');
+      expect(text).toContain('### interpreted_by (incoming)');
+    });
+
+    it('returns identical rows for celex_number and work_uri, with no source-CELEX lookup for the new types', async () => {
+      const rows = {
+        basisFor: [
+          datedRow({
+            relatedWork: `${CELLAR}adequacy`,
+            direction: 'incoming',
+            relatedCelex: '32023D1795',
+          }),
+        ],
+        interpretedBy: [
+          datedRow({
+            relatedWork: `${CELLAR}ruling`,
+            direction: 'incoming',
+            relatedCelex: '62024CJ0312',
+            title: RULING_TITLE,
+          }),
+        ],
+      };
+      const types = ['basis_for', 'interprets', 'interpreted_by'] as const;
+      mockQuery.mockImplementation(
+        routeQuery({ resolve: [makeResolveBinding(GDPR_WORK_URI)], ...rows }),
+      );
+      const byCelex = eurlex_get_relations.output.parse(
+        (
+          await runToolContract(eurlex_get_relations, {
+            celex_number: '32016R0679',
+            relation_types: [...types],
+          })
+        ).structuredContent,
+      );
+
+      mockQuery.mockReset();
+      mockQuery.mockImplementation(
+        routeQuery({ sourceCelex: [makeSourceCelexBinding('32016R0679')], ...rows }),
+      );
+      const byWorkUri = eurlex_get_relations.output.parse(
+        (
+          await runToolContract(eurlex_get_relations, {
+            work_uri: GDPR_WORK_URI,
+            relation_types: [...types],
+          })
+        ).structuredContent,
+      );
+
+      expect(byWorkUri.relations).toEqual(byCelex.relations);
+      expect(byWorkUri.relations).toHaveLength(2);
+      const calls = mockQuery.mock.calls.map((c) => c[0] as string);
+      expect(calls.some((q) => q.includes('SELECT ?sourceCelex WHERE'))).toBe(false);
+      expect(calls.some(isResolutionQuery)).toBe(false);
+      expect(calls).toHaveLength(3);
+    });
+  });
+
+  // --- #149: national_transposition narrowed to named member states ---
+
+  describe('member_states on national_transposition (#149)', () => {
+    const NIS2_WORK_URI = `${CELLAR}nis2-32022L2555`;
+    /** One measure per state and index, `7{core}{state}_{n}`, newest first in state order. */
+    const measures = (core: string, counts: Record<string, number>) =>
+      Object.entries(counts).flatMap(([state, n]) =>
+        Array.from({ length: n }, (_, i) => ({
+          work: `${CELLAR}${core}-${state}-${i}`,
+          celex: `7${core}${state}_${100000 + i}`,
+        })),
+      );
+    // The NIS2 Directive's measures by state, as CELLAR counts them (no ESP, no IRL).
+    const NIS2 = measures('2022L2555', { CZE: 6, DEU: 20, EST: 28, FRA: 15 });
+    const LED = measures('2016L0680', { CZE: 3, GBR: 2, GRC: 2 });
+
+    /**
+     * CELLAR stand-in for the two directives: applies the REGEX the tool pushes into
+     * the national_transposition query, then its LIMIT and OFFSET, to the measures of
+     * the addressed work — so the pattern the tool builds decides which rows return,
+     * the way CELLAR's right-unanchored REGEX does.
+     */
+    function cellar(extra: { cites?: Row[] } = {}) {
+      return async (q: string): Promise<Row[]> => {
+        if (typeof q !== 'string') return [];
+        if (isResolutionQuery(q)) {
+          const [celex] = requestedCelex(q);
+          return resolveRowsFor(q, [
+            makeResolveBinding(celex === '32016L0680' ? DIRECTIVE_680_WORK_URI : NIS2_WORK_URI),
+          ]);
+        }
+        const led = q.includes(`<${DIRECTIVE_680_WORK_URI}>`);
+        if (q.includes('SELECT ?sourceCelex WHERE')) {
+          return [makeSourceCelexBinding(led ? '32016L0680' : '32022L2555')];
+        }
+        if (q.includes('cdm:work_cites_work')) return extra.cites ?? [];
+        if (!q.includes('cdm:measure_national_implementing_implements_resource_legal')) return [];
+        const pattern = /REGEX\(STR\(\?relatedCelex\), "([^"]+)"\)/.exec(q)?.[1] ?? '(?!)';
+        const limit = Number(/LIMIT (\d+)/.exec(q)?.[1]);
+        const offset = Number(/OFFSET (\d+)/.exec(q)?.[1]);
+        return (led ? LED : NIS2)
+          .filter((m) => new RegExp(pattern).test(m.celex))
+          .slice(offset, offset + limit)
+          .map((m) =>
+            makeRelationBinding({
+              relatedWork: m.work,
+              direction: 'incoming',
+              relatedCelex: m.celex,
+            }),
+          );
+      };
+    }
+
+    const transpositionQuery = () =>
+      mockQuery.mock.calls
+        .map((c) => c[0] as string)
+        .find((q) => q.includes('cdm:measure_national_implementing_implements_resource_legal'));
+
+    const call = async (args: Record<string, unknown>) => {
+      const result = await runToolContract(eurlex_get_relations, args);
+      expect(result.isError).toBeFalsy();
+      return { result, structured: eurlex_get_relations.output.parse(result.structuredContent) };
+    };
+
+    const NIS2_ONLY = { celex_number: '32022L2555', relation_types: ['national_transposition'] };
+
+    it('returns only the named state’s measures, pushed into the pattern, on both surfaces', async () => {
+      mockQuery.mockImplementation(cellar());
+
+      const { result, structured } = await call({ ...NIS2_ONLY, member_states: ['DEU'] });
+
+      expect(structured.relations).toHaveLength(20);
+      expect(new Set(structured.relations.map((r) => r.related_member_state))).toEqual(
+        new Set(['DEU']),
+      );
+      expect(structured).toMatchObject({ has_more: false, member_states: ['DEU'] });
+      expect(structured.next_offset).toBeUndefined();
+      expect(transpositionQuery()).toContain('REGEX(STR(?relatedCelex), "^72022L2555(DEU)")');
+
+      const text = contentText(result);
+      expect(text).toContain('**Member states:** DEU');
+      expect(text.match(/— member state DEU/g)).toHaveLength(20);
+      expect(text).not.toContain('member state FRA');
+    });
+
+    it('pages the filtered rows: has_more and next_offset count matching measures only', async () => {
+      mockQuery.mockImplementation(cellar());
+
+      const first = await call({ ...NIS2_ONLY, member_states: ['DEU'], limit: 10 });
+      expect(first.structured).toMatchObject({ total: 10, has_more: true, next_offset: 10 });
+      expect(contentText(first.result)).toContain('**Next offset:** 10');
+      const second = await call({ ...NIS2_ONLY, member_states: ['DEU'], limit: 10, offset: 10 });
+      expect(second.structured).toMatchObject({ total: 10, has_more: false });
+      expect(second.structured.next_offset).toBeUndefined();
+
+      const uris = [...first.structured.relations, ...second.structured.relations].map(
+        (r) => r.related_work_uri,
+      );
+      expect(uris).toEqual(NIS2.filter((m) => m.celex.includes('DEU')).map((m) => m.work));
+
+      // Past the end: an empty page with no notice.
+      mockQuery.mockClear();
+      const past = await call({ ...NIS2_ONLY, member_states: ['DEU'], limit: 10, offset: 20 });
+      expect(past.structured).toMatchObject({ relations: [], has_more: false });
+      expect((past.result.structuredContent as { notice?: string }).notice).toBeUndefined();
+    });
+
+    it('combines states, de-duplicates, and reads any case and the two-letter codes alike', async () => {
+      mockQuery.mockImplementation(cellar());
+
+      const both = await call({ ...NIS2_ONLY, member_states: ['DEU', 'FRA'] });
+      expect(both.structured.relations).toHaveLength(35);
+      expect(
+        both.structured.relations.every((r) => ['DEU', 'FRA'].includes(r.related_member_state!)),
+      ).toBe(true);
+      expect(transpositionQuery()).toContain('"^72022L2555(DEU|FRA)"');
+
+      const deu = (await call({ ...NIS2_ONLY, member_states: ['DEU'] })).structured.relations;
+      for (const states of [['deu'], ['DE'], [' de '], ['DEU', 'de', 'De']]) {
+        mockQuery.mockClear();
+        const { structured } = await call({ ...NIS2_ONLY, member_states: states });
+        expect(structured.relations).toEqual(deu);
+        expect(structured.member_states).toEqual(['DEU']);
+        expect(transpositionQuery()).toContain('"^72022L2555(DEU)"');
+      }
+    });
+
+    it('maps every two-letter code to its three-letter segment, EL/GR and UK/GB included', async () => {
+      mockQuery.mockImplementation(cellar());
+      // Two-letter code → the three-letter segment, in alphabetical order of the former.
+      const ALPHA2 = Object.entries({
+        AT: 'AUT',
+        BE: 'BEL',
+        BG: 'BGR',
+        CY: 'CYP',
+        CZ: 'CZE',
+        DE: 'DEU',
+        DK: 'DNK',
+        EE: 'EST',
+        EL: 'GRC',
+        ES: 'ESP',
+        FI: 'FIN',
+        FR: 'FRA',
+        GB: 'GBR',
+        GR: 'GRC',
+        HR: 'HRV',
+        HU: 'HUN',
+        IE: 'IRL',
+        IT: 'ITA',
+        LT: 'LTU',
+        LU: 'LUX',
+        LV: 'LVA',
+        MT: 'MLT',
+        NL: 'NLD',
+        PL: 'POL',
+        PT: 'PRT',
+        RO: 'ROU',
+        SE: 'SWE',
+        SI: 'SVN',
+        SK: 'SVK',
+        UK: 'GBR',
+      });
+      const ALPHA3 = [...new Set(ALPHA2.map(([, alpha3]) => alpha3))];
+      expect(ALPHA3).toHaveLength(28);
+
+      const { structured } = await call({
+        ...NIS2_ONLY,
+        member_states: ALPHA2.map(([alpha2]) => alpha2.toLowerCase()),
+      });
+      expect(structured.member_states).toEqual(ALPHA3);
+      expect(transpositionQuery()).toContain(`"^72022L2555(${ALPHA3.join('|')})"`);
+      // Every one of the 28 three-letter codes is accepted as itself.
+      expect(
+        eurlex_get_relations.input.safeParse({ ...NIS2_ONLY, member_states: ALPHA3 }).success,
+      ).toBe(true);
+    });
+
+    it('selects ESP for ES, never the Estonian measures a raw two-letter pattern would match', async () => {
+      mockQuery.mockImplementation(cellar());
+
+      const { result, structured } = await call({ ...NIS2_ONLY, member_states: ['ES'] });
+
+      expect(structured.relations).toEqual([]);
+      expect(structured.member_states).toEqual(['ESP']);
+      const sparql = transpositionQuery()!;
+      expect(sparql).toContain('"^72022L2555(ESP)"');
+      expect(sparql).not.toContain('(ES)');
+      expect(contentText(result)).not.toContain('member state EST');
+    });
+
+    it.each([
+      [['EL'], 'GRC'],
+      [['GR'], 'GRC'],
+      [['UK'], 'GBR'],
+      [['GB'], 'GBR'],
+    ])('reads %j as %s on 32016L0680', async (states, segment) => {
+      mockQuery.mockImplementation(cellar());
+
+      const { structured } = await call({
+        celex_number: '32016L0680',
+        relation_types: ['national_transposition'],
+        member_states: states,
+      });
+
+      expect(structured.relations.map((r) => r.related_celex_number)).toEqual(
+        LED.filter((m) => m.celex.includes(segment)).map((m) => m.celex),
+      );
+      expect(structured.relations).toHaveLength(2);
+      expect(structured.member_states).toEqual([segment]);
+    });
+
+    it.each([['XYZ'], ['NOR'], ['Germany'], ['DEU,FRA'], [''], ['D'], ['DEUT']])(
+      'rejects %j at the schema, naming the accepted codes',
+      (value) => {
+        const parsed = eurlex_get_relations.input.safeParse({
+          ...NIS2_ONLY,
+          member_states: [value],
+        });
+        expect(parsed.success).toBe(false);
+        const message = parsed.error?.issues.map((i) => i.message).join('\n') ?? '';
+        expect(message).toContain('DEU');
+        expect(message).toContain('GBR');
+        expect(message).toContain('EL');
+      },
+    );
+
+    it('fails with member_states_not_applicable when relation_types omits national_transposition', async () => {
+      mockQuery.mockImplementation(cellar());
+      const recovery = eurlex_get_relations.errors?.find(
+        (e) => e.reason === 'member_states_not_applicable',
+      )?.recovery;
+
+      const result = await runToolContract(eurlex_get_relations, {
+        celex_number: '32022L2555',
+        relation_types: ['cites'],
+        member_states: ['DEU'],
+      });
+
+      expect(result.isError).toBe(true);
+      expect((result.structuredContent as { error?: unknown }).error).toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        data: { reason: 'member_states_not_applicable', recovery: { hint: recovery } },
+      });
+      expect(recovery).toContain('national_transposition');
+      expect(contentText(result)).toContain(recovery ?? '<missing>');
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    it('treats an empty list as absent', async () => {
+      mockQuery.mockImplementation(cellar());
+
+      const { structured } = await call({ ...NIS2_ONLY, member_states: [] });
+      expect(structured.relations).toHaveLength(NIS2.length);
+      expect(structured).not.toHaveProperty('member_states');
+      expect(transpositionQuery()).toContain('"^72022L2555[A-Z]{3}"');
+
+      // An empty filter never trips the relation_types rule.
+      const cites = await runToolContract(eurlex_get_relations, {
+        celex_number: '32022L2555',
+        relation_types: ['cites'],
+        member_states: [],
+      });
+      expect(cites.isError).toBeFalsy();
+    });
+
+    it('names the codes in the notice of a first page with no matching measures', async () => {
+      mockQuery.mockImplementation(cellar());
+
+      const { result, structured } = await call({ ...NIS2_ONLY, member_states: ['IRL'] });
+
+      expect(structured).toMatchObject({
+        relations: [],
+        has_more: false,
+        member_states: ['IRL'],
+        empty_relation_types: ['national_transposition'],
+      });
+      const notice = (result.structuredContent as { notice?: string }).notice ?? '';
+      expect(notice).toContain('IRL');
+      expect(notice).toContain('32022L2555');
+      expect(notice).toContain('member_states');
+      expect(notice).not.toContain('Try other relation_types');
+      expect(contentText(result)).toContain(`> ${notice}`);
+    });
+
+    it('leaves every other type untouched when relation_types is omitted, and composes its notice with the next offset', async () => {
+      const cites = Array.from({ length: 101 }, (_, i) =>
+        makeRelationBinding({
+          relatedWork: `${CELLAR}citing-${i}`,
+          direction: 'incoming',
+          relatedCelex: `52026PC${String(i).padStart(4, '0')}`,
+        }),
+      );
+      mockQuery.mockImplementation(cellar({ cites }));
+      const without = await call({ celex_number: '32022L2555' });
+      const withoutQueries = mockQuery.mock.calls.map((c) => c[0] as string);
+
+      mockQuery.mockClear();
+      const filtered = await call({ celex_number: '32022L2555', member_states: ['IRL'] });
+      const filteredQueries = mockQuery.mock.calls.map((c) => c[0] as string);
+
+      const others = (r: { relation_type: string }) => r.relation_type !== 'national_transposition';
+      expect(filtered.structured.relations.filter(others)).toEqual(
+        without.structured.relations.filter(others),
+      );
+      expect(filtered.structured.relations.filter((r) => !others(r))).toEqual([]);
+      expect(without.structured.relations.filter((r) => !others(r))).toHaveLength(NIS2.length);
+      const nonTransposition = (qs: string[]) =>
+        qs.filter(
+          (q) => !q.includes('cdm:measure_national_implementing_implements_resource_legal'),
+        );
+      expect(nonTransposition(filteredQueries)).toEqual(nonTransposition(withoutQueries));
+      expect(filtered.structured.requested_relation_types).toEqual([...RELATION_TYPES]);
+
+      expect(filtered.structured).toMatchObject({ has_more: true, next_offset: 100 });
+      const notice = (filtered.result.structuredContent as { notice?: string }).notice ?? '';
+      expect(notice).toContain('IRL');
+      expect(notice).toContain('offset=100');
+      expect(contentText(filtered.result)).toContain(`> ${notice}`);
+    });
+
+    it('returns identical rows for celex_number and work_uri', async () => {
+      mockQuery.mockImplementation(cellar());
+
+      const byCelex = await call({ ...NIS2_ONLY, member_states: ['DEU', 'FRA'] });
+      const byWorkUri = await call({
+        work_uri: NIS2_WORK_URI,
+        relation_types: ['national_transposition'],
+        member_states: ['DEU', 'FRA'],
+      });
+
+      expect(byWorkUri.structured.relations).toHaveLength(35);
+      expect(byWorkUri.structured.relations).toEqual(byCelex.structured.relations);
+      expect(byWorkUri.structured.member_states).toEqual(['DEU', 'FRA']);
+    });
+
+    it(
+      're-checks a long upstream CELEX in time linear in its length',
+      async () => {
+        const input = eurlex_get_relations.input.parse({
+          ...NIS2_ONLY,
+          member_states: ['DEU', 'FRA'],
+        });
+        const ctx = createMockContext({ errors: eurlex_get_relations.errors });
+        /**
+         * A traversal whose upstream rows carry `n`-character CELEX values: one that
+         * matches the pattern, beside one that repeats the act core's opener with no
+         * member-state code to close it.
+         */
+        const traversal = (n: number) => {
+          const cellar = routeQuery({
+            resolve: [makeResolveBinding(NIS2_WORK_URI)],
+            nationalTransposition: [
+              makeRelationBinding({
+                relatedWork: `${CELLAR}long-match`,
+                direction: 'incoming',
+                relatedCelex: `72022L2555DEU_${'1'.repeat(n)}`,
+              }),
+              makeRelationBinding({
+                relatedWork: `${CELLAR}long-miss`,
+                direction: 'incoming',
+                relatedCelex: `72022L2555${'7'.repeat(n)}`,
+              }),
+            ],
+          });
+          return () => {
+            mockQuery.mockImplementation(cellar);
+            return eurlex_get_relations.handler(input, ctx);
+          };
+        };
+
+        const result = await traversal(80_000)();
+        expect(result.relations.map((r) => r.related_work_uri)).toEqual([`${CELLAR}long-match`]);
+        // CPU time: the 80k/5k ratio under 64, and the 80k traversal under 100 ms.
+        await expectLinearScaling(traversal, 100);
+      },
+      CPU_TIMED_TEST_TIMEOUT_MS,
+    );
+  });
+});
+
+// --- #154: pages stop at CELLAR's 10,000-row sort window ---
+
+describe('eurlex_get_relations CELLAR sort window (#154)', () => {
+  beforeEach(() => {
+    mockQuery.mockReset();
+    mockMaxResults = 100;
+  });
+
+  /** The Merger Regulation: 14,567 works name it among their legal bases. */
+  const MERGER_WORK_URI = `${CELLAR}merger-32004R0139`;
+
+  /** The related date at sorted position `i` of a direction: one per day, newest first. */
+  const dateAt = (i: number) =>
+    new Date(Date.UTC(2026, 0, 1) - i * 86_400_000).toISOString().slice(0, 10);
+
+  /**
+   * CELLAR over every relation type of one work, `totals[type][direction]` related
+   * works per direction: refuses any subquery reading past row 10,000 with SR353, as
+   * CELLAR does, and otherwise serves each subquery's slice newest first. A `both`
+   * query's union lists the outgoing subquery first; a one-direction query names its
+   * direction in its BIND. Rows from sorted position `undatedFrom` on carry no
+   * date, as CELLAR sorts undated works last.
+   */
+  function windowedRelations(
+    totals: Partial<Record<string, { outgoing?: number; incoming?: number }>>,
+    undatedFrom = Number.POSITIVE_INFINITY,
+  ) {
+    return async (q: string): Promise<Row[]> => {
+      if (typeof q !== 'string') return [];
+      if (isResolutionQuery(q)) return resolveRowsFor(q, [makeResolveBinding(MERGER_WORK_URI)]);
+      assertInSortWindow(q);
+      const clauses = pagingClauses(q);
+      const type = q.includes('cdm:work_cites_work')
+        ? 'cites'
+        : q.includes('?relatedWork cdm:resource_legal_based_on_resource_legal <')
+          ? 'basis_for'
+          : 'other';
+      const directions: ('outgoing' | 'incoming')[] =
+        clauses.length === 2
+          ? ['outgoing', 'incoming']
+          : [q.includes('BIND("incoming" AS ?direction)') ? 'incoming' : 'outgoing'];
+      return clauses.flatMap((clause, k) => {
+        const direction = directions[k] ?? 'outgoing';
+        const { start, end } = pageSpan(clause, totals[type]?.[direction] ?? 0);
+        return Array.from({ length: end - start }, (_, i) => ({
+          ...makeRelationBinding({
+            relatedWork: `${CELLAR}${type}-${direction}-${start + i}`,
+            direction,
+            relatedCelex: `3${String(start + i).padStart(9, '0')}`,
+          }),
+          ...(start + i < undatedFrom
+            ? { relatedDateMax: { type: 'literal', value: dateAt(start + i) } }
+            : {}),
+        }));
+      });
+    };
+  }
+
+  /** The relation queries sent, without the CELEX resolution. */
+  const relationQueries = () =>
+    mockQuery.mock.calls.map((c) => c[0] as string).filter((q) => !isResolutionQuery(q));
+
+  const call = (args: Record<string, unknown>) =>
+    runToolContract(eurlex_get_relations, { celex_number: '32004R0139', ...args });
+
+  it('keeps the sentinel while the page and its sentinel fit (offset 9,899)', async () => {
+    mockQuery.mockImplementation(windowedRelations({ basis_for: { incoming: 14_567 } }));
+
+    const result = await call({ relation_types: ['basis_for'], offset: 9_899 });
+
+    expect(relationQueries()[0]).toContain('LIMIT 101 OFFSET 9899');
+    expect(result.structuredContent).toMatchObject({
+      total: 100,
+      has_more: true,
+      next_offset: 9_999,
+    });
+  });
+
+  it.each([
+    [9_900, 100],
+    [9_949, 51],
+    [9_950, 50],
+    [9_999, 1],
+  ])(
+    'serves the rows left in the window at offset %i (LIMIT %i), with no next_offset past it',
+    async (offset, limit) => {
+      mockQuery.mockImplementation(windowedRelations({ basis_for: { incoming: 14_567 } }));
+
+      const result = await call({ relation_types: ['basis_for'], offset });
+
+      expect(result.isError).toBeFalsy();
+      expect(relationQueries()[0]).toContain(`LIMIT ${limit} OFFSET ${offset}`);
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured).toMatchObject({ total: 10_000 - offset, offset, has_more: false });
+      expect(structured).not.toHaveProperty('next_offset');
+      expect(structured).not.toHaveProperty('truncated');
+      const notice = structured.notice as string;
+      expect(notice).toContain('basis_for (incoming)');
+      expect(notice).toContain('row 10,000');
+      expect(notice).toContain('eurlex_query_sparql');
+      expect(notice).toContain(dateAt(9_999));
+      const text = contentText(result);
+      expect(text).toContain(`> ${notice}`);
+      expect(text).not.toContain('**Next offset:**');
+    },
+  );
+
+  it('caps both directions of a symmetric type and names only the direction that reached the window', async () => {
+    mockQuery.mockImplementation(windowedRelations({ cites: { outgoing: 30, incoming: 14_567 } }));
+
+    const result = await call({ relation_types: ['cites'], offset: 9_900 });
+
+    expect(pagingClauses(relationQueries()[0] ?? '')).toEqual([
+      { limit: 100, offset: 9_900 },
+      { limit: 100, offset: 9_900 },
+    ]);
+    const structured = result.structuredContent as Record<string, unknown>;
+    expect(structured).toMatchObject({ total: 100, has_more: false });
+    const notice = structured.notice as string;
+    expect(notice).toContain('cites (incoming)');
+    expect(notice).not.toContain('cites (outgoing)');
+    expect(notice).toContain(`?work cdm:work_cites_work <${MERGER_WORK_URI}> .`);
+    expect(notice).not.toContain(`<${MERGER_WORK_URI}> cdm:work_cites_work ?work`);
+  });
+
+  it('gives a dated window end a ready-to-run, ungrouped continuation query, on both surfaces', async () => {
+    mockQuery.mockImplementation(windowedRelations({ basis_for: { incoming: 14_567 } }));
+
+    const result = await call({ relation_types: ['basis_for'], offset: 9_900 });
+
+    const notice = (result.structuredContent as Record<string, unknown>).notice as string;
+    const lastDate = dateAt(9_999);
+    const continuation = `SELECT ?work ?celex ?date WHERE { ?work cdm:resource_legal_based_on_resource_legal <${MERGER_WORK_URI}> . ?work cdm:work_date_document ?date . OPTIONAL { ?work cdm:resource_legal_id_celex ?celex } FILTER(?date <= "${lastDate}"^^xsd:date) } ORDER BY DESC(?date) ?work`;
+    expect(notice).toContain(`basis_for (incoming): ${continuation}`);
+    // A grouped MAX over the date attaches other works' dates in CELLAR.
+    expect(notice).not.toMatch(/GROUP BY|MAX\(/);
+    expect(contentText(result)).toContain(continuation);
+  });
+
+  it('gives an all-undated window end a continuation over the undated works, with no date bound', async () => {
+    mockQuery.mockImplementation(windowedRelations({ basis_for: { incoming: 14_567 } }, 9_000));
+
+    const result = await call({ relation_types: ['basis_for'], offset: 9_900 });
+
+    const structured = result.structuredContent as Record<string, unknown>;
+    expect(structured).toMatchObject({ total: 100, has_more: false });
+    expect(
+      (structured.relations as { related_date?: string }[]).every((r) => !r.related_date),
+    ).toBe(true);
+    const notice = structured.notice as string;
+    expect(notice).toContain('basis_for (incoming)');
+    expect(notice).not.toContain('last related_date');
+    expect(notice).not.toContain('on or before');
+    const continuation = `SELECT ?work ?celex WHERE { ?work cdm:resource_legal_based_on_resource_legal <${MERGER_WORK_URI}> . OPTIONAL { ?work cdm:resource_legal_id_celex ?celex } FILTER NOT EXISTS { ?work cdm:work_date_document ?date } } ORDER BY ?work`;
+    expect(notice).toContain(`basis_for (incoming): ${continuation}`);
+    expect(notice).not.toContain('xsd:date');
+    expect(contentText(result)).toContain(continuation);
+  });
+
+  it('gives each direction of a symmetric type that reaches the window its own continuation', async () => {
+    mockQuery.mockImplementation(
+      windowedRelations({ cites: { outgoing: 12_000, incoming: 14_567 } }, 9_950),
+    );
+
+    const result = await call({ relation_types: ['cites'], offset: 9_900 });
+
+    const notice = (result.structuredContent as Record<string, unknown>).notice as string;
+    expect(notice).toContain(
+      `cites (outgoing): SELECT ?work ?celex WHERE { <${MERGER_WORK_URI}> cdm:work_cites_work ?work .`,
+    );
+    expect(notice).toContain(
+      `cites (incoming): SELECT ?work ?celex WHERE { ?work cdm:work_cites_work <${MERGER_WORK_URI}> .`,
+    );
+  });
+
+  it('keeps every subquery of every relation type and direction inside the window', async () => {
+    mockQuery.mockImplementation(windowedRelations({}));
+
+    const result = await call({ offset: 9_950 });
+
+    expect(result.isError).toBeFalsy();
+    const clauses = relationQueries().flatMap(pagingClauses);
+    // One subquery per one-direction type, two for cites.
+    expect(clauses).toHaveLength(RELATION_TYPES.length + 1);
+    for (const clause of clauses) expect(clause).toEqual({ limit: 50, offset: 9_950 });
+  });
+
+  it('walks next_offset to row 10,000 and promises nothing past it', async () => {
+    mockQuery.mockImplementation(windowedRelations({ basis_for: { incoming: 14_567 } }));
+    const offsets: number[] = [];
+    let offset: number | undefined = 9_700;
+    let last: Record<string, unknown> = {};
+    while (offset !== undefined) {
+      offsets.push(offset);
+      const result = await call({ relation_types: ['basis_for'], offset });
+      expect(result.isError).toBeFalsy();
+      last = result.structuredContent as Record<string, unknown>;
+      offset = last.next_offset as number | undefined;
+    }
+
+    expect(offsets).toEqual([9_700, 9_800, 9_900]);
+    expect(last).toMatchObject({ total: 100, has_more: false });
+    expect(last.notice).toContain('basis_for (incoming)');
+  });
+
+  it('reads a short direction inside the cut window as the end of its rows', async () => {
+    mockQuery.mockImplementation(windowedRelations({ basis_for: { incoming: 9_920 } }));
+
+    const result = await call({ relation_types: ['basis_for'], offset: 9_900 });
+
+    const structured = result.structuredContent as Record<string, unknown>;
+    expect(structured).toMatchObject({ total: 20, has_more: false });
+    expect(structured).not.toHaveProperty('notice');
+  });
+
+  it('rejects offset 10,000 with a typed error and sends no query', async () => {
+    mockQuery.mockImplementation(windowedRelations({ cites: { incoming: 2_309 } }));
+    const declared = eurlex_get_relations.errors?.find((e) => e.reason === 'offset_past_window');
+
+    const result = await runToolContract(eurlex_get_relations, {
+      celex_number: '32016R0679',
+      relation_types: ['cites'],
+      offset: 10_000,
+    });
+
+    expect(result.isError).toBe(true);
+    const error = (
+      result.structuredContent as {
+        error?: { code?: number; data?: { reason?: string; recovery?: { hint?: string } } };
+      }
+    ).error;
+    expect(error?.code).toBe(JsonRpcErrorCode.ValidationError);
+    expect(error?.data?.reason).toBe('offset_past_window');
+    expect(error?.data?.recovery?.hint).toBe(declared?.recovery);
+    expect(declared?.recovery).toContain('eurlex_query_sparql');
+    expect(contentText(result)).toContain('10,000');
+    expect(mockQuery).not.toHaveBeenCalled();
+  });
+
+  it('states the bound in the offset and has_more descriptions', () => {
+    expect(eurlex_get_relations.input.shape.offset.description).toContain('10,000');
+    expect(eurlex_get_relations.output.shape.has_more.description).toContain('10,000');
+  });
+
+  it('discloses both the clamp and the window when they meet (offset 9,950, limit 150)', async () => {
+    mockQuery.mockImplementation(windowedRelations({ basis_for: { incoming: 14_567 } }));
+
+    const result = await call({ relation_types: ['basis_for'], limit: 150, offset: 9_950 });
+
+    expect(relationQueries()[0]).toContain('LIMIT 50 OFFSET 9950');
+    const structured = result.structuredContent as Record<string, unknown>;
+    expect(structured).toMatchObject({
+      total: 50,
+      has_more: false,
+      limit_clamp: { requested: 150, applied: 100 },
+    });
+    const notice = structured.notice as string;
+    expect(notice).toContain('basis_for (incoming)');
+    const text = contentText(result);
+    expect(text).toContain('**Limit clamped:** 150 → 100 (per-call maximum)');
+    expect(text).toContain(`> ${notice}`);
+  });
+});
+
+// --- #151: an over-maximum limit is served at the maximum and disclosed ---
+
+describe('eurlex_get_relations over-maximum limit (#151)', () => {
+  beforeEach(() => {
+    mockQuery.mockReset();
+    mockMaxResults = 100;
+  });
+
+  /** Related works newest first: `n` rows of one direction. */
+  const relatedRows = (n: number, direction: 'outgoing' | 'incoming') =>
+    Array.from({ length: n }, (_, i) =>
+      makeRelationBinding({ relatedWork: `${CELLAR}${direction}-${i}`, direction }),
+    );
+
+  it('serves limit 101 at 100 per type and direction and reports the clamp', async () => {
+    mockQuery.mockImplementation(
+      routeQuery({
+        resolve: [makeResolveBinding(GDPR_WORK_URI)],
+        cites: [...relatedRows(101, 'outgoing'), ...relatedRows(101, 'incoming')],
+      }),
+    );
+
+    const result = await runToolContract(eurlex_get_relations, {
+      celex_number: '32016R0679',
+      relation_types: ['cites'],
+      limit: 101,
+    });
+
+    const citesQuery = mockQuery.mock.calls
+      .map((c) => c[0] as string)
+      .find((q) => q.includes('cdm:work_cites_work'));
+    expect(pagingClauses(citesQuery ?? '')).toEqual([
+      { limit: 101, offset: 0 },
+      { limit: 101, offset: 0 },
+    ]);
+    expect(result.structuredContent).toMatchObject({
+      total: 200,
+      has_more: true,
+      next_offset: 100,
+      cap: 100,
+      limit_clamp: { requested: 101, applied: 100 },
+    });
+    expect(contentText(result)).toContain('**Limit clamped:** 101 → 100 (per-call maximum)');
+  });
+
+  it('reports the operator ceiling as the applied value', async () => {
+    mockMaxResults = 50;
+    mockQuery.mockImplementation(
+      routeQuery({
+        resolve: [makeResolveBinding(GDPR_WORK_URI)],
+        amendedBy: relatedRows(10, 'incoming'),
+      }),
+    );
+
+    const result = await runToolContract(eurlex_get_relations, {
+      celex_number: '32016R0679',
+      relation_types: ['amended_by'],
+      limit: 80,
+    });
+
+    expect(result.structuredContent).toMatchObject({
+      total: 10,
+      has_more: false,
+      limit_clamp: { requested: 80, applied: 50 },
+    });
+    expect(contentText(result)).toContain('**Limit clamped:** 80 → 50 (per-call maximum)');
+  });
+
+  it('adds no clamp at the default limit, and rejects limit 0 and 10,001', async () => {
+    mockQuery.mockImplementation(
+      routeQuery({
+        resolve: [makeResolveBinding(GDPR_WORK_URI)],
+        amendedBy: relatedRows(3, 'incoming'),
+      }),
+    );
+
+    const result = await runToolContract(eurlex_get_relations, {
+      celex_number: '32016R0679',
+      relation_types: ['amended_by'],
+    });
+
+    expect(result.structuredContent).not.toHaveProperty('limit_clamp');
+    expect(contentText(result)).not.toContain('Limit clamped');
+    expect(() =>
+      eurlex_get_relations.input.parse({ celex_number: '32016R0679', limit: 0 }),
+    ).toThrow();
+    expect(() =>
+      eurlex_get_relations.input.parse({ celex_number: '32016R0679', limit: 10_001 }),
+    ).toThrow();
+    expect(
+      eurlex_get_relations.input.parse({ celex_number: '32016R0679', limit: 10_000 }).limit,
+    ).toBe(10_000);
+  });
+});
+
+// --- CELLAR failures carry this tool's own recovery ---
+
+describe('eurlex_get_relations CELLAR failures', () => {
+  beforeEach(() => {
+    mockQuery.mockReset();
+    mockMaxResults = 100;
+  });
+
+  it.each([
+    [
+      'sparql_error',
+      JsonRpcErrorCode.ValidationError,
+      () =>
+        validationError('CELLAR SPARQL error: Virtuoso 37000 Error SQ156: compiler error', {
+          reason: 'sparql_error',
+          retryable: false,
+        }),
+    ],
+    [
+      'sparql_timeout',
+      JsonRpcErrorCode.ServiceUnavailable,
+      () =>
+        serviceUnavailable('CELLAR SPARQL query timed out on Virtuoso', {
+          reason: 'sparql_timeout',
+          retryable: false,
+        }),
+    ],
+  ])('fails %s with recovery naming relation_types', async (reason, code, failure) => {
+    mockQuery.mockRejectedValue(failure());
+
+    const result = await runToolContract(eurlex_get_relations, { celex_number: '32016R0679' });
+
+    expect(result.isError).toBe(true);
+    const error = (
+      result.structuredContent as {
+        error: { code: number; data: { reason: string; recovery?: { hint?: string } } };
+      }
+    ).error;
+    expect(error.code).toBe(code);
+    expect(error.data.reason).toBe(reason);
+    const hint = error.data.recovery?.hint ?? '';
+    expect(hint).toContain('relation_types');
+    expect(hint).toBe(eurlex_get_relations.errors?.find((e) => e.reason === reason)?.recovery);
+    expect(contentText(result)).toContain(hint);
   });
 });

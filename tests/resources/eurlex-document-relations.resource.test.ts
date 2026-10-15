@@ -3,7 +3,13 @@
  * @module tests/resources/eurlex-document-relations.resource.test
  */
 
+import {
+  JsonRpcErrorCode,
+  serviceUnavailable,
+  validationError,
+} from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createWorkerHandler } from '@cyanheads/mcp-ts-core/worker';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_document_relations_resource } from '@/mcp-server/resources/definitions/eurlex-document-relations.resource.js';
 import { escapeSparqlLiteral } from '@/services/cellar-sparql/eli-resolution.js';
@@ -14,6 +20,12 @@ import {
   isResolutionQuery,
   requestedCelex,
 } from '../fixtures/cellar-works.js';
+import { pagingClauses } from '../helpers/sort-window.js';
+
+// Reserved per-request `_meta` keys of MCP protocol revision 2026-07-28.
+const PROTOCOL_VERSION_META_KEY = 'io.modelcontextprotocol/protocolVersion';
+const CLIENT_CAPABILITIES_META_KEY = 'io.modelcontextprotocol/clientCapabilities';
+const CLIENT_INFO_META_KEY = 'io.modelcontextprotocol/clientInfo';
 
 // --- Service mock ---
 const mockQuery = vi.fn();
@@ -76,6 +88,9 @@ function routeQuery(handlers: {
   implicitlyRepeals?: Row[];
   implicitlyRepealedBy?: Row[];
   legalBasis?: Row[];
+  basisFor?: Row[];
+  interprets?: Row[];
+  interpretedBy?: Row[];
   consolidated?: Row[];
   nationalTransposition?: Row[];
 }) {
@@ -89,7 +104,18 @@ function routeQuery(handlers: {
       return handlers.consolidated ?? [];
     if (q.includes('cdm:measure_national_implementing_implements_resource_legal'))
       return handlers.nationalTransposition ?? [];
-    if (q.includes('cdm:resource_legal_based_on_resource_legal')) return handlers.legalBasis ?? [];
+    // legal_basis/basis_for and interprets/interpreted_by share a predicate each and
+    // differ by which side of the triple binds the source work.
+    if (q.includes('cdm:resource_legal_based_on_resource_legal')) {
+      return q.includes('?relatedWork cdm:resource_legal_based_on_resource_legal <')
+        ? (handlers.basisFor ?? [])
+        : (handlers.legalBasis ?? []);
+    }
+    if (q.includes('cdm:case-law_interpretes_resource_legal')) {
+      return q.includes('?relatedWork cdm:case-law_interpretes_resource_legal <')
+        ? (handlers.interpretedBy ?? [])
+        : (handlers.interprets ?? []);
+    }
     // Implicit repeal is checked before explicit — same shared-predicate,
     // direction-by-triple-side pattern as amends/amended_by.
     if (q.includes('cdm:resource_legal_implicitly_repeals_resource_legal')) {
@@ -111,6 +137,61 @@ function routeQuery(handlers: {
   };
 }
 
+/** A resources/read response: the read's contents, or the error a client receives. */
+interface WireRead {
+  error?: {
+    code: number;
+    data?: { reason?: string; celexNumber?: string; recovery?: { hint?: string } };
+  };
+  result?: { contents: { text: string }[] };
+}
+
+const worker = createWorkerHandler({
+  name: 'eur-lex-mcp-server',
+  title: 'eur-lex-mcp-server',
+  resources: [eurlex_document_relations_resource],
+});
+
+/**
+ * Read `uri` the way a client does: one resources/read request to the resource
+ * served by the framework, which parses the URI's variables and fills a declared
+ * `errors[]` entry's recovery into the error — neither of which a direct handler
+ * call does.
+ */
+async function readOverWire(uri: string): Promise<WireRead> {
+  const revision = '2026-07-28';
+  const request = new Request('http://localhost/mcp', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      accept: 'application/json, text/event-stream',
+      'mcp-protocol-version': revision,
+      'mcp-method': 'resources/read',
+      'mcp-name': uri,
+    },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'resources/read',
+      params: {
+        uri,
+        _meta: {
+          [PROTOCOL_VERSION_META_KEY]: revision,
+          [CLIENT_CAPABILITIES_META_KEY]: {},
+          [CLIENT_INFO_META_KEY]: { name: 'test-client', version: '1.0.0' },
+        },
+      },
+    }),
+  });
+  type FetchArgs = Parameters<typeof worker.fetch>;
+  const response = await worker.fetch(
+    request,
+    {} as FetchArgs[1],
+    { waitUntil: () => {}, passThroughOnException: () => {} } as unknown as FetchArgs[2],
+  );
+  return (await response.json()) as WireRead;
+}
+
 describe('eurlex_document_relations_resource', () => {
   beforeEach(() => {
     mockQuery.mockReset();
@@ -119,7 +200,10 @@ describe('eurlex_document_relations_resource', () => {
   // --- Happy path ---
 
   it('returns relation summary for a valid CELEX number', async () => {
-    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    const ctx = createMockContext({
+      tenantId: 'test-tenant',
+      errors: eurlex_document_relations_resource.errors,
+    });
     mockQuery.mockImplementation(
       routeQuery({
         resolve: [makeResolveBinding(GDPR_WORK_URI)],
@@ -153,7 +237,10 @@ describe('eurlex_document_relations_resource', () => {
   // --- #71: the summary exposes continuation only with exact proof ---
 
   it('does not disclose continuation for an exactly-full final summary page', async () => {
-    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    const ctx = createMockContext({
+      tenantId: 'test-tenant',
+      errors: eurlex_document_relations_resource.errors,
+    });
     // 25 incoming amenders = the public summary cap, with no 26th sentinel row.
     const manyAmenders = Array.from({ length: 25 }, (_, i) =>
       makeRelationBinding({
@@ -183,7 +270,10 @@ describe('eurlex_document_relations_resource', () => {
   });
 
   it('caps the summary and adds machine-readable expanded-traversal guidance when proven', async () => {
-    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    const ctx = createMockContext({
+      tenantId: 'test-tenant',
+      errors: eurlex_document_relations_resource.errors,
+    });
     const manyAmenders = Array.from({ length: 26 }, (_, i) =>
       makeRelationBinding({
         relatedWork: `http://publications.europa.eu/resource/cellar/amender-${i}`,
@@ -214,7 +304,10 @@ describe('eurlex_document_relations_resource', () => {
   // --- #19: amendment + consolidation relations now surface on the resource ---
 
   it('surfaces amended_by and consolidated_version (previously zero-triple predicates)', async () => {
-    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    const ctx = createMockContext({
+      tenantId: 'test-tenant',
+      errors: eurlex_document_relations_resource.errors,
+    });
     mockQuery.mockImplementation(
       routeQuery({
         resolve: [makeResolveBinding(GDPR_WORK_URI)],
@@ -247,7 +340,10 @@ describe('eurlex_document_relations_resource', () => {
   });
 
   it('surfaces the directive-matching national transposition measure (#56)', async () => {
-    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    const ctx = createMockContext({
+      tenantId: 'test-tenant',
+      errors: eurlex_document_relations_resource.errors,
+    });
     mockQuery.mockImplementation(
       routeQuery({
         resolve: [makeResolveBinding(DIRECTIVE_680_WORK_URI)],
@@ -287,7 +383,10 @@ describe('eurlex_document_relations_resource', () => {
   // --- #85: national_transposition rows carry the member state ---
 
   it('carries related_member_state on national_transposition rows and on no other type (#85)', async () => {
-    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    const ctx = createMockContext({
+      tenantId: 'test-tenant',
+      errors: eurlex_document_relations_resource.errors,
+    });
     mockQuery.mockImplementation(
       routeQuery({
         resolve: [makeResolveBinding(DIRECTIVE_680_WORK_URI)],
@@ -340,7 +439,10 @@ describe('eurlex_document_relations_resource', () => {
   // --- #92: typed exact CELEX triple ---
 
   it('resolves the CELEX through a typed literal, not a STR() scan (#92)', async () => {
-    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    const ctx = createMockContext({
+      tenantId: 'test-tenant',
+      errors: eurlex_document_relations_resource.errors,
+    });
     mockQuery.mockImplementation(routeQuery({ resolve: [makeResolveBinding(GDPR_WORK_URI)] }));
 
     const params = eurlex_document_relations_resource.params!.parse({ celexNumber: '32016R0679' });
@@ -358,7 +460,10 @@ describe('eurlex_document_relations_resource', () => {
   // --- #31: repeal relations surface through the resource's shared traversal ---
 
   it('surfaces repeals and implicitly_repeals (GDPR → 31995L0046, 32003R1882)', async () => {
-    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    const ctx = createMockContext({
+      tenantId: 'test-tenant',
+      errors: eurlex_document_relations_resource.errors,
+    });
     mockQuery.mockImplementation(
       routeQuery({
         resolve: [makeResolveBinding(GDPR_WORK_URI)],
@@ -392,10 +497,94 @@ describe('eurlex_document_relations_resource', () => {
     expect(implicit?.related_celex_number).toBe('32003R1882');
   });
 
+  // --- #148: works adopted under the act, and the rulings interpreting it ---
+
+  it('summarizes basis_for, interprets, and interpreted_by at the 25-row cap, beside legal_basis (#148)', async () => {
+    const ctx = createMockContext({
+      tenantId: 'test-tenant',
+      errors: eurlex_document_relations_resource.errors,
+    });
+    const based = Array.from({ length: 40 }, (_, i) =>
+      makeRelationBinding({
+        relatedWork: `${CELLAR}based-${i}`,
+        direction: 'incoming',
+        relatedCelex: `5202${i % 10}IP${String(100 + i).padStart(4, '0')}`,
+      }),
+    );
+    const route = routeQuery({
+      resolve: [makeResolveBinding(GDPR_WORK_URI)],
+      legalBasis: [
+        makeRelationBinding({
+          relatedWork: `${CELLAR}tfeu-16`,
+          direction: 'outgoing',
+          relatedCelex: '12012E016',
+        }),
+      ],
+      basisFor: based,
+      interprets: [
+        makeRelationBinding({
+          relatedWork: `${CELLAR}interpreted`,
+          direction: 'outgoing',
+          relatedCelex: '31995L0046',
+        }),
+      ],
+      interpretedBy: [
+        makeRelationBinding({
+          relatedWork: `${CELLAR}ruling`,
+          direction: 'incoming',
+          relatedCelex: '62024CJ0312',
+        }),
+      ],
+    });
+    // CELLAR serves each relation query's LIMIT/OFFSET slice, so the rows past the
+    // summary cap reach the resource only through the sentinel row it asks for.
+    mockQuery.mockImplementation(async (q: string) => {
+      const rows = await route(q);
+      const [page] = pagingClauses(q);
+      return page ? rows.slice(page.offset, page.offset + page.limit) : rows;
+    });
+
+    const params = eurlex_document_relations_resource.params!.parse({ celexNumber: '32016R0679' });
+    const result = (await eurlex_document_relations_resource.handler(params, ctx)) as Record<
+      string,
+      unknown
+    >;
+    const relations = result.relations as Array<Record<string, unknown>>;
+
+    const byType = (type: string) => relations.filter((r) => r.relation_type === type);
+    expect(byType('legal_basis').map((r) => r.related_celex_number)).toEqual(['12012E016']);
+    expect(byType('basis_for').map((r) => r.related_work_uri)).toEqual(
+      based.slice(0, 25).map((row) => row.relatedWork?.value),
+    );
+    expect(byType('basis_for').every((r) => r.direction === 'incoming')).toBe(true);
+    expect(byType('interprets')).toEqual([
+      {
+        relation_type: 'interprets',
+        direction: 'outgoing',
+        related_work_uri: `${CELLAR}interpreted`,
+        related_celex_number: '31995L0046',
+      },
+    ]);
+    expect(byType('interpreted_by')).toEqual([
+      {
+        relation_type: 'interpreted_by',
+        direction: 'incoming',
+        related_work_uri: `${CELLAR}ruling`,
+        related_celex_number: '62024CJ0312',
+      },
+    ]);
+    // The 26th based-on work is the private sentinel proving more exist.
+    expect(result.truncated).toBe(true);
+    expect(result.continuation).toMatchObject({ tool: 'eurlex_get_relations' });
+  });
+
   // --- #32/#109: the resource inherits the consolidated_version CELEX requirement ---
 
   it('keeps CELEX-bearing consolidated_version rows and drops CELEX-less ones', async () => {
-    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    const ctx = createMockContext({
+      tenantId: 'test-tenant',
+      errors: eurlex_document_relations_resource.errors,
+    });
     mockQuery.mockImplementation(
       routeQuery({
         resolve: [makeResolveBinding(GDPR_WORK_URI)],
@@ -428,7 +617,10 @@ describe('eurlex_document_relations_resource', () => {
   // --- #45: filtered consolidated_version artifacts must not set the summary's truncated flag ---
 
   it('does not set truncated when filtered consolidated_version artifacts fill the summary cap but valid rows are under it (issue #45)', async () => {
-    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    const ctx = createMockContext({
+      tenantId: 'test-tenant',
+      errors: eurlex_document_relations_resource.errors,
+    });
     // 25 raw consolidated rows = the SUMMARY_PER_TYPE_LIMIT: one CELEX-bearing
     // consolidation plus 24 CELEX-less CONS_TEXT members. The raw page fills the cap,
     // but only the genuine row survives the filter — the resource must not flag truncation.
@@ -464,7 +656,10 @@ describe('eurlex_document_relations_resource', () => {
   });
 
   it('deduplicates identical relation rows', async () => {
-    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    const ctx = createMockContext({
+      tenantId: 'test-tenant',
+      errors: eurlex_document_relations_resource.errors,
+    });
     mockQuery.mockImplementation(
       routeQuery({
         resolve: [makeResolveBinding(GDPR_WORK_URI)],
@@ -489,7 +684,10 @@ describe('eurlex_document_relations_resource', () => {
   });
 
   it('returns empty relations array when every relation query returns no bindings', async () => {
-    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    const ctx = createMockContext({
+      tenantId: 'test-tenant',
+      errors: eurlex_document_relations_resource.errors,
+    });
     mockQuery.mockImplementation(routeQuery({ resolve: [makeResolveBinding(GDPR_WORK_URI)] }));
 
     const params = eurlex_document_relations_resource.params!.parse({ celexNumber: '32016R0679' });
@@ -503,7 +701,10 @@ describe('eurlex_document_relations_resource', () => {
   // --- Error path: not found ---
 
   it('throws notFound when CELEX resolves to no work URI', async () => {
-    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    const ctx = createMockContext({
+      tenantId: 'test-tenant',
+      errors: eurlex_document_relations_resource.errors,
+    });
     mockQuery.mockImplementation(routeQuery({ resolve: [] }));
 
     const params = eurlex_document_relations_resource.params!.parse({ celexNumber: '99999X0000' });
@@ -511,6 +712,51 @@ describe('eurlex_document_relations_resource', () => {
       'No CELLAR work',
     );
   });
+
+  it('fails a missing CELEX as its declared not_found, with a recovery naming the lookup tool', async () => {
+    mockQuery.mockImplementation(routeQuery({ resolve: [] }));
+
+    const { error } = await readOverWire('eurlex://document/99999X0000/relations');
+
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: { reason: 'not_found', celexNumber: '99999X0000' },
+    });
+    expect(error?.data?.recovery?.hint).toContain('eurlex_lookup_celex');
+  });
+
+  it.each([
+    [
+      'sparql_error',
+      JsonRpcErrorCode.ValidationError,
+      () =>
+        validationError('CELLAR SPARQL error: Virtuoso 37000 Error SQ156: compiler error', {
+          reason: 'sparql_error',
+          retryable: false,
+        }),
+    ],
+    [
+      'sparql_timeout',
+      JsonRpcErrorCode.ServiceUnavailable,
+      () =>
+        serviceUnavailable('CELLAR SPARQL query timed out on Virtuoso', {
+          reason: 'sparql_timeout',
+          retryable: false,
+        }),
+    ],
+  ])(
+    'fails a CELLAR %s with a recovery through eurlex_get_relations',
+    async (reason, code, failure) => {
+      mockQuery.mockRejectedValue(failure());
+
+      const { error } = await readOverWire('eurlex://document/32016R0679/relations');
+
+      expect(error).toMatchObject({ code, data: { reason } });
+      const hint = error?.data?.recovery?.hint;
+      expect(hint).toContain('eurlex_get_relations');
+      expect(hint).toContain('relation_types');
+    },
+  );
 
   // --- #61: SPARQL literal escaping routes through the shared helper ---
   //
@@ -520,7 +766,10 @@ describe('eurlex_document_relations_resource', () => {
   // raw SP030 error — internal query text attached — replaced the not_found.
 
   it('escapes a trailing backslash in the resolve query so the literal terminates (#61)', async () => {
-    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    const ctx = createMockContext({
+      tenantId: 'test-tenant',
+      errors: eurlex_document_relations_resource.errors,
+    });
     mockQuery.mockImplementation(routeQuery({ resolve: [] }));
 
     const celexNumber = '32016R0679\\';
@@ -541,7 +790,10 @@ describe('eurlex_document_relations_resource', () => {
   });
 
   it('leaves an ordinary CELEX byte-identical through the shared helper (#61)', async () => {
-    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    const ctx = createMockContext({
+      tenantId: 'test-tenant',
+      errors: eurlex_document_relations_resource.errors,
+    });
     mockQuery.mockImplementation(routeQuery({ resolve: [makeResolveBinding(GDPR_WORK_URI)] }));
 
     const params = eurlex_document_relations_resource.params!.parse({ celexNumber: '32016R0679' });
@@ -605,6 +857,21 @@ describe('eurlex_document_relations_resource', () => {
       ).toBe('32016R0679');
     });
 
+    it.each(['CELEX:32016R0679', 'celex:32016r0679', 'CELEX%3A32016R0679'])(
+      'reads eurlex://document/%s/relations as the CELEX it prefixes (#147)',
+      async (celexNumber) => {
+        mockQuery.mockImplementation(routeQuery({ resolve: [makeResolveBinding(GDPR_WORK_URI)] }));
+
+        const { result, error } = await readOverWire(`eurlex://document/${celexNumber}/relations`);
+
+        expect(error).toBeUndefined();
+        expect(JSON.parse(result?.contents[0]?.text ?? '{}')).toMatchObject({
+          celex_number: '32016R0679',
+          work_uri: GDPR_WORK_URI,
+        });
+      },
+    );
+
     it('still rejects a whitespace-only value, which trims to empty', () => {
       expect(() =>
         eurlex_document_relations_resource.params!.parse({ celexNumber: '   ' }),
@@ -612,7 +879,10 @@ describe('eurlex_document_relations_resource', () => {
     });
 
     it('hands the handler the normalized CELEX', async () => {
-      const ctx = createMockContext({ tenantId: 'test-tenant' });
+      const ctx = createMockContext({
+        tenantId: 'test-tenant',
+        errors: eurlex_document_relations_resource.errors,
+      });
       mockQuery.mockImplementation(routeQuery({ resolve: [makeResolveBinding(GDPR_WORK_URI)] }));
 
       const params = eurlex_document_relations_resource.params!.parse({
@@ -647,7 +917,10 @@ describe('eurlex_document_relations_resource', () => {
     const params = eurlex_document_relations_resource.params!.parse({ celexNumber: '62022TJ0181' });
     const result = (await eurlex_document_relations_resource.handler(
       params,
-      createMockContext({ tenantId: 'test-tenant' }),
+      createMockContext({
+        tenantId: 'test-tenant',
+        errors: eurlex_document_relations_resource.errors,
+      }),
     )) as Record<string, unknown>;
 
     expect(result.work_uri).toBe(canonicalWork('62022TJ0181'));
@@ -685,7 +958,10 @@ describe('eurlex_document_relations_resource', () => {
     const params = eurlex_document_relations_resource.params!.parse({ celexNumber: '32016R0679' });
     const result = (await eurlex_document_relations_resource.handler(
       params,
-      createMockContext({ tenantId: 'test-tenant' }),
+      createMockContext({
+        tenantId: 'test-tenant',
+        errors: eurlex_document_relations_resource.errors,
+      }),
     )) as { relations: Record<string, string>[] };
 
     expect(result.relations).toEqual([
@@ -713,7 +989,10 @@ describe('eurlex_document_relations_resource', () => {
     const params = eurlex_document_relations_resource.params!.parse({ celexNumber: '32016R0679' });
     await eurlex_document_relations_resource.handler(
       params,
-      createMockContext({ tenantId: 'test-tenant' }),
+      createMockContext({
+        tenantId: 'test-tenant',
+        errors: eurlex_document_relations_resource.errors,
+      }),
     );
 
     const relationQueries = mockQuery.mock.calls

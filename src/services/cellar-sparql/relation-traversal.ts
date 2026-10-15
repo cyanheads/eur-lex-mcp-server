@@ -10,6 +10,7 @@ import type { Context } from '@cyanheads/mcp-ts-core';
 import { ENG_LANGUAGE_URI } from './cdm-labels.js';
 import { CellarSparqlService } from './cellar-sparql-service.js';
 import { celexLiteral } from './eli-resolution.js';
+import { readWindowedPage, windowedLimit } from './sort-window.js';
 import type { SparqlBinding, WorkRelation } from './types.js';
 
 /** The relation types this server exposes over the CDM graph. */
@@ -22,6 +23,9 @@ export const RELATION_TYPES = [
   'implicitly_repeals',
   'implicitly_repealed_by',
   'legal_basis',
+  'basis_for',
+  'interprets',
+  'interpreted_by',
   'consolidated_version',
   'national_transposition',
 ] as const;
@@ -61,10 +65,17 @@ const CONSOLIDATION_BASE_PREDICATE = 'cdm:act_consolidated_based_on_resource_leg
  * `amended_by` uses. That lets a caller ask either "what did this act repeal?" or
  * "what repealed it?", and keeps explicit and implicit repeal distinguishable.
  *
- * `amends` and `legal_basis` are outgoing-only — their incoming rows describe a
- * different relation (what amends this / what is based on this) and belong under
- * `amended_by` and another work's `legal_basis`, not here. `cites` is symmetric
- * ("citation graph"), so both directions are surfaced and tagged via `?direction`.
+ * Legal basis and case-law interpretation pair the same way:
+ *  - `legal_basis` is the outgoing side of `…based_on…` (the treaty article or act
+ *    this act rests on); `basis_for` is its incoming side, the works naming this
+ *    act among their legal bases — implementing and delegated acts, but also
+ *    Parliament resolutions and drafts, which CELLAR links with the same predicate.
+ *  - `interprets` is the outgoing side of `…case-law_interpretes…`, whose subject is
+ *    always sector-6 case law (what a ruling interprets); `interpreted_by` is its
+ *    incoming side, the rulings interpreting this act.
+ *
+ * Each of these types is one direction only; `cites` is symmetric ("citation
+ * graph"), so both directions are surfaced and tagged via `?direction`.
  */
 const RELATION_SPECS: Record<RelationType, { predicate: string; direction: Direction }> = {
   cites: { predicate: 'cdm:work_cites_work', direction: 'both' },
@@ -81,6 +92,9 @@ const RELATION_SPECS: Record<RelationType, { predicate: string; direction: Direc
     direction: 'incoming',
   },
   legal_basis: { predicate: 'cdm:resource_legal_based_on_resource_legal', direction: 'outgoing' },
+  basis_for: { predicate: 'cdm:resource_legal_based_on_resource_legal', direction: 'incoming' },
+  interprets: { predicate: 'cdm:case-law_interpretes_resource_legal', direction: 'outgoing' },
+  interpreted_by: { predicate: 'cdm:case-law_interpretes_resource_legal', direction: 'incoming' },
   consolidated_version: { predicate: CONSOLIDATION_BASE_PREDICATE, direction: 'incoming' },
   national_transposition: {
     predicate: 'cdm:measure_national_implementing_implements_resource_legal',
@@ -220,10 +234,101 @@ function celexActCore(celex: string): string | undefined {
 }
 
 /**
+ * The member-state codes a sector-7 CELEX carries after the act core: ISO 3166-1
+ * alpha-3 for the 27 member states plus `GBR` for the United Kingdom. Every CELEX of
+ * a national implementing measure in CELLAR carries one of these 28, in upper case,
+ * and nothing else (268,076 values, 2026-10-14).
+ */
+export const MEMBER_STATE_CODES = [
+  'AUT',
+  'BEL',
+  'BGR',
+  'CYP',
+  'CZE',
+  'DEU',
+  'DNK',
+  'ESP',
+  'EST',
+  'FIN',
+  'FRA',
+  'GBR',
+  'GRC',
+  'HRV',
+  'HUN',
+  'IRL',
+  'ITA',
+  'LTU',
+  'LUX',
+  'LVA',
+  'MLT',
+  'NLD',
+  'POL',
+  'PRT',
+  'ROU',
+  'SVK',
+  'SVN',
+  'SWE',
+] as const;
+
+export type MemberStateCode = (typeof MEMBER_STATE_CODES)[number];
+
+/**
+ * Each member state's two-letter code: ISO 3166-1 alpha-2 plus the EU's own `EL`
+ * (Greece) and `UK` (the United Kingdom). A two-letter code never reaches the CELEX
+ * pattern as given — the pattern is right-unanchored, so `ES` would match the
+ * Estonian `EST` measures rather than the Spanish `ESP` ones.
+ */
+const MEMBER_STATE_ALPHA2 = new Map<string, MemberStateCode>([
+  ['AT', 'AUT'],
+  ['BE', 'BEL'],
+  ['BG', 'BGR'],
+  ['CY', 'CYP'],
+  ['CZ', 'CZE'],
+  ['DE', 'DEU'],
+  ['DK', 'DNK'],
+  ['EE', 'EST'],
+  ['EL', 'GRC'],
+  ['ES', 'ESP'],
+  ['FI', 'FIN'],
+  ['FR', 'FRA'],
+  ['GB', 'GBR'],
+  ['GR', 'GRC'],
+  ['HR', 'HRV'],
+  ['HU', 'HUN'],
+  ['IE', 'IRL'],
+  ['IT', 'ITA'],
+  ['LT', 'LTU'],
+  ['LU', 'LUX'],
+  ['LV', 'LVA'],
+  ['MT', 'MLT'],
+  ['NL', 'NLD'],
+  ['PL', 'POL'],
+  ['PT', 'PRT'],
+  ['RO', 'ROU'],
+  ['SE', 'SWE'],
+  ['SI', 'SVN'],
+  ['SK', 'SVK'],
+  ['UK', 'GBR'],
+]);
+
+/**
+ * The member-state code a caller's value names — one of {@link MEMBER_STATE_CODES}
+ * or its two-letter code, in any case and with surrounding whitespace — as the
+ * three-letter code a sector-7 CELEX carries; `undefined` for anything else.
+ */
+export function toMemberStateCode(value: string): MemberStateCode | undefined {
+  const code = value.trim().toUpperCase();
+  return (
+    MEMBER_STATE_CODES.find((memberState) => memberState === code) ?? MEMBER_STATE_ALPHA2.get(code)
+  );
+}
+
+/**
  * CELEX pattern for a national implementing measure that transposes the act
  * identified by `sourceActCore`: sector `7`, the source act core, then the
  * three-letter member-state code every sector-7 CELEX carries
- * (`72016L0680CZE_225030`, `72014L0056FIN_240353`).
+ * (`72016L0680CZE_225030`, `72014L0056FIN_240353`) — any code, or one of
+ * `memberStates` when the caller narrows to them (`^72022L2555(DEU|FRA)`).
  *
  * The country code is what anchors the act core on its right-hand side, and it
  * has to be there: a left-anchored `^7{core}` alone also matches a longer act
@@ -233,10 +338,15 @@ function celexActCore(celex: string): string | undefined {
  * unanchored — no digit can extend the act core across three letters, so
  * anchoring it would add false-rejection risk without closing anything.
  * Verified against 3,000 sector-7 CELEX values pulled live from CELLAR: all
- * carry the three-letter code.
+ * carry the three-letter code. The codes come from the closed
+ * {@link MEMBER_STATE_CODES} set, so no caller character reaches the pattern.
  */
-function nationalMeasureCelexPattern(sourceActCore: string): string {
-  return `^7${sourceActCore}[A-Z]{3}`;
+function nationalMeasureCelexPattern(
+  sourceActCore: string,
+  memberStates?: readonly MemberStateCode[],
+): string {
+  const memberState = memberStates?.length ? `(${memberStates.join('|')})` : '[A-Z]{3}';
+  return `^7${sourceActCore}${memberState}`;
 }
 
 /**
@@ -360,6 +470,50 @@ SELECT ?baseWork ?currentCelex ?currentDate ?pendingCelex ?pendingDate WHERE {
   };
 }
 
+/** A relation type and direction whose page ends at CELLAR's sort window (#154). */
+export interface RelationWindowEnd {
+  /**
+   * A ready-to-run SELECT, for the raw SPARQL tool, listing the direction's related
+   * works past the page — see {@link continuationQuery}.
+   */
+  continuationQuery: string;
+  direction: 'outgoing' | 'incoming';
+  /** Related date of the direction's last row on the page; absent when it is undated. */
+  lastDate?: string;
+  relationType: RelationType;
+}
+
+/**
+ * The SELECT that lists a direction's related works past a page ending at row
+ * 10,000, ordered as the page was: the works dated on or before the page's last
+ * date, newest first, or — when the page ended among the undated works, which
+ * sort last — the undated works. Either way the page's own last rows come first
+ * again, and nothing past them is skipped.
+ *
+ * Ungrouped by design: CELLAR evaluates a grouped `MAX` over the date wrongly (see
+ * {@link buildRelationQuery}), so a work with several dates or CELEX numbers repeats
+ * rather than being aggregated. The CELEX constraint of the relation type carries
+ * over, so the rows are the ones the traversal would have returned.
+ */
+function continuationQuery(
+  workUri: string,
+  predicate: string,
+  direction: 'outgoing' | 'incoming',
+  lastDate: string | undefined,
+  celex?: CelexConstraint,
+): string {
+  const edge =
+    direction === 'outgoing'
+      ? `<${workUri}> ${predicate} ?work .`
+      : `?work ${predicate} <${workUri}> .`;
+  const celexPattern = celex
+    ? `?work cdm:resource_legal_id_celex ?celex .${celex.pattern ? ` FILTER(REGEX(STR(?celex), "${celex.pattern}"))` : ''}`
+    : 'OPTIONAL { ?work cdm:resource_legal_id_celex ?celex }';
+  return lastDate
+    ? `SELECT ?work ?celex ?date WHERE { ${edge} ?work cdm:work_date_document ?date . ${celexPattern} FILTER(?date <= "${lastDate}"^^xsd:date) } ORDER BY DESC(?date) ?work`
+    : `SELECT ?work ?celex WHERE { ${edge} ${celexPattern} FILTER NOT EXISTS { ?work cdm:work_date_document ?date } } ORDER BY ?work`;
+}
+
 /**
  * Traverse the requested CDM relation types for a work — one query per type, run
  * concurrently — and return de-duplicated relations tagged with their type and
@@ -386,10 +540,19 @@ SELECT ?baseWork ?currentCelex ?currentDate ?pendingCelex ?pendingDate WHERE {
  * a CELEX-less `CONS_TEXT` member or manifestation work can't be fetched via
  * get_document. Every other relation type is returned unfiltered.
  *
- * `perTypeLimit` bounds each direction of each type; `offset` pages within a
- * direction. Each query requests one additional grouped row per direction, then
- * removes that private sentinel before returning. `hasMore` is true only when a
- * direction produced that additional row.
+ * `memberStates`, when non-empty, narrows `national_transposition` to the measures
+ * of those member states by replacing the pattern's any-code segment with their
+ * alternation, so paging and `hasMore` count matching measures only. Every other
+ * relation type ignores it.
+ *
+ * `perTypeLimit` bounds each direction of each type; `offset` (below 10,000) pages
+ * within a direction. Each query requests one additional grouped row per direction,
+ * then removes that private sentinel before returning. `hasMore` is true only when a
+ * direction produced that additional row. Near row 10,000 CELLAR's sort window cuts
+ * the request (#154): the sentinel, then part of the page, no longer fit, and a
+ * direction that fills what the window allows is listed in `windowEnds` with its
+ * last related date and the query that continues it — its rows may continue past
+ * row 10,000, where no offset reaches.
  *
  * Each relation carries the related work's date — the value its page is ordered
  * by — and its English title (#119), each omitted when the work has none; no
@@ -403,47 +566,59 @@ export async function traverseRelations(
   sourceCelex?: string,
   perTypeLimit: number = DEFAULT_PER_TYPE_LIMIT,
   offset = 0,
-): Promise<{ relations: WorkRelation[]; hasMore: boolean }> {
+  memberStates?: readonly MemberStateCode[],
+): Promise<{ relations: WorkRelation[]; hasMore: boolean; windowEnds: RelationWindowEnd[] }> {
   const sourceActCore = sourceCelex ? celexActCore(sourceCelex) : undefined;
+  const fetchLimit = windowedLimit(offset, perTypeLimit);
   const perType = await Promise.all(
-    types.map(async (type): Promise<{ type: RelationType; bindings: SparqlBinding[] }> => {
-      /**
-       * Push relation-specific CELEX validity into the query before pagination:
-       * CELEX-bearing consolidations and sector-7 same-act national measures.
-       */
-      let celex: CelexConstraint | undefined;
-      if (type === 'consolidated_version') {
-        celex = {};
-      } else if (type === 'national_transposition') {
-        // With no source act core there is no pattern that selects this act's
-        // implementing measures, and every row is dropped either way. Return the
-        // empty result directly rather than spending a CELLAR round-trip on a
-        // query whose filter can match nothing.
-        if (!sourceActCore) return { type, bindings: [] };
-        celex = { pattern: nationalMeasureCelexPattern(sourceActCore) };
-      }
-      return {
+    types.map(
+      async (
         type,
-        bindings: await svc.queryWithContinuation(
-          buildRelationQuery(workUri, RELATION_SPECS[type], perTypeLimit + 1, offset, celex),
-          ctx,
-        ),
-      };
-    }),
+      ): Promise<{ type: RelationType; bindings: SparqlBinding[]; celex?: CelexConstraint }> => {
+        /**
+         * Push relation-specific CELEX validity into the query before pagination:
+         * CELEX-bearing consolidations and sector-7 same-act national measures.
+         */
+        let celex: CelexConstraint | undefined;
+        if (type === 'consolidated_version') {
+          celex = {};
+        } else if (type === 'national_transposition') {
+          // With no source act core there is no pattern that selects this act's
+          // implementing measures, and every row is dropped either way. Return the
+          // empty result directly rather than spending a CELLAR round-trip on a
+          // query whose filter can match nothing.
+          if (!sourceActCore) return { type, bindings: [] };
+          celex = { pattern: nationalMeasureCelexPattern(sourceActCore, memberStates) };
+        }
+        return {
+          type,
+          bindings: await svc.queryWithContinuation(
+            buildRelationQuery(workUri, RELATION_SPECS[type], fetchLimit, offset, celex),
+            ctx,
+          ),
+          ...(celex ? { celex } : {}),
+        };
+      },
+    ),
   );
 
   const nationalMeasureRe = sourceActCore
-    ? new RegExp(nationalMeasureCelexPattern(sourceActCore))
+    ? new RegExp(nationalMeasureCelexPattern(sourceActCore, memberStates))
     : undefined;
   const relations: WorkRelation[] = [];
+  const windowEnds: RelationWindowEnd[] = [];
   let hasMore = false;
-  for (const { type, bindings } of perType) {
+  for (const { type, bindings, celex } of perType) {
     const rowsByDirection = new Map<'outgoing' | 'incoming', Omit<WorkRelation, 'direction'>[]>();
+    // Rows CELLAR returned per direction, before the client-side re-checks: the
+    // window is reached by what the query read, not by what survived them.
+    const fetchedByDirection = new Map<'outgoing' | 'incoming', number>();
     const seenForType = new Set<string>();
     for (const b of bindings) {
       const relatedWorkUri = CellarSparqlService.bindingValue(b, 'relatedWork') ?? '';
       const direction =
         CellarSparqlService.bindingValue(b, 'direction') === 'incoming' ? 'incoming' : 'outgoing';
+      fetchedByDirection.set(direction, (fetchedByDirection.get(direction) ?? 0) + 1);
       const relatedCelex = CellarSparqlService.bindingValue(b, 'relatedCelexSample');
       const relatedDate = CellarSparqlService.bindingValue(b, 'relatedDateMax')?.slice(0, 10);
       const relatedTitle = CellarSparqlService.bindingValue(b, 'relatedTitleMax');
@@ -480,8 +655,25 @@ export async function traverseRelations(
 
     for (const [direction, rows] of rowsByDirection) {
       if (rows.length > perTypeLimit) hasMore = true;
-      for (const row of rows.slice(0, perTypeLimit)) relations.push({ ...row, direction });
+      const page = rows.slice(0, perTypeLimit);
+      for (const row of page) relations.push({ ...row, direction });
+      const fetched = fetchedByDirection.get(direction) ?? 0;
+      if (readWindowedPage(fetched, offset, perTypeLimit).atWindowEnd) {
+        const lastDate = page.at(-1)?.relatedDate;
+        windowEnds.push({
+          relationType: type,
+          direction,
+          ...(lastDate ? { lastDate } : {}),
+          continuationQuery: continuationQuery(
+            workUri,
+            RELATION_SPECS[type].predicate,
+            direction,
+            lastDate,
+            celex,
+          ),
+        });
+      }
     }
   }
-  return { relations, hasMore };
+  return { relations, hasMore, windowEnds };
 }

@@ -4,9 +4,9 @@
  */
 
 import { resource, z } from '@cyanheads/mcp-ts-core';
-import { notFound } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getCellarSparqlService } from '@/services/cellar-sparql/cellar-sparql-service.js';
-import { CELEX_PATTERN } from '@/services/cellar-sparql/eli-resolution.js';
+import { CELEX_PATTERN, normalizeCelex } from '@/services/cellar-sparql/eli-resolution.js';
 import { RELATION_TYPES, traverseRelations } from '@/services/cellar-sparql/relation-traversal.js';
 import { resolveCelexWorks } from '@/services/cellar-sparql/work-resolution.js';
 
@@ -22,12 +22,12 @@ export const eurlex_document_relations_resource = resource(
   {
     name: 'EUR-Lex document relations',
     description:
-      'One-hop CDM relationship summary for a CELLAR work by CELEX number: amendment chain, consolidations, national transposition measures, legal basis, and citations. Each related work carries its CELEX, its document date, and its English title where it has them.',
+      'One-hop CDM relationship summary for a CELLAR work by CELEX number: amendment and repeal chain, consolidations, national transposition measures, legal basis and the works adopted under it, interpreting rulings (or, for a ruling, what it interprets), and citations — the newest 25 per relation type and direction. Each related work carries its CELEX, its document date, and its English title where it has them.',
     mimeType: 'application/json',
     params: z.object({
       celexNumber: z
         .string()
-        .overwrite((value) => value.trim().toUpperCase())
+        .overwrite(normalizeCelex)
         .regex(
           CELEX_PATTERN,
           'celexNumber must be a CELEX identifier — a sector character followed by the year, type letters, and number (e.g. 32016R0679). Resolve a citation to its CELEX with eurlex_lookup_celex first.',
@@ -37,6 +37,32 @@ export const eurlex_document_relations_resource = resource(
         ),
     }),
 
+    errors: [
+      {
+        reason: 'not_found',
+        code: JsonRpcErrorCode.NotFound,
+        when: 'No CELLAR work holds the CELEX number.',
+        recovery:
+          'Confirm the CELEX number with eurlex_lookup_celex, then read the resource again with the CELEX it returns.',
+      },
+      {
+        reason: 'sparql_error',
+        code: JsonRpcErrorCode.ValidationError,
+        when: 'CELLAR rejected a query this summary sent to resolve the CELEX or traverse its relations.',
+        recovery:
+          'Traverse the act with the eurlex_get_relations tool, naming the types you need in relation_types.',
+        thrownBy: 'service',
+      },
+      {
+        reason: 'sparql_timeout',
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        when: 'A query this summary sent to CELLAR ran past the client timeout, or CELLAR refused it as too costly to run. It is not retried.',
+        recovery:
+          'Read the resource again shortly, or call the eurlex_get_relations tool with relation_types narrowed to the types you need.',
+        thrownBy: 'service',
+      },
+    ],
+
     async handler(params, ctx) {
       const svc = getCellarSparqlService();
       const celexNumber = params.celexNumber.trim();
@@ -45,7 +71,9 @@ export const eurlex_document_relations_resource = resource(
       // several works never summarizes a copy that lacks edges.
       const workUri = (await resolveCelexWorks(svc, [celexNumber], ctx)).get(celexNumber);
       if (!workUri) {
-        throw notFound(`No CELLAR work found for CELEX: ${celexNumber}`, { celexNumber });
+        throw ctx.fail('not_found', `No CELLAR work found for CELEX: ${celexNumber}`, {
+          celexNumber,
+        });
       }
 
       // Summarize all relation types via the shared traversal — one query per

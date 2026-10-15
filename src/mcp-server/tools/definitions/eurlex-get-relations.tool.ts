@@ -6,22 +6,39 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { echoValue } from '@/mcp-server/tools/echo-value.js';
+import { enumInput } from '@/mcp-server/tools/enum-input.js';
+import {
+  clampLimit,
+  limitClampEnrichment,
+  limitClampTrailer,
+  ROW_LIMIT_CEILING,
+} from '@/mcp-server/tools/limit-clamp.js';
 import {
   CellarSparqlService,
   getCellarSparqlService,
 } from '@/services/cellar-sparql/cellar-sparql-service.js';
-import { CELEX_PATTERN, isSafeSparqlIri } from '@/services/cellar-sparql/eli-resolution.js';
 import {
+  CELEX_PATTERN,
+  celexOfAliasUri,
+  isSafeSparqlIri,
+  normalizeCelex,
+  normalizeWorkUri,
+} from '@/services/cellar-sparql/eli-resolution.js';
+import {
+  DEFAULT_PER_TYPE_LIMIT,
+  MEMBER_STATE_CODES,
   RELATION_TYPES,
   type RelationType,
+  toMemberStateCode,
   traverseRelations,
 } from '@/services/cellar-sparql/relation-traversal.js';
+import { isPastSortWindow } from '@/services/cellar-sparql/sort-window.js';
 import { resolveCelexWorks } from '@/services/cellar-sparql/work-resolution.js';
 
 export const eurlex_get_relations = tool('eurlex_get_relations', {
   title: 'Get CELLAR Relationship Graph',
   description:
-    'Traverse the one-hop CDM relationship graph of an EU act: what it amends or is amended by, what it repeals or is repealed by (explicit and implicit), its consolidated versions, national transposition measures, its legal basis, and works that cite it. Returns direct relations only, paginated per relation type and direction. Requires a CELEX number or CELLAR work URI.',
+    'Traverse the one-hop CDM relationship graph of an EU act: what it amends or is amended by, what it repeals or is repealed by (explicit and implicit), its consolidated versions, national transposition measures, its legal basis and the works adopted under it, the CJEU rulings interpreting it (or, for a ruling, the acts it interprets), and works that cite it. Returns direct relations only, paginated per relation type and direction. Requires a CELEX number or CELLAR work URI.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     celex_number: z
@@ -29,7 +46,7 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
         z.literal(''),
         z
           .string()
-          .overwrite((value) => value.trim().toUpperCase())
+          .overwrite(normalizeCelex)
           .regex(
             CELEX_PATTERN,
             'celex_number must be a CELEX identifier — a sector character followed by the year, type letters, and number (e.g. 32016R0679). Resolve a citation to its CELEX with eurlex_lookup_celex first.',
@@ -44,6 +61,7 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
       ),
     work_uri: z
       .string()
+      .overwrite(normalizeWorkUri)
       .refine((v) => !v || isSafeSparqlIri(v), {
         message:
           'work_uri must be an http URI with no whitespace, control characters, or any of < > " { } | ^ ` \\.',
@@ -53,10 +71,25 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
         'CELLAR work resource URI to traverse (e.g. http://publications.europa.eu/resource/cellar/3e485e15-11bd-11e6-ba9a-01aa75ed71a1). Used directly as the addressed work; its CELEX identity is resolved for the national_transposition act match, which stands down when the work carries several CELEX numbers — address such a work by celex_number to name the act you mean. Provide exactly one of celex_number or work_uri.',
       ),
     relation_types: z
-      .array(z.enum([...RELATION_TYPES]))
+      .array(enumInput(RELATION_TYPES, z.enum([...RELATION_TYPES])))
       .optional()
       .describe(
-        'Subset of relation types to return; omit for all. Types: cites, amends, amended_by, repeals, repealed_by, implicitly_repeals, implicitly_repealed_by, legal_basis (treaty/article this act rests on), consolidated_version (consolidated texts of this act), national_transposition (member-state implementing measures).',
+        'Subset of relation types to return; omit for all. Types: cites, amends, amended_by, repeals, repealed_by, implicitly_repeals, implicitly_repealed_by, legal_basis (treaty/article this act rests on), basis_for (works naming this act among their legal bases — implementing and delegated acts, decisions, Parliament resolutions, drafts; the incoming side of legal_basis), interprets (for a ruling: the acts it interprets), interpreted_by (CJEU and General Court rulings interpreting this act; the incoming side of interprets), consolidated_version (consolidated texts of this act), national_transposition (member-state implementing measures). Omitted on a heavily linked act (the GDPR, a framework regulation), the call returns hundreds of related works with whole titles — a response of well over 100 KB; name only the types you need.',
+      ),
+    member_states: z
+      .array(
+        z
+          .string()
+          .refine((value) => toMemberStateCode(value) !== undefined, {
+            message: `member_states takes member-state codes: ISO 3166-1 alpha-3 (${MEMBER_STATE_CODES.join(', ')}; GBR is the United Kingdom) or the two-letter codes (DE, FR; EL or GR for Greece, UK or GB for the United Kingdom), in any case.`,
+          })
+          .describe(
+            'A member state as its ISO 3166-1 alpha-3 code (DEU, GRC, GBR for the United Kingdom) or two-letter code (DE; EL or GR for Greece; UK or GB), in any case.',
+          ),
+      )
+      .optional()
+      .describe(
+        'Narrow national_transposition rows to the measures of these member states — the 27 member states plus the United Kingdom, by alpha-3 or two-letter code, in any case. Paging, has_more, and next_offset then count matching measures only; other relation types are unaffected. With an explicit relation_types, include national_transposition. An empty list is the same as omitting it.',
       ),
     offset: z
       .number()
@@ -64,16 +97,16 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
       .min(0)
       .default(0)
       .describe(
-        'Pagination offset applied per relation type and direction — related works to skip (default 0). Page forward by adding limit; incoming edges are newest-first, so higher offsets reach older works.',
+        'Pagination offset applied per relation type and direction — related works to skip (default 0). Page forward by adding limit; incoming edges are newest-first, so higher offsets reach older works. Must be below 10,000: CELLAR sorts at most 10,000 related works per type and direction, so pages stop at row 10,000.',
       ),
     limit: z
       .number()
       .int()
       .min(1)
-      .max(100)
+      .max(ROW_LIMIT_CEILING)
       .default(100)
       .describe(
-        'Maximum related works per relation type and direction (1–100, default 100). Incoming edges are ordered newest-first, so the cap keeps the newest — page with offset for older ones.',
+        'Maximum related works per relation type and direction, served up to 100 per call (default 100); a larger value (up to 10,000) is served at 100 and reported in limit_clamp. Incoming edges are ordered newest-first, so the cap keeps the newest — page with offset for older ones. The cap applies to each type and direction separately, so on a heavily linked act a lower limit, with relation_types narrowed, keeps the response small.',
       ),
   }),
   output: z.object({
@@ -93,7 +126,7 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
             relation_type: z
               .string()
               .describe(
-                'Type of relation: cites, amends, amended_by, repeals, repealed_by, implicitly_repeals, implicitly_repealed_by, legal_basis, consolidated_version, national_transposition.',
+                'Type of relation: cites, amends, amended_by, repeals, repealed_by, implicitly_repeals, implicitly_repealed_by, legal_basis, basis_for, interprets, interpreted_by, consolidated_version, national_transposition.',
               ),
             direction: z
               .string()
@@ -136,7 +169,7 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
     has_more: z
       .boolean()
       .describe(
-        'True only when at least one requested relation type/direction returned an additional valid row beyond this page.',
+        'True only when at least one requested relation type/direction returned an additional valid row beyond this page. False on a page that ends at row 10,000, the last one CELLAR sorts; its notice names the types and directions that reached it.',
       ),
     next_offset: z
       .number()
@@ -146,6 +179,12 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
       .array(z.string())
       .describe(
         'The relation types this request traversed — the explicit relation_types list, or all types when it was omitted. Diff against the types present in relations[], or read empty_relation_types, to confirm which requested types returned edges.',
+      ),
+    member_states: z
+      .array(z.string())
+      .optional()
+      .describe(
+        'The member states national_transposition rows were narrowed to, as ISO 3166-1 alpha-3 codes, normalized from member_states and de-duplicated. Absent when no member_states filter was given.',
       ),
     empty_relation_types: z
       .array(z.string())
@@ -177,11 +216,20 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
       .string()
       .optional()
       .describe(
-        'Guidance for the next call: on an empty first page, how to widen the traversal; on a page with more rows, the offset to continue from.',
+        'Guidance for the next call: on an empty first page, how to widen the traversal; on a first page where member_states matched no national_transposition measures, the codes it named; on a page with more rows, the offset to continue from; on a page ending at row 10,000, the relation types and directions that reached it, each with a ready-to-run eurlex_query_sparql query listing its older works.',
       ),
+    limit_clamp: limitClampEnrichment,
   },
+  enrichmentTrailer: { limit_clamp: limitClampTrailer },
 
   errors: [
+    {
+      reason: 'offset_past_window',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'offset is 10,000 or more, past the last row CELLAR sorts for one relation type and direction.',
+      recovery:
+        'Page from an offset below 10,000; the page that reaches row 10,000 gives, for each relation type and direction it ends, a ready-to-run eurlex_query_sparql query listing the older related works.',
+    },
     {
       reason: 'invalid_identifier_args',
       code: JsonRpcErrorCode.ValidationError,
@@ -189,21 +237,68 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
       recovery: 'Provide exactly one of celex_number or work_uri.',
     },
     {
+      reason: 'member_states_not_applicable',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'member_states was given with a relation_types list that does not include national_transposition, the only type it filters.',
+      recovery:
+        'Add national_transposition to relation_types, omit relation_types to traverse every type, or drop member_states.',
+    },
+    {
       reason: 'not_found',
       code: JsonRpcErrorCode.NotFound,
-      when: 'CELEX number not found in CELLAR — resolve the identifier with eurlex_lookup_celex first.',
+      when: 'The CELEX number, given directly or as a resource/celex/ work URI, is not found in CELLAR — resolve the identifier with eurlex_lookup_celex first.',
       recovery: 'Use eurlex_lookup_celex to confirm the CELEX number exists, then retry.',
+    },
+    {
+      reason: 'sparql_error',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'CELLAR rejected a query this traversal sent. The same call fails the same way again.',
+      recovery:
+        'Name fewer types in relation_types to isolate the one CELLAR rejects, or list that relation with eurlex_query_sparql.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'sparql_timeout',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'A query this traversal sent ran past the client timeout, or CELLAR refused it as too costly to run. It is not retried.',
+      recovery:
+        'Name only the relation types you need in relation_types, or lower limit, then call again; every type on a heavily linked act is the heaviest call.',
+      thrownBy: 'service',
     },
   ],
 
   async handler(input, ctx) {
+    if (isPastSortWindow(input.offset)) {
+      throw ctx.fail(
+        'offset_past_window',
+        `offset ${input.offset} is past row 10,000, the last row CELLAR sorts for one relation type and direction, so no page starts there.`,
+      );
+    }
     const svc = getCellarSparqlService();
     const requestedTypes: readonly RelationType[] = input.relation_types ?? RELATION_TYPES;
 
+    // Normalize to the three-letter codes a sector-7 CELEX carries; the schema has
+    // already rejected anything that names no member state. An empty list is absent.
+    const memberStates = input.member_states?.length
+      ? [...new Set(input.member_states.flatMap((value) => toMemberStateCode(value) ?? []))]
+      : undefined;
+    // A filter on a type the call does not traverse would read as applied.
+    if (memberStates && !requestedTypes.includes('national_transposition')) {
+      throw ctx.fail(
+        'member_states_not_applicable',
+        `member_states narrows national_transposition, which relation_types (${requestedTypes.join(', ')}) does not include.`,
+      );
+    }
+
     // Accept exactly one identifier. Treat empty/whitespace as absent so
     // form-based clients sending "" for an omitted field hit the friendly guard.
-    const celexNumber = input.celex_number?.trim();
-    const workUriInput = input.work_uri?.trim();
+    // A `resource/celex/{CELEX}` alias work_uri is `owl:sameAs` its work, not a work
+    // with edges of its own, so it is traversed as the CELEX it names (#147).
+    const celexInput = input.celex_number?.trim();
+    const workUriGiven = input.work_uri?.trim();
+    const aliasCelex = workUriGiven && !celexInput ? celexOfAliasUri(workUriGiven) : undefined;
+    const celexNumber = celexInput || aliasCelex;
+    const workUriInput = aliasCelex ? undefined : workUriGiven;
 
     // Step 1: Determine the source work URI. A work_uri is the CELLAR work
     // resource directly — use it as-is, skipping the CELEX→work resolution that
@@ -225,7 +320,7 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
        * measures selected against an act the caller never named.
        *
        * Only `national_transposition` consumes that identity, so the lookup runs
-       * only when it was requested — a traversal of the other nine types spends no
+       * only when it was requested — a traversal of any other type spends no
        * CELLAR round-trip on it.
        */
       if (requestedTypes.includes('national_transposition')) {
@@ -275,11 +370,19 @@ SELECT ?sourceCelex WHERE {
     // (MAX_SPARQL_RESULTS) up front so both sides of a symmetric query stay
     // capped consistently — the symmetric UNION has no outer LIMIT and the
     // internal query path passes its per-arm subselect LIMITs through unchanged.
-    const perDirectionLimit = Math.min(input.limit, svc.maxResults);
+    const perDirectionLimit = clampLimit(
+      ctx,
+      input.limit,
+      Math.min(DEFAULT_PER_TYPE_LIMIT, svc.maxResults),
+    );
     // Pass the source CELEX resolved from either identifier path so the
     // national_transposition act-core constraint operates before LIMIT/OFFSET and
     // continuation proof.
-    const { relations: workRelations, hasMore } = await traverseRelations(
+    const {
+      relations: workRelations,
+      hasMore,
+      windowEnds,
+    } = await traverseRelations(
       svc,
       workUri,
       requestedTypes,
@@ -287,10 +390,12 @@ SELECT ?sourceCelex WHERE {
       sourceCelexNumber,
       perDirectionLimit,
       input.offset,
+      memberStates,
     );
     ctx.log.info('Relation traversal', {
       celexNumber,
       workUri,
+      memberStates,
       resultCount: workRelations.length,
       offset: input.offset,
       hasMore,
@@ -302,13 +407,45 @@ SELECT ?sourceCelex WHERE {
      * empty_relation_types, plus a notice on how to widen the traversal. A work_uri
      * is used as given and never checked for existence, so on that path the notice
      * also routes a mistyped URI to a lookup. A page past the end stays silent.
+     *
+     * A member_states filter that matched no measure on the first page gets its own
+     * notice naming the codes, whatever the other types returned (#149): the generic
+     * one would point at relation_types when the filter is what emptied the type.
+     * The framework keeps one notice, so it joins the continuation guidance below.
      */
-    if (workRelations.length === 0 && input.offset === 0) {
-      const unchecked = celexNumber
-        ? ''
-        : ' The work URI is not checked for existence; confirm it with eurlex_get_document (content_mode "metadata_only").';
-      ctx.enrich.notice(
-        `Work ${echoValue(celexNumber ?? workUri)} has no CDM relations of the requested types. Try other relation_types or omit the filter to fetch all available relation types.${unchecked}`,
+    const notices: string[] = [];
+    if (input.offset === 0) {
+      const source = echoValue(celexNumber ?? workUri);
+      if (memberStates && !workRelations.some((r) => r.relationType === 'national_transposition')) {
+        notices.push(
+          `No national_transposition measures of ${memberStates.join(', ')} were found for ${source}. Name other member states in member_states, or drop it to list every member state's measures.`,
+        );
+      } else if (workRelations.length === 0) {
+        notices.push(
+          `Work ${source} has no CDM relations of the requested types. Try other relation_types or omit the filter to fetch all available relation types.`,
+        );
+      }
+      if (workRelations.length === 0 && !celexNumber) {
+        notices.push(
+          'The work URI is not checked for existence; confirm it with eurlex_get_document (content_mode "metadata_only").',
+        );
+      }
+    }
+    // A direction that filled what CELLAR's sort window allows may continue past row
+    // 10,000, where no offset reaches (#154); this tool has no date filter, so the
+    // route is a raw query per direction, bounded by the last date its page reached.
+    if (windowEnds.length > 0) {
+      const reached = windowEnds
+        .map(
+          (end) =>
+            `${end.relationType} (${end.direction})${end.lastDate ? `, last related_date ${end.lastDate}` : ', ending among works with no date'}`,
+        )
+        .join('; ');
+      const continuations = windowEnds
+        .map((end) => `${end.relationType} (${end.direction}): ${end.continuationQuery}`)
+        .join('; ');
+      notices.push(
+        `This page reaches row 10,000, the last row CELLAR sorts for one relation type and direction, in ${reached}. No later page can be read there, and more related works may exist. To list them, run the query for each with eurlex_query_sparql, paging it with OFFSET; its first rows repeat the end of this page, and a work with several dates or CELEX numbers appears once per value. ${continuations}`,
       );
     }
 
@@ -326,8 +463,13 @@ SELECT ?sourceCelex WHERE {
       ctx.enrich.truncated({
         shown: relations.length,
         cap: perDirectionLimit,
-        guidance: `At least one relation type or direction has more related works; call again with offset=${input.offset + perDirectionLimit}.`,
+        guidance: [
+          ...notices,
+          `At least one relation type or direction has more related works; call again with offset=${input.offset + perDirectionLimit}.`,
+        ].join(' '),
       });
+    } else if (notices.length > 0) {
+      ctx.enrich.notice(notices.join(' '));
     }
 
     // #47: make requested-but-empty types explicit. A requested type with zero
@@ -353,6 +495,7 @@ SELECT ?sourceCelex WHERE {
       has_more: hasMore,
       ...(hasMore ? { next_offset: input.offset + perDirectionLimit } : {}),
       requested_relation_types: [...requestedTypes],
+      ...(memberStates ? { member_states: memberStates } : {}),
       empty_relation_types: emptyRelationTypes,
     };
   },
@@ -369,6 +512,7 @@ SELECT ?sourceCelex WHERE {
     // #47: surface coverage so a non-structuredContent client sees the same
     // requested-vs-empty signal the structured output carries.
     lines.push(`**Requested types:** ${result.requested_relation_types.join(', ')}`);
+    if (result.member_states) lines.push(`**Member states:** ${result.member_states.join(', ')}`);
     lines.push(
       `**Empty types (this page):** ${
         result.empty_relation_types.length > 0 ? result.empty_relation_types.join(', ') : 'none'
