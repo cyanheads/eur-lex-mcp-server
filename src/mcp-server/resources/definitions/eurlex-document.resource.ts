@@ -4,13 +4,13 @@
  */
 
 import { resource, z } from '@cyanheads/mcp-ts-core';
-import { notFound } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { ENG_LANGUAGE_URI, resolveResourceTypeLabel } from '@/services/cellar-sparql/cdm-labels.js';
 import {
   CellarSparqlService,
   getCellarSparqlService,
 } from '@/services/cellar-sparql/cellar-sparql-service.js';
-import { CELEX_PATTERN } from '@/services/cellar-sparql/eli-resolution.js';
+import { CELEX_PATTERN, normalizeCelex } from '@/services/cellar-sparql/eli-resolution.js';
 import {
   findConsolidation,
   isConsolidatedCelex,
@@ -46,7 +46,7 @@ export const eurlex_document_resource = resource('eurlex://document/{celexNumber
   params: z.object({
     celexNumber: z
       .string()
-      .overwrite((value) => value.trim().toUpperCase())
+      .overwrite(normalizeCelex)
       .regex(
         CELEX_PATTERN,
         'celexNumber must be a CELEX identifier — a sector character followed by the year, type letters, and number (e.g. 32016R0679). Resolve a citation to its CELEX with eurlex_lookup_celex first.',
@@ -55,6 +55,32 @@ export const eurlex_document_resource = resource('eurlex://document/{celexNumber
         'CELEX number of the EU act (e.g. 32016R0679 for GDPR). Surrounding whitespace is trimmed and the value is uppercased before validation. A CELEX containing "/" (e.g. 11957A/PRO/CJ/09) cannot be addressed here — the URI template stops at the path separator, so fetch it with the eurlex_get_document tool instead.',
       ),
   }),
+
+  errors: [
+    {
+      reason: 'not_found',
+      code: JsonRpcErrorCode.NotFound,
+      when: 'No CELLAR work holds the CELEX number.',
+      recovery:
+        'Confirm the CELEX number with eurlex_lookup_celex, then read the resource again with the CELEX it returns.',
+    },
+    {
+      reason: 'sparql_error',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'CELLAR rejected a query this read sent to resolve the CELEX or read its metadata.',
+      recovery:
+        'Fetch the same metadata with the eurlex_get_document tool, passing celex_number and content_mode "metadata_only".',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'sparql_timeout',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'A query this read sent to CELLAR ran past the client timeout, or CELLAR refused it as too costly to run. It is not retried.',
+      recovery:
+        'Read the resource again shortly, or fetch the metadata with the eurlex_get_document tool and content_mode "metadata_only".',
+      thrownBy: 'service',
+    },
+  ],
 
   async handler(params, ctx) {
     const svc = getCellarSparqlService();
@@ -73,7 +99,9 @@ export const eurlex_document_resource = resource('eurlex://document/{celexNumber
     ]);
     const workUri = resolved.get(celexNumber);
     if (!workUri) {
-      throw notFound(`No CELLAR work found for CELEX: ${celexNumber}`, { celexNumber });
+      throw ctx.fail('not_found', `No CELLAR work found for CELEX: ${celexNumber}`, {
+        celexNumber,
+      });
     }
     const baseAct = consolidation?.base;
     const actWork = baseAct?.workUri ?? workUri;

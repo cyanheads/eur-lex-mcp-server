@@ -4,11 +4,15 @@
  */
 
 import { z } from '@cyanheads/mcp-ts-core';
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import {
+  JsonRpcErrorCode,
+  serviceUnavailable,
+  validationError,
+} from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_get_document } from '@/mcp-server/tools/definitions/eurlex-get-document.tool.js';
-import { parseActStructure } from '@/services/eurlex-content/act-structure.js';
+import { parseActStructure, readActStructure } from '@/services/eurlex-content/act-structure.js';
 import { EURLEX_LANGUAGES } from '@/services/eurlex-content/eurlex-content-service.js';
 import { htmlToMarkdown } from '@/services/eurlex-content/html-to-markdown.js';
 import {
@@ -27,6 +31,21 @@ import {
   isResolutionQuery,
   resolutionRows,
 } from '../fixtures/cellar-works.js';
+import {
+  AI_ACT_ANNEX_HTML,
+  AI_ACT_FORMEX,
+  DIRECTIVE_FORMEX,
+  DIRECTIVE_OJ_HTML,
+  DRONES_CONSOLIDATED_FORMEX,
+  DRONES_CONSOLIDATED_HTML,
+  GDPR_ARTICLE_99_DE,
+  GDPR_ARTICLE_99_EN,
+  GDPR_ARTICLE_99_ET,
+  GDPR_ARTICLE_99_FI,
+  GDPR_ARTICLE_99_LV,
+  GDPR_CONSOLIDATED_HTML,
+  WHISTLEBLOWER_CONSOLIDATED_HTML,
+} from '../fixtures/eurlex-act-boundaries.js';
 import { AI_ACT_HEADINGS, actHtml } from '../fixtures/eurlex-act-headings.js';
 import { AMENDING_FORMEX, AMENDING_HTML } from '../fixtures/eurlex-amending-act.js';
 import { CONSOLIDATED_ACT_HTML } from '../fixtures/eurlex-consolidated-act.js';
@@ -390,6 +409,8 @@ describe('eurlex_get_document', () => {
       'invalid_identifier_args',
       'not_found',
       'content_challenge',
+      'sparql_error',
+      'sparql_timeout',
     ]);
   });
 
@@ -2132,6 +2153,369 @@ describe('eurlex_get_document', () => {
 
       expect(result.outline?.map((h) => h.label)).toEqual(['Article 1', 'Article 2']);
     });
+
+    it('ends a selected section at a served boundary, on both surfaces (#153)', async () => {
+      const headings = parseActStructure(CONTENT, 'markdown', 'EN');
+      serve(headings);
+      mockFetchContent.mockResolvedValue({
+        content: CONTENT,
+        contentAvailable: true,
+        format: 'markdown',
+        language: 'EN',
+        headings,
+        boundaries: [CONTENT.indexOf('Body two.')],
+      });
+      const { result, text } = await call({ format: 'markdown', select: { articles: '2' } });
+
+      const offset = CONTENT.indexOf('Article 2');
+      expect(result.content).toBe('Article 2');
+      expect(result.selected_sections).toEqual([{ label: 'Article 2', offset, chars: 11 }]);
+      expect(text).toContain(`Article 2 — offset ${offset}, 11 chars`);
+      expect(text).not.toContain('Body two.');
+    });
+  });
+
+  // --- #153 an act's final part and a consolidated text's trailing notes ---
+
+  describe('the final part and trailing notes end no section (#153)', () => {
+    const serve = (celex: string, content: string, format: string, language = 'EN') => {
+      mockSparqlQuery.mockImplementation(async (q: string) =>
+        isResolutionQuery(q) ? resolutionRows(q) : [makeMetaBinding({ celex })],
+      );
+      mockFetchContent.mockResolvedValue({ content, contentAvailable: true, format, language });
+    };
+    const call = async (celex: string, args: Record<string, unknown>) => {
+      const response = await runToolContract(eurlex_get_document, { celex_number: celex, ...args });
+      expect(response.isError).toBeFalsy();
+      const text = response.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+      return { result: eurlex_get_document.output.parse(response.structuredContent), text };
+    };
+    const FINAL_PART = '<div class="eli-subdivision" id="fnp_1">';
+
+    it('html: the last article stops before "Done at", on both surfaces', async () => {
+      serve('32019L1937', DIRECTIVE_OJ_HTML, 'html');
+      const { result, text } = await call('32019L1937', { select: { articles: '29' } });
+
+      const heading = DIRECTIVE_OJ_HTML.indexOf(
+        '<p id="d1e2639-17-1" class="oj-ti-art">Article 29',
+      );
+      const offset = DIRECTIVE_OJ_HTML.lastIndexOf('\n', heading) + 1;
+      const chars = DIRECTIVE_OJ_HTML.indexOf(FINAL_PART) - offset;
+      expect(result.selected_sections).toEqual([{ label: 'Article 29', offset, chars }]);
+      expect(result.content).toBe(DIRECTIVE_OJ_HTML.slice(offset, offset + chars).trim());
+      expect(result.content).toContain('This Directive is addressed to the Member States.');
+      expect(result.content).not.toContain('Done at Strasbourg');
+      expect(text).toContain(`Article 29 — offset ${offset}, ${chars} chars`);
+      expect(text).not.toContain('Done at Strasbourg');
+    });
+
+    it('html: the last chapter ends at the same offset and still holds its last article in one slice (#88)', async () => {
+      serve('32019L1937', DIRECTIVE_OJ_HTML, 'html');
+      const { result, text } = await call('32019L1937', {
+        select: { chapters: 'VII', articles: '29' },
+      });
+
+      const end = DIRECTIVE_OJ_HTML.indexOf(FINAL_PART);
+      const [chapter, article] = result.selected_sections ?? [];
+      expect(chapter?.label).toBe('CHAPTER VII');
+      expect(article?.label).toBe('Article 29');
+      expect((chapter?.offset ?? 0) + (chapter?.chars ?? 0)).toBe(end);
+      expect((article?.offset ?? 0) + (article?.chars ?? 0)).toBe(end);
+      expect(result.content).toBe(DIRECTIVE_OJ_HTML.slice(chapter?.offset, end).trim());
+      expect(text).toContain('from 1 disjoint section');
+      expect(text).not.toContain('Done at Strasbourg');
+    });
+
+    it.each([
+      ['EN', GDPR_ARTICLE_99_EN, 'shall be binding in its entirety'],
+      ['DE', GDPR_ARTICLE_99_DE, 'Diese Verordnung ist in allen'],
+      ['FI', GDPR_ARTICLE_99_FI, 'Tämä asetus on kaikilta'],
+      ['ET', GDPR_ARTICLE_99_ET, 'Käesolev määrus on tervikuna'],
+      ['LV', GDPR_ARTICLE_99_LV, 'Šī regula uzliek'],
+    ] as const)(
+      'html %s: Article 99 and CHAPTER XI end where the final part begins, on both surfaces',
+      async (language, html, bindingFormula) => {
+        serve('32016R0679', html, 'html', language);
+        const { result, text } = await call('32016R0679', {
+          language,
+          select: { chapters: 'XI', articles: '99' },
+        });
+
+        const end = html.indexOf(FINAL_PART);
+        expect(result.selection?.matched).toEqual(['CHAPTER XI', 'Article 99']);
+        expect(result.selected_sections).toHaveLength(2);
+        for (const section of result.selected_sections ?? []) {
+          expect(section.offset + section.chars).toBe(end);
+        }
+        // CHAPTER XI holds Article 99, so the two join as one slice ending at the final part.
+        const chapter = result.selected_sections?.[0]?.offset;
+        expect(result.content).toBe(html.slice(chapter, end).trim());
+        for (const surface of [result.content, text]) {
+          expect(surface).not.toContain(bindingFormula);
+          expect(surface).not.toContain('oj-note');
+        }
+      },
+    );
+
+    it('xml: the last article and chapter stop at </ENACTING.TERMS>, leaving <FINAL> and the annex out', async () => {
+      serve('32019L1937', DIRECTIVE_FORMEX, 'xml');
+      const { result, text } = await call('32019L1937', {
+        format: 'xml',
+        select: { chapters: 'VII', articles: '29' },
+      });
+
+      const end = DIRECTIVE_FORMEX.indexOf('</ENACTING.TERMS>');
+      expect(result.selected_sections).toHaveLength(2);
+      for (const section of result.selected_sections ?? []) {
+        expect(section.offset + section.chars).toBe(end);
+      }
+      expect(result.content).toContain('This Directive is addressed to the Member States.');
+      for (const surface of [result.content, text]) {
+        expect(surface).not.toContain('<FINAL>');
+        expect(surface).not.toContain('<ANNEX');
+      }
+    });
+
+    it('consolidated html: Article 99 leaves out the binding formula and the trailing notes', async () => {
+      serve('02016R0679-20160504', GDPR_CONSOLIDATED_HTML, 'html');
+      const { result, text } = await call('02016R0679-20160504', { select: { articles: '99' } });
+
+      const [section] = result.selected_sections ?? [];
+      expect((section?.offset ?? 0) + (section?.chars ?? 0)).toBe(
+        GDPR_CONSOLIDATED_HTML.indexOf(FINAL_PART),
+      );
+      expect(result.content).toContain('It shall apply from 25 May 2018.');
+      for (const surface of [result.content, text]) {
+        expect(surface).not.toContain('shall be binding in its entirety');
+        expect(surface).not.toContain('separator-short');
+      }
+    });
+
+    it('leaves the outline of a body with a final part unchanged, on both surfaces', async () => {
+      serve('32019L1937', DIRECTIVE_OJ_HTML, 'html');
+      const { result, text } = await call('32019L1937', { outline: true });
+
+      const parsed = parseActStructure(DIRECTIVE_OJ_HTML, 'html', 'EN');
+      expect(result.outline).toEqual(parsed);
+      for (const h of parsed) expect(text).toContain(`\`offset ${h.offset}\``);
+    });
+  });
+
+  // --- #157 headings inside an annex are not the act's own ---
+
+  describe('headings inside an annex are not the act’s own (#157)', () => {
+    const serve = (celex: string, content: string, format: string, sourceHtml?: string) => {
+      mockSparqlQuery.mockImplementation(async (q: string) =>
+        isResolutionQuery(q) ? resolutionRows(q) : [makeMetaBinding({ celex })],
+      );
+      mockFetchContent.mockResolvedValue({
+        content,
+        contentAvailable: true,
+        format,
+        language: 'EN',
+        ...(sourceHtml
+          ? { headings: parseActStructure(content, 'markdown', 'EN', sourceHtml), boundaries: [] }
+          : {}),
+      });
+    };
+    const call = async (celex: string, args: Record<string, unknown>) => {
+      const response = await runToolContract(eurlex_get_document, { celex_number: celex, ...args });
+      expect(response.isError).toBeFalsy();
+      const text = response.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+      return { result: eurlex_get_document.output.parse(response.structuredContent), text };
+    };
+    /** The rendered outline, which must announce exactly `count` sections. */
+    const outlineText = (text: string, count: number) => {
+      const header = `**Outline** — ${count} section${count === 1 ? '' : 's'} detected`;
+      expect(text).toContain(header);
+      return text.slice(text.indexOf(header));
+    };
+
+    it('xml: Annex VIII’s "Section C" and Annex XI’s sections stay out of the outline, on both surfaces', async () => {
+      serve('32024R1689', AI_ACT_FORMEX, 'xml');
+      const { result, text } = await call('32024R1689', { format: 'xml', outline: true });
+
+      expect(result.outline?.map((h) => h.label)).toEqual(['CHAPTER XIII', 'Article 113']);
+      expect(outlineText(text, 2)).not.toMatch(/\[section /);
+    });
+
+    it('xml: a consolidated appendix’s chapters stay out, and chapters "I" misses, on both surfaces', async () => {
+      serve('02019R0947-20250501', DRONES_CONSOLIDATED_FORMEX, 'xml');
+      const outline = await call('02019R0947-20250501', { format: 'xml', outline: true });
+      expect(outline.result.outline?.map((h) => h.label)).toEqual(['Article 23']);
+
+      const { result, text } = await call('02019R0947-20250501', {
+        format: 'xml',
+        select: { chapters: 'I' },
+      });
+      expect(result.structure_detected).toBe(true);
+      expect(result.selection).toEqual({
+        requested: ['CHAPTER I'],
+        matched: [],
+        missed: ['CHAPTER I'],
+      });
+      expect(result.content).toBeUndefined();
+      expect(text).toContain('Not found: CHAPTER I — no such section in this act');
+    });
+
+    it.each([
+      ['html', DRONES_CONSOLIDATED_HTML, undefined],
+      ['markdown', htmlToMarkdown(DRONES_CONSOLIDATED_HTML), DRONES_CONSOLIDATED_HTML],
+    ] as const)(
+      '%s: a consolidated appendix’s chapters stay out, and chapters "I" misses, on both surfaces',
+      async (format, content, html) => {
+        serve('02019R0947-20250501', content, format, html);
+        const outline = await call('02019R0947-20250501', { format, outline: true });
+        expect(outline.result.outline?.map((h) => h.label)).toEqual(['Article 23', 'ANNEX']);
+        expect(outlineText(outline.text, 2)).not.toContain('CHAPTER');
+
+        const { result, text } = await call('02019R0947-20250501', {
+          format,
+          select: { chapters: 'I' },
+        });
+        expect(result.selection?.missed).toEqual(['CHAPTER I']);
+        expect(text).toContain('Not found: CHAPTER I — no such section in this act');
+      },
+    );
+
+    it('html: an annex runs past the headings inside it, on both surfaces', async () => {
+      const numbered = DRONES_CONSOLIDATED_HTML.replace('>ANNEX</p>', '>ANNEX I</p>');
+      serve('02019R0947-20250501', numbered, 'html');
+      const { result, text } = await call('02019R0947-20250501', { select: { annexes: 'I' } });
+
+      // The annex ends at the trailing notes, not at the appendix's CHAPTER I inside it.
+      const annex = parseActStructure(numbered, 'html', 'EN').find((h) => h.kind === 'annex');
+      expect(annex?.label).toBe('ANNEX I');
+      const start = annex?.offset ?? -1;
+      const end = numbered.indexOf('<hr class="separator-short"/>');
+      expect(result.selection?.matched).toEqual(['ANNEX I']);
+      expect(result.selected_sections).toEqual([
+        { label: 'ANNEX I', offset: start, chars: end - start },
+      ]);
+      expect(result.content).toBe(numbered.slice(start, end).trim());
+      expect(text).toContain(`ANNEX I — offset ${start}, ${end - start} chars`);
+      expect(text).toContain('CHAPTER II');
+    });
+
+    it('html: an OJ annex’s "Section 1" and "Section 2" stay out of the outline', async () => {
+      serve('32024R1689', AI_ACT_ANNEX_HTML, 'html');
+      const { result, text } = await call('32024R1689', { outline: true });
+
+      expect(result.outline?.map((h) => h.label)).toEqual(['Article 113', 'ANNEX XI']);
+      expect(outlineText(text, 2)).not.toMatch(/\[section /);
+    });
+  });
+
+  // --- #156 a lone unnumbered annex ---
+
+  describe('a lone unnumbered annex is selected as "ANNEX" (#156)', () => {
+    /** Serve a body as the content service does: Markdown with its cached structure. */
+    const serve = (celex: string, content: string, format: string, sourceHtml?: string) => {
+      mockSparqlQuery.mockImplementation(async (q: string) =>
+        isResolutionQuery(q) ? resolutionRows(q) : [makeMetaBinding({ celex })],
+      );
+      mockFetchContent.mockResolvedValue({
+        content,
+        contentAvailable: true,
+        format,
+        language: 'EN',
+        ...(sourceHtml ? readActStructure(content, 'markdown', 'EN', sourceHtml) : {}),
+      });
+    };
+    const call = async (celex: string, args: Record<string, unknown>) => {
+      const response = await runToolContract(eurlex_get_document, { celex_number: celex, ...args });
+      expect(response.isError).toBeFalsy();
+      const text = response.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+      const { notice } = response.structuredContent as { notice?: string };
+      return { result: eurlex_get_document.output.parse(response.structuredContent), text, notice };
+    };
+    const directiveMd = htmlToMarkdown(DIRECTIVE_OJ_HTML);
+    const whistleblowerMd = htmlToMarkdown(WHISTLEBLOWER_CONSOLIDATED_HTML);
+
+    it.each([
+      ['html OJ', '32019L1937', 'html', DIRECTIVE_OJ_HTML, undefined, DIRECTIVE_OJ_HTML.length],
+      ['markdown OJ', '32019L1937', 'markdown', directiveMd, DIRECTIVE_OJ_HTML, directiveMd.length],
+      [
+        'html consolidated',
+        '02019L1937-20241230',
+        'html',
+        WHISTLEBLOWER_CONSOLIDATED_HTML,
+        undefined,
+        WHISTLEBLOWER_CONSOLIDATED_HTML.indexOf('<hr class="separator-short"/>'),
+      ],
+      [
+        'markdown consolidated',
+        '02019L1937-20241230',
+        'markdown',
+        whistleblowerMd,
+        WHISTLEBLOWER_CONSOLIDATED_HTML,
+        whistleblowerMd.indexOf('( 1 ) Directive 2008/52/EC'),
+      ],
+    ] as const)(
+      '%s: "ANNEX" and "annex" select the lone annex to its end, on both surfaces',
+      async (_, celex, format, content, html, end) => {
+        serve(celex, content, format, html);
+        const annex = parseActStructure(content, format, 'EN', html).find(
+          (h) => h.kind === 'annex',
+        );
+        expect(annex).toMatchObject({ number: '', label: 'ANNEX' });
+        const offset = annex?.offset ?? -1;
+
+        for (const annexes of ['ANNEX', 'annex']) {
+          const { result, text, notice } = await call(celex, { format, select: { annexes } });
+          expect(result.selection).toEqual({
+            requested: ['ANNEX'],
+            matched: ['ANNEX'],
+            missed: [],
+          });
+          expect(result.selected_sections).toEqual([
+            { label: 'ANNEX', offset, chars: end - offset },
+          ]);
+          expect(result.content).toBe(content.slice(offset, end).trim());
+          expect(text).toContain(`ANNEX — offset ${offset}, ${end - offset} chars`);
+          for (const surface of [result.content, text]) {
+            expect(surface).toContain('Part I');
+            expect(surface).not.toContain('Directive 2008/52/EC');
+          }
+          expect(text).not.toContain('Not found');
+          expect(notice).toBeUndefined();
+        }
+      },
+    );
+
+    it.each([
+      ['html', AI_ACT_ANNEX_HTML, undefined],
+      ['markdown', htmlToMarkdown(AI_ACT_ANNEX_HTML), AI_ACT_ANNEX_HTML],
+    ] as const)(
+      '%s: "ANNEX" misses on an act with numbered annexes, naming them, on both surfaces',
+      async (format, content, html) => {
+        serve('32024R1689', content, format, html);
+        const { result, text, notice } = await call('32024R1689', {
+          format,
+          select: { annexes: 'ANNEX' },
+        });
+
+        expect(result.selection).toEqual({ requested: ['ANNEX'], matched: [], missed: ['ANNEX'] });
+        expect(result.content).toBeUndefined();
+        expect(notice).toBe(
+          'No lone unnumbered annex matches "ANNEX": this act\'s annexes are numbered (ANNEX XI). Select one by its number, e.g. annexes: "XI".',
+        );
+        expect(text).toContain('Not found: ANNEX — no such section in this act');
+        expect(text).toContain(notice as string);
+      },
+    );
+
+    it('xml: annexes are not detected, so "ANNEX" misses with no numbered annex to name', async () => {
+      serve('32019L1937', DIRECTIVE_FORMEX, 'xml');
+      const { result, text, notice } = await call('32019L1937', {
+        format: 'xml',
+        select: { annexes: 'ANNEX' },
+      });
+
+      expect(result.selection?.missed).toEqual(['ANNEX']);
+      expect(text).toContain('Not found: ANNEX — no such section in this act');
+      expect(notice).toBeUndefined();
+    });
   });
 
   // --- #120 legacy chrome and consolidated labels, #126 one-line legacy html ---
@@ -2286,7 +2670,10 @@ describe('eurlex_get_document', () => {
      */
     const routeSparql = (routes: {
       eli?: SparqlRows;
+      workExists?: SparqlRows;
       workUriDeref?: SparqlRows;
+      /** The miss path's expression/manifestation → owning work lookup (#158). */
+      owner?: SparqlRows;
       core?: SparqlRows;
       author?: SparqlRows;
       legalBasis?: SparqlRows;
@@ -2304,8 +2691,11 @@ describe('eurlex_get_document', () => {
           return Promise.resolve(routes.legalBasis ?? []);
         if (query.includes('cdm:work_is_about_concept_eurovoc'))
           return Promise.resolve(routes.eurovoc ?? []);
+        if (query.includes('cdm:manifestation_manifests_expression'))
+          return Promise.resolve(routes.owner ?? []);
         if (query.includes('cdm:expression_belongs_to_work'))
           return Promise.resolve(routes.core ?? []);
+        if (query.includes('?p ?o')) return Promise.resolve(routes.workExists ?? []);
         return Promise.resolve(routes.workUriDeref ?? []); // work_uri → CELEX deref
       });
     };
@@ -2474,7 +2864,11 @@ describe('eurlex_get_document', () => {
 
     it('#34: a CELLAR work with no CELEX throws not_found with an honest message, not a mislabeled ELI', async () => {
       const ctx = createMockContext({ errors: eurlex_get_document.errors });
-      routeSparql({ workUriDeref: [] }); // deref resolves no CELEX
+      // The work exists (it has triples) but the deref resolves no CELEX.
+      routeSparql({
+        workExists: [row('p', 'http://publications.europa.eu/ontology/cdm#work_date_document')],
+        workUriDeref: [],
+      });
 
       const input = eurlex_get_document.input.parse({
         work_uri: 'http://publications.europa.eu/resource/cellar/no-celex-uuid',
@@ -2490,6 +2884,250 @@ describe('eurlex_get_document', () => {
       // Must NOT label a cellar URI an "ELI".
       expect((err as Error).message).not.toMatch(/\bELI\b/i);
     });
+
+    // --- #158: a work_uri miss tells an unknown URI from a work without a CELEX ---
+
+    it('#158: a work_uri CELLAR holds no triples for is not found in CELLAR, on both channels', async () => {
+      routeSparql({ workExists: [], workUriDeref: [] });
+
+      const result = await runToolContract(eurlex_get_document, {
+        work_uri: 'http://example.com/x',
+      });
+      expect(result.isError).toBe(true);
+      const error = (
+        result.structuredContent as { error: { data: { reason: string }; message: string } }
+      ).error;
+      expect(error.data.reason).toBe('not_found');
+      expect(error.message).toBe('No CELLAR work found for work URI: http://example.com/x');
+      const text = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+      expect(text).toContain('No CELLAR work found for work URI: http://example.com/x');
+      expect(text).not.toMatch(/carries no CELEX/);
+    });
+
+    it('#158: a work that exists without a CELEX keeps the "carries no CELEX number" message', async () => {
+      const uri = `${CELLAR}celexless-member`;
+      routeSparql({
+        workExists: [row('p', 'http://publications.europa.eu/ontology/cdm#work_date_document')],
+        workUriDeref: [],
+      });
+
+      const result = await runToolContract(eurlex_get_document, { work_uri: uri });
+      const error = (
+        result.structuredContent as { error: { data: { reason: string }; message: string } }
+      ).error;
+      expect(error.data.reason).toBe('not_found');
+      expect(error.message).toBe(
+        `This CELLAR work carries no CELEX number and cannot be fetched as a document: ${uri}`,
+      );
+      const existence = mockSparqlQuery.mock.calls
+        .map((c) => c[0] as string)
+        .find((q) => q.includes('?p ?o'));
+      expect(existence).toContain(`<${uri}> ?p ?o`);
+    });
+
+    it('#158: the existence check runs only on the miss path', async () => {
+      routeSparql({
+        workExists: [row('p', 'http://publications.europa.eu/ontology/cdm#work_date_document')],
+        workUriDeref: [{ celex: { type: 'literal', value: '32024R2822' } }],
+        core: [makeMetaBinding({ celex: '32024R2822' })],
+      });
+
+      const result = await runToolContract(eurlex_get_document, {
+        work_uri: `${CELLAR}bd40f370-a54d-11ef-85f0-01aa75ed71a1`,
+        content_mode: 'metadata_only',
+      });
+      expect(result.isError).toBeFalsy();
+      expect(mockSparqlQuery.mock.calls.some((c) => (c[0] as string).includes('?p ?o'))).toBe(
+        false,
+      );
+      expect(
+        mockSparqlQuery.mock.calls.some((c) =>
+          (c[0] as string).includes('cdm:manifestation_manifests_expression'),
+        ),
+      ).toBe(false);
+    });
+
+    // --- #158: an expression or manifestation URI is served as its work ---
+
+    const GDPR_WORK = `${CELLAR}3e485e15-11bd-11e6-ba9a-01aa75ed71a1`;
+    /** An owning-work row of the miss path's lookup. */
+    const ownerRow = (kind: string, celex?: string, celexCount = celex ? '1' : '0') => ({
+      work: { type: 'uri', value: GDPR_WORK },
+      kind: { type: 'literal', value: kind },
+      celexCount: { type: 'literal', value: celexCount },
+      ...(celex ? { celex: { type: 'literal', value: celex } } : {}),
+    });
+
+    it.each([
+      ['an', 'expression', `${GDPR_WORK}.0006`],
+      ['a', 'manifestation', `${GDPR_WORK}.0006.03`],
+    ])(
+      '#158: serves a work_uri naming %s %s as its work, saying so on both surfaces',
+      async (article, kind, uri) => {
+        routeSparql({
+          workUriDeref: [],
+          owner: [ownerRow(kind, '32016R0679')],
+          workExists: [row('p', 'http://publications.europa.eu/ontology/cdm#expression_title')],
+          core: [makeMetaBinding({ celex: '32016R0679', title: 'GDPR' })],
+        });
+
+        const result = await runToolContract(eurlex_get_document, {
+          work_uri: uri,
+          content_mode: 'metadata_only',
+        });
+
+        expect(result.isError).toBeFalsy();
+        const structured = eurlex_get_document.output.parse(result.structuredContent);
+        expect(structured.celex_number).toBe('32016R0679');
+        const notice = (result.structuredContent as { notice?: string }).notice ?? '';
+        expect(notice).toBe(
+          `work_uri names ${article} ${kind} of the CELLAR work ${GDPR_WORK}, not a work; served that work, CELEX 32016R0679. Pass the work URI or celex_number to address it directly.`,
+        );
+        const text = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+        expect(text).toContain(notice);
+        const lookup = mockSparqlQuery.mock.calls
+          .map((c) => c[0] as string)
+          .find((q) => q.includes('cdm:manifestation_manifests_expression'));
+        expect(lookup).toContain(`<${uri}> cdm:expression_belongs_to_work ?work`);
+        // The owning work answered, so the existence check never ran.
+        expect(mockSparqlQuery.mock.calls.some((c) => (c[0] as string).includes('?p ?o'))).toBe(
+          false,
+        );
+      },
+    );
+
+    it('#158: a work_uri naming an expression of a work with no CELEX is not found, naming that work', async () => {
+      const uri = `${GDPR_WORK}.0006`;
+      routeSparql({ workUriDeref: [], owner: [ownerRow('expression')] });
+
+      const result = await runToolContract(eurlex_get_document, { work_uri: uri });
+
+      expect(result.isError).toBe(true);
+      const error = (
+        result.structuredContent as { error: { data: { reason: string }; message: string } }
+      ).error;
+      expect(error.data.reason).toBe('not_found');
+      expect(error.message).toBe(
+        `work_uri names an expression of the CELLAR work ${GDPR_WORK}, which carries no CELEX number and cannot be fetched as a document: ${uri}`,
+      );
+      expect(error.message).not.toContain('This CELLAR work carries no CELEX');
+    });
+
+    it('#158: an expression of a work carrying several CELEX numbers gets both notices', async () => {
+      routeSparql({
+        workUriDeref: [],
+        owner: [ownerRow('expression', '72016L0680CZE_1', '3')],
+        core: [makeMetaBinding({ celex: '72016L0680CZE_1' })],
+      });
+
+      const result = await runToolContract(eurlex_get_document, {
+        work_uri: `${GDPR_WORK}.0006`,
+        content_mode: 'metadata_only',
+      });
+
+      const notice = (result.structuredContent as { notice?: string }).notice ?? '';
+      expect(notice).toContain('names an expression of the CELLAR work');
+      expect(notice).toContain('This work carries 3 CELEX numbers');
+    });
+
+    // --- #147: pasted identifier forms ---
+
+    /** The CELEX a resolution query asked for, as the served document reports it. */
+    const servedCelex = async (args: Record<string, unknown>) => {
+      const result = await runToolContract(eurlex_get_document, {
+        content_mode: 'metadata_only',
+        ...args,
+      });
+      expect(result.isError).toBeFalsy();
+      return eurlex_get_document.output.parse(result.structuredContent).celex_number;
+    };
+
+    /**
+     * Narrow the routed CELLAR so the queries `route` picks answer only when they
+     * carry `literal`, as CELLAR answers only for a value it holds: a lookup sent
+     * under any other form of the identifier misses and the call fails not_found.
+     */
+    const holdsOnly = (route: (query: string) => boolean, literal: string) => {
+      const routed = mockSparqlQuery.getMockImplementation() as (q: string) => Promise<SparqlRows>;
+      mockSparqlQuery.mockImplementation((query: string) =>
+        route(query) && !query.includes(literal) ? Promise.resolve([]) : routed(query),
+      );
+    };
+
+    it.each([
+      ['a CELEX: prefix', 'CELEX:32016R0679', '32016R0679'],
+      ['a lowercase prefix and CELEX', 'celex:32016r0679', '32016R0679'],
+      ['an encoded prefix', 'CELEX%3A32016R0679', '32016R0679'],
+      [
+        'a legal-content URL',
+        'https://eur-lex.europa.eu/legal-content/EN/TXT/HTML/?uri=CELEX:32016R0679&qid=1#d1',
+        '32016R0679',
+      ],
+      [
+        'a URL naming an encoded corrigendum',
+        'https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX:32016R0679R%2802%29',
+        '32016R0679R(02)',
+      ],
+      [
+        'the legacy LexUriServ URL',
+        'https://eur-lex.europa.eu/LexUriServ/LexUriServ.do?uri=CELEX:31995L0046:EN:HTML',
+        '31995L0046',
+      ],
+    ])('#147: celex_number reads %s as %s', async (_label, value, celex) => {
+      routeSparql({ core: [makeMetaBinding({ celex })] });
+      holdsOnly(isResolutionQuery, `"${celex}"^^xsd:string`);
+      expect(eurlex_get_document.input.parse({ celex_number: value }).celex_number).toBe(celex);
+      expect(await servedCelex({ celex_number: value })).toBe(celex);
+    });
+
+    it('#147: celex_number still rejects a EUR-Lex URL naming no CELEX', () => {
+      expect(() =>
+        eurlex_get_document.input.parse({
+          celex_number: 'https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=OJ:L:2016:119:TOC',
+        }),
+      ).toThrow(/celex_number must be a CELEX identifier/);
+    });
+
+    it.each([
+      ['https', 'https://data.europa.eu/eli/reg/2016/679/oj'],
+      ['the eur-lex host', 'https://eur-lex.europa.eu/eli/reg/2016/679/oj'],
+      ['no scheme', 'data.europa.eu/eli/reg/2016/679/oj'],
+      ['a trailing slash', 'http://data.europa.eu/eli/reg/2016/679/oj/'],
+      ['a language segment', 'http://data.europa.eu/eli/reg/2016/679/oj/eng'],
+    ])('#147: eli_uri over %s matches the stored ELI literal', async (_label, eli) => {
+      const stored = 'http://data.europa.eu/eli/reg/2016/679/oj';
+      routeSparql({
+        eli: [{ celexNumber: { type: 'literal', value: '32016R0679' } }],
+        core: [makeMetaBinding({ celex: '32016R0679' })],
+      });
+      holdsOnly((q) => q.includes('cdm:resource_legal_eli'), `"${stored}"^^xsd:anyURI`);
+      expect(await servedCelex({ eli_uri: eli })).toBe('32016R0679');
+    });
+
+    it('#147: an https work_uri is dereferenced as its http form', async () => {
+      const work = `${CELLAR}bd40f370-a54d-11ef-85f0-01aa75ed71a1`;
+      routeSparql({
+        workUriDeref: [{ celex: { type: 'literal', value: '32024R2822' } }],
+        core: [makeMetaBinding({ celex: '32024R2822' })],
+      });
+      holdsOnly((q) => q.includes('cdm:resource_legal_id_celex ?celexValue'), `<${work}>`);
+      expect(await servedCelex({ work_uri: work.replace('http:', 'https:') })).toBe('32024R2822');
+    });
+
+    it.each([
+      ['http', 'http://publications.europa.eu/resource/celex/32016R0679'],
+      ['https', 'https://publications.europa.eu/resource/celex/32016R0679'],
+    ])(
+      '#147: a resource/celex alias work_uri over %s is served as its CELEX',
+      async (_label, uri) => {
+        routeSparql({ core: [makeMetaBinding({ celex: '32016R0679' })] });
+        holdsOnly(isResolutionQuery, '"32016R0679"^^xsd:string');
+        expect(await servedCelex({ work_uri: uri })).toBe('32016R0679');
+        const queries = mockSparqlQuery.mock.calls.map((c) => c[0] as string);
+        // No dereference of the alias itself, which carries no triples of its own.
+        expect(queries.some((q) => q.includes('/resource/celex/32016R0679>'))).toBe(false);
+      },
+    );
 
     it('#34: providing more than one identifier throws invalid_identifier_args before any query', async () => {
       const ctx = createMockContext({ errors: eurlex_get_document.errors });
@@ -3711,6 +4349,7 @@ describe('eurlex_get_document', () => {
         if (query.includes(`<${work}> cdm:resource_legal_id_celex`)) {
           return derefRows(query, celexes);
         }
+        if (query.includes(`<${work}> ?p ?o`)) return [{ p: literal('cdm:work_date_document') }];
       }
       if (query.includes('cdm:expression_belongs_to_work')) {
         return [makeMetaBinding({ celex: 'n/a', title: 'National measure' })];
@@ -3750,6 +4389,7 @@ describe('eurlex_get_document', () => {
       await expect(eurlex_get_document.handler(input, ctx)).rejects.toMatchObject({
         code: JsonRpcErrorCode.NotFound,
         data: { reason: 'not_found' },
+        message: expect.stringContaining('carries no CELEX number'),
       });
     });
 
@@ -3826,5 +4466,248 @@ describe('eurlex_get_document', () => {
         false,
       );
     });
+  });
+
+  // --- #143: case and separator variants of the enum inputs ---
+
+  describe('enum input variants (#143)', () => {
+    const parse = (args: Record<string, unknown>) =>
+      eurlex_get_document.input.parse({ celex_number: '32016R0679', ...args });
+
+    it.each([
+      ['metadata', 'metadata_only'],
+      [' METADATA ', 'metadata_only'],
+      ['Metadata_Only', 'metadata_only'],
+      ['metadata-only', 'metadata_only'],
+      ['PAGED', 'paged'],
+      ['Full', 'full'],
+    ])('serves content_mode %j as %s', (value, mode) => {
+      expect(parse({ content_mode: value }).content_mode).toBe(mode);
+    });
+
+    it('reports the canonical content_mode it served, on both channels', async () => {
+      mockSparqlQuery.mockResolvedValue([makeMetaBinding({ celex: '32016R0679' })]);
+      const result = await runToolContract(eurlex_get_document, {
+        celex_number: '32016R0679',
+        content_mode: 'metadata',
+      });
+
+      expect(result.isError).toBeFalsy();
+      const structured = eurlex_get_document.output.parse(result.structuredContent);
+      expect(structured.content_mode).toBe('metadata_only');
+      expect(structured.content_status).toBe('not_requested');
+      expect(mockFetchContent).not.toHaveBeenCalled();
+      const text = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+      expect(text).toContain('Body omitted (content_mode "metadata_only")');
+    });
+
+    it('still defaults an omitted content_mode to paged', () => {
+      expect(parse({}).content_mode).toBe('paged');
+    });
+
+    it.each([
+      ['meta', 'meta'],
+      ['none', 'none'],
+      ['an empty string', ''],
+      ['a number', 7],
+    ])('still rejects content_mode %s with the enum message', (_label, value) => {
+      const result = eurlex_get_document.input.safeParse({
+        celex_number: '32016R0679',
+        content_mode: value,
+      });
+      expect(result.success).toBe(false);
+      expect(result.error?.issues[0]).toMatchObject({
+        path: ['content_mode'],
+        message: 'Invalid option: expected one of "metadata_only"|"paged"|"full"',
+      });
+    });
+
+    it.each([
+      ['format', 'HTML', 'html'],
+      ['format', 'Markdown', 'markdown'],
+      ['format', ' XML ', 'xml'],
+      ['resolve', 'Current_Consolidated', 'current_consolidated'],
+      ['resolve', 'current-consolidated', 'current_consolidated'],
+      ['resolve', 'AS_REQUESTED', 'as_requested'],
+    ])('serves %s %j as %s', (field, value, member) => {
+      expect(parse({ [field]: value })[field as 'format' | 'resolve']).toBe(member);
+    });
+
+    it('keeps the format and resolve defaults', () => {
+      const input = parse({});
+      expect(input.format).toBe('html');
+      expect(input.resolve).toBe('as_requested');
+    });
+
+    it('advertises content_mode in tools/list exactly as before', () => {
+      const schema = z.toJSONSchema(eurlex_get_document.input, { io: 'input' }) as {
+        properties: Record<string, unknown>;
+      };
+      expect(schema.properties.content_mode).toEqual({
+        type: 'string',
+        enum: ['metadata_only', 'paged', 'full'],
+        default: 'paged',
+        description:
+          'How much of the body to return. "paged" (default) returns an offset/limit window; "full" requests from the start and returns at most 100000 characters with continuation metadata when more exists; "metadata_only" skips the content fetch. offset and limit apply only to "paged".',
+      });
+    });
+  });
+});
+
+// --- #151: an over-maximum limit is served at the 100,000-character window ---
+
+describe('eurlex_get_document over-maximum limit (#151)', () => {
+  /** The GDPR's HTML body is 804,894 characters. */
+  const BODY = 'x'.repeat(804_894);
+
+  beforeEach(() => {
+    mockSparqlQuery.mockReset();
+    mockFetchContent.mockReset();
+    mockSparqlQuery.mockResolvedValue([makeMetaBinding({ celex: '32016R0679' })]);
+    mockFetchContent.mockResolvedValue({
+      content: BODY,
+      contentAvailable: true,
+      format: 'html',
+      language: 'EN',
+    });
+  });
+
+  const contentText = (result: { content: unknown[] }) =>
+    result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+
+  it('serves limit 200,000 as a 100,000-character window and reports the clamp on both surfaces', async () => {
+    const result = await runToolContract(eurlex_get_document, {
+      celex_number: '32016R0679',
+      limit: 200_000,
+    });
+
+    expect(result.isError).toBeFalsy();
+    const structured = result.structuredContent as Record<string, unknown>;
+    expect(structured).toMatchObject({
+      content_chars_returned: 100_000,
+      content_chars_total: 804_894,
+      has_more: true,
+      truncated: true,
+      cap: 100_000,
+      limit_clamp: { requested: 200_000, applied: 100_000 },
+    });
+    expect(structured.notice).toContain('offset=100000');
+    expect(contentText(result)).toContain('**Limit clamped:** 200000 → 100000 (per-call maximum)');
+  });
+
+  it('reports the clamp on the last window, which carries no truncation', async () => {
+    const result = await runToolContract(eurlex_get_document, {
+      celex_number: '32016R0679',
+      offset: 800_000,
+      limit: 1_000_000,
+    });
+
+    const structured = result.structuredContent as Record<string, unknown>;
+    expect(structured).toMatchObject({
+      content_chars_returned: 4_894,
+      has_more: false,
+      limit_clamp: { requested: 1_000_000, applied: 100_000 },
+    });
+    expect(structured).not.toHaveProperty('truncated');
+    expect(contentText(result)).toContain('**Limit clamped:** 1000000 → 100000 (per-call maximum)');
+  });
+
+  it('adds no clamp at the maximum, and none in a mode that ignores limit', async () => {
+    const atMax = await runToolContract(eurlex_get_document, {
+      celex_number: '32016R0679',
+      limit: 100_000,
+    });
+    expect(atMax.structuredContent).toMatchObject({
+      content_chars_returned: 100_000,
+      cap: 100_000,
+    });
+    expect(atMax.structuredContent).not.toHaveProperty('limit_clamp');
+
+    for (const ignored of [
+      { content_mode: 'full' },
+      { content_mode: 'metadata_only' },
+      { outline: true },
+    ]) {
+      const result = await runToolContract(eurlex_get_document, {
+        celex_number: '32016R0679',
+        limit: 500_000,
+        ...ignored,
+      });
+      expect(result.isError).toBeFalsy();
+      expect(result.structuredContent).not.toHaveProperty('limit_clamp');
+      expect(contentText(result)).not.toContain('Limit clamped');
+    }
+  });
+
+  it('accepts any positive integer limit and still rejects 0 and fractions', () => {
+    expect(
+      eurlex_get_document.input.parse({ celex_number: '32016R0679', limit: 5_000_000 }).limit,
+    ).toBe(5_000_000);
+    for (const limit of [0, 1.5]) {
+      expect(() =>
+        eurlex_get_document.input.parse({ celex_number: '32016R0679', limit }),
+      ).toThrow();
+    }
+  });
+
+  it('advertises limit as an integer from 1 with no maximum', () => {
+    // Serialized as tools/list sends it, so an advertised maximum of any value shows.
+    const schema = JSON.parse(
+      JSON.stringify(z.toJSONSchema(eurlex_get_document.input, { io: 'input' })),
+    ) as { properties: Record<string, Record<string, unknown>> };
+    const limit = schema.properties.limit;
+    expect(limit).toMatchObject({ type: 'integer', minimum: 1 });
+    expect(limit).not.toHaveProperty('maximum');
+    expect(limit?.description).toContain('100000');
+  });
+});
+
+// --- CELLAR failures carry this tool's own recovery ---
+
+describe('eurlex_get_document CELLAR failures', () => {
+  beforeEach(() => {
+    mockSparqlQuery.mockReset();
+    mockFetchContent.mockReset();
+  });
+
+  it.each([
+    [
+      'sparql_error',
+      JsonRpcErrorCode.ValidationError,
+      () =>
+        validationError('CELLAR SPARQL error: Virtuoso 37000 Error SQ156: compiler error', {
+          reason: 'sparql_error',
+          retryable: false,
+        }),
+    ],
+    [
+      'sparql_timeout',
+      JsonRpcErrorCode.ServiceUnavailable,
+      () =>
+        serviceUnavailable('CELLAR SPARQL query timed out on Virtuoso', {
+          reason: 'sparql_timeout',
+          retryable: false,
+        }),
+    ],
+  ])('fails %s with recovery naming its identifier inputs', async (reason, code, failure) => {
+    mockSparqlQuery.mockRejectedValue(failure());
+
+    const result = await runToolContract(eurlex_get_document, {
+      eli_uri: 'http://data.europa.eu/eli/reg/2016/679',
+    });
+
+    expect(result.isError).toBe(true);
+    const error = (
+      result.structuredContent as {
+        error: { code: number; data: { reason: string; recovery?: { hint?: string } } };
+      }
+    ).error;
+    expect(error.code).toBe(code);
+    expect(error.data.reason).toBe(reason);
+    const hint = error.data.recovery?.hint ?? '';
+    expect(hint).toContain('celex_number');
+    expect(hint).toBe(eurlex_get_document.errors?.find((e) => e.reason === reason)?.recovery);
+    const text = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+    expect(text).toContain(hint);
   });
 });

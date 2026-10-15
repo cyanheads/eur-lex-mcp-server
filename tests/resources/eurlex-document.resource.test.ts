@@ -3,7 +3,13 @@
  * @module tests/resources/eurlex-document.resource.test
  */
 
+import {
+  JsonRpcErrorCode,
+  serviceUnavailable,
+  validationError,
+} from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createWorkerHandler } from '@cyanheads/mcp-ts-core/worker';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_document_resource } from '@/mcp-server/resources/definitions/eurlex-document.resource.js';
 import { escapeSparqlLiteral } from '@/services/cellar-sparql/eli-resolution.js';
@@ -23,6 +29,11 @@ import {
   isResolutionQuery,
   resolutionRows,
 } from '../fixtures/cellar-works.js';
+
+// Reserved per-request `_meta` keys of MCP protocol revision 2026-07-28.
+const PROTOCOL_VERSION_META_KEY = 'io.modelcontextprotocol/protocolVersion';
+const CLIENT_CAPABILITIES_META_KEY = 'io.modelcontextprotocol/clientCapabilities';
+const CLIENT_INFO_META_KEY = 'io.modelcontextprotocol/clientInfo';
 
 // --- Service mock ---
 const mockQuery = vi.fn();
@@ -86,6 +97,61 @@ function mockAgents(creators: [code: string, label?: string][]): void {
   });
 }
 
+/** A resources/read response: the read's contents, or the error a client receives. */
+interface WireRead {
+  error?: {
+    code: number;
+    data?: { reason?: string; celexNumber?: string; recovery?: { hint?: string } };
+  };
+  result?: { contents: { text: string }[] };
+}
+
+const worker = createWorkerHandler({
+  name: 'eur-lex-mcp-server',
+  title: 'eur-lex-mcp-server',
+  resources: [eurlex_document_resource],
+});
+
+/**
+ * Read `uri` the way a client does: one resources/read request to the resource
+ * served by the framework, which parses the URI's variables and fills a declared
+ * `errors[]` entry's recovery into the error — neither of which a direct handler
+ * call does.
+ */
+async function readOverWire(uri: string): Promise<WireRead> {
+  const revision = '2026-07-28';
+  const request = new Request('http://localhost/mcp', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      accept: 'application/json, text/event-stream',
+      'mcp-protocol-version': revision,
+      'mcp-method': 'resources/read',
+      'mcp-name': uri,
+    },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'resources/read',
+      params: {
+        uri,
+        _meta: {
+          [PROTOCOL_VERSION_META_KEY]: revision,
+          [CLIENT_CAPABILITIES_META_KEY]: {},
+          [CLIENT_INFO_META_KEY]: { name: 'test-client', version: '1.0.0' },
+        },
+      },
+    }),
+  });
+  type FetchArgs = Parameters<typeof worker.fetch>;
+  const response = await worker.fetch(
+    request,
+    {} as FetchArgs[1],
+    { waitUntil: () => {}, passThroughOnException: () => {} } as unknown as FetchArgs[2],
+  );
+  return (await response.json()) as WireRead;
+}
+
 describe('eurlex_document_resource', () => {
   beforeEach(() => {
     mockQuery.mockReset();
@@ -94,7 +160,10 @@ describe('eurlex_document_resource', () => {
   // --- Happy path ---
 
   it('returns metadata snapshot for a valid CELEX number', async () => {
-    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    const ctx = createMockContext({
+      tenantId: 'test-tenant',
+      errors: eurlex_document_resource.errors,
+    });
     mockQuery.mockResolvedValue([
       makeMetaBinding({
         celex: '32016R0679',
@@ -121,7 +190,10 @@ describe('eurlex_document_resource', () => {
   // --- #67: legal basis and EuroVoc subjects resolve inline ---
 
   it('returns legal_basis with CELEX and eurovoc_subjects with English labels', async () => {
-    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    const ctx = createMockContext({
+      tenantId: 'test-tenant',
+      errors: eurlex_document_resource.errors,
+    });
     const LB = 'http://publications.europa.eu/resource/cellar/fc797fa2-af0e-4cbd-8e74-5ed41139e4dc';
     mockQuery.mockImplementation(async (sparql: string) => {
       if (sparql.includes('cdm:resource_legal_based_on_resource_legal')) {
@@ -160,7 +232,10 @@ describe('eurlex_document_resource', () => {
   });
 
   it('omits legal_basis and eurovoc_subjects when the work records neither', async () => {
-    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    const ctx = createMockContext({
+      tenantId: 'test-tenant',
+      errors: eurlex_document_resource.errors,
+    });
     mockQuery.mockImplementation(async (sparql: string) =>
       isResolutionQuery(sparql) ? resolutionRows(sparql) : [],
     );
@@ -175,7 +250,10 @@ describe('eurlex_document_resource', () => {
   // --- #35: metadata authorities resolve to human-readable labels ---
 
   it('resolves resource_type and author URIs to labels, matching eurlex_get_document', async () => {
-    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    const ctx = createMockContext({
+      tenantId: 'test-tenant',
+      errors: eurlex_document_resource.errors,
+    });
     const CB = 'http://publications.europa.eu/resource/authority/corporate-body';
     // A co-legislated act: the agent query returns one row per author. CONSIL is
     // first, so it is the primary — matching the tool's output for GDPR.
@@ -226,7 +304,10 @@ describe('eurlex_document_resource', () => {
   ] as [string, [string, string][], string[]][])(
     '#103: %s names its authority-code authors by English label, once each',
     async (celex, codes, labels) => {
-      const ctx = createMockContext({ tenantId: 'test-tenant' });
+      const ctx = createMockContext({
+        tenantId: 'test-tenant',
+        errors: eurlex_document_resource.errors,
+      });
       const AUTHORITY = 'http://publications.europa.eu/resource/authority/';
       mockAgents(codes.map(([code, label]) => [`${AUTHORITY}${code}`, label]));
 
@@ -242,7 +323,10 @@ describe('eurlex_document_resource', () => {
   );
 
   it('#103: renders an authority code with no English label as its last path segment', async () => {
-    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    const ctx = createMockContext({
+      tenantId: 'test-tenant',
+      errors: eurlex_document_resource.errors,
+    });
     mockAgents([['http://publications.europa.eu/resource/agent/UNLABELLED']]);
 
     const params = eurlex_document_resource.params!.parse({ celexNumber: '32024R2822' });
@@ -252,7 +336,10 @@ describe('eurlex_document_resource', () => {
   });
 
   it('surfaces a single author as both the primary and the one-element institutions list', async () => {
-    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    const ctx = createMockContext({
+      tenantId: 'test-tenant',
+      errors: eurlex_document_resource.errors,
+    });
     const CB = 'http://publications.europa.eu/resource/authority/corporate-body';
     mockAgents([[`${CB}/COM`, 'European Commission']]);
 
@@ -264,7 +351,10 @@ describe('eurlex_document_resource', () => {
   });
 
   it('returns sparse result when only required fields are present', async () => {
-    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    const ctx = createMockContext({
+      tenantId: 'test-tenant',
+      errors: eurlex_document_resource.errors,
+    });
     mockQuery.mockResolvedValue([makeMetaBinding({ celex: '32016R0679' })]);
 
     const params = eurlex_document_resource.params!.parse({ celexNumber: '32016R0679' });
@@ -277,7 +367,10 @@ describe('eurlex_document_resource', () => {
   });
 
   it('converts inForce string binding to boolean correctly', async () => {
-    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    const ctx = createMockContext({
+      tenantId: 'test-tenant',
+      errors: eurlex_document_resource.errors,
+    });
     mockQuery.mockResolvedValue([makeMetaBinding({ celex: '32016R0679', inForce: 'false' })]);
 
     const params = eurlex_document_resource.params!.parse({ celexNumber: '32016R0679' });
@@ -289,7 +382,10 @@ describe('eurlex_document_resource', () => {
   // --- #20: CELLAR serializes xsd:boolean as the lexical "1"/"0" ---
 
   it('parses in_force from the xsd:boolean lexical "1"', async () => {
-    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    const ctx = createMockContext({
+      tenantId: 'test-tenant',
+      errors: eurlex_document_resource.errors,
+    });
     mockQuery.mockResolvedValue([makeMetaBinding({ celex: '32016R0679', inForce: '1' })]);
 
     const params = eurlex_document_resource.params!.parse({ celexNumber: '32016R0679' });
@@ -301,7 +397,10 @@ describe('eurlex_document_resource', () => {
   // --- Title traversal (issue #7) ---
 
   it('uses the expression-level title traversal, not the obsolete work_title pattern', async () => {
-    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    const ctx = createMockContext({
+      tenantId: 'test-tenant',
+      errors: eurlex_document_resource.errors,
+    });
     mockQuery.mockResolvedValue([
       makeMetaBinding({ celex: '32016R0679', title: 'General Data Protection Regulation' }),
     ]);
@@ -321,12 +420,60 @@ describe('eurlex_document_resource', () => {
   // --- Error path: not found ---
 
   it('throws notFound when CELEX resolves to no bindings', async () => {
-    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    const ctx = createMockContext({
+      tenantId: 'test-tenant',
+      errors: eurlex_document_resource.errors,
+    });
     mockQuery.mockResolvedValue([]);
 
     const params = eurlex_document_resource.params!.parse({ celexNumber: '99999X0000' });
     await expect(eurlex_document_resource.handler(params, ctx)).rejects.toThrow('No CELLAR work');
   });
+
+  it('fails a missing CELEX as its declared not_found, with a recovery naming the lookup tool', async () => {
+    mockQuery.mockResolvedValue([]);
+
+    const { error } = await readOverWire('eurlex://document/99999X0000');
+
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: { reason: 'not_found', celexNumber: '99999X0000' },
+    });
+    expect(error?.data?.recovery?.hint).toContain('eurlex_lookup_celex');
+  });
+
+  it.each([
+    [
+      'sparql_error',
+      JsonRpcErrorCode.ValidationError,
+      () =>
+        validationError('CELLAR SPARQL error: Virtuoso 37000 Error SQ156: compiler error', {
+          reason: 'sparql_error',
+          retryable: false,
+        }),
+    ],
+    [
+      'sparql_timeout',
+      JsonRpcErrorCode.ServiceUnavailable,
+      () =>
+        serviceUnavailable('CELLAR SPARQL query timed out on Virtuoso', {
+          reason: 'sparql_timeout',
+          retryable: false,
+        }),
+    ],
+  ])(
+    'fails a CELLAR %s with a recovery through eurlex_get_document',
+    async (reason, code, failure) => {
+      mockQuery.mockRejectedValue(failure());
+
+      const { error } = await readOverWire('eurlex://document/32016R0679');
+
+      expect(error).toMatchObject({ code, data: { reason } });
+      const hint = error?.data?.recovery?.hint;
+      expect(hint).toContain('eurlex_get_document');
+      expect(hint).toContain('content_mode "metadata_only"');
+    },
+  );
 
   // --- #61: SPARQL literal escaping routes through the shared helper ---
   //
@@ -337,7 +484,10 @@ describe('eurlex_document_resource', () => {
   // place of this resource's own not_found.
 
   it('escapes a trailing backslash so the SPARQL literal terminates (#61)', async () => {
-    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    const ctx = createMockContext({
+      tenantId: 'test-tenant',
+      errors: eurlex_document_resource.errors,
+    });
     mockQuery.mockResolvedValue([]);
 
     const celexNumber = '32016R0679\\';
@@ -359,7 +509,10 @@ describe('eurlex_document_resource', () => {
   });
 
   it('escapes an embedded quote-and-backslash sequence (#61)', async () => {
-    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    const ctx = createMockContext({
+      tenantId: 'test-tenant',
+      errors: eurlex_document_resource.errors,
+    });
     mockQuery.mockResolvedValue([]);
 
     const celexNumber = '32016R0679\\" x';
@@ -378,7 +531,10 @@ describe('eurlex_document_resource', () => {
   });
 
   it('leaves an ordinary CELEX byte-identical through the shared helper (#61)', async () => {
-    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    const ctx = createMockContext({
+      tenantId: 'test-tenant',
+      errors: eurlex_document_resource.errors,
+    });
     mockQuery.mockResolvedValue([makeMetaBinding({ celex: '32016R0679' })]);
 
     const params = eurlex_document_resource.params!.parse({ celexNumber: '32016R0679' });
@@ -392,7 +548,10 @@ describe('eurlex_document_resource', () => {
   // --- #92 / #97: the typed CELEX resolves once; metadata keys on the work ---
 
   it('types the CELEX in the resolution and keys all four metadata queries on the resolved work', async () => {
-    const ctx = createMockContext({ tenantId: 'test-tenant' });
+    const ctx = createMockContext({
+      tenantId: 'test-tenant',
+      errors: eurlex_document_resource.errors,
+    });
     mockQuery.mockImplementation(async (q: string) =>
       isResolutionQuery(q) ? resolutionRows(q) : [makeMetaBinding({ celex: '62012CJ0131' })],
     );
@@ -461,12 +620,32 @@ describe('eurlex_document_resource', () => {
       ).toBe('32016R0679');
     });
 
+    it.each(['CELEX:32016R0679', 'celex:32016r0679', 'CELEX%3A32016R0679'])(
+      'reads eurlex://document/%s as the CELEX it prefixes (#147)',
+      async (celexNumber) => {
+        mockQuery.mockImplementation(async (q: string) =>
+          isResolutionQuery(q) ? resolutionRows(q) : [],
+        );
+
+        const { result, error } = await readOverWire(`eurlex://document/${celexNumber}`);
+
+        expect(error).toBeUndefined();
+        expect(JSON.parse(result?.contents[0]?.text ?? '{}')).toMatchObject({
+          celex_number: '32016R0679',
+          work_uri: `${CELLAR}32016R0679`,
+        });
+      },
+    );
+
     it('still rejects a whitespace-only value, which trims to empty', () => {
       expect(() => eurlex_document_resource.params!.parse({ celexNumber: '   ' })).toThrow();
     });
 
     it('hands the handler the normalized CELEX', async () => {
-      const ctx = createMockContext({ tenantId: 'test-tenant' });
+      const ctx = createMockContext({
+        tenantId: 'test-tenant',
+        errors: eurlex_document_resource.errors,
+      });
       mockQuery.mockResolvedValue([makeMetaBinding({ celex: '32016R0679' })]);
 
       const params = eurlex_document_resource.params!.parse({ celexNumber: ' 32016r0679 ' });
@@ -517,7 +696,7 @@ describe('eurlex_document_resource', () => {
       const params = eurlex_document_resource.params!.parse({ celexNumber });
       return (await eurlex_document_resource.handler(
         params,
-        createMockContext({ tenantId: 'test-tenant' }),
+        createMockContext({ tenantId: 'test-tenant', errors: eurlex_document_resource.errors }),
       )) as Record<string, unknown>;
     };
 
@@ -578,7 +757,7 @@ describe('eurlex_document_resource', () => {
   describe('consolidated texts (#110)', () => {
     const read = async (celex: string) => {
       mockQuery.mockImplementation(fakeConsolidationCellar);
-      const ctx = createMockContext();
+      const ctx = createMockContext({ errors: eurlex_document_resource.errors });
       const params = eurlex_document_resource.params!.parse({ celexNumber: celex });
       return (await eurlex_document_resource.handler(params, ctx)) as Record<string, unknown>;
     };
@@ -639,7 +818,7 @@ describe('eurlex_document_resource', () => {
       const params = eurlex_document_resource.params!.parse({ celexNumber: '02024R1689-20240712' });
       const result = (await eurlex_document_resource.handler(
         params,
-        createMockContext(),
+        createMockContext({ errors: eurlex_document_resource.errors }),
       )) as Record<string, unknown>;
       expect(result.base_act_celex).toBe('32024R1689');
     });

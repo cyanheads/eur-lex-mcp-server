@@ -5,6 +5,12 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { enumInput } from '@/mcp-server/tools/enum-input.js';
+import {
+  clampLimit,
+  limitClampEnrichment,
+  limitClampTrailer,
+} from '@/mcp-server/tools/limit-clamp.js';
 import {
   ENG_LANGUAGE_URI,
   LANGUAGE_AUTHORITY_URI,
@@ -18,7 +24,11 @@ import {
 import {
   CELEX_PATTERN,
   celexLiteral,
+  celexOfAliasUri,
   isSafeSparqlIri,
+  normalizeCelex,
+  normalizeEli,
+  normalizeWorkUri,
   resolveEliToWork,
 } from '@/services/cellar-sparql/eli-resolution.js';
 import {
@@ -35,7 +45,7 @@ import {
   extractSections,
   isCaseLawCelex,
   outermostSections,
-  parseDocumentStructure,
+  readDocumentStructure,
   type SectionSelectors,
   type SelectedSection,
 } from '@/services/eurlex-content/act-structure.js';
@@ -57,6 +67,11 @@ const DEFAULT_CONTENT_LIMIT = 25_000;
 
 /** Hard ceiling on any one body window, including an oversized "full" request. */
 const MAX_CONTENT_LIMIT = 100_000;
+
+/** The `resolve`, `format`, and `content_mode` members. */
+const RESOLVE_MODES = ['as_requested', 'current_consolidated'] as const;
+const CONTENT_FORMATS = ['html', 'xml', 'markdown'] as const;
+const CONTENT_MODES = ['metadata_only', 'paged', 'full'] as const;
 
 /** Case-insensitive pattern derived from the canonical supported-language list. */
 const EURLEX_LANGUAGE_PATTERN = new RegExp(
@@ -124,7 +139,7 @@ export const eurlex_get_document = tool('eurlex_get_document', {
         z.literal(''),
         z
           .string()
-          .overwrite((value) => value.trim().toUpperCase())
+          .overwrite(normalizeCelex)
           .regex(
             CELEX_PATTERN,
             'celex_number must be a CELEX identifier — a sector character followed by the year, type letters, and number (e.g. 32016R0679). Resolve a citation to its CELEX with eurlex_lookup_celex first.',
@@ -139,26 +154,31 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       ),
     eli_uri: z
       .string()
+      .overwrite(normalizeEli)
       .optional()
       .describe(
         'Work-level ELI URI of the act to fetch (e.g. http://data.europa.eu/eli/reg/2016/679, with or without the /oj suffix). Provide exactly one of celex_number, eli_uri, or work_uri.',
       ),
     work_uri: z
       .string()
+      .overwrite(normalizeWorkUri)
       .refine((v) => !v || isSafeSparqlIri(v), {
         message:
           'work_uri must be an http URI with no whitespace, control characters, or any of < > " { } | ^ ` \\.',
       })
       .optional()
       .describe(
-        'CELLAR work resource URI to fetch (e.g. http://publications.europa.eu/resource/cellar/3e485e15-11bd-11e6-ba9a-01aa75ed71a1) — the form returned by eurlex_lookup_celex, eurlex_get_relations, and eurlex_search_documents. A work carrying several CELEX numbers (a national implementing measure, one per directive it was notified against) is served under its lowest, with a notice giving the count; each names the same document, so pass celex_number to serve a specific one. Provide exactly one of celex_number, eli_uri, or work_uri.',
+        'CELLAR work resource URI to fetch (e.g. http://publications.europa.eu/resource/cellar/3e485e15-11bd-11e6-ba9a-01aa75ed71a1) — the form returned by eurlex_lookup_celex, eurlex_get_relations, and eurlex_search_documents. A work carrying several CELEX numbers (a national implementing measure, one per directive it was notified against) is served under its lowest, with a notice giving the count; each names the same document, so pass celex_number to serve a specific one. An expression or manifestation URI (…/cellar/{id}.0006, ….0006.03) is served as the work it belongs to, with a notice. Provide exactly one of celex_number, eli_uri, or work_uri.',
       ),
-    resolve: z
-      .enum(['as_requested', 'current_consolidated'])
-      .default('as_requested')
-      .describe(
-        'Which version to serve. "as_requested" (default) returns the exact CELEX requested; "current_consolidated" serves the newest consolidated version in effect of the requested act — or, for a consolidated CELEX, of its base act — echoing the request in requested_celex, and is a no-op when none exists (with a notice when the act\'s only consolidated versions are dated in the future). Either way, is_superseded / current_consolidated_celex / consolidated_as_of describe the text served.',
-      ),
+    resolve: enumInput(
+      RESOLVE_MODES,
+      z
+        .enum(RESOLVE_MODES)
+        .default('as_requested')
+        .describe(
+          'Which version to serve. "as_requested" (default) returns the exact CELEX requested; "current_consolidated" serves the newest consolidated version in effect of the requested act — or, for a consolidated CELEX, of its base act — echoing the request in requested_celex, and is a no-op when none exists (with a notice when the act\'s only consolidated versions are dated in the future). Either way, is_superseded / current_consolidated_celex / consolidated_as_of describe the text served.',
+        ),
+    ),
     language: z
       .string()
       .regex(EURLEX_LANGUAGE_PATTERN, 'language must be one of the 24 supported EUR-Lex codes')
@@ -168,18 +188,25 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .describe(
         'One of the 24 supported two-letter EUR-Lex language codes (e.g. EN, FR, DE), accepted case-insensitively and normalized to uppercase. Defaults to EN, and falls back to EN if the requested language is unavailable.',
       ),
-    format: z
-      .enum(['html', 'xml', 'markdown'])
-      .default('html')
-      .describe(
-        'Content format: "html" for the act text as served by EUR-Lex (default), "markdown" for that HTML converted to clean Markdown server-side, or "xml" for Formex4 structured XML.',
-      ),
-    content_mode: z
-      .enum(['metadata_only', 'paged', 'full'])
-      .default('paged')
-      .describe(
-        `How much of the body to return. "paged" (default) returns an offset/limit window; "full" requests from the start and returns at most ${MAX_CONTENT_LIMIT} characters with continuation metadata when more exists; "metadata_only" skips the content fetch. offset and limit apply only to "paged".`,
-      ),
+    format: enumInput(
+      CONTENT_FORMATS,
+      z
+        .enum(CONTENT_FORMATS)
+        .default('html')
+        .describe(
+          'Content format: "html" for the act text as served by EUR-Lex (default), "markdown" for that HTML converted to clean Markdown server-side, or "xml" for Formex4 structured XML.',
+        ),
+    ),
+    content_mode: enumInput(
+      CONTENT_MODES,
+      z
+        .enum(CONTENT_MODES)
+        .default('paged')
+        .describe(
+          `How much of the body to return. "paged" (default) returns an offset/limit window; "full" requests from the start and returns at most ${MAX_CONTENT_LIMIT} characters with continuation metadata when more exists; "metadata_only" skips the content fetch. offset and limit apply only to "paged".`,
+        ),
+      { metadata: 'metadata_only' },
+    ),
     offset: z
       .number()
       .int()
@@ -192,10 +219,12 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .number()
       .int()
       .min(1)
-      .max(MAX_CONTENT_LIMIT)
+      // `.int()` advertises the safe-integer bound as a maximum; any larger value is
+      // served at the window cap, so the schema advertises none.
+      .meta({ maximum: undefined })
       .default(DEFAULT_CONTENT_LIMIT)
       .describe(
-        `Maximum characters to return in this window ("paged" mode only; select ignores it). Default ${DEFAULT_CONTENT_LIMIT}, max ${MAX_CONTENT_LIMIT}. Follow has_more and the returned offsets until false to reconstruct the complete body.`,
+        `Maximum characters to return in this window ("paged" mode only; select ignores it). Default ${DEFAULT_CONTENT_LIMIT}; a window holds at most ${MAX_CONTENT_LIMIT} characters, so a larger value is served at ${MAX_CONTENT_LIMIT} and reported in limit_clamp. Follow has_more and the returned offsets until false to reconstruct the complete body.`,
       ),
     outline: z
       .boolean()
@@ -220,7 +249,9 @@ export const eurlex_get_document = tool('eurlex_get_document', {
         annexes: z
           .string()
           .optional()
-          .describe('Comma-separated annex numbers or letters, e.g. "I,II".'),
+          .describe(
+            'Comma-separated annex numbers or letters, e.g. "I,II". "ANNEX" alone (any case, or the served language\'s annex word, e.g. "Anhang") selects an act\'s lone unnumbered annex; on an act whose annexes are numbered it misses, and the notice names their numbers.',
+          ),
         headings: z
           .string()
           .optional()
@@ -236,7 +267,7 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       })
       .optional()
       .describe(
-        `Return only the text of specific sections by type and number, instead of a raw character window (Roman and Arabic numbers are equivalent; a number may carry an English kind word or one in the language served, e.g. "Article 5", "Artikel 5", "5. cikk"). For case law, select headed sections by position or the operative part. Sections are located in the body of the requested format, so pair select with the same format used for any outline. A section inside another selected section (an article in a selected chapter) is returned once, within the enclosing one. A section that cannot be located — including a number that appears only in text an amending act inserts into another act — is reported in selection.missed with no wrong text returned. offset and limit do not apply: the joined sections are capped at ${MAX_CONTENT_LIMIT} characters with no continuation, and each section stays readable on its own from its offset and chars in selected_sections. Ignored when outline is true or in content_mode "metadata_only".`,
+        `Return only the text of specific sections by type and number, instead of a raw character window (Roman and Arabic numbers are equivalent; a number may carry an English kind word or one in the language served, e.g. "Article 5", "Artikel 5", "5. cikk"). For case law, select headed sections by position or the operative part. An act's section runs to its next heading, and its last article, section, and chapter stop where the enacting terms end: the closing formula, signatures, and footnotes after them (and in xml the annexes) belong to no section, nor do the notes closing a consolidated text — read those by paging on from the section's end. Sections are located in the body of the requested format, so pair select with the same format used for any outline. A section inside another selected section (an article in a selected chapter) is returned once, within the enclosing one. A section that cannot be located — including a number that appears only in text an amending act inserts into another act — is reported in selection.missed with no wrong text returned. offset and limit do not apply: the joined sections are capped at ${MAX_CONTENT_LIMIT} characters with no continuation, and each section stays readable on its own from its offset and chars in selected_sections. Ignored when outline is true or in content_mode "metadata_only".`,
       ),
   }),
   output: z.object({
@@ -563,9 +594,11 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .string()
       .optional()
       .describe(
-        'How to retrieve the remaining document content; when a work_uri carries several CELEX numbers, how many it carries and which one was served; and, when no consolidated version is in effect yet, that the consolidated text served does not apply yet, or that resolve "current_consolidated" served the base act.',
+        'How to retrieve the remaining document content; when select.annexes asked for "ANNEX" on an act whose annexes are numbered, which numbers select one; when work_uri names an expression or manifestation, the work served in its place; when a work_uri carries several CELEX numbers, how many it carries and which one was served; and, when no consolidated version is in effect yet, that the consolidated text served does not apply yet, or that resolve "current_consolidated" served the base act.',
       ),
+    limit_clamp: limitClampEnrichment,
   },
+  enrichmentTrailer: { limit_clamp: limitClampTrailer },
 
   errors: [
     {
@@ -577,7 +610,7 @@ export const eurlex_get_document = tool('eurlex_get_document', {
     {
       reason: 'not_found',
       code: JsonRpcErrorCode.NotFound,
-      when: 'The CELEX, ELI, or work URI resolves to no fetchable work — the work is absent from the corpus, or the CELLAR work carries no CELEX number.',
+      when: 'The CELEX, ELI, or work URI resolves to no fetchable work — the work is absent from the corpus, or the CELLAR work (for an expression or manifestation URI, the work it belongs to) carries no CELEX number.',
       recovery:
         'Verify the identifier with eurlex_lookup_celex; a CELLAR work with no CELEX cannot be fetched as a document.',
     },
@@ -587,6 +620,22 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       when: 'The primary content response is an AWS WAF bot-challenge interstitial rather than legal text.',
       recovery:
         'Retry shortly, or use content_mode "metadata_only" while the content host challenge persists.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'sparql_error',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'CELLAR rejected a query this call sent to resolve the identifier or read its metadata. The same call fails the same way again.',
+      recovery:
+        'Fetch the act by celex_number in place of eli_uri or work_uri, or confirm the identifier with eurlex_lookup_celex first.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'sparql_timeout',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'A query this call sent to CELLAR ran past the client timeout, or CELLAR refused it as too costly to run. It is not retried.',
+      recovery:
+        'Retry the call shortly, passing celex_number in place of eli_uri or work_uri to skip the identifier lookup.',
       thrownBy: 'service',
     },
   ],
@@ -640,21 +689,63 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       // (#104). The lowest serves, the order eurlex_get_relations reads a work's
       // CELEX in, and the count rides the same query for the notice below.
       const safeWorkUri = workUriInput as string;
-      const [deref] = await sparqlSvc.query(
-        `SELECT (MIN(STR(?celexValue)) AS ?celex) (COUNT(DISTINCT ?celexValue) AS ?celexCount) WHERE {\n  <${safeWorkUri}> cdm:resource_legal_id_celex ?celexValue .\n}`,
-        ctx,
-      );
-      const resolvedCelex = CellarSparqlService.bindingValue(deref, 'celex');
-      if (!resolvedCelex) {
-        throw ctx.fail(
-          'not_found',
-          `This CELLAR work carries no CELEX number and cannot be fetched as a document: ${safeWorkUri}`,
+      // A `resource/celex/{CELEX}` alias is `owl:sameAs` its work, not a work with
+      // triples of its own, so it is served as the CELEX it names (#147).
+      const aliasCelex = celexOfAliasUri(safeWorkUri);
+      if (aliasCelex) {
+        requestedCelex = aliasCelex;
+      } else {
+        let [deref] = await sparqlSvc.query(
+          `SELECT (MIN(STR(?celexValue)) AS ?celex) (COUNT(DISTINCT ?celexValue) AS ?celexCount) WHERE {\n  <${safeWorkUri}> cdm:resource_legal_id_celex ?celexValue .\n}`,
+          ctx,
         );
-      }
-      requestedCelex = resolvedCelex;
-      const celexCount = Number(CellarSparqlService.bindingValue(deref, 'celexCount'));
-      if (celexCount > 1) {
-        celexNotice = `This work carries ${celexCount} CELEX numbers, each naming the same document; served the lowest, ${resolvedCelex}. Pass celex_number to serve it under a specific one.`;
+        let ownerNotice: string | undefined;
+        if (!CellarSparqlService.bindingValue(deref, 'celex')) {
+          /**
+           * The dereference returns nothing for a URI CELLAR doesn't hold, a work
+           * without a CELEX, and an expression or manifestation (`….0006`,
+           * `….0006.03`), which carries its work's CELEX only through the work. On the
+           * miss path only, one query finds the work an expression or manifestation
+           * belongs to, which is then served as an alias URI is; failing that, one
+           * more tells an unknown URI from a work without a CELEX (#158).
+           */
+          const [owner] = await sparqlSvc.query(
+            `SELECT ?work ?kind (MIN(STR(?celexValue)) AS ?celex) (COUNT(DISTINCT ?celexValue) AS ?celexCount) WHERE {\n  { <${safeWorkUri}> cdm:expression_belongs_to_work ?work . BIND("expression" AS ?kind) }\n  UNION\n  { <${safeWorkUri}> cdm:manifestation_manifests_expression ?expression . ?expression cdm:expression_belongs_to_work ?work . BIND("manifestation" AS ?kind) }\n  OPTIONAL { ?work cdm:resource_legal_id_celex ?celexValue . }\n} GROUP BY ?work ?kind LIMIT 1`,
+            ctx,
+          );
+          const ownerWork = CellarSparqlService.bindingValue(owner, 'work');
+          if (ownerWork) {
+            const kind = CellarSparqlService.bindingValue(owner, 'kind');
+            const named = `work_uri names ${kind === 'expression' ? 'an' : 'a'} ${kind} of the CELLAR work ${ownerWork}`;
+            const ownerCelex = CellarSparqlService.bindingValue(owner, 'celex');
+            if (!ownerCelex) {
+              throw ctx.fail(
+                'not_found',
+                `${named}, which carries no CELEX number and cannot be fetched as a document: ${safeWorkUri}`,
+              );
+            }
+            ownerNotice = `${named}, not a work; served that work, CELEX ${ownerCelex}. Pass the work URI or celex_number to address it directly.`;
+            deref = owner;
+          } else {
+            const exists =
+              (await sparqlSvc.query(`SELECT ?p WHERE { <${safeWorkUri}> ?p ?o } LIMIT 1`, ctx))
+                .length > 0;
+            throw ctx.fail(
+              'not_found',
+              exists
+                ? `This CELLAR work carries no CELEX number and cannot be fetched as a document: ${safeWorkUri}`
+                : `No CELLAR work found for work URI: ${safeWorkUri}`,
+            );
+          }
+        }
+        const resolvedCelex = CellarSparqlService.bindingValue(deref, 'celex') ?? '';
+        requestedCelex = resolvedCelex;
+        const celexCount = Number(CellarSparqlService.bindingValue(deref, 'celexCount'));
+        const countNotice =
+          celexCount > 1
+            ? `This work carries ${celexCount} CELEX numbers, each naming the same document; served the lowest, ${resolvedCelex}. Pass celex_number to serve it under a specific one.`
+            : undefined;
+        celexNotice = [ownerNotice, countNotice].filter(Boolean).join(' ') || undefined;
       }
     }
 
@@ -1023,6 +1114,8 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
 
     /** Uncapped size of a structural selection, set only when the cap cut it. */
     let selectedCharsBeforeCap: number | undefined;
+    /** The numbered annexes a missed "ANNEX" selector could have meant (#156). */
+    let annexNotice: string | undefined;
 
     if (body) {
       result.content_available = body.contentAvailable;
@@ -1045,12 +1138,14 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
 
         // Headings are read in the language served, after any English fallback
         // (#107), by the parser the served CELEX calls for (#117). A Markdown body
-        // arrives with its own, parsed once against the HTML it was rendered from
-        // so its quoted headings are told apart (#106) and a judgment's section
-        // headings found; an html or xml body carries its own markup and is parsed
-        // here.
-        const headings = () =>
-          body.headings ?? parseDocumentStructure(servedCelex, full, format, body.language);
+        // arrives with its own, and with where its sections stop (#153), both read
+        // once against the HTML it was rendered from so its quoted headings are
+        // told apart (#106) and a judgment's section headings found; an html or
+        // xml body carries its own markup and is parsed here.
+        const structure = () =>
+          body.headings
+            ? { headings: body.headings, boundaries: body.boundaries ?? [] }
+            : readDocumentStructure(servedCelex, full, format, body.language);
 
         if (input.outline) {
           // Structure-only view: the detected headings and their offsets into the
@@ -1058,7 +1153,7 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
           // No parseable structure yields an empty outline, never an error. The
           // preamble's recitals collapse into one entry unless asked for one by
           // one (#118); select keeps resolving against every heading.
-          const outline = headings();
+          const outline = structure().headings;
           result.outline = input.include_recitals ? outline : collapseRecitals(outline);
           result.structure_detected = outline.length > 0;
           result.content_chars_returned = 0;
@@ -1076,13 +1171,14 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
           // truncated enrichment, and selected_sections carries each section's own
           // source address so every one stays individually reachable through the
           // paging floor (#12).
-          const located = headings();
+          const { headings: located, boundaries } = structure();
           result.structure_detected = located.length > 0;
           const selection = extractSections(
             full,
             located,
             input.select as SectionSelectors,
             body.language,
+            boundaries,
           );
           result.selection = {
             requested: selection.requested,
@@ -1091,6 +1187,13 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
           };
           result.selected_sections = selection.sections;
           result.has_more = false;
+          // "ANNEX" alone names a lone unnumbered annex; on an act whose annexes
+          // are numbered it misses, so name the numbers that select one (#156).
+          const numberedAnnexes = located.filter((h) => h.kind === 'annex' && h.number);
+          if (selection.missed.includes('ANNEX') && numberedAnnexes[0]) {
+            const labels = [...new Set(numberedAnnexes.map((h) => h.label))].join(', ');
+            annexNotice = `No lone unnumbered annex matches "ANNEX": this act's annexes are numbered (${labels}). Select one by its number, e.g. annexes: "${numberedAnnexes[0].number}".`;
+          }
           const windowText = selection.text.slice(0, MAX_CONTENT_LIMIT);
           if (windowText.length < selection.text.length) {
             selectedCharsBeforeCap = selection.text.length;
@@ -1106,9 +1209,10 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
         } else {
           // Bounded [offset, offset+limit) window over the full body. offset is
           // clamped to the body length so over-paging returns an empty window
-          // (has_more false) rather than erroring.
+          // (has_more false) rather than erroring, and limit to the window ceiling.
           const offset = Math.min(input.offset, total);
-          const windowText = full.slice(offset, offset + input.limit);
+          const pagedLimit = clampLimit(ctx, input.limit, MAX_CONTENT_LIMIT);
+          const windowText = full.slice(offset, offset + pagedLimit);
           result.content_offset = offset;
           result.content_chars_returned = windowText.length;
           result.has_more = offset + windowText.length < total;
@@ -1121,14 +1225,19 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
     // continuation offset; a capped selection has no resumable offset, so it
     // discloses through this enrichment alone and points at the per-section
     // addresses instead (#80).
-    // Both write the one notice field, so the served-CELEX (#104) and consolidation
-    // (#109) notices ride behind it.
-    const trailingNotice = [consolidationNotice, celexNotice].filter(Boolean).join(' ');
+    // Both write the one notice field, so the numbered-annex (#156), consolidation
+    // (#109), and served-CELEX (#104) notices ride behind it.
+    const trailingNotice = [annexNotice, consolidationNotice, celexNotice]
+      .filter(Boolean)
+      .join(' ');
     const withTrailingNotice = (guidance: string) =>
       trailingNotice ? `${guidance} ${trailingNotice}` : guidance;
     if (result.has_more) {
       const nextOffset = (result.content_offset ?? 0) + (result.content_chars_returned ?? 0);
-      const cap = input.content_mode === 'full' ? MAX_CONTENT_LIMIT : input.limit;
+      const cap =
+        input.content_mode === 'full'
+          ? MAX_CONTENT_LIMIT
+          : Math.min(input.limit, MAX_CONTENT_LIMIT);
       ctx.enrich.truncated({
         shown: result.content_chars_returned ?? 0,
         cap,
