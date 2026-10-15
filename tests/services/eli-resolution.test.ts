@@ -2,17 +2,26 @@
  * @fileoverview Tests for the SPARQL-safety primitives shared by every CELLAR
  * query builder — `escapeSparqlLiteral` (values interpolated into a `"…"` literal)
  * and `isSafeSparqlIri` (URIs interpolated into a `<…>` IRI) — plus the shared
- * input-validity primitives `CELEX_PATTERN` and `isValidCalendarDate`.
+ * input-validity primitives `CELEX_PATTERN` and `isValidCalendarDate`, and the
+ * CELEX, ELI, and work-URI normalizers and case-number detection (#147).
  * @module tests/services/eli-resolution.test
  */
 
 import { describe, expect, it } from 'vitest';
 import {
   CELEX_PATTERN,
+  celexOfAliasUri,
   escapeSparqlLiteral,
+  extractCelex,
+  isPrefixedCaseNumber,
   isSafeSparqlIri,
   isValidCalendarDate,
+  normalizeCelex,
+  normalizeEli,
+  normalizeWorkUri,
 } from '@/services/cellar-sparql/eli-resolution.js';
+import { LANGUAGE_TO_ISO_639_2 } from '@/services/eurlex-content/eurlex-content-service.js';
+import { bestCpuMs, CPU_TIMED_TEST_TIMEOUT_MS } from '../helpers/cpu-time.js';
 
 /**
  * Expected values use `String.raw` throughout: these assertions are about which
@@ -262,4 +271,342 @@ describe('isValidCalendarDate', () => {
   ])('rejects %s on shape alone', (_label, value) => {
     expect(isValidCalendarDate(value)).toBe(false);
   });
+});
+
+/**
+ * Identifier normalization (#147): every form a citation pasted from a EUR-Lex page
+ * or a browser URL takes, mapped to the canonical form CELLAR resolves, and every
+ * other value returned as given (trimmed) for the field's own check to decide.
+ */
+describe('normalizeCelex / extractCelex', () => {
+  it.each([
+    ['lowercase', '32016r0679', '32016R0679'],
+    ['lowercase consolidated', '02016r0679-20160504', '02016R0679-20160504'],
+    ['lowercase corrigendum', '32016r0679r(02)', '32016R0679R(02)'],
+    ['a CELEX: prefix', 'CELEX:32016R0679', '32016R0679'],
+    ['a lowercase prefix', 'celex:32016R0679', '32016R0679'],
+    ['a prefix and a lowercase CELEX', 'CELEX:32016r0679', '32016R0679'],
+    ['a percent-encoded prefix', 'CELEX%3A32016R0679', '32016R0679'],
+    ['a prefix and a space', 'CELEX: 32016R0679', '32016R0679'],
+    ['a prefix and surrounding whitespace', '  CELEX:32016R0679 ', '32016R0679'],
+    [
+      'a legal-content TXT URL',
+      'https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX:32016R0679',
+      '32016R0679',
+    ],
+    [
+      'a legal-content URL with an encoded colon',
+      'https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX%3A32016R0679',
+      '32016R0679',
+    ],
+    [
+      'a legal-content URL with a lowercase prefix',
+      'https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=celex:32016R0679',
+      '32016R0679',
+    ],
+    [
+      'a French legal-content URL',
+      'https://eur-lex.europa.eu/legal-content/FR/TXT/?uri=CELEX:32016R0679',
+      '32016R0679',
+    ],
+    [
+      'a TXT/HTML URL',
+      'https://eur-lex.europa.eu/legal-content/EN/TXT/HTML/?uri=CELEX:32016R0679',
+      '32016R0679',
+    ],
+    [
+      'a TXT/PDF URL',
+      'https://eur-lex.europa.eu/legal-content/EN/TXT/PDF/?uri=CELEX:32016R0679',
+      '32016R0679',
+    ],
+    [
+      'an ALL URL',
+      'https://eur-lex.europa.eu/legal-content/EN/ALL/?uri=CELEX:32016R0679',
+      '32016R0679',
+    ],
+    [
+      'an AUTO URL',
+      'https://eur-lex.europa.eu/legal-content/EN/AUTO/?uri=CELEX:32016R0679',
+      '32016R0679',
+    ],
+    [
+      'a URL with extra parameters',
+      'https://eur-lex.europa.eu/legal-content/EN/TXT/?qid=1&uri=CELEX:32016R0679&from=EN',
+      '32016R0679',
+    ],
+    [
+      'a URL with a fragment',
+      'https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX:32016R0679#d1e40-1-1',
+      '32016R0679',
+    ],
+    [
+      'a URL naming a consolidated version',
+      'https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX:02016R0679-20160504',
+      '02016R0679-20160504',
+    ],
+    [
+      'a URL naming a percent-encoded corrigendum',
+      'https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX:32016R0679R%2802%29',
+      '32016R0679R(02)',
+    ],
+    [
+      'an http URL with an upper-case host',
+      'http://EUR-LEX.EUROPA.EU/legal-content/EN/TXT/?uri=CELEX:32016R0679',
+      '32016R0679',
+    ],
+    [
+      'the legacy LexUriServ URL',
+      'https://eur-lex.europa.eu/LexUriServ/LexUriServ.do?uri=CELEX:31995L0046:EN:HTML',
+      '31995L0046',
+    ],
+    [
+      'a resource/celex alias URI',
+      'http://publications.europa.eu/resource/celex/32016R0679',
+      '32016R0679',
+    ],
+    [
+      'an https resource/celex alias URI',
+      'https://publications.europa.eu/resource/celex/32016R0679',
+      '32016R0679',
+    ],
+    [
+      'an encoded corrigendum alias URI',
+      'http://publications.europa.eu/resource/celex/32016R0679R%2802%29',
+      '32016R0679R(02)',
+    ],
+  ])('reads %s', (_label, value, celex) => {
+    expect(normalizeCelex(value)).toBe(celex);
+  });
+
+  it.each([
+    ['a canonical CELEX', '32016R0679'],
+    ['a consolidated CELEX', '02016R0679-20160504'],
+    ['a slashed treaty reference', '11957A/PRO/CJ/09'],
+    ['a sector-C CELEX', 'C/2026/01104'],
+  ])('returns %s unchanged', (_label, celex) => {
+    expect(normalizeCelex(celex)).toBe(celex);
+    expect(extractCelex(celex)).toBeUndefined();
+  });
+
+  it.each([
+    [
+      'an OJ uri parameter',
+      'https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=OJ:L:2016:119:TOC',
+    ],
+    [
+      'a uriserv parameter',
+      'https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=uriserv:OJ.L_.2016.119.01.0001.01.ENG',
+    ],
+    ['a URL on another host', 'https://example.com/?uri=CELEX:32016R0679'],
+    ['a EUR-Lex URL with no uri parameter', 'https://eur-lex.europa.eu/homepage.html'],
+    ['a CELLAR work URI', 'http://publications.europa.eu/resource/cellar/3e485e15-11bd-11e6'],
+    ['a word', 'privacy'],
+    ['a case number', 'C-131/12'],
+    ['a bare EuroVoc code', '3030'],
+  ])('extracts no CELEX from %s', (_label, value) => {
+    expect(extractCelex(value)).toBeUndefined();
+  });
+
+  it('keeps a URL whose uri names no CELEX failing the CELEX check', () => {
+    const url = 'https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=OJ:L:2016:119:TOC';
+    expect(CELEX_PATTERN.test(normalizeCelex(url))).toBe(false);
+  });
+
+  it('keeps a malformed percent escape as given', () => {
+    expect(normalizeCelex('CELEX%3A3201%ZZ')).toBe('3201%ZZ');
+  });
+});
+
+describe('normalizeEli', () => {
+  const OJ = 'http://data.europa.eu/eli/reg/2016/679/oj';
+  it.each([
+    ['a trailing slash', 'http://data.europa.eu/eli/reg/2016/679/oj/', OJ],
+    ['several trailing slashes', 'http://data.europa.eu/eli/reg/2016/679/oj///', OJ],
+    ['https', 'https://data.europa.eu/eli/reg/2016/679/oj', OJ],
+    [
+      'an https bare work ELI',
+      'https://data.europa.eu/eli/reg/2016/679',
+      'http://data.europa.eu/eli/reg/2016/679',
+    ],
+    ['the eur-lex host over https', 'https://eur-lex.europa.eu/eli/reg/2016/679/oj', OJ],
+    ['the eur-lex host over http', 'http://eur-lex.europa.eu/eli/reg/2016/679/oj', OJ],
+    ['no scheme', 'data.europa.eu/eli/reg/2016/679/oj', OJ],
+    ['an upper-case scheme and host', 'HTTP://DATA.EUROPA.EU/eli/reg/2016/679/oj', OJ],
+    ['a language segment after /oj', 'http://data.europa.eu/eli/reg/2016/679/oj/eng', OJ],
+    ['a French language segment', 'http://data.europa.eu/eli/reg/2016/679/oj/fra', OJ],
+    ['the eur-lex host and a language', 'https://eur-lex.europa.eu/eli/reg/2016/679/oj/eng', OJ],
+    ['a language and a trailing slash', 'http://data.europa.eu/eli/reg/2016/679/oj/deu/', OJ],
+    [
+      'a language after a point in time',
+      'http://data.europa.eu/eli/reg/2016/679/2016-05-04/eng',
+      'http://data.europa.eu/eli/reg/2016/679/2016-05-04',
+    ],
+    [
+      'a language after a corrigendum /oj',
+      'http://data.europa.eu/eli/reg/2016/679/corrigendum/2018-05-23/oj/eng',
+      'http://data.europa.eu/eli/reg/2016/679/corrigendum/2018-05-23/oj',
+    ],
+    [
+      'the legacy-directive ELI on eur-lex',
+      'https://eur-lex.europa.eu/eli/dir/1995/46/oj',
+      'http://data.europa.eu/eli/dir/1995/46/oj',
+    ],
+  ])('rewrites %s', (_label, value, eli) => {
+    expect(normalizeEli(value)).toBe(eli);
+  });
+
+  it.each([
+    ['a canonical OJ ELI', OJ],
+    ['a bare work ELI', 'http://data.europa.eu/eli/reg/2016/679'],
+    ['a point-in-time ELI', 'http://data.europa.eu/eli/reg/2016/679/2016-05-04'],
+    ['a format segment after the language', 'http://data.europa.eu/eli/reg/2016/679/oj/eng/pdf'],
+    ['a language segment not after a manifestation', 'http://data.europa.eu/eli/reg/2016/eng'],
+    ['an unknown three-letter segment', 'http://data.europa.eu/eli/reg/2016/679/oj/xyz'],
+    ['a word', 'privacy'],
+    ['a CELEX', '32016R0679'],
+  ])('leaves %s unchanged', (_label, value) => {
+    expect(normalizeEli(value)).toBe(value);
+  });
+
+  it('drops exactly the 24 EUR-Lex language codes', () => {
+    for (const code of Object.values(LANGUAGE_TO_ISO_639_2)) {
+      expect(normalizeEli(`${OJ}/${code}`)).toBe(OJ);
+    }
+    expect(Object.values(LANGUAGE_TO_ISO_639_2)).toHaveLength(24);
+  });
+});
+
+describe('normalizeWorkUri / celexOfAliasUri', () => {
+  const WORK = 'http://publications.europa.eu/resource/cellar/3e485e15-11bd-11e6-ba9a-01aa75ed71a1';
+  it.each([
+    ['https', WORK.replace('http:', 'https:')],
+    [
+      'an upper-case scheme and host',
+      WORK.replace('http://publications.europa.eu', 'HTTP://PUBLICATIONS.EUROPA.EU'),
+    ],
+    ['surrounding whitespace', ` ${WORK} `],
+  ])('rewrites %s to the http form', (_label, value) => {
+    expect(normalizeWorkUri(value)).toBe(WORK);
+  });
+
+  it.each([
+    ['a canonical work URI', WORK],
+    ['another host', 'https://example.com/x'],
+    ['an empty string', ''],
+  ])('leaves %s unchanged', (_label, value) => {
+    expect(normalizeWorkUri(value)).toBe(value);
+  });
+
+  it.each([
+    ['http', 'http://publications.europa.eu/resource/celex/32016R0679', '32016R0679'],
+    ['https', 'https://publications.europa.eu/resource/celex/32016r0679', '32016R0679'],
+    [
+      'an encoded corrigendum',
+      'http://publications.europa.eu/resource/celex/32016R0679R%2802%29',
+      '32016R0679R(02)',
+    ],
+  ])('reads the CELEX of an alias URI over %s', (_label, uri, celex) => {
+    expect(celexOfAliasUri(uri)).toBe(celex);
+  });
+
+  it.each([
+    ['a cellar work URI', WORK],
+    ['an alias with a query', 'http://publications.europa.eu/resource/celex/32016R0679?x=1'],
+    ['an alias holding no CELEX', 'http://publications.europa.eu/resource/celex/x'],
+  ])('reads no CELEX from %s', (_label, uri) => {
+    expect(celexOfAliasUri(uri)).toBeUndefined();
+  });
+});
+
+describe('isPrefixedCaseNumber', () => {
+  it.each([
+    'C-131/12',
+    'Case C-131/12',
+    'case c-131/12',
+    'T-1/99 P',
+    'F-12/05',
+    'C‑131/12',
+    '  C-131/12  ',
+  ])('matches %s', (value) => {
+    expect(isPrefixedCaseNumber(value)).toBe(true);
+  });
+
+  it.each([
+    '26/62',
+    '32016R0679',
+    'C/2026/01104',
+    'privacy',
+    'Directive 95/46/EC',
+    'ECLI:EU:C:2014:317',
+  ])('does not match %s', (value) => {
+    expect(isPrefixedCaseNumber(value)).toBe(false);
+  });
+});
+
+/**
+ * The normalizers scan caller-sized text. Each is timed in thread CPU across a 64×
+ * span on the inputs that would drive a backtracking pattern or a rescan: a run of
+ * slashes with no end (the trailing-slash strip), a repeated prefix opener, a
+ * EUR-Lex URL of repeated `&` parameters, and a case-number opener with no year.
+ */
+describe('identifier normalizers run in linear time', () => {
+  const SMALL = 5_000;
+  const LARGE = 320_000;
+  const cases: [string, (n: number) => () => unknown][] = [
+    [
+      'normalizeEli over a slash run',
+      (n) => {
+        const value = `http://data.europa.eu/eli/${'/'.repeat(n)}x`;
+        return () => normalizeEli(value);
+      },
+    ],
+    [
+      'normalizeEli over trailing slashes',
+      (n) => {
+        const value = `http://data.europa.eu/eli/reg${'/'.repeat(n)}`;
+        return () => normalizeEli(value);
+      },
+    ],
+    [
+      'normalizeCelex over repeated prefixes',
+      (n) => {
+        const value = 'celex:'.repeat(n / 6);
+        return () => normalizeCelex(value);
+      },
+    ],
+    [
+      'normalizeCelex over a parameter run',
+      (n) => {
+        const value = `https://eur-lex.europa.eu/?${'&'.repeat(n)}uri=x`;
+        return () => normalizeCelex(value);
+      },
+    ],
+    [
+      'normalizeWorkUri over a long path',
+      (n) => {
+        const value = `https://publications.europa.eu/resource/${'a'.repeat(n)}`;
+        return () => normalizeWorkUri(value);
+      },
+    ],
+    [
+      'isPrefixedCaseNumber over an opener with no year',
+      (n) => {
+        const value = `Case${' '.repeat(n)}C-${'1'.repeat(n)}`;
+        return () => isPrefixedCaseNumber(value);
+      },
+    ],
+  ];
+  it.each(cases)(
+    '%s',
+    async (_label, setup) => {
+      const small = setup(SMALL);
+      const large = setup(LARGE);
+      const tSmall = await bestCpuMs(small);
+      const tLarge = await bestCpuMs(large);
+      const timings = `${tLarge.toFixed(3)} ms at ${LARGE}, ${tSmall.toFixed(3)} ms at ${SMALL}`;
+      expect(tLarge / Math.max(tSmall, 0.01), timings).toBeLessThan(256);
+      expect(tLarge, timings).toBeLessThan(250);
+    },
+    CPU_TIMED_TEST_TIMEOUT_MS,
+  );
 });

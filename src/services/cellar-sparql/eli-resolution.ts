@@ -15,6 +15,15 @@
  * or phrase. The file also holds the shared input-validity primitives that reject a
  * value before a CELLAR round-trip is spent on it: `CELEX_PATTERN` and
  * `isValidCalendarDate`.
+ *
+ * The identifier normalizers live here too: `normalizeCelex`,
+ * `normalizeEli`, and `normalizeWorkUri` map the forms a citation pasted from a
+ * EUR-Lex page or a browser URL takes to the canonical one, and return every other
+ * value trimmed, so each field's existing check still decides it. The schemas apply
+ * them with `.overwrite()`, never `z.preprocess`: an overwrite keeps the field a
+ * plain string, so its advertised JSON Schema is unchanged and the lexical-safety
+ * test still reaches it. The case-number grammar eurlex_get_cases matches and
+ * eurlex_lookup_celex routes on sits beside them.
  * @module services/cellar-sparql/eli-resolution
  */
 
@@ -104,6 +113,226 @@ export function celexLiteral(celex: string): string {
  * this charset and shape passed either way.
  */
 export const CELEX_PATTERN = /^[0-9A-Z][0-9A-Z()/_-]{5,}$/;
+
+/** Percent-decode a value, or return it as given when its escapes are malformed. */
+function decodeOrKeep(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+/** A `CELEX:` prefix as EUR-Lex writes it, in any case, raw or percent-encoded. */
+const CELEX_PREFIX = /^celex(?::|%3a)\s*/i;
+
+/** A CELLAR resource URI in any scheme or host case. */
+const CELLAR_RESOURCE_PREFIX = /^https?:\/\/publications\.europa\.eu\/resource\//i;
+
+/** Canonical form of {@link CELLAR_RESOURCE_PREFIX}, the form CELLAR stores. */
+const CELLAR_RESOURCE_NAMESPACE = 'http://publications.europa.eu/resource/';
+
+/** Namespace of the CELEX alias URIs CELLAR records as `owl:sameAs` a work. */
+export const CELEX_ALIAS_NAMESPACE = `${CELLAR_RESOURCE_NAMESPACE}celex/`;
+
+/**
+ * A CELLAR work URI in the `http` form CELLAR stores: an `https` scheme or an
+ * upper-case scheme or host is rewritten. Every other value is returned trimmed.
+ */
+export function normalizeWorkUri(value: string): string {
+  const trimmed = value.trim();
+  const prefix = CELLAR_RESOURCE_PREFIX.exec(trimmed);
+  return prefix ? CELLAR_RESOURCE_NAMESPACE + trimmed.slice(prefix[0].length) : trimmed;
+}
+
+/**
+ * The CELEX a `…/resource/celex/{CELEX}` alias URI names, uppercased, or undefined
+ * for any other URI. CELLAR records the alias as `owl:sameAs` the work rather than
+ * as a work of its own, so a caller passing one as a work URI means that CELEX.
+ */
+export function celexOfAliasUri(uri: string): string | undefined {
+  const normalized = normalizeWorkUri(uri);
+  if (!normalized.startsWith(CELEX_ALIAS_NAMESPACE)) return undefined;
+  const celex = decodeOrKeep(normalized.slice(CELEX_ALIAS_NAMESPACE.length)).toUpperCase();
+  return CELEX_PATTERN.test(celex) ? celex : undefined;
+}
+
+/**
+ * The CELEX a wrapped citation carries, uppercased: a `CELEX:` prefix (`celex:`,
+ * `CELEX%3A`), a `…/resource/celex/{CELEX}` alias URI, or a EUR-Lex page URL whose
+ * `uri` parameter is `CELEX:{celex}` — any `legal-content` view, extra parameters, a
+ * fragment, a percent-encoded value, and the legacy `LexUriServ.do?uri=CELEX:{celex}:{LANG}:{FORMAT}`.
+ * Undefined for any other value, a EUR-Lex URL whose `uri` names no CELEX
+ * (`OJ:L:2016:119:TOC`) included: nothing is guessed from it.
+ */
+export function extractCelex(value: string): string | undefined {
+  const trimmed = value.trim();
+  const prefix = CELEX_PREFIX.exec(trimmed);
+  if (prefix) return decodeOrKeep(trimmed.slice(prefix[0].length)).toUpperCase();
+  const alias = celexOfAliasUri(trimmed);
+  if (alias) return alias;
+  if (!URL.canParse(trimmed)) return undefined;
+  const url = new URL(trimmed);
+  if (!/^https?:$/.test(url.protocol) || url.hostname !== 'eur-lex.europa.eu') return undefined;
+  const uri = url.searchParams.get('uri') ?? '';
+  const uriPrefix = CELEX_PREFIX.exec(uri);
+  return uriPrefix ? uri.slice(uriPrefix[0].length).split(':')[0]?.toUpperCase() : undefined;
+}
+
+/**
+ * A CELEX field's value: the CELEX a wrapped citation carries
+ * ({@link extractCelex}), else the value trimmed and uppercased.
+ */
+export function normalizeCelex(value: string): string {
+  return extractCelex(value) ?? value.trim().toUpperCase();
+}
+
+/** An ELI root in any scheme or host case, on either host that serves ELIs, or with no scheme. */
+const ELI_ROOT = /^(?:https?:\/\/)?(?:data|eur-lex)\.europa\.eu\/eli\//i;
+
+/**
+ * The ISO 639-2/T codes of the 24 EUR-Lex languages, the language segment an ELI
+ * carries after its manifestation (`…/oj/eng`).
+ */
+const ELI_LANGUAGE_SEGMENTS: ReadonlySet<string> = new Set([
+  'bul',
+  'ces',
+  'dan',
+  'deu',
+  'ell',
+  'eng',
+  'est',
+  'fin',
+  'fra',
+  'gle',
+  'hrv',
+  'hun',
+  'ita',
+  'lav',
+  'lit',
+  'mlt',
+  'nld',
+  'pol',
+  'por',
+  'ron',
+  'slk',
+  'slv',
+  'spa',
+  'swe',
+]);
+
+/** A point-in-time ELI segment (`…/2016-05-04`). */
+const ELI_POINT_IN_TIME = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * An ELI in the `http://data.europa.eu/eli/…` form CELLAR stores: an `https` or
+ * missing scheme, the `eur-lex.europa.eu` host, an upper-case scheme or host, and a
+ * trailing `/` are rewritten, and a language segment after `/oj` or a point-in-time
+ * date is dropped (no CELLAR literal carries one). A format segment after the
+ * language (`…/oj/eng/pdf`) is left in place. Every other value is returned trimmed.
+ */
+export function normalizeEli(value: string): string {
+  const trimmed = value.trim();
+  const root = ELI_ROOT.exec(trimmed);
+  if (!root) return trimmed;
+  const eli = ELI_NAMESPACE + trimmed.slice(root[0].length);
+  let end = eli.length;
+  while (end > ELI_NAMESPACE.length && eli[end - 1] === '/') end--;
+  const path = eli.slice(0, end);
+  const lastSlash = path.lastIndexOf('/');
+  const head = path.slice(0, lastSlash);
+  const manifestation = head.slice(head.lastIndexOf('/') + 1);
+  const dropsLanguage =
+    ELI_LANGUAGE_SEGMENTS.has(path.slice(lastSlash + 1)) &&
+    (manifestation === 'oj' || ELI_POINT_IN_TIME.test(manifestation));
+  return dropsLanguage ? head : path;
+}
+
+/**
+ * Case-number grammar, shared by eurlex_get_cases (which matches a case number to
+ * its CELEX) and eurlex_lookup_celex (which routes one there). A `C-`/`T-`/`F-`
+ * prefix takes any hyphen form a published reference uses (ASCII, U+2010–U+2015,
+ * U+2212 — CELLAR titles often carry U+2011). A prefix-less number is a pre-1989
+ * Court of Justice case (`26/62`, `133-73`), where `/` or a hyphen separates number
+ * and year. Both accept a leading "Case" and ignore the text after the year — a
+ * procedural suffix (`P`, `R II`, `PPU`, …) or the trailing "." of a case reference
+ * — since CELEX carries no suffix. Trailing text that holds another case designation
+ * (a digit, `/` or a hyphen, a digit — as in "C-131/12 and C-132/12") names a second
+ * case, which a single CELEX match would silently drop, so it is rejected; no
+ * procedural suffix contains a digit. Each pattern is anchored or fixed-width and
+ * backtracks through a single digit run at most, so cost stays linear in the input
+ * length.
+ */
+const HYPHEN = '[-\\u2010-\\u2015\\u2212]';
+const PREFIXED_CASE_NUMBER = new RegExp(
+  `^(?:case\\s+)?([CTF])${HYPHEN}(\\d+)/(\\d{2,4})(?!\\d)`,
+  'i',
+);
+const PREFIXLESS_CASE_NUMBER = new RegExp(
+  `^(?:case\\s+)?(\\d+)(?:/|${HYPHEN})(\\d{2,4})(?!\\d)`,
+  'i',
+);
+const ANOTHER_CASE_NUMBER = new RegExp(`\\d(?:/|${HYPHEN})\\d`);
+
+/** Unprefixed Court of Justice case numbers were issued from 1953 until the General Court opened in 1989. */
+const PREFIXLESS_FIRST_YEAR = 1953;
+const PREFIXLESS_LAST_YEAR = 1988;
+
+/** CELEX court letter a case-number prefix names: Court of Justice, General Court, Civil Service Tribunal. */
+export type CaseCourtLetter = 'C' | 'T' | 'F';
+
+export type ParsedCaseNumber =
+  | { kind: 'case'; court: CaseCourtLetter; year: number; number: string }
+  | { kind: 'unprefixed_out_of_range'; year: number }
+  | { kind: 'several' }
+  | { kind: 'unparsed' };
+
+/**
+ * True when `value` opens with a prefixed case number (`C-131/12`, `Case T-1/99 P`).
+ * Never a CELEX: a sector-C CELEX reads `C/2024/01469` or `C2017/111/07`, and a
+ * case number names several records (the judgment, the Advocate General's opinion,
+ * orders), not one work. A prefix-less number (`26/62`) is not matched: it collides
+ * with OJ citation numbering (`95/46`).
+ */
+export function isPrefixedCaseNumber(value: string): boolean {
+  return PREFIXED_CASE_NUMBER.test(value.trim());
+}
+
+/**
+ * Parse a single case number into the CELEX parts it names.
+ *
+ * Prefixed years keep the historical two-digit heuristic (yy ≤ 60 → 20yy, else
+ * 19yy), so C-25/62 still reads as 1962; a three- or four-digit year is taken as
+ * written. A prefix-less number always reads as the Court of Justice with a 19yy
+ * year, and one dated outside 1953–1988 is reported separately — it cannot be told
+ * apart from a General Court or Court of Justice number that lost its prefix. A value
+ * whose trailing text holds a second case designation is reported as `several`.
+ */
+export function parseCaseNumber(value: string): ParsedCaseNumber {
+  const prefixed = PREFIXED_CASE_NUMBER.exec(value);
+  const match = prefixed ?? PREFIXLESS_CASE_NUMBER.exec(value);
+  if (!match) return { kind: 'unparsed' };
+  if (ANOTHER_CASE_NUMBER.test(value.slice(match[0].length))) return { kind: 'several' };
+  if (prefixed) {
+    // Groups 1–3 are all present once the pattern matches; the `?? ''` fallbacks
+    // satisfy the type-checker without a non-null assertion and never fire at runtime.
+    const yearText = prefixed[3] ?? '';
+    const rawYear = parseInt(yearText, 10);
+    return {
+      kind: 'case',
+      court: (prefixed[1] ?? '').toUpperCase() as CaseCourtLetter,
+      year: yearText.length === 2 ? (rawYear <= 60 ? 2000 + rawYear : 1900 + rawYear) : rawYear,
+      number: (prefixed[2] ?? '').padStart(4, '0'),
+    };
+  }
+  const yearText = match[2] ?? '';
+  const rawYear = parseInt(yearText, 10);
+  const year = yearText.length === 2 ? 1900 + rawYear : rawYear;
+  if (year < PREFIXLESS_FIRST_YEAR || year > PREFIXLESS_LAST_YEAR) {
+    return { kind: 'unprefixed_out_of_range', year };
+  }
+  return { kind: 'case', court: 'C', year, number: (match[1] ?? '').padStart(4, '0') };
+}
 
 /** Days in each month for a non-leap year, indexed by month number minus one. */
 const DAYS_IN_MONTH = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31] as const;

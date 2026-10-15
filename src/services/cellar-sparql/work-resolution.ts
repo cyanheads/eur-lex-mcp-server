@@ -10,11 +10,8 @@
 
 import type { Context } from '@cyanheads/mcp-ts-core';
 import { CellarSparqlService } from './cellar-sparql-service.js';
-import { celexLiteral } from './eli-resolution.js';
+import { CELEX_ALIAS_NAMESPACE, celexLiteral } from './eli-resolution.js';
 import type { SparqlBinding } from './types.js';
-
-/** Namespace of the CELEX alias IRIs CELLAR attaches to a work with `owl:sameAs`. */
-const CELEX_ALIAS_NAMESPACE = 'http://publications.europa.eu/resource/celex/';
 
 /**
  * An `OPTIONAL` that binds `?canonicalAlias` on the row of the work `owl:sameAs` the
@@ -69,35 +66,75 @@ export function resolvedWorkRow(bindings: readonly SparqlBinding[]): SparqlBindi
 }
 
 /**
- * Resolve each CELEX to its work in one round trip: a `VALUES` join on the typed CELEX
- * literals, one row per work. A CELEX no work holds is absent from the map; an empty
- * list sends no query. The query has no `LIMIT` because the `VALUES` list bounds it —
- * no CELEX has been seen with more than four works.
+ * Columns a resolution query reads on every work beside its URI: the variables to
+ * project and the patterns that bind them on `?work`. Each pattern is an `OPTIONAL`,
+ * so a work lacking one still returns, and the query stays ungrouped, the one shape
+ * in which {@link canonicalAliasPattern} binds.
  */
-export async function resolveCelexWorks(
+export interface PerWorkColumns {
+  patterns: readonly string[];
+  /** Projected variables, e.g. `?type`. */
+  variables: readonly string[];
+}
+
+/** A CELEX's resolved work, with the rows the resolution query returned for it. */
+export interface ResolvedCelexWork {
+  /** Rows of every work holding the CELEX, the resolved one included. */
+  celexRows: SparqlBinding[];
+  work: string;
+  /** Rows of the resolved work alone: one per combination of its column values. */
+  workRows: SparqlBinding[];
+}
+
+/**
+ * Resolve each CELEX to its work in one round trip: a `VALUES` join on the typed CELEX
+ * literals, one row per work — with `perWork`, one per work and combination of its
+ * column values. A CELEX no work holds is absent from the map; an empty list sends no
+ * query. The query has no `LIMIT` because the `VALUES` list bounds it — no CELEX has
+ * been seen with more than four works.
+ */
+export async function resolveCelexWorkRows(
   svc: Pick<CellarSparqlService, 'query'>,
   celexNumbers: readonly string[],
   ctx: Context,
-): Promise<Map<string, string>> {
+  perWork?: PerWorkColumns,
+): Promise<Map<string, ResolvedCelexWork>> {
   const distinct = [...new Set(celexNumbers)];
   if (distinct.length === 0) return new Map();
 
+  const variables = perWork?.variables.map((v) => ` ${v}`).join('') ?? '';
+  const patterns = perWork?.patterns.map((p) => `\n  ${p}`).join('') ?? '';
   const query = `
-SELECT ?celexNumber ?work ?canonicalAlias WHERE {
+SELECT ?celexNumber ?work ?canonicalAlias${variables} WHERE {
   VALUES ?celexNumber { ${distinct.map(celexLiteral).join(' ')} }
   ?work cdm:resource_legal_id_celex ?celexNumber .
-  ${canonicalAliasPattern('?celexNumber')}
+  ${canonicalAliasPattern('?celexNumber')}${patterns}
 }`;
 
   const byCelex = Map.groupBy(await svc.query(query, ctx), (b) =>
     CellarSparqlService.bindingValue(b, 'celexNumber'),
   );
 
-  const resolved = new Map<string, string>();
+  const resolved = new Map<string, ResolvedCelexWork>();
   for (const [celex, rows] of byCelex) {
     if (!celex) continue;
     const work = pickResolvedWork(rows);
-    if (work) resolved.set(celex, work);
+    if (!work) continue;
+    resolved.set(celex, {
+      work,
+      workRows: rows.filter((b) => CellarSparqlService.bindingValue(b, 'work') === work),
+      celexRows: rows,
+    });
   }
   return resolved;
+}
+
+/** Resolve each CELEX to its work URI: {@link resolveCelexWorkRows} with no columns. */
+export async function resolveCelexWorks(
+  svc: Pick<CellarSparqlService, 'query'>,
+  celexNumbers: readonly string[],
+  ctx: Context,
+): Promise<Map<string, string>> {
+  const resolved = await resolveCelexWorkRows(svc, celexNumbers, ctx);
+  return new Map([...resolved].map(([celex, { work }]) => [celex, work]));
 }

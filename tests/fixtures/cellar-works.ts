@@ -130,6 +130,123 @@ export function celexWorkRows(
   return rows;
 }
 
+const RESOURCE_TYPE = 'http://publications.europa.eu/resource/authority/resource-type/';
+
+/** A case-law work with the per-work columns a resolution query can read beside it. */
+export interface FixtureCaseWork extends FixtureWork {
+  ecli?: string;
+  /** English expression titles; a work can carry several. */
+  titles: string[];
+  /** Resource-type codes, e.g. `JUDG`. */
+  types: string[];
+}
+
+const SCHREMS_PARTIES =
+  'Data Protection Commissioner v Facebook Ireland Limited and Maximillian Schrems.';
+const SCHREMS_SUBJECT =
+  'Reference for a preliminary ruling — Protection of individuals with regard to the processing of personal data — Charter of Fundamental Rights of the European Union — Articles 7, 8 and 47 — Regulation (EU) 2016/679.';
+const FIE_TAIL =
+  '#Friends of the Irish Environment Ltd v Commissioner for Environmental Information.#Request for a preliminary ruling from the High Court (Irlande).#Reference for a preliminary ruling – Aarhus Convention – Directive 2003/4/EC – Right of access to environmental information held by public authorities.#Case C-470/19.';
+const PLASTICS_EUROPE =
+  'Judgment of the General Court (Eighth Chamber) of 16 December 2020 (Extracts).#PlasticsEurope v European Chemicals Agency.#REACH – Establishment of a list of substances identified with a view to their eventual inclusion in Annex XIV to Regulation (EC) No 1907/2006.#Case T-207/18.';
+
+/**
+ * Case-law CELEX whose `do_not_index` copy differs from the canonical work, with the
+ * work URIs, types, and ECLI read live on 2026-10-14. Subject-matter segments are
+ * shortened; every other segment is as CELLAR stores it. The copy comes first, as in
+ * {@link CELEX_WORKS}.
+ */
+export const CASE_LAW_WORKS: Record<string, FixtureCaseWork[]> = {
+  /** Schrems II: the copy's title lacks the referral segment. */
+  '62018CJ0311': [
+    {
+      uri: `${CELLAR}d17ef5a0-c749-11ea-adf7-01aa75ed71a1`,
+      canonical: false,
+      types: ['JUDG'],
+      ecli: 'ECLI:EU:C:2020:559',
+      titles: [
+        `Judgment of the Court (Grand Chamber) of 16 July 2020.#${SCHREMS_PARTIES}#${SCHREMS_SUBJECT}#Case C-311/18.`,
+      ],
+    },
+    {
+      uri: `${CELLAR}c93f72bb-c749-11ea-adf7-01aa75ed71a1`,
+      canonical: true,
+      types: ['JUDG'],
+      ecli: 'ECLI:EU:C:2020:559',
+      titles: [
+        `Judgment of the Court (Grand Chamber) of 16 July 2020.#${SCHREMS_PARTIES}#Request for a preliminary ruling from the High Court (Ireland).#${SCHREMS_SUBJECT}#Case C-311/18.`,
+      ],
+    },
+  ],
+  /** An AG opinion whose copy carries only the bare "Opinion of … delivered on …" title. */
+  '62019CC0470': [
+    {
+      uri: `${CELLAR}f5da411c-9dcd-11eb-b85c-01aa75ed71a1`,
+      canonical: false,
+      types: ['OPIN_AG'],
+      ecli: 'ECLI:EU:C:2020:986',
+      titles: ['Opinion of Advocate General Bobek delivered on 3 December 2020.'],
+    },
+    {
+      uri: `${CELLAR}e5466ea7-3561-11eb-b27b-01aa75ed71a1`,
+      canonical: true,
+      types: ['OPIN_AG'],
+      ecli: 'ECLI:EU:C:2020:986',
+      titles: [`Opinion of Advocate General Bobek delivered on 3 December 2020.${FIE_TAIL}`],
+    },
+  ],
+  /** A General Court judgment whose copy is typed as published by extracts. */
+  '62018TJ0207': [
+    {
+      uri: `${CELLAR}5d1274a0-3fab-11eb-b27b-01aa75ed71a1`,
+      canonical: false,
+      types: ['JUDG_EXTRACT'],
+      ecli: 'ECLI:EU:T:2020:623',
+      titles: [PLASTICS_EUROPE],
+    },
+    {
+      uri: `${CELLAR}039ca67d-3faa-11eb-b27b-01aa75ed71a1`,
+      canonical: true,
+      types: ['JUDG'],
+      ecli: 'ECLI:EU:T:2020:623',
+      titles: [PLASTICS_EUROPE],
+    },
+  ],
+};
+
+/**
+ * Answer a resolution query from a case-law `registry` the way CELLAR does: one row
+ * per work, per type, and per title it carries, each column bound only when the
+ * query reads it, so a query that reads no per-work column gets one row per work.
+ */
+export function caseWorkRows(
+  sparql: string,
+  registry: Record<string, FixtureCaseWork[]> = CASE_LAW_WORKS,
+): Row[] {
+  const readsType = sparql.includes('cdm:work_has_resource-type ?type');
+  const readsEcli = sparql.includes('cdm:case-law_ecli ?ecli');
+  const readsTitle = sparql.includes('cdm:expression_title ?title');
+  const works = new Map(
+    Object.values(registry)
+      .flat()
+      .map((w) => [w.uri, w]),
+  );
+  return celexWorkRows(sparql, registry).flatMap((row) => {
+    const work = works.get(row.work?.value ?? '');
+    if (!work) return [row];
+    const types = readsType && work.types.length > 0 ? work.types : [undefined];
+    const titles = readsTitle && work.titles.length > 0 ? work.titles : [undefined];
+    return types.flatMap((type) =>
+      titles.map((title) => ({
+        ...row,
+        ...(type ? { type: { type: 'uri', value: `${RESOURCE_TYPE}${type}` } } : {}),
+        ...(readsEcli && work.ecli ? { ecli: { type: 'literal', value: work.ecli } } : {}),
+        ...(title ? { title: { type: 'literal', value: title } } : {}),
+      })),
+    );
+  });
+}
+
 const CORPORATE_BODY = 'http://publications.europa.eu/resource/authority/corporate-body/';
 
 /** A `cdm:work_created_by_agent` or `cdm:case-law_delivered_by_advocate-general` value. */
