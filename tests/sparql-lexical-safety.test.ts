@@ -69,12 +69,19 @@ const HOSTILE = 'Zq7"\'\\<>{}|^`*\nZq7\r\tZq7\x01Zq7';
  */
 const IRI_EXCLUDED = ['<', '>', '"', '{', '}', '|', '^', '`', '\\', '\x00', '\x01', '\x1f', ' '];
 
-/** Prefixes that route an identifier into its ECLI, ELI, EuroVoc, or work-URI branch. */
+/**
+ * Prefixes that route an identifier into its ECLI, ELI, EuroVoc, or work-URI branch,
+ * and into the normalizers that rewrite a pasted form to one of those (#147).
+ */
 const PREFIXES = [
   'ECLI:EU:C:',
   'http://data.europa.eu/eli/',
   'http://eurovoc.europa.eu/',
   'http://publications.europa.eu/resource/cellar/',
+  'https://eur-lex.europa.eu/eli/',
+  'https://publications.europa.eu/resource/cellar/',
+  'http://publications.europa.eu/resource/celex/',
+  'CELEX:',
 ];
 
 const VARIANTS = [
@@ -99,6 +106,7 @@ const VARIANTS = [
 const BENIGN = [
   'privacy',
   'en',
+  'DEU',
   '32016R0679',
   '2016-05-04',
   'C-311/18',
@@ -301,7 +309,8 @@ const MUST_REACH = [
 
 /**
  * One case per top-level string input of `target`, each sending its value beside
- * the seeded required siblings and the target's base input.
+ * the seeded required siblings and the target's base input. A top-level list of
+ * strings gets its case too, sending each value as a one-element list.
  */
 function casesFor(target: GateTarget): GateCase[] {
   const { base = {}, exclusive = [] } = BASE[target.name] ?? {};
@@ -313,11 +322,20 @@ function casesFor(target: GateTarget): GateCase[] {
   );
   const defaults = { ...seeded, ...base };
   return Object.entries(shape).flatMap(([field, schema]) => {
-    const id = `${target.name}.${field}`;
-    if (!stringLeaves(schema, id).includes(id) || id in EXEMPT) return [];
+    const path = `${target.name}.${field}`;
+    const leaves = stringLeaves(schema, path);
+    const id = [path, `${path}[]`].find((candidate) => leaves.includes(candidate));
+    if (!id || id in EXEMPT) return [];
+    const asList = id.endsWith('[]');
     const dropped = exclusive.includes(field) ? exclusive : [field];
     const kept = Object.entries(defaults).filter(([key]) => !dropped.includes(key));
-    return [{ id, target, build: (v: string) => ({ ...Object.fromEntries(kept), [field]: v }) }];
+    return [
+      {
+        id,
+        target,
+        build: (v: string) => ({ ...Object.fromEntries(kept), [field]: asList ? [v] : v }),
+      },
+    ];
   });
 }
 
@@ -409,6 +427,17 @@ describe('gate harness', () => {
     const { reached, findings } = await runCase(gateCase as GateCase);
     expect(reached).toBe(true);
     expect(findings).toEqual([]);
+  });
+
+  it('sends a top-level list of strings its value as a one-element list', () => {
+    const target: GateTarget = {
+      name: 'probe',
+      schema: z.object({ codes: z.array(z.string()).optional().describe('Codes.') }),
+      handler: (async () => {}) as never,
+    };
+    const [gateCase] = casesFor(target);
+    expect(gateCase?.id).toBe('probe.codes[]');
+    expect(gateCase?.build('x')).toEqual({ codes: ['x'] });
   });
 
   it('finds string leaves through wrappers, unions, nested objects, and arrays', () => {
