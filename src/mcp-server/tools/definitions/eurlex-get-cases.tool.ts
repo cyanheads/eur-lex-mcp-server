@@ -6,6 +6,13 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { echoValue } from '@/mcp-server/tools/echo-value.js';
+import { enumInput } from '@/mcp-server/tools/enum-input.js';
+import {
+  clampLimit,
+  limitClampEnrichment,
+  limitClampTrailer,
+  ROW_LIMIT_CEILING,
+} from '@/mcp-server/tools/limit-clamp.js';
 import {
   DERIVATIVE_RESOURCE_TYPES,
   ENG_LANGUAGE_URI,
@@ -17,8 +24,10 @@ import {
   getCellarSparqlService,
 } from '@/services/cellar-sparql/cellar-sparql-service.js';
 import {
+  type CaseCourtLetter,
   escapeSparqlLiteral,
   isValidCalendarDate,
+  parseCaseNumber,
 } from '@/services/cellar-sparql/eli-resolution.js';
 import {
   celexFragmentRoute,
@@ -27,7 +36,21 @@ import {
   keywordMatchPattern,
   keywordTitlePhrase,
 } from '@/services/cellar-sparql/keyword-match.js';
-import { resolveCelexWorks } from '@/services/cellar-sparql/work-resolution.js';
+import {
+  dateRangeFilters,
+  isPastSortWindow,
+  readWindowedPage,
+  windowEndRoute,
+  windowedLimit,
+} from '@/services/cellar-sparql/sort-window.js';
+import type { SparqlBinding } from '@/services/cellar-sparql/types.js';
+import {
+  type PerWorkColumns,
+  resolveCelexWorkRows,
+} from '@/services/cellar-sparql/work-resolution.js';
+
+/** Cases served per call; a larger `limit` is clamped to it. */
+const MAX_PAGE_SIZE = 100;
 
 /**
  * Case type → CDM resource-type authority URI. A case_type filter tests the
@@ -39,11 +62,36 @@ import { resolveCelexWorks } from '@/services/cellar-sparql/work-resolution.js';
  * CJEU/GC judgments as JUDG, orders as ORDER, and AG opinions (CELEX "CC") as
  * OPIN_AG.
  */
+const CASE_TYPES = ['judgment', 'order', 'ag_opinion'] as const;
 const CASE_TYPE_RESOURCE_TYPE: Record<string, string> = {
   judgment: 'http://publications.europa.eu/resource/authority/resource-type/JUDG',
   order: 'http://publications.europa.eu/resource/authority/resource-type/ORDER',
   ag_opinion: 'http://publications.europa.eu/resource/authority/resource-type/OPIN_AG',
 };
+
+/**
+ * What a row reads from the work its CELEX resolves to, in the page's resolution
+ * follow-up (#146): its resource types, ECLI, and English titles. Titles live on
+ * expressions, not works: ?expr cdm:expression_belongs_to_work ?work (inverse of
+ * cdm:work_has_expression), in English, carrying cdm:expression_title.
+ */
+const CASE_WORK_COLUMNS: PerWorkColumns = {
+  variables: ['?type', '?ecli', '?title'],
+  patterns: [
+    'OPTIONAL { ?work cdm:work_has_resource-type ?type . }',
+    'OPTIONAL { ?work cdm:case-law_ecli ?ecli . }',
+    `OPTIONAL {
+    ?expr cdm:expression_belongs_to_work ?work .
+    ?expr cdm:expression_uses_language <${ENG_LANGUAGE_URI}> .
+    ?expr cdm:expression_title ?title .
+  }`,
+  ],
+};
+
+/** The values a column takes across rows, sorted by code unit. */
+function columnValues(rows: readonly SparqlBinding[], column: string): string[] {
+  return rows.flatMap((b) => CellarSparqlService.bindingValue(b, column) ?? []).sort();
+}
 
 /**
  * CELEX type letters of sector-6 case law. A case-law CELEX reads
@@ -61,42 +109,12 @@ const CASE_TYPE_RESOURCE_TYPE: Record<string, string> = {
  * number and year.
  */
 const COURT_CELEX_LETTER = { CJEU: 'C', GC: 'T' } as const;
+const COURTS = ['CJEU', 'GC'] as const satisfies readonly (keyof typeof COURT_CELEX_LETTER)[];
 const CASE_NUMBER_DOCUMENT_LETTERS = {
   C: { primary: 'JOCPSTD', notices: 'ABN' },
   T: { primary: 'JOCT', notices: 'ABN' },
   F: { primary: 'JO', notices: 'ABN' },
-} as const;
-
-/** CELEX court letter a case-number prefix names: Court of Justice, General Court, Civil Service Tribunal. */
-type CaseCourtLetter = keyof typeof CASE_NUMBER_DOCUMENT_LETTERS;
-
-/**
- * Case-number grammar. A `C-`/`T-`/`F-` prefix takes any hyphen form a published
- * reference uses (ASCII, U+2010–U+2015, U+2212 — CELLAR titles often carry U+2011).
- * A prefix-less number is a pre-1989 Court of Justice case (`26/62`, `133-73`),
- * where `/` or a hyphen separates number and year. Both accept a leading "Case" and
- * ignore the text after the year — a procedural suffix (`P`, `R II`, `PPU`, …) or
- * the trailing "." of a case reference — since CELEX carries no suffix. Trailing
- * text that holds another case designation (a digit, `/` or a hyphen, a digit — as
- * in "C-131/12 and C-132/12") names a second case, which a single CELEX match would
- * silently drop, so it is rejected; no procedural suffix contains a digit. Each
- * pattern is anchored or fixed-width and backtracks through a single digit run at
- * most, so cost stays linear in the input length.
- */
-const HYPHEN = '[-\\u2010-\\u2015\\u2212]';
-const PREFIXED_CASE_NUMBER = new RegExp(
-  `^(?:case\\s+)?([CTF])${HYPHEN}(\\d+)/(\\d{2,4})(?!\\d)`,
-  'i',
-);
-const PREFIXLESS_CASE_NUMBER = new RegExp(
-  `^(?:case\\s+)?(\\d+)(?:/|${HYPHEN})(\\d{2,4})(?!\\d)`,
-  'i',
-);
-const ANOTHER_CASE_NUMBER = new RegExp(`\\d(?:/|${HYPHEN})\\d`);
-
-/** Unprefixed Court of Justice case numbers were issued from 1953 until the General Court opened in 1989. */
-const PREFIXLESS_FIRST_YEAR = 1953;
-const PREFIXLESS_LAST_YEAR = 1988;
+} as const satisfies Record<CaseCourtLetter, { primary: string; notices: string }>;
 
 /**
  * A value made only of characters a CELEX can hold. Every sector-6 CELEX is made of
@@ -160,48 +178,6 @@ function caseNumberMatch(
   return `${celexPrefixTerms('?celexNumber', terms)}\n    ${regex}`;
 }
 
-type ParsedCaseNumber =
-  | { kind: 'case'; court: CaseCourtLetter; year: number; number: string }
-  | { kind: 'unprefixed_out_of_range'; year: number }
-  | { kind: 'several' }
-  | { kind: 'unparsed' };
-
-/**
- * Parse a single case number into the CELEX parts it names.
- *
- * Prefixed years keep the historical two-digit heuristic (yy ≤ 60 → 20yy, else
- * 19yy), so C-25/62 still reads as 1962; a three- or four-digit year is taken as
- * written. A prefix-less number always reads as the Court of Justice with a 19yy
- * year, and one dated outside 1953–1988 is reported separately — it cannot be told
- * apart from a General Court or Court of Justice number that lost its prefix. A value
- * whose trailing text holds a second case designation is reported as `several`.
- */
-function parseCaseNumber(value: string): ParsedCaseNumber {
-  const prefixed = PREFIXED_CASE_NUMBER.exec(value);
-  const match = prefixed ?? PREFIXLESS_CASE_NUMBER.exec(value);
-  if (!match) return { kind: 'unparsed' };
-  if (ANOTHER_CASE_NUMBER.test(value.slice(match[0].length))) return { kind: 'several' };
-  if (prefixed) {
-    // Groups 1–3 are all present once the pattern matches; the `?? ''` fallbacks
-    // satisfy the type-checker without a non-null assertion and never fire at runtime.
-    const yearText = prefixed[3] ?? '';
-    const rawYear = parseInt(yearText, 10);
-    return {
-      kind: 'case',
-      court: (prefixed[1] ?? '').toUpperCase() as CaseCourtLetter,
-      year: yearText.length === 2 ? (rawYear <= 60 ? 2000 + rawYear : 1900 + rawYear) : rawYear,
-      number: (prefixed[2] ?? '').padStart(4, '0'),
-    };
-  }
-  const yearText = match[2] ?? '';
-  const rawYear = parseInt(yearText, 10);
-  const year = yearText.length === 2 ? 1900 + rawYear : rawYear;
-  if (year < PREFIXLESS_FIRST_YEAR || year > PREFIXLESS_LAST_YEAR) {
-    return { kind: 'unprefixed_out_of_range', year };
-  }
-  return { kind: 'case', court: 'C', year, number: (match[1] ?? '').padStart(4, '0') };
-}
-
 export const eurlex_get_cases = tool('eurlex_get_cases', {
   title: 'Search CJEU/GC Case Law',
   description:
@@ -220,30 +196,34 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
       .describe(
         'Keyword matched against English case titles via the full-text index (multi-word input is treated as a phrase), and against CELEX numbers. A keyword that is a whole CELEX (e.g. 62023CO0097) matches that record, its numbered siblings (…(01) to …(20)), its _INF, _RES, _SUM, and _EXT records, and its corrigenda, with notices, abstracts, summaries, and corrigenda still joining only under include_derivative; for every record filed under a case, use case_number. A partial CELEX that opens with the sector and year (62013CJ), the year and type letters (2013CJ0131), or type letters followed by the number (CJ0131, J0131) matches every CELEX that holds it at that position; one opening with letters not followed by a digit (R(01)) tests every CELEX and can take tens of seconds; a bare year (2013) or a fragment opening mid-year or mid-number (013CJ0131, 0131) matches titles only. A keyword with no digit, or with a character no CELEX holds (a space, a period), matches titles only. A keyword with no letter or digit is rejected.',
       ),
-    court: z
-      .union([
-        z.literal(''),
-        z
-          .enum(['CJEU', 'GC'])
-          .describe('CJEU (C) = Court of Justice of the EU, GC (T) = General Court.'),
-      ])
-      .optional()
-      .describe(
-        'Court filter, by the court letter at position 6 of the CELEX: CJEU (C) = Court of Justice of the EU, GC (T) = General Court. It does not narrow by record type: every primary record the court filed matches, and its derivative records (notices, abstracts, summaries, corrigenda) join only under include_derivative. Omit to search every court.',
-      ),
-    case_type: z
-      .union([
-        z.literal(''),
-        z
-          .enum(['judgment', 'order', 'ag_opinion'])
-          .describe(
-            'judgment, order (procedural decision), or ag_opinion (Advocate General opinion).',
-          ),
-      ])
-      .optional()
-      .describe(
-        'Case type: judgment, order (procedural decision), or ag_opinion (Advocate General opinion). Omit to search all.',
-      ),
+    court: enumInput(
+      COURTS,
+      z
+        .union([
+          z.literal(''),
+          z.enum(COURTS).describe('CJEU (C) = Court of Justice of the EU, GC (T) = General Court.'),
+        ])
+        .optional()
+        .describe(
+          'Court filter, by the court letter at position 6 of the CELEX: CJEU (C) = Court of Justice of the EU, GC (T) = General Court. It does not narrow by record type: every primary record the court filed matches, and its derivative records (notices, abstracts, summaries, corrigenda) join only under include_derivative. Omit to search every court.',
+        ),
+    ),
+    case_type: enumInput(
+      CASE_TYPES,
+      z
+        .union([
+          z.literal(''),
+          z
+            .enum(CASE_TYPES)
+            .describe(
+              'judgment, order (procedural decision), or ag_opinion (Advocate General opinion).',
+            ),
+        ])
+        .optional()
+        .describe(
+          'Case type: judgment, order (procedural decision), or ag_opinion (Advocate General opinion). Omit to search all.',
+        ),
+    ),
     include_derivative: z
       .boolean()
       .default(false)
@@ -285,14 +265,18 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
       .int()
       .min(0)
       .default(0)
-      .describe('Pagination offset — number of results to skip. Defaults to 0.'),
+      .describe(
+        'Pagination offset — number of results to skip. Defaults to 0. Must be below 10,000: CELLAR sorts at most 10,000 matches for one search, so pages stop at row 10,000; narrow with a date_from/date_to window to reach older cases.',
+      ),
     limit: z
       .number()
       .int()
       .min(1)
-      .max(100)
+      .max(ROW_LIMIT_CEILING)
       .default(20)
-      .describe('Maximum number of results to return (1–100). Defaults to 20.'),
+      .describe(
+        'Maximum number of results to return, served up to 100 per call; a larger value (up to 10,000) is served at 100 and reported in limit_clamp. Defaults to 20.',
+      ),
   }),
   output: z.object({
     cases: z
@@ -372,7 +356,9 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
     offset: z.number().describe('Pagination offset used for this response.'),
     has_more: z
       .boolean()
-      .describe('True only when CELLAR returned an additional valid row beyond this page.'),
+      .describe(
+        'True only when CELLAR returned an additional valid row beyond this page. False on a page that ends at row 10,000, the last one CELLAR sorts; its notice says whether more may match.',
+      ),
     next_offset: z
       .number()
       .optional()
@@ -411,11 +397,20 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
       .string()
       .optional()
       .describe(
-        'Guidance for the next call: on an empty first page, the filters that matched nothing and how to broaden them; on a page with more rows, the offset to continue from.',
+        'Guidance for the next call: on an empty first page, the filters that matched nothing and how to broaden them; on a page with more rows, the offset to continue from; on a page ending at row 10,000, that no later page can be read and the closed date_from/date_to window that continues past it.',
       ),
+    limit_clamp: limitClampEnrichment,
   },
+  enrichmentTrailer: { limit_clamp: limitClampTrailer },
 
   errors: [
+    {
+      reason: 'offset_past_window',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'offset is 10,000 or more, past the last row CELLAR sorts for one search.',
+      recovery:
+        'Narrow the search below 10,000 matches — search a date_from/date_to window ending at the date of the last case reached (results run newest first), or add court, case_type, or keyword — then page from offset 0.',
+    },
     {
       reason: 'invalid_date_range',
       code: JsonRpcErrorCode.ValidationError,
@@ -439,16 +434,31 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
     },
     {
       reason: 'sparql_error',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'CELLAR rejected the search it was sent: a filter combination its query planner cannot compile. The same call fails the same way again.',
+      recovery:
+        'Drop one of the combined filters (keyword, case_number, case_type, court), then search again.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'sparql_timeout',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'Virtuoso returned HTTP 200 with an error body — query malformed or timed out.',
-      recovery: 'Simplify the query or reduce the date range and retry.',
+      when: 'The search ran past the client timeout, or CELLAR refused it as too costly to run. It is not retried.',
+      recovery:
+        'Narrow the search with a closer date_from/date_to range, a court, or a more specific keyword or case_number, then search again.',
       thrownBy: 'service',
     },
   ],
 
   async handler(input, ctx) {
+    if (isPastSortWindow(input.offset)) {
+      throw ctx.fail(
+        'offset_past_window',
+        `offset ${input.offset} is past row 10,000, the last row CELLAR sorts for one search, so no page starts there.`,
+      );
+    }
     const svc = getCellarSparqlService();
-    const pageLimit = Math.min(input.limit, svc.maxResults);
+    const pageLimit = clampLimit(ctx, input.limit, Math.min(MAX_PAGE_SIZE, svc.maxResults));
 
     /**
      * Date-range validity, checked before any clause is built. The schema pins the
@@ -541,8 +551,8 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
      * (`_RES`) and summary (`_SUM`) sibling works, which share the parent's CELEX
      * type letters under a distinct CELEX and so survived `GROUP BY ?celexNumber`
      * as extra rows. Requiring the resource-type keeps only true judgments/orders/
-     * opinions (issue #38). The `OPTIONAL { … ?type }` below still gathers every
-     * type for the display label, so a corrigendum-judgment keeps all its labels.
+     * opinions (issue #38). The display label still lists every type the resolved
+     * work carries, so a corrigendum-judgment keeps all its labels.
      */
     let typeConstraint = '';
     if (input.case_type) {
@@ -568,117 +578,54 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
       );
     }
 
-    if (dateFrom) {
-      filters.push(`FILTER(?date >= "${dateFrom}"^^xsd:date)`);
-    }
-    if (dateTo) {
-      filters.push(`FILTER(?date <= "${dateTo}"^^xsd:date)`);
-    }
-
-    /**
-     * Titles live on expressions, not works — traverse the expression graph:
-     * ?expr cdm:expression_belongs_to_work ?work (inverse of cdm:work_has_expression),
-     * ?expr cdm:expression_uses_language <.../ENG>, ?expr cdm:expression_title ?title.
-     *
-     * GROUP BY ?celexNumber collapses each case to one row, handling two distinct
-     * CELLAR duplications at once:
-     *   1. A work carrying several cdm:work_has_resource-type values (corrigenda
-     *      hold 2–3) — GROUP_CONCAT gathers every type URI per case (issue #14).
-     *   2. Several distinct work URIs sharing one CELEX (e.g. a titled judgment
-     *      plus a do_not_index member work) — grouping by CELEX rather than ?work
-     *      merges them, so LIMIT N returns N distinct cases and `total` counts
-     *      cases rather than rows (issue #21).
-     * MAX(?title) keeps a bound title across the group, so a titled member's title
-     * survives over a bare duplicate's absent one; MAX(?titledWork) likewise prefers
-     * the work URI that carries a title — ?titledWork binds to ?work only inside the
-     * title OPTIONAL — and the handler falls back to SAMPLE(?work) when no work in the
-     * group is titled. Both are fallbacks: the row's work_uri is the CELEX's canonical
-     * work, resolved for the whole page after this query (#97). ?docDate uses SAMPLE,
-     * NOT MAX: under ORDER BY DESC(?docDate) a MAX over the ordered column lets
-     * Virtuoso pick a date-index TOP-k plan that bypasses the date-range upper-bound
-     * FILTER whenever no selective graph pattern is present (a bare date/court/type
-     * search), returning the globally-latest cases
-     * instead of the in-range ones. Date is single-valued per CELEX, so SAMPLE shows
-     * the same value without triggering that plan. The ECLI is single-valued per
-     * CELEX too, but only some member works of a group carry it, so MAX keeps a
-     * bound value the way it does for the title (issue #84).
-     *
-     * The CELEX breaks date ties, so the order is total: identical calls return
-     * identical pages, and consecutive offsets neither repeat nor skip a case that
-     * shares its date with others (#102). The tiebreak is the GROUP BY key
-     * ?celexNumber, not the projected ?celex — Virtuoso does not sort on a SAMPLE
-     * alias of a string.
-     */
-    const projection = (dateVar: string) => `SELECT
-  (SAMPLE(?celexNumber) AS ?celex)
-  (MAX(?titledWork) AS ?titledWork)
-  (SAMPLE(?work) AS ?work)
-  (GROUP_CONCAT(DISTINCT STR(?type); SEPARATOR=" ") AS ?types)
-  (SAMPLE(${dateVar}) AS ?docDate)
-  (MAX(?caseEcli) AS ?ecli)
-  (MAX(?title) AS ?docTitle)`;
-    const rowPattern = (keywordPart: string) => `?work cdm:resource_legal_id_celex ?celexNumber .
-  ${typeConstraint}
-  OPTIONAL { ?work cdm:work_has_resource-type ?type . }
-  OPTIONAL { ?work cdm:work_date_document ?date . }
-  OPTIONAL { ?work cdm:case-law_ecli ?caseEcli . }
-  OPTIONAL {
-    ?expr cdm:expression_belongs_to_work ?work .
-    ?expr cdm:expression_uses_language <${ENG_LANGUAGE_URI}> .
-    ?expr cdm:expression_title ?title .
-    BIND(?work AS ?titledWork)
-  }
-  ${keywordPart}
-  ${filters.join('\n  ')}`;
-    const paging = `LIMIT ${pageLimit + 1} OFFSET ${input.offset}`;
+    filters.push(...dateRangeFilters(dateFrom, dateTo));
 
     // Title arm on the full-text index, CELEX arm by the keyword's shape (#17, #105).
     // Its one CELLAR lookup runs only once the input has passed validation.
     const keywordClause = keywordInput ? await keywordMatchPattern(svc, keywordInput, ctx) : '';
 
     /**
-     * Page-first form for a search with any date bound (#98). The flat query groups
-     * and aggregates every matching case before ORDER BY and LIMIT pick the page;
-     * with a date bound, selecting the page's CELEX keys first and aggregating only
-     * those is far cheaper. The subquery holds the match pattern alone — the CELEX,
-     * the required type, the date, the keyword, and every filter — and pages in the
-     * same total order the outer query uses. The outer query repeats the whole row
-     * pattern, so each CELEX groups the same works, types, ECLI, and titles as the
-     * flat form, and takes the row date from the subquery's ?pageDate so a case sorts
-     * where it was paged. ?pageDate is a SAMPLE for the same reason ?docDate is. The
-     * page LIMIT sits inside the subquery, below the outer level the service's LIMIT
-     * ceiling rewrites, so pageLimit stays the only clamp.
+     * The search pages CELEX keys and dates alone; each row's title, types, and ECLI
+     * come from the work its CELEX resolves to, read in the page's follow-up (#146).
+     * It also samples one work of each CELEX, the row's work URI should the follow-up
+     * miss it.
      *
-     * The outer query tests the keyword as FILTER EXISTS rather than joining it
-     * again: the grouped works are the same (a work stays in its CELEX group only
-     * when it matches the keyword either way), but a join re-drives the full-text
-     * and CELEX arms over the whole corpus, which made a keyword search over
-     * a wide date range slower than the flat form. With ?work already bound, EXISTS
-     * checks the page's works alone.
+     * GROUP BY ?celexNumber collapses the several works that can share one CELEX
+     * (e.g. a judgment plus its do_not_index copy) into one row, so LIMIT N returns N
+     * distinct cases and `total` counts cases rather than rows (issue #21).
      *
-     * A date-less search keeps the flat form: finding a broad browse's page keys
-     * costs about as much as the whole query, and a court-only browse measured the
-     * two forms at parity.
+     * ?docDate uses SAMPLE, NOT MAX: under ORDER BY DESC(?docDate) a MAX over the
+     * ordered column lets Virtuoso pick a date-index TOP-k plan that bypasses the
+     * date-range upper-bound FILTER whenever no selective graph pattern is present (a
+     * bare date/court/type search), returning the globally-latest cases instead of
+     * the in-range ones. Date is single-valued per CELEX, so SAMPLE shows the same
+     * value without triggering that plan.
+     *
+     * The CELEX breaks date ties, so the order is total: identical calls return
+     * identical pages, and consecutive offsets neither repeat nor skip a case that
+     * shares its date with others (#102). The tiebreak is the GROUP BY key
+     * ?celexNumber, not the projected ?celex — Virtuoso does not sort on a SAMPLE
+     * alias of a string.
+     *
+     * With nothing to aggregate beyond the key, the date, and that work, the query is the page
+     * subquery the date-bounded page-first form (#98) once wrapped, whatever the
+     * filters: the cost #98 avoided was gathering titles, types, and ECLI for every
+     * matching case before the page was picked.
+     *
+     * The page asks for one sentinel row past it, cut to CELLAR's sort window
+     * (#154): a sorted query may not read past row 10,000.
      */
-    const sparql =
-      dateFrom || dateTo
-        ? `
-${projection('?pageDate')} WHERE {
-  {
-    SELECT ?celexNumber (SAMPLE(?date) AS ?pageDate) WHERE {
-      ?work cdm:resource_legal_id_celex ?celexNumber .
-      ${typeConstraint}
-      OPTIONAL { ?work cdm:work_date_document ?date . }
-      ${keywordClause}
-      ${filters.join('\n      ')}
-    } GROUP BY ?celexNumber ORDER BY DESC(?pageDate) ?celexNumber ${paging}
-  }
-  ${rowPattern(keywordClause && `FILTER EXISTS {\n    ${keywordClause}\n  }`)}
-} GROUP BY ?celexNumber ORDER BY DESC(?docDate) ?celexNumber`
-        : `
-${projection('?date')} WHERE {
-  ${rowPattern(keywordClause)}
-} GROUP BY ?celexNumber ORDER BY DESC(?docDate) ?celexNumber ${paging}`;
+    const sparql = `
+SELECT
+  (SAMPLE(?celexNumber) AS ?celex)
+  (SAMPLE(?date) AS ?docDate)
+  (SAMPLE(?work) AS ?pageWork) WHERE {
+  ?work cdm:resource_legal_id_celex ?celexNumber .
+  ${typeConstraint}
+  OPTIONAL { ?work cdm:work_date_document ?date . }
+  ${keywordClause}
+  ${filters.join('\n  ')}
+} GROUP BY ?celexNumber ORDER BY DESC(?docDate) ?celexNumber LIMIT ${windowedLimit(input.offset, pageLimit)} OFFSET ${input.offset}`;
 
     const queryEcho = {
       ...(input.case_number ? { case_number: input.case_number } : {}),
@@ -718,18 +665,34 @@ ${projection('?date')} WHERE {
       );
     }
 
-    const hasMore = bindings.length > pageLimit;
+    const { hasMore, atWindowEnd } = readWindowedPage(bindings.length, input.offset, pageLimit);
     const page = bindings.slice(0, pageLimit);
     // A CELEX held by several works resolves to its canonical work (#97), in one
-    // follow-up query for the page — the alias match never binds inside the
-    // grouped query above.
-    const resolvedWorks = await resolveCelexWorks(
+    // follow-up query for the page that also reads each work's types, ECLI, and
+    // English titles (#146) — the alias match never binds inside the grouped
+    // query above.
+    const resolvedWorks = await resolveCelexWorkRows(
       svc,
       page.map((b) => CellarSparqlService.bindingValue(b, 'celex') ?? ''),
       ctx,
+      CASE_WORK_COLUMNS,
     );
     const cases = page.map((b) => {
       const celexNumber = CellarSparqlService.bindingValue(b, 'celex') ?? '';
+      const date = CellarSparqlService.bindingValue(b, 'docDate');
+      const resolved = resolvedWorks.get(celexNumber);
+      /**
+       * The page's CELEX came from the same triple the follow-up joins on, so a miss
+       * means CELLAR changed between the two queries. The row is served as the search
+       * found it, under the work it sampled, with no fields the follow-up would read.
+       */
+      if (!resolved) {
+        return {
+          work_uri: CellarSparqlService.bindingValue(b, 'pageWork') ?? '',
+          celex_number: celexNumber,
+          ...(date ? { date } : {}),
+        };
+      }
       const c: {
         work_uri: string;
         celex_number: string;
@@ -744,19 +707,21 @@ ${projection('?date')} WHERE {
         referring_court?: string;
         subject_matter?: string;
         case_reference?: string;
-      } = {
-        work_uri:
-          resolvedWorks.get(celexNumber) ??
-          CellarSparqlService.bindingValue(b, 'titledWork') ??
-          CellarSparqlService.bindingValue(b, 'work') ??
-          '',
-        celex_number: celexNumber,
-      };
-      const ecli = CellarSparqlService.bindingValue(b, 'ecli');
+      } = { work_uri: resolved.work, celex_number: celexNumber };
+      /**
+       * Every field but the date is the resolved work's, so a row matches
+       * eurlex_get_document. Its ECLI is its own, else the lowest any work of the
+       * CELEX records, since the canonical work can carry none while a copy does
+       * (#84, #117); its title the greatest of its English titles, else of any work's,
+       * so an untitled canonical work keeps a copy's (#21). The date stays the page's,
+       * the value the row was sorted on.
+       */
+      const ecli =
+        columnValues(resolved.workRows, 'ecli')[0] ?? columnValues(resolved.celexRows, 'ecli')[0];
       if (ecli) c.ecli = ecli;
-      const resourceType = resolveResourceTypeLabels(CellarSparqlService.bindingValue(b, 'types'));
+      const types = [...new Set(columnValues(resolved.workRows, 'type'))].join(' ');
+      const resourceType = resolveResourceTypeLabels(types);
       if (resourceType) c.resource_type = resourceType;
-      const date = CellarSparqlService.bindingValue(b, 'docDate');
       if (date) c.date = date;
       /**
        * Surface the parsed case-law segments, and the raw title only when the parse
@@ -765,7 +730,9 @@ ${projection('?date')} WHERE {
        * while it would otherwise repeat the row; an incomplete one keeps it, so
        * nothing the fields miss is dropped (#40).
        */
-      const title = CellarSparqlService.bindingValue(b, 'docTitle');
+      const title =
+        columnValues(resolved.workRows, 'title').at(-1) ??
+        columnValues(resolved.celexRows, 'title').at(-1);
       if (title) {
         const parsed = parseCaseLawTitle(title, date);
         if (!parsed.complete) c.title = title;
@@ -786,6 +753,12 @@ ${projection('?date')} WHERE {
         cap: pageLimit,
         guidance: `More cases match beyond this page; call again with offset=${input.offset + pageLimit}.`,
       });
+    } else if (atWindowEnd) {
+      // Rows run newest first, so the last row's date continues the search past the
+      // window; cases of that date are read again.
+      ctx.enrich.notice(
+        `This page ends at row 10,000, the last row CELLAR sorts for one search, so no later page can be read and more cases may match. ${windowEndRoute('cases', cases.at(-1)?.date, dateFrom)}`,
+      );
     }
 
     return {
