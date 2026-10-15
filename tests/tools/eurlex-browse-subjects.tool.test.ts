@@ -3,10 +3,16 @@
  * @module tests/tools/eurlex-browse-subjects.tool.test
  */
 
+import {
+  JsonRpcErrorCode,
+  serviceUnavailable,
+  validationError,
+} from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_browse_subjects } from '@/mcp-server/tools/definitions/eurlex-browse-subjects.tool.js';
 import { escapeSparqlLiteral } from '@/services/cellar-sparql/eli-resolution.js';
+import { assertInSortWindow, pageSpan, pagingClauses } from '../helpers/sort-window.js';
 
 // --- Service mock ---
 const mockQuery = vi.fn();
@@ -168,7 +174,7 @@ describe('eurlex_browse_subjects', () => {
   });
 
   it('rejects pagination values outside the public boundary', () => {
-    expect(() => eurlex_browse_subjects.input.parse({ keyword: 'data', limit: 51 })).toThrow();
+    expect(() => eurlex_browse_subjects.input.parse({ keyword: 'data', limit: 10_001 })).toThrow();
     expect(() => eurlex_browse_subjects.input.parse({ keyword: 'data', offset: -1 })).toThrow();
   });
 
@@ -790,5 +796,241 @@ describe('eurlex_browse_subjects', () => {
       expect(notice.length).toBeLessThan(300);
       expect(contentText(result)).toContain(`> ${notice}`);
     });
+  });
+
+  describe('CELLAR sort window (#154)', () => {
+    /** CELLAR over `total` concepts ranked by the query: refuses a page past row 10,000. */
+    function windowedConcepts(total: number) {
+      return async (q: string) => {
+        assertInSortWindow(q);
+        const [clause] = pagingClauses(q);
+        const { start, end } = pageSpan(clause ?? { limit: 0, offset: 0 }, total);
+        return Array.from({ length: end - start }, (_, i) =>
+          makeConceptBinding({
+            uri: `http://eurovoc.europa.eu/${start + i}`,
+            label: `law ${start + i}`,
+          }),
+        );
+      };
+    }
+
+    it('keeps the sentinel while the page and its sentinel fit (offset 9,949)', async () => {
+      mockQuery.mockImplementation(windowedConcepts(14_567));
+
+      const result = await runToolContract(eurlex_browse_subjects, {
+        keyword: 'law',
+        limit: 50,
+        offset: 9_949,
+      });
+
+      expect(sentQuery()).toContain('LIMIT 51 OFFSET 9949');
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured).toMatchObject({ total: 50, has_more: true, next_offset: 9_999 });
+      expect(structured.notice).toContain('offset=9999');
+    });
+
+    it.each([
+      [9_950, 50, 50],
+      [9_999, 1, 1],
+    ])(
+      'serves the rows left in the window at offset %i (LIMIT %i) and promises no page past it',
+      async (offset, limit, served) => {
+        mockQuery.mockImplementation(windowedConcepts(14_567));
+
+        const result = await runToolContract(eurlex_browse_subjects, {
+          keyword: 'law',
+          limit: 50,
+          offset,
+        });
+
+        expect(result.isError).toBeFalsy();
+        expect(sentQuery()).toContain(`LIMIT ${limit} OFFSET ${offset}`);
+        const structured = result.structuredContent as Record<string, unknown>;
+        expect(structured).toMatchObject({ total: served, offset, has_more: false });
+        expect(structured).not.toHaveProperty('next_offset');
+        expect(structured).not.toHaveProperty('truncated');
+        const notice = structured.notice as string;
+        expect(notice).toContain('row 10,000');
+        expect(notice).toContain('more specific keyword');
+        expect(notice).not.toContain('offset=');
+        const text = contentText(result);
+        expect(text).toContain(`> ${notice}`);
+        expect(text).not.toContain('**Next offset:**');
+      },
+    );
+
+    it('reads a short page inside the cut window as the end of the matches', async () => {
+      mockQuery.mockImplementation(windowedConcepts(9_960));
+
+      const result = await runToolContract(eurlex_browse_subjects, {
+        keyword: 'law',
+        limit: 50,
+        offset: 9_950,
+      });
+
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured).toMatchObject({ total: 10, has_more: false });
+      expect(structured).not.toHaveProperty('notice');
+    });
+
+    it('rejects an offset at or past row 10,000 with a typed error and no query', async () => {
+      mockQuery.mockImplementation(windowedConcepts(14_567));
+      const declared = eurlex_browse_subjects.errors?.find(
+        (e) => e.reason === 'offset_past_window',
+      );
+
+      const result = await runToolContract(eurlex_browse_subjects, {
+        keyword: 'law',
+        limit: 50,
+        offset: 10_000,
+      });
+
+      expect(result.isError).toBe(true);
+      const error = (
+        result.structuredContent as {
+          error?: { code?: number; data?: { reason?: string; recovery?: { hint?: string } } };
+        }
+      ).error;
+      expect(error?.code).toBe(JsonRpcErrorCode.ValidationError);
+      expect(error?.data?.reason).toBe('offset_past_window');
+      expect(error?.data?.recovery?.hint).toBe(declared?.recovery);
+      expect(declared?.recovery).toContain('keyword');
+      expect(contentText(result)).toContain('10,000');
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    it('states the bound in the offset description', () => {
+      const offset = eurlex_browse_subjects.input.shape.offset;
+      expect(offset.description).toContain('10,000');
+      // A schema maximum would reject the call as invalid_arguments, skipping the recovery.
+      expect(eurlex_browse_subjects.input.parse({ keyword: 'law', offset: 10_000 }).offset).toBe(
+        10_000,
+      );
+    });
+
+    it('discloses both the clamp and the window when they meet (offset 9,975, limit 80)', async () => {
+      mockQuery.mockImplementation(windowedConcepts(14_567));
+
+      const result = await runToolContract(eurlex_browse_subjects, {
+        keyword: 'law',
+        limit: 80,
+        offset: 9_975,
+      });
+
+      expect(sentQuery()).toContain('LIMIT 25 OFFSET 9975');
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured).toMatchObject({
+        total: 25,
+        has_more: false,
+        limit_clamp: { requested: 80, applied: 50 },
+      });
+      const notice = structured.notice as string;
+      expect(notice).toContain('row 10,000');
+      const text = contentText(result);
+      expect(text).toContain('**Limit clamped:** 80 → 50 (per-call maximum)');
+      expect(text).toContain(`> ${notice}`);
+    });
+  });
+
+  describe('over-maximum limit (#151)', () => {
+    /** `n` concepts, labelled in rank order. */
+    const concepts = (n: number) =>
+      Array.from({ length: n }, (_, i) =>
+        makeConceptBinding({ uri: `http://eurovoc.europa.eu/${i}`, label: `law ${i}` }),
+      );
+
+    it('serves limit 51 at the 50-concept maximum and reports the clamp on both surfaces', async () => {
+      mockQuery.mockResolvedValue(concepts(51));
+
+      const result = await runToolContract(eurlex_browse_subjects, { keyword: 'law', limit: 51 });
+
+      expect(sentQuery()).toContain('LIMIT 51 OFFSET 0');
+      expect(result.structuredContent).toMatchObject({
+        total: 50,
+        has_more: true,
+        next_offset: 50,
+        cap: 50,
+        limit_clamp: { requested: 51, applied: 50 },
+      });
+      expect(contentText(result)).toContain('**Limit clamped:** 51 → 50 (per-call maximum)');
+    });
+
+    it('reports the operator ceiling as the applied value on a short page', async () => {
+      mockMaxResults = 30;
+      mockQuery.mockResolvedValue(concepts(4));
+
+      const result = await runToolContract(eurlex_browse_subjects, { keyword: 'law', limit: 40 });
+
+      expect(sentQuery()).toContain('LIMIT 31 OFFSET 0');
+      expect(result.structuredContent).toMatchObject({
+        total: 4,
+        has_more: false,
+        limit_clamp: { requested: 40, applied: 30 },
+      });
+      expect(result.structuredContent).not.toHaveProperty('truncated');
+      expect(contentText(result)).toContain('**Limit clamped:** 40 → 30 (per-call maximum)');
+    });
+
+    it('adds no clamp within the maximum, and rejects limit 0 and 10,001', async () => {
+      mockQuery.mockResolvedValue(concepts(51));
+
+      const result = await runToolContract(eurlex_browse_subjects, { keyword: 'law', limit: 50 });
+
+      expect(result.structuredContent).toMatchObject({ total: 50, cap: 50 });
+      expect(result.structuredContent).not.toHaveProperty('limit_clamp');
+      expect(contentText(result)).not.toContain('Limit clamped');
+      expect(() => eurlex_browse_subjects.input.parse({ keyword: 'law', limit: 0 })).toThrow();
+      expect(() => eurlex_browse_subjects.input.parse({ keyword: 'law', limit: 10_001 })).toThrow();
+      expect(eurlex_browse_subjects.input.parse({ keyword: 'law', limit: 10_000 }).limit).toBe(
+        10_000,
+      );
+    });
+  });
+});
+
+// --- CELLAR failures carry this tool's own recovery ---
+
+describe('eurlex_browse_subjects CELLAR failures', () => {
+  beforeEach(() => {
+    mockQuery.mockReset();
+  });
+
+  it.each([
+    [
+      'sparql_error',
+      JsonRpcErrorCode.ValidationError,
+      () =>
+        validationError('CELLAR SPARQL error: Virtuoso 37000 Error SQ156: compiler error', {
+          reason: 'sparql_error',
+          retryable: false,
+        }),
+    ],
+    [
+      'sparql_timeout',
+      JsonRpcErrorCode.ServiceUnavailable,
+      () =>
+        serviceUnavailable('CELLAR SPARQL query timed out on Virtuoso', {
+          reason: 'sparql_timeout',
+          retryable: false,
+        }),
+    ],
+  ])('fails %s with recovery naming keyword', async (reason, code, failure) => {
+    mockQuery.mockRejectedValue(failure());
+
+    const result = await runToolContract(eurlex_browse_subjects, { keyword: 'privacy' });
+
+    expect(result.isError).toBe(true);
+    const error = (
+      result.structuredContent as {
+        error: { code: number; data: { reason: string; recovery?: { hint?: string } } };
+      }
+    ).error;
+    expect(error.code).toBe(code);
+    expect(error.data.reason).toBe(reason);
+    const hint = error.data.recovery?.hint ?? '';
+    expect(hint).toContain('keyword');
+    expect(hint).toBe(eurlex_browse_subjects.errors?.find((e) => e.reason === reason)?.recovery);
+    const text = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+    expect(text).toContain(hint);
   });
 });

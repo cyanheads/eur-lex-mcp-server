@@ -4,13 +4,28 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { echoValue } from '@/mcp-server/tools/echo-value.js';
+import {
+  clampLimit,
+  limitClampEnrichment,
+  limitClampTrailer,
+  ROW_LIMIT_CEILING,
+} from '@/mcp-server/tools/limit-clamp.js';
 import { EUROVOC_CONCEPT_NAMESPACE } from '@/services/cellar-sparql/cdm-labels.js';
 import {
   CellarSparqlService,
   getCellarSparqlService,
 } from '@/services/cellar-sparql/cellar-sparql-service.js';
 import { escapeSparqlLiteral } from '@/services/cellar-sparql/eli-resolution.js';
+import {
+  isPastSortWindow,
+  readWindowedPage,
+  windowedLimit,
+} from '@/services/cellar-sparql/sort-window.js';
+
+/** Concepts served per call; a larger `limit` is clamped to it. */
+const MAX_PAGE_SIZE = 50;
 
 export const eurlex_browse_subjects = tool('eurlex_browse_subjects', {
   title: 'Browse EuroVoc Subjects',
@@ -36,14 +51,18 @@ export const eurlex_browse_subjects = tool('eurlex_browse_subjects', {
       .int()
       .min(0)
       .default(0)
-      .describe('Pagination offset — number of concepts to skip. Defaults to 0.'),
+      .describe(
+        'Pagination offset — number of concepts to skip. Defaults to 0. Must be below 10,000: CELLAR sorts at most 10,000 matches for one search, so pages stop at row 10,000.',
+      ),
     limit: z
       .number()
       .int()
       .min(1)
-      .max(50)
+      .max(ROW_LIMIT_CEILING)
       .default(20)
-      .describe('Maximum number of EuroVoc concepts to return (1–50). Defaults to 20.'),
+      .describe(
+        'Maximum number of EuroVoc concepts to return, served up to 50 per call; a larger value (up to 10,000) is served at 50 and reported in limit_clamp. Defaults to 20.',
+      ),
   }),
   output: z.object({
     concepts: z
@@ -77,7 +96,9 @@ export const eurlex_browse_subjects = tool('eurlex_browse_subjects', {
     offset: z.number().describe('Pagination offset used for this response.'),
     has_more: z
       .boolean()
-      .describe('True only when CELLAR returned an additional valid row beyond this page.'),
+      .describe(
+        'True only when CELLAR returned an additional valid row beyond this page. False on a page that ends at row 10,000, the last one CELLAR sorts; its notice says whether more may match.',
+      ),
     next_offset: z
       .number()
       .optional()
@@ -95,13 +116,46 @@ export const eurlex_browse_subjects = tool('eurlex_browse_subjects', {
       .string()
       .optional()
       .describe(
-        'Guidance for the next call: on an empty first page, the keyword and language that matched nothing and how to broaden them; on a page with more rows, the offset to continue from.',
+        'Guidance for the next call: on an empty first page, the keyword and language that matched nothing and how to broaden them; on a page with more rows, the offset to continue from; on a page ending at row 10,000, that no later page can be read and how to narrow the keyword.',
       ),
+    limit_clamp: limitClampEnrichment,
   },
+  enrichmentTrailer: { limit_clamp: limitClampTrailer },
+
+  errors: [
+    {
+      reason: 'offset_past_window',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'offset is 10,000 or more, past the last row CELLAR sorts for one search.',
+      recovery: 'Use a more specific keyword so fewer concepts match, then page from offset 0.',
+    },
+    {
+      reason: 'sparql_error',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'CELLAR rejected the thesaurus search this call sent. The same call fails the same way again.',
+      recovery:
+        'Search again with a plainer keyword (words only, no punctuation) or another language code.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'sparql_timeout',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'The thesaurus search ran past the client timeout, or CELLAR refused it as too costly to run. It is not retried.',
+      recovery:
+        'Use a longer, more specific keyword so fewer labels match, or a smaller limit, then search again.',
+      thrownBy: 'service',
+    },
+  ],
 
   async handler(input, ctx) {
+    if (isPastSortWindow(input.offset)) {
+      throw ctx.fail(
+        'offset_past_window',
+        `offset ${input.offset} is past row 10,000, the last row CELLAR sorts for one search, so no page starts there.`,
+      );
+    }
     const svc = getCellarSparqlService();
-    const pageLimit = Math.min(input.limit, svc.maxResults);
+    const pageLimit = clampLimit(ctx, input.limit, Math.min(MAX_PAGE_SIZE, svc.maxResults));
     const keyword = input.keyword.toLowerCase().trim();
     const lang = input.language.toLowerCase().trim() || 'en';
 
@@ -143,6 +197,9 @@ export const eurlex_browse_subjects = tool('eurlex_browse_subjects', {
      * evaluates a function over an unbound variable. `?matchedKey` is the matching
      * alternative label behind its own tier digit, and its MIN is the best-tier
      * one, alphabetical among equals; an empty key means none matched.
+     *
+     * The page asks for one sentinel row past it, cut to CELLAR's sort window: a
+     * sorted query may not read past row 10,000.
      */
     const kw = escapeSparqlLiteral(keyword);
     const pref = 'LCASE(STR(?label))';
@@ -174,7 +231,7 @@ SELECT ?concept ?label
   FILTER(STRSTARTS(STR(?concept), "${EUROVOC_CONCEPT_NAMESPACE}"))
   FILTER(LANG(?label) = "${lang}")
   FILTER(CONTAINS(${pref}, "${kw}") || BOUND(?altValue))
-} GROUP BY ?concept ?label ORDER BY ?tier ?label ?concept LIMIT ${pageLimit + 1} OFFSET ${input.offset}`;
+} GROUP BY ?concept ?label ORDER BY ?tier ?label ?concept LIMIT ${windowedLimit(input.offset, pageLimit)} OFFSET ${input.offset}`;
 
     const bindings = await svc.queryWithContinuation(sparql, ctx);
     ctx.log.info('EuroVoc subject browse', {
@@ -200,7 +257,7 @@ SELECT ?concept ?label
       );
     }
 
-    const hasMore = bindings.length > pageLimit;
+    const { hasMore, atWindowEnd } = readWindowedPage(bindings.length, input.offset, pageLimit);
     const concepts = bindings.slice(0, pageLimit).map((b) => {
       const entry: {
         concept_uri: string;
@@ -227,6 +284,10 @@ SELECT ?concept ?label
         cap: pageLimit,
         guidance: `More concepts match beyond this page; call again with offset=${input.offset + pageLimit}.`,
       });
+    } else if (atWindowEnd) {
+      ctx.enrich.notice(
+        'This page ends at row 10,000, the last row CELLAR sorts for one search, so no later page can be read and more concepts may match. Use a more specific keyword to reach them.',
+      );
     }
 
     return {
