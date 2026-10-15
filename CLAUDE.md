@@ -2,10 +2,10 @@
 
 **Server:** eur-lex-mcp-server
 **Version:** 0.18.2
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.13`
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.15`
 **Engines:** Bun ≥1.4.0, Node ≥24.0.0
-**MCP SDK:** `@modelcontextprotocol/server` ^2.2.0
-**Zod:** ^4.6.5
+**MCP SDK:** `@modelcontextprotocol/server` ^2.3.1
+**Zod:** ^4.6.6
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
 
@@ -44,6 +44,12 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 
 ```ts
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import {
+  clampLimit,
+  limitClampEnrichment,
+  limitClampTrailer,
+  ROW_LIMIT_CEILING,
+} from '@/mcp-server/tools/limit-clamp.js';
 import { getCellarSparqlService } from '@/services/cellar-sparql/cellar-sparql-service.js';
 
 export const eurlex_browse_subjects = tool('eurlex_browse_subjects', {
@@ -52,7 +58,7 @@ export const eurlex_browse_subjects = tool('eurlex_browse_subjects', {
   input: z.object({
     keyword: z.string().min(1).describe('Search term to match against EuroVoc concept labels.'),
     language: z.string().default('en').describe('Language code for concept labels (e.g. "en", "fr", "de").'),
-    limit: z.number().int().min(1).max(50).default(20).describe('Maximum number of concepts to return (1–50).'),
+    limit: z.number().int().min(1).max(ROW_LIMIT_CEILING).default(20).describe('Maximum number of concepts to return, served up to 50 per call; a larger value is served at 50 and reported in limit_clamp.'),
   }),
   output: z.object({
     concepts: z.array(z.object({
@@ -66,11 +72,14 @@ export const eurlex_browse_subjects = tool('eurlex_browse_subjects', {
   // Zero hits is a result, not an error: an empty page plus a notice on both surfaces.
   enrichment: {
     notice: z.string().optional().describe('How to broaden the search when nothing matched.'),
+    limit_clamp: limitClampEnrichment,
   },
+  enrichmentTrailer: { limit_clamp: limitClampTrailer },
 
   async handler(input, ctx) {
     const service = getCellarSparqlService();
-    const concepts = await service.browseSubjects(input.keyword, input.language, input.limit);
+    const limit = clampLimit(ctx, input.limit, 50);
+    const concepts = await service.browseSubjects(input.keyword, input.language, limit);
     if (concepts.length === 0) {
       ctx.enrich.notice(`No EuroVoc concepts matched "${input.keyword}". Try a broader term or retry with language "en".`);
     }
@@ -222,8 +231,10 @@ src/
     cellar-sparql/
       cellar-sparql-service.ts          # CELLAR SPARQL POST client, binding mapper, LIMIT enforcement
       cdm-labels.ts                     # CDM authority URI → label maps, case-law title parser
-      eli-resolution.ts                 # ELI → work resolution, SPARQL-safety and input-validity primitives
+      eli-resolution.ts                 # ELI → work resolution, CELEX/ELI/work-URI normalizers, case-number grammar, SPARQL-safety and input-validity primitives
+      keyword-match.ts                  # Keyword title phrase and CELEX arm by keyword shape
       relation-traversal.ts             # Relation-type model and paged per-type traversal
+      sort-window.ts                    # CELLAR's 10,000-row sort window (page sizing, window-end reading) and the date_to-only date floor
       work-agents.ts                    # Institutions and Advocates General of a work
       work-resolution.ts                # CELEX → canonical work resolution
       types.ts                          # SPARQL binding types
@@ -233,6 +244,10 @@ src/
       formex-package.ts                 # Zipped Formex 4 package reader (manifest-ordered parts)
       html-to-markdown.ts               # Server-side HTML → Markdown conversion
   mcp-server/
+    tools/
+      echo-value.ts                     # Bounded quoting of caller values in notices and errors
+      enum-input.ts                     # Case/separator-tolerant enum inputs (#143)
+      limit-clamp.ts                    # limit_clamp enrichment: over-maximum limits served at the maximum (#151)
     tools/definitions/
       eurlex-browse-subjects.tool.ts    # EuroVoc thesaurus search
       eurlex-get-cases.tool.ts          # CJEU/GC case law search
