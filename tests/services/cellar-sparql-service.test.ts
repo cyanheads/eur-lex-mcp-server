@@ -7,30 +7,53 @@
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ServerConfig } from '@/config/server-config.js';
 import { eurlex_query_sparql } from '@/mcp-server/tools/definitions/eurlex-query-sparql.tool.js';
 import {
   CellarSparqlService,
-  SPARQL_ERROR_RECOVERY_HINT,
-  SPARQL_TIMEOUT_RECOVERY_HINT,
+  initCellarSparqlService,
 } from '@/services/cellar-sparql/cellar-sparql-service.js';
 
+const TEST_SERVER_CONFIG = {
+  cellarSparqlEndpoint: 'http://cellar.test/sparql',
+  eurLexContentBaseUrl: 'http://content.test',
+  sparqlQueryTimeoutMs: 5_000,
+  maxSparqlResults: 100,
+} satisfies ServerConfig;
+
 function makeService(): CellarSparqlService {
-  const serverConfig = {
-    cellarSparqlEndpoint: 'http://cellar.test/sparql',
-    eurLexContentBaseUrl: 'http://content.test',
-    sparqlQueryTimeoutMs: 5_000,
-    maxSparqlResults: 100,
-  } satisfies ServerConfig;
   // config/storage are unused by the query path.
   return new CellarSparqlService(
     {} as unknown as AppConfig,
     {} as unknown as StorageService,
-    serverConfig,
+    TEST_SERVER_CONFIG,
   );
 }
+
+/*
+ * CELLAR error bodies as CELLAR returns them (captured 2026-10-15): SQ156 and
+ * SR353 arrive as HTTP 500, a syntax error as HTTP 400.
+ */
+const SQ156_BODY = `Virtuoso 37000 Error SQ156: Internal Optimized compiler error : subq ot was supposed to be found given the tree in sqlo.c:1119.
+Please report the statement compiled.
+
+SPARQL query:
+#output-format:application/sparql-results+json
+SELECT ?x WHERE { ?x ?y ?z }`;
+
+const SR353_BODY = `Virtuoso 22023 Error SR353: Sorted TOP clause specifies more then 10050 rows to sort. Only 10000 are allowed. Either decrease the offset and/or row count or use a scrollable cursor
+
+SPARQL query:
+#output-format:application/sparql-results+json
+SELECT ?w ?c WHERE { ?w cdm:resource_legal_id_celex ?c } ORDER BY ?c LIMIT 100 OFFSET 9950`;
+
+const TIMEOUT_BODY =
+  'Virtuoso 42000 Error SP031: SPARQL compiler: Estimated query execution time exceeds the limit';
+
+const GATEWAY_PAGE =
+  '<html><head><title>502 Bad Gateway</title></head><body><center><h1>502 Bad Gateway</h1></center></body></html>';
 
 function stubFetchJson(payload: unknown): void {
   vi.stubGlobal(
@@ -376,39 +399,39 @@ describe('CellarSparqlService #63 outer-LIMIT enforcement', () => {
   });
 });
 
-// --- #26: sparql_error throws carry the declared recovery hint on the wire ---
+// --- #26: typed sparql_error / sparql_timeout throws; the calling tool's contract
+// recovery reaches the wire (#145) ---
 
-describe('CellarSparqlService sparql_error recovery (#26)', () => {
+describe('CellarSparqlService typed failures (#26)', () => {
   afterEach(() => vi.unstubAllGlobals());
 
   function stubFetchRaw(opts: { ok: boolean; status: number; body: string }): void {
     vi.stubGlobal(
       'fetch',
-      vi.fn(async () => ({
-        ok: opts.ok,
-        status: opts.status,
-        text: async () => opts.body,
-      })),
+      vi.fn(async (url: string) => {
+        if (new URL(url).hostname !== 'cellar.test') throw new Error(`unmocked fetch: ${url}`);
+        return { ok: opts.ok, status: opts.status, text: async () => opts.body };
+      }),
     );
   }
 
-  it('fails fast on a client-side timeout: one attempt, typed reason, recovery hint (#78)', async () => {
+  it('fails fast on a client-side timeout: one attempt, typed reason, no hint of its own (#78, #145)', async () => {
     const fetchMock = vi.fn(async () => {
       throw new DOMException('The operation timed out.', 'TimeoutError');
     });
     vi.stubGlobal('fetch', fetchMock);
     const ctx = createMockContext();
 
-    await expect(
-      makeService().query('SELECT ?work WHERE { ?s ?p ?o }', ctx, 1_000),
-    ).rejects.toMatchObject({
+    const error = (await makeService()
+      .query('SELECT ?work WHERE { ?s ?p ?o }', ctx, 1_000)
+      .catch((e: unknown) => e)) as { data?: Record<string, unknown> };
+
+    expect(error).toMatchObject({
       code: JsonRpcErrorCode.ServiceUnavailable,
-      data: {
-        reason: 'sparql_timeout',
-        retryable: false,
-        recovery: { hint: SPARQL_TIMEOUT_RECOVERY_HINT },
-      },
+      data: { reason: 'sparql_timeout', retryable: false },
     });
+    // The calling tool's sparql_timeout recovery fills the hint on the wire.
+    expect(error?.data).not.toHaveProperty('recovery');
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
@@ -434,7 +457,7 @@ describe('CellarSparqlService sparql_error recovery (#26)', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it('marks a Virtuoso-side timeout non-retryable with the same recovery hint (#78)', async () => {
+  it('marks a Virtuoso-side timeout non-retryable as sparql_timeout (#78)', async () => {
     const fetchMock = vi.fn(async () => ({
       ok: true,
       status: 200,
@@ -453,7 +476,7 @@ describe('CellarSparqlService sparql_error recovery (#26)', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it('attaches the recovery hint to an HTTP 400 malformed-query error', async () => {
+  it('fails an HTTP 400 malformed-query error as sparql_error', async () => {
     stubFetchRaw({
       ok: false,
       status: 400,
@@ -463,15 +486,12 @@ describe('CellarSparqlService sparql_error recovery (#26)', () => {
 
     await expect(makeService().query('SELECT WHERE { ?s ?p ?o }', ctx)).rejects.toMatchObject({
       code: JsonRpcErrorCode.ValidationError,
-      data: {
-        reason: 'sparql_error',
-        recovery: { hint: SPARQL_ERROR_RECOVERY_HINT },
-      },
+      data: { reason: 'sparql_error', retryable: false },
     });
   });
 
-  it('attaches the recovery hint to a Virtuoso HTTP-200 error body', async () => {
-    // Virtuoso returns HTTP 200 even for syntax errors — the body carries the error.
+  it('fails a Virtuoso HTTP-200 error body as sparql_error', async () => {
+    // Virtuoso can return HTTP 200 for an error — the body carries it.
     stubFetchRaw({
       ok: true,
       status: 200,
@@ -481,18 +501,236 @@ describe('CellarSparqlService sparql_error recovery (#26)', () => {
 
     await expect(makeService().query('SELECT WHERE { ?s ?p ?o }', ctx)).rejects.toMatchObject({
       code: JsonRpcErrorCode.ValidationError,
-      data: {
-        reason: 'sparql_error',
-        recovery: { hint: SPARQL_ERROR_RECOVERY_HINT },
+      data: { reason: 'sparql_error', retryable: false },
+    });
+  });
+
+  it('reads an HTTP-200 results body whose literal quotes a Virtuoso error as rows', async () => {
+    // A real result can quote error text — a title, a comment, a raw query's own
+    // literal — and the parsed results are the answer, not a failure.
+    const literal = 'CELLAR answered: Virtuoso 37000 Error SP030: syntax error at "WHERE"';
+    stubFetchRaw({
+      ok: true,
+      status: 200,
+      body: JSON.stringify({
+        head: { vars: ['note'] },
+        results: { bindings: [{ note: { type: 'literal', value: literal } }] },
+      }),
+    });
+
+    const rows = await makeService().query(
+      'SELECT ?note WHERE { ?s ?p ?note }',
+      createMockContext(),
+    );
+
+    expect(rows).toEqual([{ note: { type: 'literal', value: literal } }]);
+  });
+
+  it('reads an HTTP-200 results body quoting a Virtuoso timeout as rows, on the raw path too', async () => {
+    const literal = 'Virtuoso 42000 Error SP031: query execution timed out';
+    stubFetchRaw({
+      ok: true,
+      status: 200,
+      body: JSON.stringify({
+        head: { vars: ['note'] },
+        results: { bindings: [{ note: { type: 'literal', value: literal } }] },
+      }),
+    });
+
+    const { variables, bindings } = await makeService().queryWithVars(
+      'SELECT ?note WHERE { ?s ?p ?note } LIMIT 1',
+      createMockContext(),
+    );
+
+    expect(variables).toEqual(['note']);
+    expect(bindings).toEqual([{ note: { type: 'literal', value: literal } }]);
+  });
+
+  describe('through eurlex_query_sparql on the wire', () => {
+    beforeEach(() => {
+      initCellarSparqlService({} as AppConfig, {} as StorageService, TEST_SERVER_CONFIG);
+    });
+
+    /** The `error` envelope of one eurlex_query_sparql call. */
+    async function wireError(): Promise<{
+      code?: number;
+      data?: { reason?: string; recovery?: { hint?: string } };
+    }> {
+      const result = await runToolContract(eurlex_query_sparql, {
+        sparql_query: 'SELECT ?s WHERE { ?s ?p ?o } LIMIT 1',
+      });
+      expect(result.isError).toBe(true);
+      return (result.structuredContent as { error: Record<string, never> }).error;
+    }
+
+    it.each([
+      ['an HTTP 400 syntax error', 400, "Virtuoso 37000 Error SP030: syntax error at '}'"],
+      ['an HTTP 500 compile error', 500, SQ156_BODY],
+    ])('carries the tool’s sparql_error recovery for %s', async (_label, status, body) => {
+      stubFetchRaw({ ok: false, status, body });
+
+      const error = await wireError();
+
+      expect(error).toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        data: {
+          reason: 'sparql_error',
+          recovery: {
+            hint: 'Fix the SPARQL query syntax, ensure predicates use the cdm: prefix, and verify variable names.',
+          },
+        },
+      });
+    });
+
+    it('carries the sort-window recovery, not the syntax one, for an HTTP 500 SR353', async () => {
+      stubFetchRaw({ ok: false, status: 500, body: SR353_BODY });
+
+      const error = await wireError();
+
+      expect(error).toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        data: { reason: 'sparql_error' },
+      });
+      expect(error.data?.recovery?.hint).toContain('lower OFFSET so OFFSET + LIMIT stays within');
+      expect(error.data?.recovery?.hint).not.toContain('syntax');
+    });
+
+    it('carries the tool’s sparql_timeout recovery for a Virtuoso timeout', async () => {
+      stubFetchRaw({ ok: true, status: 200, body: TIMEOUT_BODY });
+
+      const error = await wireError();
+
+      expect(error).toMatchObject({
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        data: {
+          reason: 'sparql_timeout',
+          recovery: {
+            hint: eurlex_query_sparql.errors?.find((e) => e.reason === 'sparql_timeout')?.recovery,
+          },
+        },
+      });
+      expect(error.data?.recovery?.hint).toContain('timeout_hint');
+    });
+  });
+});
+
+// --- #145: a non-200/400 body is read and classified by its Virtuoso SQLSTATE ---
+//
+// CELLAR answers deterministic compile (SQ156, SQLSTATE 37000) and sort-window
+// (SR353, 22023) errors with HTTP 500. Those fail on the first attempt with the
+// Virtuoso text; a gateway page, an empty body, or another SQLSTATE stays a
+// retryable outage.
+
+describe('CellarSparqlService non-200 bodies (#145)', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  /** A fetch answering every attempt with `status` and `body`, routed to the CELLAR host only. */
+  function stubStatus(status: number, body: string): ReturnType<typeof vi.fn> {
+    const fetchMock = vi.fn(async (url: string) => {
+      if (new URL(url).hostname !== 'cellar.test') throw new Error(`unmocked fetch: ${url}`);
+      return { ok: status >= 200 && status < 300, status, text: async () => body };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+
+  /** The rejection of one query, with the retry backoff fast-forwarded. */
+  async function rejectionOfQuery(): Promise<{
+    code?: number;
+    message: string;
+    data?: Record<string, unknown>;
+  }> {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const pending = makeService()
+      .query('SELECT ?work WHERE { ?s ?p ?o } LIMIT 1', createMockContext())
+      .then(
+        () => {
+          throw new Error('Expected the query to reject');
+        },
+        (error: unknown) =>
+          error as { code?: number; message: string; data?: Record<string, unknown> },
+      );
+    await vi.runAllTimersAsync();
+    return pending;
+  }
+
+  it.each([
+    ['an HTML gateway page on 502', 502, GATEWAY_PAGE],
+    ['an empty body on 503', 503, ''],
+    [
+      'a Virtuoso body of another SQLSTATE on 500',
+      500,
+      'Virtuoso 40001 Error SR172: Transaction deadlocked',
+    ],
+  ])('retries %s as a transient outage carrying the status', async (_label, status, body) => {
+    const fetchMock = stubStatus(status, body);
+
+    const error = await rejectionOfQuery();
+
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+    expect(error.message).toContain(`CELLAR SPARQL HTTP ${status}`);
+    expect(error.data?.reason).toBeUndefined();
+  });
+
+  it.each([
+    ['SQ156 compile error', SQ156_BODY, 'SQ156'],
+    ['SR353 sort-window error', SR353_BODY, 'SR353'],
+  ])('fails a 500 %s on the first attempt as sparql_error', async (_label, body, code) => {
+    const fetchMock = stubStatus(500, body);
+
+    const error = await rejectionOfQuery();
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(error.code).toBe(JsonRpcErrorCode.ValidationError);
+    expect(error.data).toMatchObject({ reason: 'sparql_error', retryable: false });
+    expect(error.message).toContain(code);
+    // The Virtuoso text is cut at 300 characters, so the echoed query stays short.
+    expect(error.message).toBe(`CELLAR SPARQL error: ${body.slice(0, 300)}`);
+  });
+
+  it('fails a 500 timeout body on the first attempt as sparql_timeout', async () => {
+    const fetchMock = stubStatus(500, TIMEOUT_BODY);
+
+    const error = await rejectionOfQuery();
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+    expect(error.data).toMatchObject({ reason: 'sparql_timeout', retryable: false });
+  });
+
+  it.each([
+    [500, SR353_BODY],
+    [200, SR353_BODY],
+  ])('gives an HTTP %i SR353 sort-window error its own recovery hint', async (status, body) => {
+    stubStatus(status, body);
+
+    const error = await rejectionOfQuery();
+
+    expect(error.data).toMatchObject({
+      reason: 'sparql_error',
+      recovery: {
+        hint: 'CELLAR sorts at most 10,000 rows: lower OFFSET so OFFSET + LIMIT stays within 10,000, or narrow the query with a FILTER so fewer rows match.',
       },
     });
   });
 
-  it('keeps the service hint identical to the eurlex_query_sparql contract recovery (no drift)', () => {
-    const contractRecovery = eurlex_query_sparql.errors?.find(
-      (e) => e.reason === 'sparql_error',
-    )?.recovery;
-    expect(SPARQL_ERROR_RECOVERY_HINT).toBe(contractRecovery);
+  it('leaves the recovery hint to the calling tool on every other typed throw', async () => {
+    for (const [status, body] of [
+      [400, "Virtuoso 37000 Error SP030: SPARQL compiler, line 2: syntax error at '}'"],
+      [200, "Virtuoso 37000 Error SP030: SPARQL compiler, line 2: syntax error at '}'"],
+      [200, TIMEOUT_BODY],
+      [500, SQ156_BODY],
+      [500, TIMEOUT_BODY],
+    ] as const) {
+      stubStatus(status, body);
+      const error = await rejectionOfQuery();
+      expect(error.data?.reason).toMatch(/^sparql_(error|timeout)$/);
+      expect(error.data).not.toHaveProperty('recovery');
+    }
   });
 });
 

@@ -1,7 +1,7 @@
 /**
  * @fileoverview CellarSparqlService — HTTP client for the EU Publications Office CELLAR
- * Virtuoso SPARQL endpoint. Handles POST queries, LIMIT enforcement, and Virtuoso-specific
- * error detection (HTTP 200 with error body).
+ * Virtuoso SPARQL endpoint. Handles POST queries, LIMIT enforcement, and classification
+ * of Virtuoso error bodies on any HTTP status.
  * @module services/cellar-sparql/cellar-sparql-service
  */
 
@@ -19,28 +19,78 @@ PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
 PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
 `;
 
-/** Pattern matching Virtuoso-specific error responses (HTTP 200 with error body). */
-const VIRTUOSO_ERROR_RE = /Virtuoso\s+\d+\s+Error/i;
+/**
+ * A Virtuoso error body (`Virtuoso <SQLSTATE> Error <code>: …`), capturing a
+ * numeric SQLSTATE. CELLAR sends one on HTTP 200, 400, and 500.
+ */
+const VIRTUOSO_ERROR_RE = /Virtuoso\s+(\d+)\s+Error/i;
 /** Pattern for Virtuoso timeout messages (SP031). */
 const VIRTUOSO_TIMEOUT_RE = /SP031|query execution timed out/i;
 
 /**
- * Recovery hint attached to every `sparql_error` throw so the wire
- * `data.recovery.hint` (and its mirrored `Recovery:` content line) is populated
- * even though the error is raised here in the shared service rather than through
- * a handler's `ctx.fail`. Kept identical to the `sparql_error` contract recovery
- * declared on eurlex_query_sparql — that tool's inline literal is the
- * human-readable source of truth, and a service test asserts the two never drift.
+ * SQLSTATEs that fail the same way on every attempt: `37000` (syntax and compile
+ * errors, e.g. SQ156) and class `22` (data exceptions, e.g. SR353's sort window).
+ * Any other SQLSTATE on a 5xx, such as a `40001` deadlock, may clear on a retry.
  */
-export const SPARQL_ERROR_RECOVERY_HINT =
-  'Fix the SPARQL query syntax, ensure predicates use the cdm: prefix, and verify variable names.';
+const DETERMINISTIC_SQLSTATE_RE = /^(?:37000|22\d{3})$/;
+
+/** Virtuoso's sort-window error: a sorted query reading past row 10,000. */
+const SORT_WINDOW_ERROR_RE = /\bSR353\b/;
 
 /**
- * Recovery hint attached to both timeout shapes: the client-side abort from
- * `AbortSignal.timeout` and Virtuoso's own execution-limit error.
+ * A query CELLAR rejected: it fails the same way on every attempt. A sort-window
+ * error carries its own recovery hint, since the fix is the query's paging, not
+ * its syntax; every other one leaves the hint to the calling tool's contract.
  */
-export const SPARQL_TIMEOUT_RECOVERY_HINT =
-  'Narrow the query with more specific FILTER conditions or a smaller LIMIT, or raise timeout_hint on eurlex_query_sparql.';
+function sparqlError(text: string) {
+  return validationError(`CELLAR SPARQL error: ${text.slice(0, 300)}`, {
+    reason: 'sparql_error',
+    retryable: false,
+    ...(SORT_WINDOW_ERROR_RE.test(text)
+      ? {
+          recovery: {
+            hint: 'CELLAR sorts at most 10,000 rows: lower OFFSET so OFFSET + LIMIT stays within 10,000, or narrow the query with a FILTER so fewer rows match.',
+          },
+        }
+      : {}),
+  });
+}
+
+/**
+ * The typed failure a Virtuoso error body stands for, or `undefined` when the
+ * body is not one. `deterministic` marks a failure a retry would repeat: a
+ * timeout, or a SQLSTATE matching {@link DETERMINISTIC_SQLSTATE_RE}.
+ *
+ * Apart from the sort-window hint, the throws carry no recovery hint: each
+ * calling tool declares `sparql_error` and `sparql_timeout` with recovery text
+ * for its own inputs, which the framework fills in from that contract.
+ */
+function virtuosoFailure(text: string) {
+  const sqlState = VIRTUOSO_ERROR_RE.exec(text)?.[1];
+  if (sqlState === undefined) return;
+  if (VIRTUOSO_TIMEOUT_RE.test(text)) {
+    // Virtuoso's estimated-cost limit is deterministic for the query as
+    // written — a retry re-runs the same estimate and fails the same way.
+    return {
+      deterministic: true,
+      error: serviceUnavailable('CELLAR SPARQL query timed out on Virtuoso', {
+        reason: 'sparql_timeout',
+        retryable: false,
+      }),
+    };
+  }
+  return { deterministic: DETERMINISTIC_SQLSTATE_RE.test(sqlState), error: sparqlError(text) };
+}
+
+/** A SPARQL-results JSON body, or `undefined` for any other body. */
+function parseResults(text: string): SparqlResultsJson | undefined {
+  try {
+    const parsed = JSON.parse(text) as Partial<SparqlResultsJson> | null;
+    return parsed?.results ? (parsed as SparqlResultsJson) : undefined;
+  } catch {
+    return;
+  }
+}
 
 /**
  * Locate the outermost (brace-depth 0) `LIMIT` clause — the solution modifier
@@ -284,59 +334,38 @@ export class CellarSparqlService {
           if (error instanceof DOMException && error.name === 'TimeoutError') {
             throw serviceUnavailable(
               `CELLAR SPARQL request exceeded the ${effectiveTimeoutMs} ms client timeout`,
-              {
-                reason: 'sparql_timeout',
-                retryable: false,
-                recovery: { hint: SPARQL_TIMEOUT_RECOVERY_HINT },
-              },
+              { reason: 'sparql_timeout', retryable: false },
             );
           }
           throw error;
         }
 
         if (!response.ok) {
-          if (response.status === 400) {
-            // HTTP 400 = client error (malformed query) — not retryable
-            throw validationError(`CELLAR SPARQL error: ${text.slice(0, 300)}`, {
-              reason: 'sparql_error',
-              retryable: false,
-              recovery: { hint: SPARQL_ERROR_RECOVERY_HINT },
-            });
-          }
+          // HTTP 400 = client error (malformed query) — not retryable
+          if (response.status === 400) throw sparqlError(text);
+          // CELLAR answers compile and sort-window errors with HTTP 500. Those fail the
+          // same way on every attempt; a gateway page, an empty body, or a Virtuoso
+          // state that can clear stays a retryable outage.
+          const failure = virtuosoFailure(text);
+          if (failure?.deterministic) throw failure.error;
           throw serviceUnavailable(`CELLAR SPARQL HTTP ${response.status}`, {
             status: response.status,
           });
         }
 
-        /** Virtuoso returns HTTP 200 even for errors — inspect the body. */
-        if (VIRTUOSO_ERROR_RE.test(text)) {
-          if (VIRTUOSO_TIMEOUT_RE.test(text)) {
-            // Virtuoso's estimated-cost limit is deterministic for the query as
-            // written — a retry re-runs the same estimate and fails the same way.
-            throw serviceUnavailable('CELLAR SPARQL query timed out on Virtuoso', {
-              reason: 'sparql_timeout',
-              retryable: false,
-              recovery: { hint: SPARQL_TIMEOUT_RECOVERY_HINT },
-            });
-          }
-          // Syntax / semantic error — not transient, fail immediately
-          throw validationError(`CELLAR SPARQL error: ${text.slice(0, 300)}`, {
-            reason: 'sparql_error',
-            retryable: false,
-            recovery: { hint: SPARQL_ERROR_RECOVERY_HINT },
-          });
+        // A results body is the answer, even when a literal in it quotes Virtuoso
+        // error text. Virtuoso also answers some errors with HTTP 200, as plain text
+        // rather than results, so only a body that is not results is read for one.
+        const parsed = parseResults(text);
+        if (parsed) return parsed;
+        const failure = virtuosoFailure(text);
+        if (failure) throw failure.error;
+        if (/^\s*<(!DOCTYPE\s+html|html[\s>])/i.test(text)) {
+          throw serviceUnavailable(
+            'CELLAR returned HTML instead of SPARQL results — possibly rate-limited.',
+          );
         }
-
-        try {
-          return JSON.parse(text) as SparqlResultsJson;
-        } catch {
-          if (/^\s*<(!DOCTYPE\s+html|html[\s>])/i.test(text)) {
-            throw serviceUnavailable(
-              'CELLAR returned HTML instead of SPARQL results — possibly rate-limited.',
-            );
-          }
-          throw serviceUnavailable('Failed to parse CELLAR SPARQL response as JSON');
-        }
+        throw serviceUnavailable('Failed to parse CELLAR SPARQL response as JSON');
       },
       {
         operation: 'CellarSparqlService.query',
