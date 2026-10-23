@@ -247,6 +247,98 @@ describe('eurlex_get_cases', () => {
   // --- #143: court and case_type case variants ---
 
   it.each([
+    ['C-129/14', '62014CP0129', 'VIEW_AG', 'AG View'],
+    ['C-550/09', '62009CP0550', 'VIEW_AG', 'AG View'],
+    ['C-97/23', '62023CC0097', 'OPIN_AG', 'AG Opinion'],
+  ])(
+    'selects the exact AG family and preserves %s as %s (#165 regression)',
+    async (caseNumber, celex, code, label) => {
+      mockQuery.mockResolvedValue([
+        makeCaseBinding(celex, {
+          types: `http://publications.europa.eu/resource/authority/resource-type/${code}`,
+        }),
+      ]);
+      const result = await runToolContract(eurlex_get_cases, {
+        case_number: caseNumber,
+        case_type: 'ag_opinion',
+        include_derivative: true,
+      });
+      const query = mockQuery.mock.calls[0]?.[0] as string;
+      const values = /VALUES \?selectedCaseType \{([^}]+)\}/.exec(query)?.[1];
+      expect(values?.match(/resource-type\/([A-Z_]+)>/g)).toEqual([
+        'resource-type/OPIN_AG>',
+        'resource-type/VIEW_AG>',
+      ]);
+      expect(query).toContain('?work cdm:work_has_resource-type ?selectedCaseType .');
+      expect(admits(query, celex)).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        cases: [{ celex_number: celex, resource_type: label }],
+      });
+      expect(contentText(result)).toContain(celex);
+      expect(contentText(result)).toContain(label);
+    },
+  );
+
+  it('keeps an ordinary AG opinion labelled on both surfaces (#165 characterization)', async () => {
+    mockQuery.mockResolvedValue([
+      makeCaseBinding('62023CC0097', {
+        types: 'http://publications.europa.eu/resource/authority/resource-type/OPIN_AG',
+      }),
+    ]);
+    const result = await runToolContract(eurlex_get_cases, {
+      case_number: 'C-97/23',
+      case_type: 'ag_opinion',
+    });
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({
+      cases: [{ celex_number: '62023CC0097', resource_type: 'AG Opinion' }],
+    });
+    expect(contentText(result)).toContain('62023CC0097');
+    expect(contentText(result)).toContain('AG Opinion');
+    expect(admits(mockQuery.mock.calls[0]?.[0] as string, '62023CC0097')).toBe(true);
+  });
+
+  it.each([
+    ['empty first page', 0, 0, false],
+    ['offset past the end', 5, 0, false],
+    ['one result plus the continuation sentinel', 0, 2, true],
+  ])('keeps AG family pagination on %s (#165)', async (_name, offset, rows, hasMore) => {
+    mockQuery.mockResolvedValue(
+      [
+        makeCaseBinding('62014CP0129', {
+          types: 'http://publications.europa.eu/resource/authority/resource-type/VIEW_AG',
+        }),
+        makeCaseBinding('62009CP0550', {
+          types: 'http://publications.europa.eu/resource/authority/resource-type/VIEW_AG',
+        }),
+      ].slice(0, rows),
+    );
+    const result = await runToolContract(eurlex_get_cases, {
+      case_type: 'ag_opinion',
+      court: 'CJEU',
+      date_from: '2009-01-01',
+      date_to: '2014-12-31',
+      limit: 1,
+      offset,
+    });
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({
+      total: rows === 0 ? 0 : 1,
+      has_more: hasMore,
+      offset,
+    });
+    const query = mockQuery.mock.calls[0]?.[0] as string;
+    expect(query).toContain('?work cdm:work_has_resource-type ?selectedCaseType .');
+    expect(query).toContain(`LIMIT 2 OFFSET ${offset}`);
+    expect(query).toContain('FILTER(?date >= "2009-01-01"^^xsd:date)');
+    expect(query).toContain('FILTER(?date <= "2014-12-31"^^xsd:date)');
+    if (hasMore) {
+      expect(contentText(result)).toContain('62014CP0129');
+      expect(contentText(result)).not.toContain('62009CP0550');
+    }
+  });
+
+  it.each([
     ['cjeu', 'CJEU', '62013CJ0131', '62020TJ0001'],
     [' Gc ', 'GC', '62020TJ0001', '62013CJ0131'],
   ])(
@@ -274,7 +366,7 @@ describe('eurlex_get_cases', () => {
     expect(eurlex_get_cases.output.parse(result.structuredContent).query_echo.case_type).toBe(
       member,
     );
-    expect(mockQuery.mock.calls[0]?.[0] as string).toContain(`resource-type/${typeCode}> .`);
+    expect(mockQuery.mock.calls[0]?.[0] as string).toContain(`resource-type/${typeCode}>`);
   });
 
   it('still reads "" as unset and rejects a court or case_type naming no member (#143)', () => {
@@ -326,7 +418,7 @@ describe('eurlex_get_cases', () => {
     expect(sparql).not.toContain('CONTAINS(STR(?celexNumber), "CO")');
   });
 
-  it('applies case_type=ag_opinion as a required OPIN_AG resource-type (issue #38)', async () => {
+  it('applies case_type=ag_opinion as a required AG resource-type family (#38, #165)', async () => {
     const ctx = createMockContext({ errors: eurlex_get_cases.errors });
     mockQuery.mockResolvedValue([
       makeCaseBinding('62025CC0300', {
@@ -338,9 +430,7 @@ describe('eurlex_get_cases', () => {
     await eurlex_get_cases.handler(input, ctx);
 
     const sparql = mockQuery.mock.calls[0]?.[0] as string;
-    expect(sparql).toContain(
-      '?work cdm:work_has_resource-type <http://publications.europa.eu/resource/authority/resource-type/OPIN_AG> .',
-    );
+    expect(sparql).toContain('?work cdm:work_has_resource-type ?selectedCaseType .');
     expect(sparql).not.toContain('CONTAINS(STR(?celexNumber), "CC")');
   });
 
@@ -1516,8 +1606,11 @@ describe('eurlex_get_cases', () => {
         // The CELEX match no longer pins the judgment letters, so case_type can reach
         // the orders and opinions; the resource-type triple does the narrowing.
         for (const celex of C_97_23_PRIMARY) expect(admits(sparql, celex), celex).toBe(true);
+        expect(sparql).toContain(`resource-type/${typeCode}>`);
         expect(sparql).toContain(
-          `?work cdm:work_has_resource-type <http://publications.europa.eu/resource/authority/resource-type/${typeCode}> .`,
+          caseType === 'ag_opinion'
+            ? '?work cdm:work_has_resource-type ?selectedCaseType .'
+            : `?work cdm:work_has_resource-type <http://publications.europa.eu/resource/authority/resource-type/${typeCode}> .`,
         );
       },
     );
@@ -1825,9 +1918,7 @@ describe('eurlex_get_cases', () => {
       const sparql = await courtQuery({ court: 'GC', case_type: 'ag_opinion' });
 
       expect(admits(sparql, '62024TC0643')).toBe(true);
-      expect(sparql).toContain(
-        '?work cdm:work_has_resource-type <http://publications.europa.eu/resource/authority/resource-type/OPIN_AG> .',
-      );
+      expect(sparql).toContain('?work cdm:work_has_resource-type ?selectedCaseType .');
     });
 
     it('CJEU with a CELEX keyword reaches Opinion 2/13', async () => {

@@ -32,8 +32,157 @@ import {
   toMemberStateCode,
   traverseRelations,
 } from '@/services/cellar-sparql/relation-traversal.js';
-import { isPastSortWindow } from '@/services/cellar-sparql/sort-window.js';
+import { isPastSortWindow, SORT_WINDOW } from '@/services/cellar-sparql/sort-window.js';
 import { resolveCelexWorks } from '@/services/cellar-sparql/work-resolution.js';
+
+/** The tool's domain output, before framework enrichment. */
+const RelationsOutputSchema = z.object({
+  celex_number: z
+    .string()
+    .optional()
+    .describe(
+      'CELEX number of the source work whose relations were traversed — the celex_number input, or the CELEX resolved from work_uri when the addressed work carries exactly one. Absent when the addressed work carries none, carries several, or its identity was not resolved because no requested relation type needs it.',
+    ),
+  work_uri: z
+    .string()
+    .describe('CELLAR URI of the source work (the work_uri input, or resolved from the CELEX).'),
+  relations: z
+    .array(
+      z
+        .object({
+          relation_type: z
+            .string()
+            .describe(
+              'Type of relation: cites, amends, amended_by, repeals, repealed_by, implicitly_repeals, implicitly_repealed_by, legal_basis, basis_for, interprets, interpreted_by, consolidated_version, national_transposition.',
+            ),
+          direction: z
+            .string()
+            .describe(
+              'Direction: "outgoing" (this work → related) or "incoming" (related → this work).',
+            ),
+          related_work_uri: z.string().describe('CELLAR URI of the related work.'),
+          related_celex_number: z
+            .string()
+            .optional()
+            .describe('CELEX number of the related work, if available.'),
+          related_member_state: z
+            .string()
+            .optional()
+            .describe(
+              'ISO 3166-1 alpha-3 code of the member state whose national measure this is (e.g. "CZE"), read from the three letters after the directive number in related_celex_number. Present on national_transposition rows only. The codes are the 27 member states plus "GBR" (the United Kingdom).',
+            ),
+          related_date: z
+            .string()
+            .optional()
+            .describe(
+              'Document date of the related work (YYYY-MM-DD), the date rows are ordered by within each relation type and direction. Absent when CELLAR records none; such rows sort last.',
+            ),
+          related_title: z
+            .string()
+            .optional()
+            .describe(
+              "The related work's English title, whole. Absent when the work has no English title — most national_transposition measures are titled only in their member state's language — with no other language substituted.",
+            ),
+        })
+        .describe('A single CDM relation between the source work and a related work.'),
+    )
+    .describe('Direct CDM relations for the requested work.'),
+  total: z
+    .number()
+    .describe('Number of relations returned in this page (not a corpus-wide count).'),
+  offset: z
+    .number()
+    .describe('Pagination offset applied to this response (per relation type and direction).'),
+  has_more: z
+    .boolean()
+    .describe(
+      'True when an additional valid row or a response-budget cut proves at least one requested relation type/direction has more rows. False on a retained page that ends at row 10,000, the last one CELLAR sorts; its notice names the types and directions that reached it.',
+    ),
+  next_offset: z
+    .number()
+    .optional()
+    .describe(
+      'Offset plus the applied per-type/direction depth after any response-budget cut. Present only when has_more is true; use this value to continue without skipping withheld rows.',
+    ),
+  requested_relation_types: z
+    .array(z.string())
+    .describe(
+      'The relation types this request traversed — the explicit relation_types list, or all types when it was omitted. Diff against the types present in relations[], or read empty_relation_types, to confirm which requested types returned edges.',
+    ),
+  member_states: z
+    .array(z.string())
+    .optional()
+    .describe(
+      'The member states national_transposition rows were narrowed to, as ISO 3166-1 alpha-3 codes, normalized from member_states and de-duplicated. Absent when no member_states filter was given.',
+    ),
+  empty_relation_types: z
+    .array(z.string())
+    .describe(
+      'Requested relation types that returned zero relations in THIS page. Page-scoped: a type can appear here because all its edges sit beyond the current offset/limit window, not only because the act genuinely has none of that relation — so absent-from-here does not prove absent-in-CELLAR. An empty page — a first page with no edges, or an exhausted later page — returns all requested types here.',
+    ),
+});
+
+type RelationsPage = z.infer<typeof RelationsOutputSchema>;
+
+/** The same renderers measure and emit every enrichment trailer byte. */
+const relationTrailers = {
+  limit_clamp: limitClampTrailer,
+  truncated: { render: (value: boolean | undefined) => `**truncated:** ${value}` },
+  shown: { render: (value: number | undefined) => `**shown:** ${value}` },
+  cap: { render: (value: number | undefined) => `**cap:** ${value}` },
+  notice: { render: (value: string | undefined) => `> ${value}` },
+};
+
+const relationEnrichment = {
+  truncated: z
+    .boolean()
+    .optional()
+    .describe(
+      'True when an additional valid row proves at least one relation type/direction has more related works — page with offset.',
+    ),
+  shown: z
+    .number()
+    .optional()
+    .describe(
+      'Number of relations returned in this page, summed across every relation type and direction — not the count for any single type or direction.',
+    ),
+  cap: z
+    .number()
+    .optional()
+    .describe(
+      'The per-direction cap. It bounds each relation type and each direction independently, so it is not an upper bound on shown: a page spanning several types and both directions can return more relations than this number.',
+    ),
+  notice: z
+    .string()
+    .optional()
+    .describe(
+      'Guidance for the next call: on an empty first page, how to widen the traversal; on a first page where member_states matched no national_transposition measures, the codes it named; on a page with more rows, the offset to continue from; on a page ending at row 10,000, the relation types and directions that reached it, each with a ready-to-run eurlex_query_sparql query listing its older works.',
+    ),
+  limit_clamp: limitClampEnrichment,
+};
+
+type RelationsEnrichment = z.infer<z.ZodObject<typeof relationEnrichment>>;
+
+/** Budget each serialized final surface independently, including the framework trailer. */
+function fitsRelationBudget(page: RelationsPage, enrichment: RelationsEnrichment): boolean {
+  const lines: string[] = [];
+  if (enrichment.limit_clamp)
+    lines.push(relationTrailers.limit_clamp.render(enrichment.limit_clamp));
+  if (enrichment.truncated !== undefined)
+    lines.push(relationTrailers.truncated.render(enrichment.truncated));
+  if (enrichment.shown !== undefined) lines.push(relationTrailers.shown.render(enrichment.shown));
+  if (enrichment.cap !== undefined) lines.push(relationTrailers.cap.render(enrichment.cap));
+  if (enrichment.notice !== undefined)
+    lines.push(relationTrailers.notice.render(enrichment.notice));
+  const content = [
+    ...formatRelationsPage(page),
+    ...(lines.length ? [{ type: 'text', text: `\n\n${lines.join('\n')}` }] : []),
+  ];
+  return (
+    Buffer.byteLength(JSON.stringify({ ...page, ...enrichment }), 'utf8') <= 64_000 &&
+    Buffer.byteLength(JSON.stringify(content), 'utf8') <= 64_000
+  );
+}
 
 export const eurlex_get_relations = tool('eurlex_get_relations', {
   title: 'Get CELLAR Relationship Graph',
@@ -74,7 +223,7 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
       .array(enumInput(RELATION_TYPES, z.enum([...RELATION_TYPES])))
       .optional()
       .describe(
-        'Subset of relation types to return; omit for all. Types: cites, amends, amended_by, repeals, repealed_by, implicitly_repeals, implicitly_repealed_by, legal_basis (treaty/article this act rests on), basis_for (works naming this act among their legal bases — implementing and delegated acts, decisions, Parliament resolutions, drafts; the incoming side of legal_basis), interprets (for a ruling: the acts it interprets), interpreted_by (CJEU and General Court rulings interpreting this act; the incoming side of interprets), consolidated_version (consolidated texts of this act), national_transposition (member-state implementing measures). Omitted on a heavily linked act (the GDPR, a framework regulation), the call returns hundreds of related works with whole titles — a response of well over 100 KB; name only the types you need.',
+        'Subset of relation types to return; omit for all thirteen, equivalent to listing them explicitly. Types: cites, amends, amended_by, repeals, repealed_by, implicitly_repeals, implicitly_repealed_by, legal_basis (treaty/article this act rests on), basis_for (works naming this act among their legal bases — implementing and delegated acts, decisions, Parliament resolutions, drafts; the incoming side of legal_basis), interprets (for a ruling: the acts it interprets), interpreted_by (CJEU and General Court rulings interpreting this act; the incoming side of interprets), consolidated_version (consolidated texts of this act), national_transposition (member-state implementing measures). Whole rows and titles are kept within a 64,000 UTF-8 byte budget per complete response surface by lowering the common per-type/direction depth, never below 1; an oversize depth-1 page is returned whole with disclosure. Name only the types you need to reduce the response.',
       ),
     member_states: z
       .array(
@@ -97,7 +246,7 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
       .min(0)
       .default(0)
       .describe(
-        'Pagination offset applied per relation type and direction — related works to skip (default 0). Page forward by adding limit; incoming edges are newest-first, so higher offsets reach older works. Must be below 10,000: CELLAR sorts at most 10,000 related works per type and direction, so pages stop at row 10,000.',
+        'Pagination offset applied per relation type and direction — related works to skip (default 0). Continue at the returned next_offset, which adds the applied depth after any response-budget cut; incoming edges are newest-first, so higher offsets reach older works. Must be below 10,000: CELLAR sorts at most 10,000 related works per type and direction, so pages stop at row 10,000.',
       ),
     limit: z
       .number()
@@ -106,121 +255,13 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
       .max(ROW_LIMIT_CEILING)
       .default(100)
       .describe(
-        'Maximum related works per relation type and direction, served up to 100 per call (default 100); a larger value (up to 10,000) is served at 100 and reported in limit_clamp. Incoming edges are ordered newest-first, so the cap keeps the newest — page with offset for older ones. The cap applies to each type and direction separately, so on a heavily linked act a lower limit, with relation_types narrowed, keeps the response small.',
+        'Maximum related works per relation type and direction, served up to 100 per call (default 100); a larger value (up to 10,000) is served at 100 and reported in limit_clamp. A response-budget cut can lower the common depth further to fit each complete surface within 64,000 UTF-8 bytes, never below 1; the notice reports requested/applied limits and withheld rows. Incoming edges are newest-first. Continue at next_offset for older works; narrow relation_types or lower limit for a smaller response.',
       ),
   }),
-  output: z.object({
-    celex_number: z
-      .string()
-      .optional()
-      .describe(
-        'CELEX number of the source work whose relations were traversed — the celex_number input, or the CELEX resolved from work_uri when the addressed work carries exactly one. Absent when the addressed work carries none, carries several, or its identity was not resolved because no requested relation type needs it.',
-      ),
-    work_uri: z
-      .string()
-      .describe('CELLAR URI of the source work (the work_uri input, or resolved from the CELEX).'),
-    relations: z
-      .array(
-        z
-          .object({
-            relation_type: z
-              .string()
-              .describe(
-                'Type of relation: cites, amends, amended_by, repeals, repealed_by, implicitly_repeals, implicitly_repealed_by, legal_basis, basis_for, interprets, interpreted_by, consolidated_version, national_transposition.',
-              ),
-            direction: z
-              .string()
-              .describe(
-                'Direction: "outgoing" (this work → related) or "incoming" (related → this work).',
-              ),
-            related_work_uri: z.string().describe('CELLAR URI of the related work.'),
-            related_celex_number: z
-              .string()
-              .optional()
-              .describe('CELEX number of the related work, if available.'),
-            related_member_state: z
-              .string()
-              .optional()
-              .describe(
-                'ISO 3166-1 alpha-3 code of the member state whose national measure this is (e.g. "CZE"), read from the three letters after the directive number in related_celex_number. Present on national_transposition rows only. The codes are the 27 member states plus "GBR" (the United Kingdom).',
-              ),
-            related_date: z
-              .string()
-              .optional()
-              .describe(
-                'Document date of the related work (YYYY-MM-DD), the date rows are ordered by within each relation type and direction. Absent when CELLAR records none; such rows sort last.',
-              ),
-            related_title: z
-              .string()
-              .optional()
-              .describe(
-                "The related work's English title, whole. Absent when the work has no English title — most national_transposition measures are titled only in their member state's language — with no other language substituted.",
-              ),
-          })
-          .describe('A single CDM relation between the source work and a related work.'),
-      )
-      .describe('Direct CDM relations for the requested work.'),
-    total: z
-      .number()
-      .describe('Number of relations returned in this page (not a corpus-wide count).'),
-    offset: z
-      .number()
-      .describe('Pagination offset applied to this response (per relation type and direction).'),
-    has_more: z
-      .boolean()
-      .describe(
-        'True only when at least one requested relation type/direction returned an additional valid row beyond this page. False on a page that ends at row 10,000, the last one CELLAR sorts; its notice names the types and directions that reached it.',
-      ),
-    next_offset: z
-      .number()
-      .optional()
-      .describe('Offset for the next page. Present only when has_more is true.'),
-    requested_relation_types: z
-      .array(z.string())
-      .describe(
-        'The relation types this request traversed — the explicit relation_types list, or all types when it was omitted. Diff against the types present in relations[], or read empty_relation_types, to confirm which requested types returned edges.',
-      ),
-    member_states: z
-      .array(z.string())
-      .optional()
-      .describe(
-        'The member states national_transposition rows were narrowed to, as ISO 3166-1 alpha-3 codes, normalized from member_states and de-duplicated. Absent when no member_states filter was given.',
-      ),
-    empty_relation_types: z
-      .array(z.string())
-      .describe(
-        'Requested relation types that returned zero relations in THIS page. Page-scoped: a type can appear here because all its edges sit beyond the current offset/limit window, not only because the act genuinely has none of that relation — so absent-from-here does not prove absent-in-CELLAR. An empty page — a first page with no edges, or an exhausted later page — returns all requested types here.',
-      ),
-  }),
+  output: RelationsOutputSchema,
 
-  enrichment: {
-    truncated: z
-      .boolean()
-      .optional()
-      .describe(
-        'True when an additional valid row proves at least one relation type/direction has more related works — page with offset.',
-      ),
-    shown: z
-      .number()
-      .optional()
-      .describe(
-        'Number of relations returned in this page, summed across every relation type and direction — not the count for any single type or direction.',
-      ),
-    cap: z
-      .number()
-      .optional()
-      .describe(
-        'The per-direction cap. It bounds each relation type and each direction independently, so it is not an upper bound on shown: a page spanning several types and both directions can return more relations than this number.',
-      ),
-    notice: z
-      .string()
-      .optional()
-      .describe(
-        'Guidance for the next call: on an empty first page, how to widen the traversal; on a first page where member_states matched no national_transposition measures, the codes it named; on a page with more rows, the offset to continue from; on a page ending at row 10,000, the relation types and directions that reached it, each with a ready-to-run eurlex_query_sparql query listing its older works.',
-      ),
-    limit_clamp: limitClampEnrichment,
-  },
-  enrichmentTrailer: { limit_clamp: limitClampTrailer },
+  enrichment: relationEnrichment,
+  enrichmentTrailer: relationTrailers,
 
   errors: [
     {
@@ -267,7 +308,7 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
     },
   ],
 
-  async handler(input, ctx) {
+  async handler(input, ctx): Promise<RelationsPage> {
     if (isPastSortWindow(input.offset)) {
       throw ctx.fail(
         'offset_past_window',
@@ -413,138 +454,190 @@ SELECT ?sourceCelex WHERE {
      * one would point at relation_types when the filter is what emptied the type.
      * The framework keeps one notice, so it joins the continuation guidance below.
      */
-    const notices: string[] = [];
-    if (input.offset === 0) {
-      const source = echoValue(celexNumber ?? workUri);
-      if (memberStates && !workRelations.some((r) => r.relationType === 'national_transposition')) {
-        notices.push(
-          `No national_transposition measures of ${memberStates.join(', ')} were found for ${source}. Name other member states in member_states, or drop it to list every member state's measures.`,
-        );
-      } else if (workRelations.length === 0) {
-        notices.push(
-          `Work ${source} has no CDM relations of the requested types. Try other relation_types or omit the filter to fetch all available relation types.`,
-        );
-      }
-      if (workRelations.length === 0 && !celexNumber) {
-        notices.push(
-          'The work URI is not checked for existence; confirm it with eurlex_get_document (content_mode "metadata_only").',
-        );
-      }
-    }
-    // A direction that filled what CELLAR's sort window allows may continue past row
-    // 10,000, where no offset reaches (#154); this tool has no date filter, so the
-    // route is a raw query per direction, bounded by the last date its page reached.
-    if (windowEnds.length > 0) {
-      const reached = windowEnds
-        .map(
-          (end) =>
-            `${end.relationType} (${end.direction})${end.lastDate ? `, last related_date ${end.lastDate}` : ', ending among works with no date'}`,
-        )
-        .join('; ');
-      const continuations = windowEnds
-        .map((end) => `${end.relationType} (${end.direction}): ${end.continuationQuery}`)
-        .join('; ');
-      notices.push(
-        `This page reaches row 10,000, the last row CELLAR sorts for one relation type and direction, in ${reached}. No later page can be read there, and more related works may exist. To list them, run the query for each with eurlex_query_sparql, paging it with OFFSET; its first rows repeat the end of this page, and a work with several dates or CELEX numbers appears once per value. ${continuations}`,
-      );
-    }
-
-    const relations = workRelations.map((r) => ({
-      relation_type: r.relationType,
-      direction: r.direction,
-      related_work_uri: r.relatedWorkUri,
-      ...(r.relatedCelexNumber ? { related_celex_number: r.relatedCelexNumber } : {}),
-      ...(r.relatedMemberState ? { related_member_state: r.relatedMemberState } : {}),
-      ...(r.relatedDate ? { related_date: r.relatedDate } : {}),
-      ...(r.relatedTitle ? { related_title: r.relatedTitle } : {}),
-    }));
-
-    if (hasMore) {
-      ctx.enrich.truncated({
-        shown: relations.length,
-        cap: perDirectionLimit,
-        guidance: [
-          ...notices,
-          `At least one relation type or direction has more related works; call again with offset=${input.offset + perDirectionLimit}.`,
-        ].join(' '),
+    const buildPage = (
+      depth: number,
+      disclose: boolean,
+    ): { page: RelationsPage; enrichment: RelationsEnrichment } => {
+      const counts = new Map<string, number>();
+      const kept = workRelations.filter((row) => {
+        const key = `${row.relationType}:${row.direction}`;
+        const count = (counts.get(key) ?? 0) + 1;
+        counts.set(key, count);
+        return count <= depth;
       });
-    } else if (notices.length > 0) {
-      ctx.enrich.notice(notices.join(' '));
-    }
+      const withheld = workRelations.length - kept.length;
+      const pageHasMore = hasMore || withheld > 0;
+      const pageWindowEnds = withheld > 0 && input.offset + depth < SORT_WINDOW ? [] : windowEnds;
+      const notices: string[] = [];
+      if (input.offset === 0) {
+        const source = echoValue(celexNumber ?? workUri);
+        if (memberStates && !kept.some((r) => r.relationType === 'national_transposition')) {
+          notices.push(
+            `No national_transposition measures of ${memberStates.join(', ')} were found for ${source}. Name other member states in member_states, or drop it to list every member state's measures.`,
+          );
+        } else if (kept.length === 0) {
+          notices.push(
+            `Work ${source} has no CDM relations of the requested types. Try other relation_types or omit the filter to fetch all available relation types.`,
+          );
+        }
+        if (kept.length === 0 && !celexNumber) {
+          notices.push(
+            'The work URI is not checked for existence; confirm it with eurlex_get_document (content_mode "metadata_only").',
+          );
+        }
+      }
+      // A direction that filled what CELLAR's sort window allows may continue past row
+      // 10,000, where no offset reaches (#154); this tool has no date filter, so the
+      // route is a raw query per direction, bounded by the last date its page reached.
+      if (pageWindowEnds.length > 0) {
+        const reached = pageWindowEnds
+          .map(
+            (end) =>
+              `${end.relationType} (${end.direction})${end.lastDate ? `, last related_date ${end.lastDate}` : ', ending among works with no date'}`,
+          )
+          .join('; ');
+        const continuations = pageWindowEnds
+          .map((end) => `${end.relationType} (${end.direction}): ${end.continuationQuery}`)
+          .join('; ');
+        notices.push(
+          `This page reaches row 10,000, the last row CELLAR sorts for one relation type and direction, in ${reached}. No later page can be read there, and more related works may exist. To list them, run the query for each with eurlex_query_sparql, paging it with OFFSET; its first rows repeat the end of this page, and a work with several dates or CELEX numbers appears once per value. ${continuations}`,
+        );
+      }
 
-    // #47: make requested-but-empty types explicit. A requested type with zero
-    // edges is silently absent from the flat relations[] array, so a caller can't
-    // tell "no such edges" from "dropped/paged out". Echo the full requested list
-    // and the subset that returned nothing in this page (computed from the
-    // post-filter relations — no extra queries).
-    const presentTypes = new Set(relations.map((r) => r.relation_type));
-    const emptyRelationTypes = requestedTypes.filter((t) => !presentTypes.has(t));
+      if (disclose) {
+        notices.push(
+          `Response budget 64,000 UTF-8 bytes per surface: requested limit ${input.limit}, applied limit ${depth}; ${withheld} rows withheld from the fetched page. Whole titles and rows are retained; a minimum depth of 1 is returned whole even when it exceeds the budget. Narrow relation_types or lower limit for a smaller response.`,
+        );
+      }
+      const relations = kept.map((r) => ({
+        relation_type: r.relationType,
+        direction: r.direction,
+        related_work_uri: r.relatedWorkUri,
+        ...(r.relatedCelexNumber ? { related_celex_number: r.relatedCelexNumber } : {}),
+        ...(r.relatedMemberState ? { related_member_state: r.relatedMemberState } : {}),
+        ...(r.relatedDate ? { related_date: r.relatedDate } : {}),
+        ...(r.relatedTitle ? { related_title: r.relatedTitle } : {}),
+      }));
 
-    // Echo the CELEX the traversal actually ran against. On the work_uri path that
-    // is the identity resolved from the work — reported only when the work carries
-    // exactly one, which is also the only case where it gated the act-core
-    // constraint — so the caller can see which act national_transposition matched.
-    const resolvedCelexNumber = celexNumber ?? sourceCelexNumber;
+      const enrichment: RelationsEnrichment = {
+        ...(input.limit > perDirectionLimit
+          ? { limit_clamp: { requested: input.limit, applied: perDirectionLimit } }
+          : {}),
+      };
+      if (pageHasMore) {
+        Object.assign(enrichment, {
+          truncated: true,
+          shown: relations.length,
+          cap: depth,
+          notice: [
+            ...notices,
+            `At least one relation type or direction has more related works; call again with offset=${input.offset + depth}.`,
+          ].join(' '),
+        });
+      } else if (notices.length > 0) {
+        enrichment.notice = notices.join(' ');
+      }
 
-    return {
-      ...(resolvedCelexNumber ? { celex_number: resolvedCelexNumber } : {}),
-      work_uri: workUri,
-      relations,
-      total: relations.length,
-      offset: input.offset,
-      has_more: hasMore,
-      ...(hasMore ? { next_offset: input.offset + perDirectionLimit } : {}),
-      requested_relation_types: [...requestedTypes],
-      ...(memberStates ? { member_states: memberStates } : {}),
-      empty_relation_types: emptyRelationTypes,
+      // #47: make requested-but-empty types explicit. A requested type with zero
+      // edges is silently absent from the flat relations[] array, so a caller can't
+      // tell "no such edges" from "dropped/paged out". Echo the full requested list
+      // and the subset that returned nothing in this page (computed from the
+      // post-filter relations — no extra queries).
+      const presentTypes = new Set(relations.map((r) => r.relation_type));
+      const emptyRelationTypes = requestedTypes.filter((t) => !presentTypes.has(t));
+
+      // Echo the CELEX the traversal actually ran against. On the work_uri path that
+      // is the identity resolved from the work — reported only when the work carries
+      // exactly one, which is also the only case where it gated the act-core
+      // constraint — so the caller can see which act national_transposition matched.
+      const resolvedCelexNumber = celexNumber ?? sourceCelexNumber;
+
+      const page: RelationsPage = {
+        ...(resolvedCelexNumber ? { celex_number: resolvedCelexNumber } : {}),
+        work_uri: workUri,
+        relations,
+        total: relations.length,
+        offset: input.offset,
+        has_more: pageHasMore,
+        ...(pageHasMore ? { next_offset: input.offset + depth } : {}),
+        requested_relation_types: [...requestedTypes],
+        ...(memberStates ? { member_states: memberStates } : {}),
+        empty_relation_types: emptyRelationTypes,
+      };
+      return { page, enrichment };
     };
+    let selected = buildPage(perDirectionLimit, false);
+    if (!fitsRelationBudget(selected.page, selected.enrichment)) {
+      const armCounts = new Map<string, number>();
+      for (const row of workRelations) {
+        const key = `${row.relationType}:${row.direction}`;
+        armCounts.set(key, (armCounts.get(key) ?? 0) + 1);
+      }
+      // Exhausted arms cannot shrink until depth falls below their actual size.
+      // In particular, an oversize lone row goes straight to the depth-1 disclosure.
+      const largestCut = Math.max(
+        1,
+        Math.min(perDirectionLimit, Math.max(0, ...armCounts.values())) - 1,
+      );
+      // The cap is at most 100. Descending checks find the largest fitting depth
+      // even when a changing notice makes serialized size non-monotonic.
+      for (let depth = largestCut; depth >= 1; depth--) {
+        selected = buildPage(depth, true);
+        if (fitsRelationBudget(selected.page, selected.enrichment)) break;
+      }
+    }
+    ctx.enrich(selected.enrichment);
+    return selected.page;
   },
 
-  format: (result) => {
-    const lines: string[] = [
-      `## Relations for ${result.celex_number ?? result.work_uri} (${result.total} in this page, offset ${result.offset})\n`,
-      `**Has more:** ${result.has_more}`,
-    ];
-    if (result.next_offset !== undefined) lines.push(`**Next offset:** ${result.next_offset}`);
-    lines.push('');
-    if (result.work_uri) lines.push(`**Work URI:** ${result.work_uri}\n`);
-
-    // #47: surface coverage so a non-structuredContent client sees the same
-    // requested-vs-empty signal the structured output carries.
-    lines.push(`**Requested types:** ${result.requested_relation_types.join(', ')}`);
-    if (result.member_states) lines.push(`**Member states:** ${result.member_states.join(', ')}`);
-    lines.push(
-      `**Empty types (this page):** ${
-        result.empty_relation_types.length > 0 ? result.empty_relation_types.join(', ') : 'none'
-      }\n`,
-    );
-
-    const grouped = new Map<string, typeof result.relations>();
-    for (const r of result.relations) {
-      const key = `${r.relation_type} (${r.direction})`;
-      let bucket = grouped.get(key);
-      if (!bucket) {
-        bucket = [];
-        grouped.set(key, bucket);
-      }
-      bucket.push(r);
-    }
-
-    for (const [group, items] of grouped) {
-      lines.push(`### ${group}`);
-      for (const item of items) {
-        const label = item.related_celex_number
-          ? `${item.related_celex_number} (${item.related_work_uri})`
-          : item.related_work_uri;
-        const memberState = item.related_member_state
-          ? ` — member state ${item.related_member_state}`
-          : '';
-        const date = item.related_date ? ` · ${item.related_date}` : '';
-        const title = item.related_title ? ` · ${item.related_title}` : '';
-        lines.push(`- ${label}${memberState}${date}${title}`);
-      }
-      lines.push('');
-    }
-    return [{ type: 'text', text: lines.join('\n') }];
-  },
+  format: formatRelationsPage,
 });
+
+/** Render every retained row without shortening titles. */
+function formatRelationsPage(result: RelationsPage): { type: 'text'; text: string }[] {
+  const lines: string[] = [
+    `## Relations for ${result.celex_number ?? result.work_uri} (${result.total} in this page, offset ${result.offset})\n`,
+    `**Has more:** ${result.has_more}`,
+  ];
+  if (result.next_offset !== undefined) lines.push(`**Next offset:** ${result.next_offset}`);
+  lines.push('');
+  if (result.work_uri) lines.push(`**Work URI:** ${result.work_uri}\n`);
+
+  // #47: surface coverage so a non-structuredContent client sees the same
+  // requested-vs-empty signal the structured output carries.
+  lines.push(`**Requested types:** ${result.requested_relation_types.join(', ')}`);
+  if (result.member_states) lines.push(`**Member states:** ${result.member_states.join(', ')}`);
+  lines.push(
+    `**Empty types (this page):** ${
+      result.empty_relation_types.length > 0 ? result.empty_relation_types.join(', ') : 'none'
+    }\n`,
+  );
+
+  const grouped = new Map<string, typeof result.relations>();
+  for (const r of result.relations) {
+    const key = `${r.relation_type} (${r.direction})`;
+    let bucket = grouped.get(key);
+    if (!bucket) {
+      bucket = [];
+      grouped.set(key, bucket);
+    }
+    bucket.push(r);
+  }
+
+  for (const [group, items] of grouped) {
+    lines.push(`### ${group}`);
+    for (const item of items) {
+      const label = item.related_celex_number
+        ? `${item.related_celex_number} (${item.related_work_uri})`
+        : item.related_work_uri;
+      const memberState = item.related_member_state
+        ? ` — member state ${item.related_member_state}`
+        : '';
+      const date = item.related_date ? ` · ${item.related_date}` : '';
+      const title = item.related_title ? ` · ${item.related_title}` : '';
+      lines.push(`- ${label}${memberState}${date}${title}`);
+    }
+    lines.push('');
+  }
+  return [{ type: 'text', text: lines.join('\n') }];
+}

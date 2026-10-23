@@ -30,7 +30,8 @@ export interface WorkAgents {
  * `OPTIONAL`s unbound in the second.
  *
  * A creator is labelled three ways. A `cdm:court_national` carries its name on
- * `cdm:court_national_name`. An authority code — a corporate body, a member state, an
+ * `cdm:court_national_name`, also matched by the `author_institution` filter. An
+ * authority code — a corporate body, a member state, an
  * MEP-register entry, or any other authority table — carries its English
  * `skos:prefLabel`, the same label the `author_institution` filter of
  * eurlex_search_documents matches, so a displayed author round-trips into that

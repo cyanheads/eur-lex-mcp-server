@@ -195,7 +195,7 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
       .string()
       .optional()
       .describe(
-        'Author name (e.g. "European Parliament", "Council", "European Commission"), matched as a phrase against the English labels of each work\'s authors — the labels eurlex_get_document reports in author_institution(s), member states and MEPs included.',
+        'Author name (e.g. "European Parliament", "Council", "European Commission", "Supremo Tribunal de Justiça"), matched as a phrase against English authority labels or national-court names — the labels eurlex_get_document reports in author_institution(s), member states and MEPs included.',
       ),
     in_force: z
       .boolean()
@@ -486,9 +486,14 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
         );
       }
       authorClause = `?work cdm:work_created_by_agent ?agent .
-  ?agent skos:prefLabel ?agentLabel .
-  ?agentLabel bif:contains "'${authorPhrase}'" .
-  FILTER(LANG(?agentLabel) = "en")`;
+  {
+    ?agent skos:prefLabel ?agentLabel .
+    ?agentLabel bif:contains "'${authorPhrase}'" .
+    FILTER(LANG(?agentLabel) = "en")
+  } UNION {
+    ?agent cdm:court_national_name ?courtName .
+    ?courtName bif:contains "'${authorPhrase}'" .
+  }`;
     }
 
     /**

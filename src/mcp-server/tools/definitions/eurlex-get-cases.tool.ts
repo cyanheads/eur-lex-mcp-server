@@ -53,21 +53,21 @@ import {
 const MAX_PAGE_SIZE = 100;
 
 /**
- * Case type → CDM resource-type authority URI. A case_type filter tests the
+ * Case type → exact CDM resource-type authority family. A case_type filter tests the
  * work's resource-type, NOT a CELEX substring: abstract (`_RES` → ABSTRACT_JUR)
  * and summary (`_SUM` → SUM_JUR) sibling works carry the same CELEX type letters
  * as their parent judgment/order (they still CONTAIN "CJ"/"CO"), only under a
  * distinct CELEX, so a substring test admitted them as separate rows. Requiring
  * the resource-type excludes those derivative works (issue #38). CELLAR types
  * CJEU/GC judgments as JUDG, orders as ORDER, and AG opinions (CELEX "CC") as
- * OPIN_AG.
+ * OPIN_AG; AG Views (CELEX "CP") use VIEW_AG and belong to the same filter.
  */
 const CASE_TYPES = ['judgment', 'order', 'ag_opinion'] as const;
-const CASE_TYPE_RESOURCE_TYPE: Record<string, string> = {
-  judgment: 'http://publications.europa.eu/resource/authority/resource-type/JUDG',
-  order: 'http://publications.europa.eu/resource/authority/resource-type/ORDER',
-  ag_opinion: 'http://publications.europa.eu/resource/authority/resource-type/OPIN_AG',
-};
+const CASE_TYPE_RESOURCE_TYPES = {
+  judgment: ['JUDG'],
+  order: ['ORDER'],
+  ag_opinion: ['OPIN_AG', 'VIEW_AG'],
+} as const satisfies Record<(typeof CASE_TYPES)[number], readonly string[]>;
 
 /**
  * What a row reads from the work its CELEX resolves to, in the page's resolution
@@ -181,7 +181,7 @@ function caseNumberMatch(
 export const eurlex_get_cases = tool('eurlex_get_cases', {
   title: 'Search CJEU/GC Case Law',
   description:
-    'Search CJEU and General Court case law — judgments, orders, and Advocate General opinions — by case number, court, case type, keyword, and date range. A case number reaches every judgment, order, and AG opinion filed under it. By default only these primary records are returned; derivative judicial information notices, case abstracts, summaries, and corrigenda are excluded so distinct cases fill the page (set include_derivative to include them). Keyword matches English case titles (which carry party names) and CELEX strings; there is no full-text body search. Returns each case with its CELEX number (whose sixth character names the court: C, T, or F), work URI, ECLI, date, and type, plus — parsed from the title where present — the formation, Advocate General, parties, referring court, subject matter, and case reference. The raw CELLAR title is returned only when those fields do not capture all of it.',
+    'Search CJEU and General Court case law — judgments, orders, and Advocate General opinions and views — by case number, court, case type, keyword, and date range. A case number reaches every judgment, order, AG opinion, and AG view filed under it. By default only these primary records are returned; derivative judicial information notices, case abstracts, summaries, and corrigenda are excluded so distinct cases fill the page (set include_derivative to include them). Keyword matches English case titles (which carry party names) and CELEX strings; there is no full-text body search. Returns each case with its CELEX number (whose sixth character names the court: C, T, or F), work URI, ECLI, date, and type, plus — parsed from the title where present — the formation, Advocate General, parties, referring court, subject matter, and case reference. The raw CELLAR title is returned only when those fields do not capture all of it.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
     case_number: z
@@ -216,19 +216,19 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
           z
             .enum(CASE_TYPES)
             .describe(
-              'judgment, order (procedural decision), or ag_opinion (Advocate General opinion).',
+              'judgment, order (procedural decision), or ag_opinion (Advocate General opinion or view).',
             ),
         ])
         .optional()
         .describe(
-          'Case type: judgment, order (procedural decision), or ag_opinion (Advocate General opinion). Omit to search all.',
+          'Case type: judgment, order (procedural decision), or ag_opinion (Advocate General opinion or view). Omit to search all.',
         ),
     ),
     include_derivative: z
       .boolean()
       .default(false)
       .describe(
-        'Include derivative sector-6 records — judicial information notices, case abstracts, case summaries, and corrigenda — alongside primary judgments, orders, and AG opinions. Default false: these are excluded so distinct primary cases fill the page. Ignored when case_type is set (that path already returns a single primary type).',
+        'Include derivative sector-6 records — judicial information notices, case abstracts, case summaries, and corrigenda — alongside primary judgments, orders, AG opinions, and AG views. Default false: these are excluded so distinct primary cases fill the page. Ignored when case_type is set (that path already requires the selected primary type family).',
       ),
     date_from: z
       .union([
@@ -556,10 +556,14 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
      */
     let typeConstraint = '';
     if (input.case_type) {
-      const typeUri = CASE_TYPE_RESOURCE_TYPE[input.case_type];
-      if (typeUri) {
-        typeConstraint = `?work cdm:work_has_resource-type <${typeUri}> .`;
-      }
+      const typeUris = CASE_TYPE_RESOURCE_TYPES[input.case_type].map(
+        (code) => `<http://publications.europa.eu/resource/authority/resource-type/${code}>`,
+      );
+      typeConstraint =
+        typeUris.length === 1
+          ? `?work cdm:work_has_resource-type ${typeUris[0]} .`
+          : `VALUES ?selectedCaseType { ${typeUris.join(' ')} }
+  ?work cdm:work_has_resource-type ?selectedCaseType .`;
     }
 
     /**

@@ -1,6 +1,6 @@
 # eur-lex-mcp-server - Directory Structure
 
-Generated on: 2026-10-15 03:53:08
+Generated on: 2026-10-23 05:13:48
 
 ```text
 eur-lex-mcp-server/
@@ -240,6 +240,7 @@ eur-lex-mcp-server/
 │   │   ├── eurlex-get-document.case-law.test.ts
 │   │   ├── eurlex-get-document.formex-package.test.ts
 │   │   ├── eurlex-get-document.tool.test.ts
+│   │   ├── eurlex-get-relations-budget.test.ts
 │   │   ├── eurlex-get-relations.tool.test.ts
 │   │   ├── eurlex-lookup-celex.tool.test.ts
 │   │   ├── eurlex-query-sparql.tool.test.ts

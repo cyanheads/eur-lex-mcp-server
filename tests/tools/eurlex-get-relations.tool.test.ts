@@ -172,6 +172,202 @@ describe('eurlex_get_relations', () => {
 
   // --- Happy path ---
 
+  it('walks a finite multi-direction budgeted graph without skips or repeated exhausted arms', async () => {
+    const title = 'Whole ruling 😀 "quoted"\\\n'.repeat(300);
+    const incoming = Array.from({ length: 47 }, (_, i) => ({
+      ...makeRelationBinding({
+        relatedWork: `http://example.test/shared-${i}`,
+        direction: 'incoming',
+      }),
+      relatedTitleMax: { type: 'literal', value: title },
+    }));
+    const outgoing = incoming
+      .slice(0, 3)
+      .map((row) => ({ ...row, direction: { type: 'literal', value: 'outgoing' } }));
+    mockQuery.mockImplementation(async (q: string) => {
+      const clause = pagingClauses(q)[0];
+      if (!clause) throw new Error('Expected relation paging clause');
+      const { limit, offset } = clause;
+      return q.includes('cdm:work_cites_work')
+        ? [...incoming.slice(offset, offset + limit), ...outgoing.slice(offset, offset + limit)]
+        : [];
+    });
+    const actual: string[] = [];
+    let offset = 0;
+    for (let calls = 0; calls < 50; calls++) {
+      const result = await runToolContract(eurlex_get_relations, {
+        work_uri: GDPR_WORK_URI,
+        relation_types: ['cites', 'amends'],
+        offset,
+      });
+      const page = result.structuredContent as {
+        relations: { direction: string; related_work_uri: string }[];
+        next_offset?: number;
+        has_more: boolean;
+      };
+      expect(result.isError).not.toBe(true);
+      expect(
+        Buffer.byteLength(JSON.stringify(result.structuredContent), 'utf8'),
+      ).toBeLessThanOrEqual(64000);
+      expect(Buffer.byteLength(JSON.stringify(result.content), 'utf8')).toBeLessThanOrEqual(64000);
+      actual.push(...page.relations.map((row) => `${row.direction}:${row.related_work_uri}`));
+      if (!page.has_more) break;
+      expect(page.next_offset).toBeGreaterThan(offset);
+      if (page.next_offset === undefined) throw new Error('Missing continuation offset');
+      offset = page.next_offset;
+      if (calls === 49) throw new Error('Traversal did not exhaust');
+    }
+    const expected = [
+      ...Array.from({ length: 47 }, (_, i) => `incoming:http://example.test/shared-${i}`),
+      ...Array.from({ length: 3 }, (_, i) => `outgoing:http://example.test/shared-${i}`),
+    ];
+    expect(actual.toSorted()).toEqual(expected.toSorted());
+    expect(new Set(actual).size).toBe(50);
+    const exhausted = await runToolContract(eurlex_get_relations, {
+      work_uri: GDPR_WORK_URI,
+      relation_types: ['cites', 'amends'],
+      offset: 60,
+    });
+    expect(exhausted.structuredContent).toMatchObject({
+      total: 0,
+      has_more: false,
+      empty_relation_types: ['cites', 'amends'],
+    });
+    expect(exhausted.structuredContent).not.toHaveProperty('notice');
+  });
+
+  it('returns an oversize depth-1 page whole with disclosure on both surfaces', async () => {
+    const title = '😀'.repeat(20_000);
+    mockQuery.mockImplementation(
+      routeQuery({
+        interpretedBy: [
+          {
+            ...makeRelationBinding({
+              relatedWork: 'http://example.test/one',
+              direction: 'incoming',
+            }),
+            relatedTitleMax: { type: 'literal', value: title },
+          },
+        ],
+      }),
+    );
+    const result = await runToolContract(eurlex_get_relations, {
+      work_uri: GDPR_WORK_URI,
+      relation_types: ['interpreted_by'],
+    });
+    expect(result.structuredContent).toMatchObject({
+      total: 1,
+      has_more: false,
+      relations: [{ related_title: title }],
+    });
+    expect(result.structuredContent).not.toHaveProperty('next_offset');
+    expect(contentText(result)).toContain(title);
+    expect(contentText(result)).toContain('applied limit 1; 0 rows withheld');
+    expect(contentText(result)).toContain('minimum depth of 1');
+  });
+
+  it('keeps continuation after a budget cut before the sort-window boundary', async () => {
+    const title = 'é'.repeat(3000);
+    mockQuery.mockImplementation(
+      routeQuery({
+        basisFor: Array.from({ length: 50 }, (_, i) => ({
+          ...makeRelationBinding({
+            relatedWork: `http://example.test/${i}`,
+            direction: 'incoming',
+          }),
+          relatedTitleMax: { type: 'literal', value: title },
+        })),
+      }),
+    );
+    const result = await runToolContract(eurlex_get_relations, {
+      work_uri: GDPR_WORK_URI,
+      relation_types: ['basis_for'],
+      offset: 9950,
+    });
+    const page = result.structuredContent as { next_offset: number; cap: number; notice: string };
+    expect(page.next_offset).toBe(9950 + page.cap);
+    expect(page.next_offset).toBeLessThan(10000);
+    expect(page.notice).not.toContain('This page reaches row 10,000');
+    expect(contentText(result)).toContain(`offset=${page.next_offset}`);
+  });
+
+  it('budgets both complete UTF-8 surfaces and keeps a common whole-row depth', async () => {
+    const title = 'é漢😀"\\\n'.repeat(150);
+    const rows = Array.from({ length: 101 }, (_, i) => ({
+      ...makeRelationBinding({ relatedWork: `http://example.test/${i}`, direction: 'incoming' }),
+      relatedTitleMax: { type: 'literal', value: title },
+    }));
+    mockQuery.mockImplementation(
+      routeQuery({
+        cites: [
+          ...rows,
+          ...rows.map((row) => ({ ...row, direction: { type: 'literal', value: 'outgoing' } })),
+        ],
+      }),
+    );
+    const result = await runToolContract(eurlex_get_relations, {
+      work_uri: GDPR_WORK_URI,
+      relation_types: ['cites', 'amends'],
+      limit: 1000,
+    });
+    expect(result.isError).not.toBe(true);
+    expect(Buffer.byteLength(JSON.stringify(result.structuredContent), 'utf8')).toBeLessThanOrEqual(
+      64000,
+    );
+    expect(Buffer.byteLength(JSON.stringify(result.content), 'utf8')).toBeLessThanOrEqual(64000);
+    const page = result.structuredContent as {
+      relations: { direction: string; related_title: string }[];
+      next_offset: number;
+      total: number;
+      notice: string;
+      cap: number;
+    };
+    expect(page.cap).toBeGreaterThan(0);
+    expect(page.cap).toBeLessThan(100);
+    expect(page.next_offset).toBe(page.cap);
+    expect(page.total).toBe(page.cap * 2);
+    expect(page.relations.filter((row) => row.direction === 'incoming')).toHaveLength(page.cap);
+    expect(page.relations.every((row) => row.related_title === title)).toBe(true);
+    expect(contentText(result).split(title)).toHaveLength(page.total + 1);
+    expect(page.notice).toContain(`${200 - page.total} rows withheld`);
+    expect(page.notice).toContain('requested limit 1000');
+    expect(page.notice).toContain(`applied limit ${page.cap}`);
+    expect(result.structuredContent).toHaveProperty('empty_relation_types', ['amends']);
+    expect(contentText(result)).toContain('**Limit clamped:** 1000 → 100');
+  });
+
+  it('characterizes a fitting complete page with clamp and continuation trailers', async () => {
+    mockQuery.mockImplementation(
+      routeQuery({
+        cites: Array.from({ length: 101 }, (_, i) =>
+          makeRelationBinding({
+            relatedWork: `http://example.test/${i}`,
+            direction: 'incoming',
+          }),
+        ),
+      }),
+    );
+    const result = await runToolContract(eurlex_get_relations, {
+      work_uri: GDPR_WORK_URI,
+      relation_types: ['cites'],
+      limit: 101,
+    });
+    expect(result.structuredContent).toMatchObject({
+      total: 100,
+      next_offset: 100,
+      truncated: true,
+      shown: 100,
+      cap: 100,
+      limit_clamp: { requested: 101, applied: 100 },
+      notice:
+        'At least one relation type or direction has more related works; call again with offset=100.',
+    });
+    expect(result.content.at(-1)).toEqual({
+      type: 'text',
+      text: '\n\n**Limit clamped:** 101 → 100 (per-call maximum)\n**truncated:** true\n**shown:** 100\n**cap:** 100\n> At least one relation type or direction has more related works; call again with offset=100.',
+    });
+  });
+
   it('returns relations across requested types with correct type and direction', async () => {
     const ctx = createMockContext({ errors: eurlex_get_relations.errors });
     mockQuery.mockImplementation(

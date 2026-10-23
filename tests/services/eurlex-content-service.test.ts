@@ -14,6 +14,7 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { NodeHtmlMarkdown } from 'node-html-markdown';
+import * as htmlParser from 'node-html-parser';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ServerConfig } from '@/config/server-config.js';
 import {
@@ -56,6 +57,13 @@ import {
   PACKAGE_TOC,
   type ZipFixtureEntry,
 } from '../fixtures/formex-zip.js';
+
+vi.mock('node-html-parser', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node-html-parser')>();
+  return { ...actual, parse: vi.fn(actual.parse) };
+});
+
+import { bestCpuMs, CPU_TIMED_TEST_TIMEOUT_MS } from '../helpers/cpu-time.js';
 
 /** A representative (non-stub) xhtml act body — well over the empty-body floor. */
 const GDPR_XHTML =
@@ -111,6 +119,213 @@ describe('EurLexContentService', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
   });
+
+  it('preserves a legacy omission marker and ordinary body availability', async () => {
+    const source = `<html><body><p>${'ordinary text '.repeat(12)}&gt;TABLE&gt;</p></body></html>`;
+    mockFetch.mockResolvedValue(new Response(source));
+    const result = await makeService().fetchContent(
+      '32000L0060',
+      'EN',
+      'html',
+      createMockContext(),
+    );
+    expect(result.content).toBe(source);
+    expect(result.contentAvailable).toBe(true);
+  });
+
+  it.each(['html', 'markdown'] as const)(
+    'retains source omission counts through the %s cache',
+    async (format) => {
+      const source = `<html><body><p>${'ordinary text '.repeat(12)}&gt;TABLE&gt; &gt;TABLE&gt;</p></body></html>`;
+      mockFetch.mockImplementation(async (_url, options) =>
+        options.headers.Accept === 'application/pdf'
+          ? new Response(null, { status: 404 })
+          : new Response(source),
+      );
+      const service = makeService();
+      const first = await service.fetchContent('32000L0060', 'EN', format, createMockContext());
+      expect(first).toMatchObject({ contentAvailable: true, contentOmissions: { tables: 2 } });
+      const cached = await service.fetchContent('32000L0060', 'EN', format, createMockContext());
+      expect(cached).toEqual(first);
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it('discovers only explicitly advertised PDF streams and isolates cached metadata', async () => {
+    const url = 'http://publications.europa.eu/resource/cellar/example.0004.02/DOC_1';
+    mockFetch.mockImplementation(async (_url, options) =>
+      options.headers.Accept === 'application/pdf'
+        ? new Response(
+            `<ul><li title="item"><a href="${url}">PDF</a><ul><li title="stream_name">original.pdf</li></ul></li><li title="item"><a href="https://example.org/other">other</a><li title="stream_name">other.pdf</li></li></ul>`,
+            { status: 300 },
+          )
+        : new Response(`<html><body>${'text '.repeat(25)}&gt;TABLE&gt;</body></html>`),
+    );
+    const service = makeService();
+    const first = await service.fetchContent('32000L0060', 'FR', 'html', createMockContext());
+    expect(first.alternativeRepresentations).toEqual([{ format: 'pdf', language: 'FR', url }]);
+    expect(headersOf(mockFetch.mock.calls[1])['Accept-Language']).toBe('fra');
+    first.alternativeRepresentations![0]!.url = 'changed';
+    first.contentOmissions!.tables = 99;
+    const cached = await service.fetchContent('32000L0060', 'FR', 'html', createMockContext());
+    expect(cached.alternativeRepresentations?.[0]?.url).toBe(url);
+    expect(cached.contentOmissions).toEqual({ tables: 1 });
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('fails optional PDF discovery softly but propagates caller cancellation', async () => {
+    const source = `<html><body>${'text '.repeat(25)}&gt;TABLE&gt;</body></html>`;
+    mockFetch.mockImplementation(async (_url, options) => {
+      if (options.headers.Accept === 'application/pdf') throw new TypeError('network unavailable');
+      return new Response(source);
+    });
+    const result = await makeService().fetchContent(
+      '32000L0060',
+      'EN',
+      'html',
+      createMockContext(),
+    );
+    expect(result).toMatchObject({ contentAvailable: true, contentOmissions: { tables: 1 } });
+    expect(result.alternativeRepresentations).toBeUndefined();
+    const controller = new AbortController();
+    mockFetch.mockImplementation(async (_url, options) => {
+      if (options.headers.Accept === 'application/pdf') {
+        controller.abort();
+        throw new DOMException('cancelled', 'AbortError');
+      }
+      return new Response(source);
+    });
+    await expect(
+      makeService().fetchContent(
+        '32000L0060',
+        'EN',
+        'html',
+        createMockContext({ signal: controller.signal }),
+      ),
+    ).rejects.toMatchObject({ name: 'AbortError' });
+  });
+
+  it('propagates an internal PDF-index parser failure instead of hiding it as absent alternatives', async () => {
+    const failure = new Error('PDF-index parser defect');
+    vi.mocked(htmlParser.parse).mockImplementationOnce(() => {
+      throw failure;
+    });
+    mockFetch.mockImplementation(async (_url, options) =>
+      options.headers.Accept === 'application/pdf'
+        ? new Response('<html>index</html>', { status: 300 })
+        : new Response(`<html><body>${'text '.repeat(25)}&gt;TABLE&gt;</body></html>`),
+    );
+    await expect(
+      makeService().fetchContent('32000L0060', 'EN', 'html', createMockContext()),
+    ).rejects.toBe(failure);
+  });
+
+  it('retains a redirected PDF location without consuming its bytes', async () => {
+    const url = 'http://publications.europa.eu/resource/cellar/example.0004.02/DOC_1';
+    let cancelled = false;
+    const pdf = new Response(
+      new ReadableStream({
+        cancel() {
+          cancelled = true;
+        },
+      }),
+      { headers: { 'Content-Type': 'application/pdf' } },
+    );
+    Object.defineProperty(pdf, 'url', { value: url });
+    const read = vi.spyOn(pdf, 'arrayBuffer');
+    mockFetch.mockImplementation(async (_url, options) =>
+      options.headers.Accept === 'application/pdf'
+        ? pdf
+        : new Response(`<html><body>${'text '.repeat(25)}&gt;TABLE&gt;</body></html>`),
+    );
+    const result = await makeService().fetchContent(
+      '32000L0060',
+      'EN',
+      'html',
+      createMockContext(),
+    );
+    expect(result.alternativeRepresentations).toEqual([{ format: 'pdf', language: 'EN', url }]);
+    expect(cancelled).toBe(true);
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  it('ends optional discovery after one three-second budget without retries', async () => {
+    vi.useFakeTimers();
+    const timeout = vi.spyOn(AbortSignal, 'timeout').mockImplementation((ms) => {
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(new DOMException('timed out', 'TimeoutError')), ms);
+      return controller.signal;
+    });
+    try {
+      mockFetch.mockImplementation(async (_url, options) => {
+        if (options.headers.Accept !== 'application/pdf')
+          return new Response(`<html><body>${'text '.repeat(25)}&gt;TABLE&gt;</body></html>`);
+        return new Promise((_resolve, reject) =>
+          options.signal.addEventListener('abort', () => reject(options.signal.reason), {
+            once: true,
+          }),
+        );
+      });
+      const pending = makeService().fetchContent('32000L0060', 'EN', 'html', createMockContext());
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(timeout).toHaveBeenCalledWith(3_000);
+      expect(await pending).toMatchObject({
+        contentAvailable: true,
+        contentOmissions: { tables: 1 },
+      });
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    } finally {
+      timeout.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(['html', 'markdown', 'xml'] as const)(
+    'does not claim source completeness or discover PDFs for ordinary %s',
+    async (format) => {
+      mockFetch.mockResolvedValue(new Response(GDPR_XHTML));
+      const result = await makeService().fetchContent(
+        '32016R0679',
+        'EN',
+        format,
+        createMockContext(),
+      );
+      expect(result.contentOmissions).toBeUndefined();
+      expect(result.alternativeRepresentations).toBeUndefined();
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it(
+    'bounds omission scanning on repeated and incomplete markers across long and interleaved lines',
+    async () => {
+      for (const fragment of ['&gt;TABLE&gt;', '&gt;TABLE', '>TABLE>', '>TAB', '&gt;'.repeat(8)]) {
+        for (const breaks of ['\n', '']) {
+          const timings: number[] = [];
+          for (const size of [5_000, 20_000, 80_000, 320_000]) {
+            const repeated = `${fragment}${breaks}`.repeat(
+              Math.ceil(size / (fragment.length + breaks.length)),
+            );
+            const source = `<html><body>${repeated}\n</body></html>`;
+            mockFetch.mockImplementation(async (_url, options) =>
+              options.headers.Accept === 'application/pdf'
+                ? new Response(null, { status: 404 })
+                : new Response(source),
+            );
+            const cpu = await bestCpuMs(() =>
+              makeService().fetchContent('32000L0060', 'EN', 'html', createMockContext()),
+            );
+            expect(cpu, `${fragment} ${size}: ${cpu} ms CPU`).toBeLessThan(100);
+            timings.push(cpu);
+          }
+          expect(timings[3]! / Math.max(timings[0]!, 0.01), JSON.stringify(timings)).toBeLessThan(
+            256,
+          );
+        }
+      }
+    },
+    CPU_TIMED_TEST_TIMEOUT_MS,
+  );
 
   it('fetches HTML via CELLAR content negotiation (xhtml + 3-letter language)', async () => {
     mockFetch.mockResolvedValue(new Response(GDPR_XHTML, { status: 200 }));

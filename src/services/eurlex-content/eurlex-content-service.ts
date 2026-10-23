@@ -40,6 +40,7 @@ import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import { serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { withRetry } from '@cyanheads/mcp-ts-core/utils';
+import { parse } from 'node-html-parser';
 import type { ServerConfig } from '@/config/server-config.js';
 import { type ActHeading, readDocumentStructure } from './act-structure.js';
 import { readFormexPackage } from './formex-package.js';
@@ -160,8 +161,10 @@ const BODY_CACHE_MAX_CHARS = 16_000_000;
  * once against the HTML it was rendered from. The HTML itself is never kept.
  */
 interface ServedBody {
+  alternativeRepresentations?: { format: 'pdf'; language: EurLexLanguage; url: string }[];
   boundaries?: number[];
   content: string;
+  contentOmissions?: { tables: number };
   headings?: ActHeading[];
   language: EurLexLanguage;
   languageFallback?: string;
@@ -183,7 +186,13 @@ function renderBody(
   language: EurLexLanguage,
   languageFallback: string | undefined,
 ): ServedBody {
-  const fallback = languageFallback ? { languageFallback } : {};
+  // CELLAR's legacy HTML replaces entire tables with these literal source markers.
+  const tables =
+    format === 'xml' ? 0 : wire.split('&gt;TABLE&gt;').length + wire.split('>TABLE>').length - 2;
+  const fallback = {
+    ...(languageFallback ? { languageFallback } : {}),
+    ...(tables ? { contentOmissions: { tables } } : {}),
+  };
   if (format !== 'markdown') return { content: wire, language, ...fallback };
   const content = htmlToMarkdown(wire);
   const { headings, boundaries } = readDocumentStructure(
@@ -199,6 +208,10 @@ function renderBody(
 /** Characters an entry retains: its text, fallback note, and heading strings. */
 function retainedChars(body: ServedBody): number {
   let chars = body.content.length + (body.languageFallback?.length ?? 0);
+  for (const representation of body.alternativeRepresentations ?? []) {
+    chars +=
+      representation.format.length + representation.language.length + representation.url.length;
+  }
   for (const h of body.headings ?? []) {
     chars += h.label.length + h.number.length + (h.title?.length ?? 0);
   }
@@ -264,6 +277,10 @@ function servedResult(body: ServedBody, format: ContentFormat): FetchContentResu
     contentAvailable: true,
     format,
     language: body.language,
+    ...(body.contentOmissions ? { contentOmissions: { ...body.contentOmissions } } : {}),
+    ...(body.alternativeRepresentations
+      ? { alternativeRepresentations: body.alternativeRepresentations.map((r) => ({ ...r })) }
+      : {}),
     ...(body.languageFallback ? { languageFallback: body.languageFallback } : {}),
     ...(body.headings ? { headings: body.headings.map((h) => ({ ...h })) } : {}),
     ...(body.boundaries ? { boundaries: [...body.boundaries] } : {}),
@@ -397,6 +414,8 @@ function combineUnavailabilityReasons(
 }
 
 export interface FetchContentResult {
+  /** PDF streams advertised by CELLAR for this CELEX and effective language. */
+  alternativeRepresentations?: { format: 'pdf'; language: EurLexLanguage; url: string }[];
   /**
    * Where an available `markdown` body's sections stop short of the next heading
    * (#153), read with {@link headings} against the wire HTML: the markup marking
@@ -406,6 +425,8 @@ export interface FetchContentResult {
   boundaries?: number[];
   content: string;
   contentAvailable: boolean;
+  /** Source-level missing tables, independent of the returned character window. */
+  contentOmissions?: { tables: number };
   format: ContentFormat;
   /**
    * Headings of an available `markdown` body, parsed against the wire HTML it was
@@ -472,8 +493,12 @@ export class EurLexContentService {
     // `markdown` is rendered from the HTML body, so it is fetched as HTML; the
     // returned `format` still reports `markdown` and `renderBody` converts.
     const wireFormat: WireFormat = format === 'markdown' ? 'html' : format;
-    const serve = (text: string, served: EurLexLanguage, languageFallback?: string) => {
+    const serve = async (text: string, served: EurLexLanguage, languageFallback?: string) => {
       const body = renderBody(celexNumber, text, format, served, languageFallback);
+      if (body.contentOmissions) {
+        const alternatives = await this.discoverPdfRepresentations(celexNumber, served, ctx);
+        if (alternatives.length) body.alternativeRepresentations = alternatives;
+      }
       if (!ctx.signal.aborted) this.cache.set(key, body);
       return servedResult(body, format);
     };
@@ -507,6 +532,56 @@ export class EurLexContentService {
       contentAvailable: false,
       unavailabilityReason: primary.reason,
     };
+  }
+
+  /** Read negotiated PDF locations, never PDF bytes; optional discovery has one three-second budget. */
+  private async discoverPdfRepresentations(
+    celexNumber: string,
+    language: EurLexLanguage,
+    ctx: Context,
+  ): Promise<NonNullable<ServedBody['alternativeRepresentations']>> {
+    const url = this.buildContentUrl(celexNumber);
+    const signal = AbortSignal.any([ctx.signal, AbortSignal.timeout(3_000)]);
+    let response: Response;
+    let indexBody: string | undefined;
+    try {
+      response = await fetch(url, {
+        headers: { Accept: 'application/pdf', 'Accept-Language': LANGUAGE_TO_ISO_639_2[language] },
+        signal,
+        redirect: 'follow',
+      });
+      if (response.status === 300) {
+        indexBody = await response.text();
+      } else {
+        await response.body?.cancel();
+      }
+    } catch (error) {
+      if (ctx.signal.aborted) throw error;
+      return [];
+    }
+    let urls: string[] = [];
+    if (indexBody !== undefined) {
+      const index = parse(indexBody);
+      urls = index.querySelectorAll('li[title="item"]').flatMap((item) => {
+        const name = item.querySelector('li[title="stream_name"]')?.text;
+        const url = item.querySelector('a')?.getAttribute('href');
+        return name?.toLowerCase().endsWith('.pdf') && url ? [url] : [];
+      });
+    } else if (response.ok && response.headers.get('content-type')?.startsWith('application/pdf')) {
+      urls = [response.url];
+    }
+    return [...new Set(urls)]
+      .filter((url) => {
+        const parsed = URL.canParse(url) ? new URL(url) : undefined;
+        return (
+          parsed?.hostname === 'publications.europa.eu' &&
+          ['http:', 'https:'].includes(parsed.protocol) &&
+          parsed.pathname.startsWith('/resource/cellar/') &&
+          !parsed.username &&
+          !parsed.password
+        );
+      })
+      .map((url) => ({ format: 'pdf', language, url }));
   }
 
   /**

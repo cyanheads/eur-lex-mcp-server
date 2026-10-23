@@ -111,6 +111,190 @@ describe('eurlex_get_document', () => {
 
   // --- Happy path: full metadata + content ---
 
+  it.each([
+    { offset: 9999 },
+    { outline: true },
+    { select: { articles: '99' } },
+    { limit: 5 },
+    { content_mode: 'full' },
+  ])('discloses source omissions independently of the view %j', async (view) => {
+    mockSparqlQuery.mockResolvedValue([makeMetaBinding({ celex: '32000L0060' })]);
+    mockFetchContent.mockResolvedValue({
+      content: 'ordinary text '.repeat(20),
+      contentAvailable: true,
+      language: 'EN',
+      format: 'markdown',
+      contentOmissions: { tables: 32 },
+    });
+    const ctx = createMockContext({ errors: eurlex_get_document.errors });
+    const result = await eurlex_get_document.handler(
+      eurlex_get_document.input.parse({ celex_number: '32000L0060', format: 'markdown', ...view }),
+      ctx,
+    );
+    expect(result).toMatchObject({
+      content_status: 'available',
+      content_omissions: { tables: 32 },
+    });
+    expect(getEnrichment(ctx).notice).toContain('The source body omits 32 table(s)');
+    expect(eurlex_get_document.format!(result)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ text: expect.stringContaining('32 table') }),
+      ]),
+    );
+  });
+
+  it('returns lexical national-measure citations in metadata-only calls for the served work', async () => {
+    const values = {
+      journal: 'Landesgesetzblatt (Länder)',
+      number: '3',
+      pages: '00052-00074',
+      publication_date: '2006-02-14',
+      notification_date: '2006-02-21',
+    };
+    mockSparqlQuery.mockImplementation(async (query: string) => {
+      if (query.includes('measure_national_implementing_name_official_journal')) {
+        expect(query).toContain(
+          '<http://publications.europa.eu/resource/cellar/f364d52d-bb0b-48c4-94a1-c43970ab278f> ?predicate ?rawValue .',
+        );
+        return Object.entries(values).map(([field, value]) => ({
+          field: { type: 'literal', value: field },
+          value: { type: 'literal', value },
+        }));
+      }
+      return [
+        makeMetaBinding({
+          celex: '72000L0060DEU_128773',
+          workUri:
+            'http://publications.europa.eu/resource/cellar/f364d52d-bb0b-48c4-94a1-c43970ab278f',
+          date: '2006-02-13',
+        }),
+      ];
+    });
+    const input = eurlex_get_document.input.parse({
+      celex_number: '72000L0060DEU_128773',
+      content_mode: 'metadata_only',
+    });
+    const result = await eurlex_get_document.handler(
+      input,
+      createMockContext({ errors: eurlex_get_document.errors }),
+    );
+    expect(result).toMatchObject({
+      date: '2006-02-13',
+      national_measure: {
+        journal: 'Landesgesetzblatt (Länder)',
+        number: '3',
+        pages: '00052-00074',
+        publication_date: '2006-02-14',
+        notification_date: '2006-02-21',
+      },
+      content_status: 'not_requested',
+    });
+    expect(mockFetchContent).not.toHaveBeenCalled();
+    const text = (eurlex_get_document.format!(result)[0] as { text: string }).text;
+    expect(text).toContain('**National official journal:** Landesgesetzblatt (Länder)');
+    expect(text).toContain('**Journal number:** 3');
+    expect(text).toContain('**Journal pages:** 00052-00074');
+    expect(text).toContain('**Journal publication date:** 2006-02-14');
+    expect(text).toContain('**Notification date:** 2006-02-21');
+  });
+
+  it('mirrors sparse national citations and unavailable-body gazette guidance on the wire', async () => {
+    mockSparqlQuery.mockImplementation(async (query: string) => {
+      if (query.includes('measure_national_implementing_name_official_journal')) {
+        expect(query).toContain(
+          '<http://publications.europa.eu/resource/cellar/72000L0060DEU_128773>',
+        );
+        return [
+          {
+            field: { type: 'literal', value: 'journal' },
+            value: { type: 'literal', value: 'Landesgesetzblatt (Länder)' },
+          },
+        ];
+      }
+      return [makeMetaBinding({ celex: '72000L0060DEU_128773' })];
+    });
+    mockFetchContent.mockResolvedValue({
+      content: '',
+      contentAvailable: false,
+      language: 'EN',
+      format: 'html',
+      unavailabilityReason: 'no_representation',
+    });
+    const response = await runToolContract(eurlex_get_document, {
+      celex_number: '72000L0060DEU_128773',
+    });
+    expect(response.isError).toBeFalsy();
+    expect(response.structuredContent).toMatchObject({
+      national_measure: { journal: 'Landesgesetzblatt (Länder)' },
+      content_status: 'unavailable',
+      content_unavailability_reason: 'no_representation',
+      notice: expect.stringContaining('Retrieve this national measure'),
+    });
+    const text = response.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+    expect(text).toContain('Landesgesetzblatt (Länder)');
+    expect(text).toContain('Notification does not establish complete transposition.');
+    expect(text).toContain('no_representation');
+    expect(response.structuredContent).not.toHaveProperty('national_measure.url');
+    expect(response.structuredContent).not.toHaveProperty('national_measure.pages');
+  });
+
+  it('omits citation objects without facts and never queries non-measure citation predicates', async () => {
+    mockSparqlQuery.mockImplementation(async (query: string) =>
+      query.includes('measure_national_implementing_name_official_journal')
+        ? []
+        : [makeMetaBinding({ celex: '72000L0060DEU_128773' })],
+    );
+    const sparse = await runToolContract(eurlex_get_document, {
+      celex_number: '72000L0060DEU_128773',
+      content_mode: 'metadata_only',
+    });
+    expect(sparse.structuredContent).not.toHaveProperty('national_measure');
+    mockSparqlQuery.mockClear();
+    await runToolContract(eurlex_get_document, {
+      celex_number: '32016R0679',
+      content_mode: 'metadata_only',
+    });
+    expect(
+      mockSparqlQuery.mock.calls.some(([query]) =>
+        query.includes('measure_national_implementing_name_official_journal'),
+      ),
+    ).toBe(false);
+    expect(mockFetchContent).not.toHaveBeenCalled();
+  });
+
+  it('composes omission notices with fallback and paging and preserves verified PDF links on both surfaces', async () => {
+    mockSparqlQuery.mockResolvedValue([makeMetaBinding({ celex: '32000L0060' })]);
+    const url = 'http://publications.europa.eu/resource/cellar/example.0004.02/DOC_1';
+    mockFetchContent.mockResolvedValue({
+      content: 'text '.repeat(25),
+      contentAvailable: true,
+      language: 'EN',
+      languageFallback: 'Requested language FR unavailable; returned English content.',
+      format: 'markdown',
+      contentOmissions: { tables: 32 },
+      alternativeRepresentations: [{ format: 'pdf', language: 'EN', url }],
+    });
+    const response = await runToolContract(eurlex_get_document, {
+      celex_number: '32000L0060',
+      language: 'FR',
+      format: 'markdown',
+      limit: 5,
+    });
+    expect(response.structuredContent).toMatchObject({
+      content: 'text ',
+      has_more: true,
+      content_omissions: { tables: 32 },
+      requested_language: 'FR',
+      alternative_representations: [{ format: 'pdf', language: 'EN', url }],
+      notice: expect.stringContaining('offset=5'),
+    });
+    expect((response.structuredContent as { notice: string }).notice).toContain('32 table');
+    const text = response.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+    expect(text).toContain('32 table');
+    expect(text).toContain(`[pdf (EN)](${url})`);
+    expect(text).toContain('Requested language FR unavailable');
+  });
+
   it('returns metadata and content for a valid CELEX number', async () => {
     const ctx = createMockContext({ errors: eurlex_get_document.errors });
     mockSparqlQuery.mockResolvedValue([

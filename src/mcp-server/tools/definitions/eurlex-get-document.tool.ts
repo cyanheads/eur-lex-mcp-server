@@ -106,6 +106,23 @@ const META_DIMENSION_LIMIT = 100;
 /** CELLAR's end-of-validity value for an act with no end date. */
 const OPEN_ENDED_VALIDITY = '9999-12-31';
 
+/** Sparse national-measure citation facts retain CELLAR's lexical strings. */
+const NationalMeasureSchema = z.object({
+  journal: z.string().optional().describe('National official journal name supplied by CELLAR.'),
+  number: z.string().optional().describe('Official journal issue number, verbatim.'),
+  pages: z.string().optional().describe('Official journal pages, retaining leading zeroes.'),
+  publication_date: z
+    .string()
+    .optional()
+    .describe(
+      'Publication date in the national official journal; distinct from the document date.',
+    ),
+  notification_date: z
+    .string()
+    .optional()
+    .describe('Date the national measure was notified; not proof of complete transposition.'),
+});
+
 /**
  * The text channel's closing line for a body that did not resolve, keyed on why
  * (#108): only an absent representation is a matter of language, and the
@@ -308,6 +325,9 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .optional()
       .describe('Case law: the case reference from the title (e.g. "Case C-131/12.").'),
     date: z.string().optional().describe('Document date in ISO 8601 format (YYYY-MM-DD).'),
+    national_measure: NationalMeasureSchema.optional().describe(
+      'National implementing measure publication citation and notification facts recorded on the served work. Missing facts are omitted; no source URL is inferred.',
+    ),
     resource_type: z
       .string()
       .optional()
@@ -454,6 +474,31 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .optional()
       .describe(
         'Why content_status is "unavailable": no representation exists, the upstream request failed, or a multipart Formex body could not be assembled completely.',
+      ),
+    content_omissions: z
+      .object({
+        tables: z
+          .number()
+          .int()
+          .describe(
+            'Number of missing-table markers in the full source body, independent of the returned window.',
+          ),
+      })
+      .optional()
+      .describe('Known source omissions; an available body can still omit substantive tables.'),
+    alternative_representations: z
+      .array(
+        z
+          .object({
+            format: z.literal('pdf').describe('Alternative format advertised by CELLAR.'),
+            language: z.string().describe('Language of this representation.'),
+            url: z.string().describe('CELLAR-advertised stream URL for this work and language.'),
+          })
+          .describe('One explicitly advertised PDF stream.'),
+      )
+      .optional()
+      .describe(
+        'Verified alternative PDF stream locations; no claim that they contain every omitted table.',
       ),
     content_offset: z
       .number()
@@ -861,12 +906,24 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
   }
 } GROUP BY ?eurovoc LIMIT ${META_DIMENSION_LIMIT}`;
 
-      const [coreBindings, agents, legalBasisBindings, eurovocBindings] = await Promise.all([
-        sparqlSvc.query(coreQuery, ctx),
-        fetchWorkAgents(sparqlSvc, actWork, ctx),
-        sparqlSvc.query(legalBasisQuery, ctx),
-        sparqlSvc.query(eurovocQuery, ctx),
-      ]);
+      const nationalQuery = `SELECT ?field (MIN(STR(?rawValue)) AS ?value) WHERE {
+  VALUES (?predicate ?field) {
+    (cdm:measure_national_implementing_name_official_journal "journal")
+    (cdm:measure_national_implementing_number_official_journal "number")
+    (cdm:measure_national_implementing_page_official_journal "pages")
+    (cdm:measure_national_implementing_date_official_journal "publication_date")
+    (cdm:measure_national_implementing_date_notification "notification_date")
+  }
+  <${workUri}> ?predicate ?rawValue .
+} GROUP BY ?field LIMIT 5`;
+      const [coreBindings, agents, legalBasisBindings, eurovocBindings, nationalBindings] =
+        await Promise.all([
+          sparqlSvc.query(coreQuery, ctx),
+          fetchWorkAgents(sparqlSvc, actWork, ctx),
+          sparqlSvc.query(legalBasisQuery, ctx),
+          sparqlSvc.query(eurovocQuery, ctx),
+          celex.startsWith('7') ? sparqlSvc.query(nationalQuery, ctx) : Promise.resolve([]),
+        ]);
 
       /** One entry per distinct URI, carrying the companion literal when bound. */
       const collectResolved = (
@@ -885,8 +942,18 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
       };
 
       const first = coreBindings[0];
+      const nationalMeasure = NationalMeasureSchema.parse(
+        Object.fromEntries(
+          nationalBindings.flatMap((binding) => {
+            const field = CellarSparqlService.bindingValue(binding, 'field');
+            const value = CellarSparqlService.bindingValue(binding, 'value');
+            return field && value ? [[field, value]] : [];
+          }),
+        ),
+      );
       return {
         workUri,
+        nationalMeasure: Object.keys(nationalMeasure).length ? nationalMeasure : undefined,
         baseActCelex: baseAct?.celex,
         resourceType: CellarSparqlService.bindingValue(first, 'type'),
         date: CellarSparqlService.bindingValue(first, 'date'),
@@ -980,6 +1047,7 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
       subject_matter?: string;
       case_reference?: string;
       date?: string;
+      national_measure?: z.infer<typeof NationalMeasureSchema>;
       resource_type?: string;
       author_institution?: string;
       author_institutions?: string[];
@@ -999,6 +1067,8 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
       content_available: boolean;
       content_status: 'not_requested' | 'available' | 'unavailable';
       content_unavailability_reason?: ContentUnavailabilityReason;
+      content_omissions?: { tables: number };
+      alternative_representations?: { format: 'pdf'; language: string; url: string }[];
       content_offset?: number;
       content_chars_returned?: number;
       content_chars_total?: number;
@@ -1022,6 +1092,7 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
     };
 
     result.work_uri = metaResult.workUri;
+    if (metaResult.nationalMeasure) result.national_measure = metaResult.nationalMeasure;
     if (metaResult.baseActCelex) result.base_act_celex = metaResult.baseActCelex;
     // The title follows the language the body is served in (#133): the requested
     // language's expression title, or English when that language has none or the
@@ -1118,6 +1189,9 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
     let annexNotice: string | undefined;
 
     if (body) {
+      if (body.contentOmissions) result.content_omissions = body.contentOmissions;
+      if (body.alternativeRepresentations)
+        result.alternative_representations = body.alternativeRepresentations;
       result.content_available = body.contentAvailable;
       result.content_status = body.contentAvailable ? 'available' : 'unavailable';
       result.language = body.language;
@@ -1227,7 +1301,20 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
     // addresses instead (#80).
     // Both write the one notice field, so the numbered-annex (#156), consolidation
     // (#109), and served-CELEX (#104) notices ride behind it.
-    const trailingNotice = [annexNotice, consolidationNotice, celexNotice]
+    const omissionNotice = result.content_omissions
+      ? `The source body omits ${result.content_omissions.tables} table(s), represented by table placeholders. This count covers the full source, including sections outside this view; pagination does not recover those tables. Consult an alternative representation where available.`
+      : undefined;
+    const gazetteNotice =
+      result.content_status === 'unavailable' && result.national_measure?.journal
+        ? `Retrieve this national measure from ${result.national_measure.journal} using the publication citation returned here. Notification does not establish complete transposition.`
+        : undefined;
+    const trailingNotice = [
+      omissionNotice,
+      gazetteNotice,
+      annexNotice,
+      consolidationNotice,
+      celexNotice,
+    ]
       .filter(Boolean)
       .join(' ');
     const withTrailingNotice = (guidance: string) =>
@@ -1265,6 +1352,26 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
       `## ${result.celex_number}${result.title ? ` — ${result.title}` : ''}\n`,
     ];
     if (result.date) lines.push(`**Date:** ${result.date}`);
+    if (result.national_measure) {
+      const citation = result.national_measure;
+      if (citation.journal) lines.push(`**National official journal:** ${citation.journal}`);
+      if (citation.number) lines.push(`**Journal number:** ${citation.number}`);
+      if (citation.pages) lines.push(`**Journal pages:** ${citation.pages}`);
+      if (citation.publication_date)
+        lines.push(`**Journal publication date:** ${citation.publication_date}`);
+      if (citation.notification_date)
+        lines.push(`**Notification date:** ${citation.notification_date}`);
+    }
+    if (result.content_omissions)
+      lines.push(
+        `**Source omissions:** ${result.content_omissions.tables} table(s) are missing from the full source body; pagination cannot recover them.`,
+      );
+    if (result.alternative_representations) {
+      for (const representation of result.alternative_representations)
+        lines.push(
+          `**Alternative representation:** [${representation.format} (${representation.language})](${representation.url})`,
+        );
+    }
     if (result.ecli) lines.push(`**ECLI:** ${result.ecli}`);
     if (result.resource_type) lines.push(`**Type:** ${result.resource_type}`);
     if (result.base_act_celex) lines.push(`**Base act:** ${result.base_act_celex}`);
@@ -1468,6 +1575,10 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
       }
     } else {
       lines.push('');
+      if (result.national_measure?.journal)
+        lines.push(
+          `Retrieve this national measure from ${result.national_measure.journal} using the publication citation above. Notification does not establish complete transposition.`,
+        );
       lines.push(
         unavailableBodyNote(
           result.content_unavailability_reason,

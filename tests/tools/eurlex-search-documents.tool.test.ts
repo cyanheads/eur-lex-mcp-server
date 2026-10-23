@@ -386,6 +386,53 @@ describe('eurlex_search_documents', () => {
 
   // --- Author institution filter (issue #6) ---
 
+  it.each([{}, { date_from: '2003-11-11', date_to: '2003-11-11' }])(
+    'matches national courts through a separate indexed UNION arm %j (#163 regression)',
+    async (dates) => {
+      mockQuery.mockResolvedValue([]);
+      await runToolContract(eurlex_search_documents, {
+        author_institution: 'Supremo Tribunal de Justiça',
+        keyword: 'data protection',
+        ...dates,
+      });
+      const query = mockQuery.mock.calls[0]?.[0] as string;
+      expect(query).toContain('?agent cdm:court_national_name ?courtName .');
+      expect(query).toContain(`?courtName bif:contains "'Supremo Tribunal de Justiça'"`);
+      expect(query).toMatch(/\}\s*UNION\s*\{\s*\?agent cdm:court_national_name/);
+      expect(query).toContain('?agent skos:prefLabel ?agentLabel .');
+      expect(query).toContain('FILTER(LANG(?agentLabel) = "en")');
+      // The dated inner selection and outer correlated check must use the same arm.
+      expect(query.split('cdm:court_national_name').length - 1).toBe('date_from' in dates ? 2 : 1);
+      if ('date_from' in dates) {
+        const outer = query.slice(query.indexOf('FILTER EXISTS'));
+        expect(outer).toContain('cdm:court_national_name');
+        expect(outer).toContain('cdm:expression_title ?kwTitle');
+        expect(outer.split('FILTER EXISTS').length - 1).toBe(1);
+      }
+    },
+  );
+
+  it.each([{}, { date_from: '2003-11-11', date_to: '2003-11-11' }])(
+    'keeps authority authors required and paged with date bounds %j (#163 characterization)',
+    async (dates) => {
+      mockQuery.mockResolvedValue([]);
+      const result = await runToolContract(eurlex_search_documents, {
+        author_institution: 'European Parliament',
+        keyword: 'data protection',
+        ...dates,
+      });
+      expect(result.isError).toBeFalsy();
+      expect(result.structuredContent).toMatchObject({ documents: [], total: 0, has_more: false });
+      expect(contentText(result)).toContain('European Parliament');
+      const query = mockQuery.mock.calls[0]?.[0] as string;
+      expect(query).toContain('?agent skos:prefLabel ?agentLabel');
+      expect(query).toContain('FILTER(LANG(?agentLabel) = "en")');
+      expect(query).toContain('GROUP BY ?celexNumber');
+      expect(query).toContain('LIMIT 21 OFFSET 0');
+      expect(query).not.toMatch(/OPTIONAL\s*\{[^}]*work_created_by_agent/);
+    },
+  );
+
   it('author_institution is a REQUIRED constraint, not an OPTIONAL binding', async () => {
     const ctx = createMockContext({ errors: eurlex_search_documents.errors });
     mockQuery.mockResolvedValue([makeDocBinding('32016R0679')]);
@@ -2125,7 +2172,7 @@ describe('eurlex_search_documents', () => {
       // keyword's a lone title arm, fail to compile on CELLAR (SQ156).
       expect(outer.match(/FILTER EXISTS \{/g)).toHaveLength(1);
       expect(outer).toMatch(
-        /FILTER EXISTS \{\s*\?work cdm:work_created_by_agent \?agent[\s\S]*FILTER\(LANG\(\?agentLabel\) = "en"\)\s*\{\s*\?kwExpr cdm:expression_title \?kwTitle/,
+        /FILTER EXISTS \{\s*\?work cdm:work_created_by_agent \?agent[\s\S]*FILTER\(LANG\(\?agentLabel\) = "en"\)[\s\S]*\?courtName bif:contains[^\n]*\n\s*\}\s*\{\s*\?kwExpr cdm:expression_title \?kwTitle/,
       );
       // Outside that test the outer query never joins the author or the keyword again.
       const outerJoins = withoutFilterExists(outer);
@@ -2166,7 +2213,7 @@ describe('eurlex_search_documents', () => {
 
       expect(inner).toContain('LIMIT 21 OFFSET 20');
       expect(outer.match(/FILTER EXISTS \{/g)).toHaveLength(1);
-      const [block] = outer.slice(outer.indexOf('FILTER EXISTS {')).split('\n  }\n');
+      const block = outer.slice(outer.indexOf('FILTER EXISTS {'));
       expect(block).toContain(`?agentLabel bif:contains "'European Parliament'" .`);
       expect(block).toContain(`?kwTitle bif:contains "'data protection'"`);
       expect(withoutFilterExists(outer)).not.toMatch(/agentLabel|kwTitle/);

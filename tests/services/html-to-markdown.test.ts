@@ -69,6 +69,31 @@ describe('htmlToMarkdown', () => {
   it('returns an empty string for empty input', () => {
     expect(htmlToMarkdown('')).toBe('');
   });
+
+  it.each([
+    [
+      'act layout and data rows',
+      ACT_XHTML,
+      ['(1) The protection of natural persons', 'Meat of swine', 'Meat of sheep or goats'],
+      /\|\s*CN code\s*\|\s*Description\s*\|\n\|\s*-+\s*\|\s*-+\s*\|\n\|\s*0203\s*\|\s*Meat of swine\s*\|\n\|\s*0204\s*\|\s*Meat of sheep or goats\s*\|/,
+    ],
+    [
+      'data table nested in a numbered point',
+      NESTED_TABLE_XHTML,
+      ['The indication shall be given in the following terms:', 'Language', 'formed meat'],
+      /\|\s*Language\s*\|\s*Term\s*\|\n\|\s*-+\s*\|\s*-+\s*\|\n\|\s*English\s*\|\s*formed meat\s*\|/,
+    ],
+  ])(
+    'preserves %s when optional table end tags are omitted (node-html-parser 9.0.5)',
+    (_name, html, expected, table) => {
+      // Browsers close these cells and rows at the next cell, row, section, or table.
+      const omitted = html.replace(/<\/t[dh]>/g, '').replace(/<\/tr>/g, '');
+      const result = htmlToMarkdown(omitted);
+      for (const text of expected) expect(result).toContain(text);
+      expect(result).toMatch(table);
+      expect(result).not.toMatch(/<table|<div|<td|<tr|<p[ >]/i);
+    },
+  );
 });
 
 describe('block-by-block translation (#127)', () => {
