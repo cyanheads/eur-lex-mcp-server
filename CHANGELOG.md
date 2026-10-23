@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.19.1](changelog/0.19.x/0.19.1.md) — 2026-10-22
+
+Whole-row relation paging and explicit source omissions, with national citations and broader search coverage.
+
 ## [0.19.0](changelog/0.19.x/0.19.0.md) — 2026-10-14
 
 eurlex_get_relations gains the basis_for, interpreted_by, and interprets relation types and a member_states filter; identifiers pasted as CELEX prefixes, EUR-Lex URLs, and https ELIs resolve; sorted searches page to CELLAR's 10,000-row window; case-law rows, annex selection, and CELLAR error handling are fixed.
