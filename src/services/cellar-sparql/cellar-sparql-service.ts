@@ -7,7 +7,7 @@
 
 import type { Context } from '@cyanheads/mcp-ts-core';
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
-import { serviceUnavailable, validationError } from '@cyanheads/mcp-ts-core/errors';
+import { McpError, serviceUnavailable, validationError } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { withRetry } from '@cyanheads/mcp-ts-core/utils';
 import type { ServerConfig } from '@/config/server-config.js';
@@ -207,6 +207,14 @@ export class CellarSparqlService {
    * through unchanged, so each arm must already respect the ceiling by construction.
    */
   readonly maxResults: number;
+  /**
+   * When each call's SPARQL budget runs out, in epoch ms, keyed by the call's
+   * context and set by its first query. A call that chains queries (an OJ
+   * reference's act then issue lookup, a relations page then its provisions)
+   * shares one `sparqlQueryTimeoutMs` across them, so the chain answers inside
+   * the client's request timeout instead of spending the full window per query.
+   */
+  private readonly callDeadlines = new WeakMap<Context, number>();
 
   constructor(_config: AppConfig, _storage: StorageService, serverConfig: ServerConfig) {
     this.endpoint = serverConfig.cellarSparqlEndpoint;
@@ -222,8 +230,9 @@ export class CellarSparqlService {
    * their own bound. The untrusted raw escape hatch uses `queryWithVars`, which
    * additionally imposes an outer LIMIT.
    *
-   * @param timeoutMs - Optional per-call client-side timeout in milliseconds.
-   *   Falls back to the server-configured `sparqlQueryTimeoutMs` when omitted.
+   * @param timeoutMs - Optional per-query client-side timeout in milliseconds.
+   *   Falls back to the server-configured `sparqlQueryTimeoutMs` when omitted;
+   *   either way no query runs past the budget its call's queries share.
    */
   async query(rawQuery: string, ctx: Context, timeoutMs?: number): Promise<SparqlBinding[]> {
     return (await this.execute(rawQuery, ctx, timeoutMs, false, this.maxResults)).parsed.results
@@ -295,6 +304,20 @@ export class CellarSparqlService {
     limitCeiling: number,
   ): Promise<{ parsed: SparqlResultsJson; limitEnforced: boolean }> {
     const effectiveTimeoutMs = timeoutMs ?? this.timeoutMs;
+    // A per-query timeout above the configured one (eurlex_query_sparql's
+    // timeout_hint on a deployment that lowered it) sizes the budget, never the reverse.
+    const budgetMs = Math.max(this.timeoutMs, effectiveTimeoutMs);
+    const deadline = this.callDeadlines.get(ctx) ?? Date.now() + budgetMs;
+    this.callDeadlines.set(ctx, deadline);
+    const budgetSpent = (cause?: unknown) =>
+      serviceUnavailable(
+        'CELLAR SPARQL queries for this request ran past the time budget they share',
+        { reason: 'sparql_timeout', retryable: false },
+        cause === undefined ? undefined : { cause },
+      );
+    const callBudgetMs = deadline - Date.now();
+    if (callBudgetMs <= 0) throw budgetSpent();
+
     const withPrefixes = rawQuery.includes('PREFIX cdm:') ? rawQuery : SPARQL_PREFIXES + rawQuery;
     const { query: cappedQuery, enforced: limitEnforced } = enforceLimitInQuery(
       withPrefixes,
@@ -303,7 +326,8 @@ export class CellarSparqlService {
     );
 
     const parsed = await withRetry(
-      async ({ signal }) => {
+      async ({ signal, remainingMs }) => {
+        const attemptTimeoutMs = Math.min(effectiveTimeoutMs, remainingMs);
         const body = new URLSearchParams({
           query: cappedQuery,
           format: 'application/sparql-results+json',
@@ -322,16 +346,19 @@ export class CellarSparqlService {
             body: body.toString(),
             // The caller's cancellation (ctx.signal, carried by withRetry) aborts the
             // request in flight; without it a cancelled call ran to completion (#122).
-            signal: AbortSignal.any([signal, AbortSignal.timeout(effectiveTimeoutMs)]),
+            signal: AbortSignal.any([signal, AbortSignal.timeout(attemptTimeoutMs)]),
           });
           text = await response.text();
         } catch (error) {
           // A caller abort propagates as itself, never relabelled as a timeout.
-          if (signal.aborted) throw error;
+          if (ctx.signal.aborted) throw error;
+          // `signal` also carries the call's deadline clock.
+          if (signal.aborted) throw budgetSpent(error);
           // The client-side bound must bound the whole call, not one attempt of
           // four (#78): a query that could not finish inside the window will not
           // finish on a retry either, and re-running it hammers a shared endpoint.
           if (error instanceof DOMException && error.name === 'TimeoutError') {
+            if (attemptTimeoutMs < effectiveTimeoutMs) throw budgetSpent(error);
             throw serviceUnavailable(
               `CELLAR SPARQL request exceeded the ${effectiveTimeoutMs} ms client timeout`,
               { reason: 'sparql_timeout', retryable: false },
@@ -371,8 +398,20 @@ export class CellarSparqlService {
         operation: 'CellarSparqlService.query',
         baseDelayMs: 1500,
         signal: ctx.signal,
+        deadlineMs: callBudgetMs,
       },
-    );
+    ).catch((error: unknown) => {
+      /*
+       * The budget ended the retry ladder: a backoff would have outlasted it, or
+       * its clock fired mid-attempt. The last attempt's typed failure (an outage
+       * status, or the budget timeout thrown above) says more than the ladder's
+       * own `retry_deadline_exceeded`, which no tool contract declares.
+       */
+      if (error instanceof McpError && error.data?.reason === 'retry_deadline_exceeded') {
+        throw error.cause instanceof McpError ? error.cause : budgetSpent(error);
+      }
+      throw error;
+    });
 
     return { parsed, limitEnforced };
   }

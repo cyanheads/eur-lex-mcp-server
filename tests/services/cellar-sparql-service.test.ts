@@ -23,13 +23,12 @@ const TEST_SERVER_CONFIG = {
   maxSparqlResults: 100,
 } satisfies ServerConfig;
 
-function makeService(): CellarSparqlService {
+function makeService(overrides: Partial<ServerConfig> = {}): CellarSparqlService {
   // config/storage are unused by the query path.
-  return new CellarSparqlService(
-    {} as unknown as AppConfig,
-    {} as unknown as StorageService,
-    TEST_SERVER_CONFIG,
-  );
+  return new CellarSparqlService({} as unknown as AppConfig, {} as unknown as StorageService, {
+    ...TEST_SERVER_CONFIG,
+    ...overrides,
+  });
 }
 
 /*
@@ -55,15 +54,15 @@ const TIMEOUT_BODY =
 const GATEWAY_PAGE =
   '<html><head><title>502 Bad Gateway</title></head><body><center><h1>502 Bad Gateway</h1></center></body></html>';
 
-function stubFetchJson(payload: unknown): void {
-  vi.stubGlobal(
-    'fetch',
-    vi.fn(async () => ({
-      ok: true,
-      status: 200,
-      text: async () => JSON.stringify(payload),
-    })),
-  );
+/** Stub fetch to answer every request with a JSON payload; returns the stub. */
+function stubFetchJson(payload: unknown) {
+  const fetchMock = vi.fn(async () => ({
+    ok: true,
+    status: 200,
+    text: async () => JSON.stringify(payload),
+  }));
+  vi.stubGlobal('fetch', fetchMock);
+  return fetchMock;
 }
 
 /**
@@ -637,14 +636,17 @@ describe('CellarSparqlService non-200 bodies (#145)', () => {
     return fetchMock;
   }
 
-  /** The rejection of one query, with the retry backoff fast-forwarded. */
-  async function rejectionOfQuery(): Promise<{
+  /**
+   * The rejection of one query, with the retry backoff fast-forwarded. The
+   * default budget fits the whole ladder (four attempts, about 10.5 s of backoff).
+   */
+  async function rejectionOfQuery(sparqlQueryTimeoutMs = 60_000): Promise<{
     code?: number;
     message: string;
     data?: Record<string, unknown>;
   }> {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
-    const pending = makeService()
+    const pending = makeService({ sparqlQueryTimeoutMs })
       .query('SELECT ?work WHERE { ?s ?p ?o } LIMIT 1', createMockContext())
       .then(
         () => {
@@ -674,6 +676,17 @@ describe('CellarSparqlService non-200 bodies (#145)', () => {
     expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
     expect(error.message).toContain(`CELLAR SPARQL HTTP ${status}`);
     expect(error.data?.reason).toBeUndefined();
+  });
+
+  it('stops retrying an outage once the next backoff would outlast the budget, reporting the outage', async () => {
+    const fetchMock = stubStatus(502, GATEWAY_PAGE);
+
+    // A 2 s budget fits the first backoff (at most 1.875 s) but not the second (at least 2.25 s).
+    const error = await rejectionOfQuery(2_000);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+    expect(error.message).toContain('CELLAR SPARQL HTTP 502');
   });
 
   it.each([
@@ -819,5 +832,87 @@ describe('CellarSparqlService caller cancellation (#122)', () => {
       code: JsonRpcErrorCode.ServiceUnavailable,
       data: { reason: 'sparql_timeout', retryable: false },
     });
+  });
+});
+
+// --- One SPARQL budget per call: chained queries share sparqlQueryTimeoutMs ---
+
+describe('CellarSparqlService per-call deadline', () => {
+  const QUERY = 'SELECT ?work WHERE { ?s ?p ?o } LIMIT 1';
+  const START = new Date('2026-10-24T12:00:00Z').getTime();
+  const BUDGET_SPENT = {
+    code: JsonRpcErrorCode.ServiceUnavailable,
+    data: { reason: 'sparql_timeout', retryable: false },
+  };
+
+  // Only the clock is faked, so moving it ages the call's first query; the budget is 5,000 ms.
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(START);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  /** Move the clock `ms` past the first query's start. */
+  const elapse = (ms: number) => vi.setSystemTime(START + ms);
+
+  it('fails a later query of the same call without sending it once the budget is spent', async () => {
+    const fetchMock = stubFetchJson(rowsPayload(1));
+    const service = makeService();
+    const ctx = createMockContext();
+
+    await service.query(QUERY, ctx);
+    elapse(5_000);
+
+    await expect(service.query(QUERY, ctx)).rejects.toMatchObject(BUDGET_SPENT);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('bounds a later query of the same call by what is left of the budget', async () => {
+    const fetchMock = vi.fn(
+      (_url: string, init: { signal: AbortSignal }) =>
+        new Promise((resolve, reject) => {
+          // The first query answers at once; the second never answers on its own.
+          if (fetchMock.mock.calls.length === 1) {
+            resolve({ ok: true, status: 200, text: async () => JSON.stringify(rowsPayload(1)) });
+            return;
+          }
+          init.signal.addEventListener('abort', () => reject(init.signal.reason));
+        }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const service = makeService();
+    const ctx = createMockContext();
+
+    await service.query(QUERY, ctx);
+    // 4,980 ms of the budget are gone: the next query gets the last 20 ms.
+    elapse(4_980);
+
+    await expect(service.query(QUERY, ctx)).rejects.toMatchObject(BUDGET_SPENT);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('sizes the budget to an explicit per-query timeout above the configured one', async () => {
+    stubFetchJson(rowsPayload(1));
+    const service = makeService();
+    const ctx = createMockContext();
+
+    // eurlex_query_sparql's timeout_hint can exceed a lowered SPARQL_QUERY_TIMEOUT_MS.
+    await service.query(QUERY, ctx, 8_000);
+    elapse(6_000);
+
+    await expect(service.query(QUERY, ctx, 8_000)).resolves.toHaveLength(1);
+  });
+
+  it('gives each call its own budget', async () => {
+    stubFetchJson(rowsPayload(1));
+    const service = makeService();
+
+    await service.query(QUERY, createMockContext());
+    elapse(5_000);
+
+    await expect(service.query(QUERY, createMockContext())).resolves.toHaveLength(1);
   });
 });
