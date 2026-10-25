@@ -23,9 +23,11 @@ const ServerConfigSchema = z.object({
   sparqlQueryTimeoutMs: z.coerce
     .number()
     .int()
-    .positive()
+    // Feeds AbortSignal.timeout(): past 2^31 - 1 ms a timer fires after 1 ms, so startup rejects it.
+    .min(1)
+    .max(2_147_483_647)
     .default(55_000)
-    .describe('Client-side timeout for SPARQL requests in milliseconds'),
+    .describe('Client-side timeout for SPARQL and content requests in milliseconds (1–2147483647)'),
   maxSparqlResults: z.coerce
     .number()
     .int()
