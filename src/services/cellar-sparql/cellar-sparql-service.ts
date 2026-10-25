@@ -210,7 +210,8 @@ export class CellarSparqlService {
   /**
    * When each call's SPARQL budget runs out, in epoch ms, keyed by the call's
    * context and set by its first query. A call that chains queries (an OJ
-   * reference's act then issue lookup, a relations page then its provisions)
+   * reference's issue or act lookup then its CELEX lookup, a relations page then
+   * its provisions)
    * shares one `sparqlQueryTimeoutMs` across them, so the chain answers inside
    * the client's request timeout instead of spending the full window per query.
    */

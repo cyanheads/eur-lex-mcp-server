@@ -23,7 +23,7 @@ const ServerConfigSchema = z.object({
   sparqlQueryTimeoutMs: z.coerce
     .number()
     .int()
-    // Feeds AbortSignal.timeout(): past 2^31 - 1 ms a timer fires after 1 ms, so startup rejects it.
+    // Feeds AbortSignal.timeout(): past 2^31 - 1 ms a Node timer fires after 1 ms, so startup rejects it.
     .min(1)
     .max(2_147_483_647)
     .default(55_000)
