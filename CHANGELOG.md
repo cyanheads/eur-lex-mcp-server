@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.19.2](changelog/0.19.x/0.19.2.md) — 2026-10-25
+
+Adds adopts/adopted_by relations, per-edge provisions with an article filter on interpreted_by, ELI and Official Journal facts on documents, and Official Journal reference lookup; content[] output is Markdown-escaped.
+
 ## [0.19.1](changelog/0.19.x/0.19.1.md) — 2026-10-22
 
 Whole-row relation paging and explicit source omissions, with national citations and broader search coverage.
