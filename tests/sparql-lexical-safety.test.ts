@@ -110,6 +110,8 @@ const BENIGN = [
   '32016R0679',
   '2016-05-04',
   'C-311/18',
+  'Art. 17',
+  'OJ L 281, 23.11.1995, p. 31',
   'http://eurovoc.europa.eu/2828',
   'http://data.europa.eu/eli/reg/2016/679/oj',
   'http://publications.europa.eu/resource/cellar/3e485e15-11bd-11e6-ba9a-01aa75ed71a1',

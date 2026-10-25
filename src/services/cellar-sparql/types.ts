@@ -59,6 +59,12 @@ export interface CaseResult {
 /** A single CDM relation between works. */
 export interface WorkRelation {
   direction: 'outgoing' | 'incoming';
+  /**
+   * The distinct, compacted designators of the provisions the edge's location axioms
+   * record, sorted; they name provisions of the edge's object. Set only when the
+   * traversal reads provisions and the edge records at least one.
+   */
+  provisions?: string[];
   relatedCelexNumber?: string;
   /** The related work's document date (`YYYY-MM-DD`), the value its page is ordered by. Absent when it has none. */
   relatedDate?: string;

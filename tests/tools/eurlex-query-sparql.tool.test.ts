@@ -7,6 +7,7 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_query_sparql } from '@/mcp-server/tools/definitions/eurlex-query-sparql.tool.js';
+import { readCommonMark } from '../helpers/commonmark.js';
 
 // --- Service mock ---
 // The tool reads the projected SELECT variables (head.vars) via queryWithVars,
@@ -37,6 +38,11 @@ function formatText(output: {
   total: number;
 }): string {
   return (eurlex_query_sparql.format!(output)[0] as { text: string }).text;
+}
+
+/** How a CommonMark parse reads one table cell holding `text`. */
+function readCell(text: string): string {
+  return `⟨td_open⟩\n\n${text}\n\n⟨td_close⟩`;
 }
 
 /** The error a handler call rejects with; fails the test if it resolves. */
@@ -320,9 +326,11 @@ describe('eurlex_query_sparql', () => {
     expect(text).toContain('http://work/0');
     expect(text).toContain('http://work/20');
     expect(text).toContain('http://work/24');
-    // One table row per binding plus the header/separator rows. IRIs render in
-    // angle brackets since #54 made the cells term-aware.
-    expect(text.match(/\| <http:\/\/work\//g)).toHaveLength(25);
+    // One table cell per binding. IRIs read back in angle brackets since #54 made
+    // the cells term-aware.
+    expect(
+      readCommonMark(text).match(/⟨td_open⟩\n\n<http:\/\/work\/\d+>\n\n⟨td_close⟩/g),
+    ).toHaveLength(25);
     // No truncation note — the text channel no longer drops rows.
     expect(text).not.toContain('Showing first');
   });
@@ -340,10 +348,10 @@ describe('eurlex_query_sparql', () => {
       variables: ['work', 'celex'],
       total: 1,
     };
-    const text = (eurlex_query_sparql.format!(output)[0] as { text: string }).text;
+    const read = readCommonMark(formatText(output));
 
-    expect(text).toContain('<http://publications.europa.eu/resource/cellar/gdpr>');
-    expect(text).toContain('"32016R0679"');
+    expect(read).toContain(readCell('<http://publications.europa.eu/resource/cellar/gdpr>'));
+    expect(read).toContain(readCell('"32016R0679"'));
   });
 
   it('format renders the datatype of a typed literal', () => {
@@ -377,9 +385,9 @@ describe('eurlex_query_sparql', () => {
       variables: ['v'],
       total: 1,
     };
-    const text = (eurlex_query_sparql.format!(output)[0] as { text: string }).text;
-
-    expect(text).toContain('"x"^^<http://example.org/custom#kind>');
+    expect(readCommonMark(formatText(output))).toContain(
+      readCell('"x"^^<http://example.org/custom#kind>'),
+    );
   });
 
   it('format renders the language tag of a language-tagged literal', () => {
@@ -406,9 +414,9 @@ describe('eurlex_query_sparql', () => {
       variables: ['plain', 'anon', 'missing'],
       total: 1,
     };
-    const text = (eurlex_query_sparql.format!(output)[0] as { text: string }).text;
-
-    expect(text).toContain('| "bare" | _:b0 |  |');
+    expect(readCommonMark(formatText(output))).toContain(
+      [readCell('"bare"'), readCell('_:b0'), readCell('')].join('\n\n'),
+    );
   });
 
   it('format escapes quotes and backslashes inside a lexical form', () => {
@@ -423,7 +431,7 @@ describe('eurlex_query_sparql', () => {
     expect(text).toContain(String.raw`"say \\"hi\\" \\\\ bye"`);
   });
 
-  it('format makes only literal lexical content safe inside the GFM table layer', () => {
+  it('format reads every term back in its SPARQL syntax through the GFM table', () => {
     const output = {
       bindings: [
         {
@@ -447,22 +455,22 @@ describe('eurlex_query_sparql', () => {
     };
     const before = structuredClone(output.bindings);
 
-    const text = (eurlex_query_sparql.format!(output)[0] as { text: string }).text;
-    const tableLines = text.split('\n').filter((line) => line.startsWith('| '));
-    expect(tableLines).toHaveLength(3);
-    const row = tableLines[2] ?? '';
+    const text = formatText(output);
+    // One header, one delimiter, one body row: no line break escapes the table.
+    expect(text.split('\n').filter((line) => line.startsWith('| '))).toHaveLength(3);
 
-    // Six cells plus the two table-edge delimiters; the lexical pipe is escaped.
-    expect(row.match(/(?<!\\)\|/g)).toHaveLength(7);
-    expect(row).toContain('"a\\|b\\\\r\\\\n\\<tag\\>\\*bold\\*\\_under\\_\\`code\\`');
-    expect(row).toContain('\\&copy; \\[link\\](url)');
-    expect(row).toContain(String.raw`"say \\"hi\\" \\\\ bye"^^xsd:string`);
-    expect(row).toContain('"left\\|right\\\\nnext"@en');
-
-    // The Markdown-safety layer never rewrites structural term syntax.
-    expect(row).toContain('<http://example.org/resource>');
-    expect(row).toContain('_:node-1');
-    expect(row).toMatch(/\|\s*\|$/);
+    // Six cells, each read back exactly: the lexical pipe, the CR LF and LF escapes,
+    // and the Markdown-active text stay data, and the term syntax around them stays.
+    expect(readCommonMark(text)).toContain(
+      [
+        readCell('<http://example.org/resource>'),
+        readCell('"a|b\\r\\n<tag>*bold*_under_`code` &copy; [link](url)"'),
+        readCell(String.raw`"say \"hi\" \\ bye"^^xsd:string`),
+        readCell(String.raw`"left|right\nnext"@en`),
+        readCell('_:node-1'),
+        readCell(''),
+      ].join('\n\n'),
+    );
     expect(output.bindings).toEqual(before);
   });
 
@@ -796,5 +804,225 @@ describe('eurlex_query_sparql', () => {
     });
 
     expect(text).toContain(`| ${cell} |`);
+  });
+
+  // --- content[] reads back as structuredContent carries it (add-tool 2.35) ---
+
+  describe('Markdown round-trip of content[]', () => {
+    type TermFixture = {
+      type: 'uri' | 'bnode' | 'literal';
+      value: string;
+      datatype?: string;
+      'xml:lang'?: string;
+    };
+
+    const XSD = 'http://www.w3.org/2001/XMLSchema#';
+
+    /**
+     * A term in the SPARQL syntax a table cell must read back as, written from the
+     * SPARQL grammar rather than the tool: `<iri>`, `_:label`, and a quoted lexical
+     * form with `\`, `"`, CR, and LF escaped, then `@lang` or `^^datatype`.
+     */
+    function sparqlSyntax(term: TermFixture | undefined): string {
+      if (!term) return '';
+      if (term.type === 'uri') return `<${term.value}>`;
+      if (term.type === 'bnode') return `_:${term.value}`;
+      const escapes: Record<string, string> = {
+        '\\': '\\\\',
+        '"': '\\"',
+        '\r': '\\r',
+        '\n': '\\n',
+      };
+      const lexical = `"${[...term.value].map((ch) => escapes[ch] ?? ch).join('')}"`;
+      const lang = term['xml:lang'];
+      if (lang) return `${lexical}@${lang}`;
+      if (!term.datatype) return lexical;
+      return term.datatype.startsWith(XSD)
+        ? `${lexical}^^xsd:${term.datatype.slice(XSD.length)}`
+        : `${lexical}^^<${term.datatype}>`;
+    }
+
+    /** How a CommonMark parse reads the whole format() text for this result. */
+    function readBack(variables: string[], rows: (TermFixture | undefined)[][]): string {
+      const cells = (tag: 'th' | 'td', values: string[]) =>
+        values.flatMap((v) => [`⟨${tag}_open⟩`, v, `⟨${tag}_close⟩`]);
+      return [
+        '⟨heading_open⟩',
+        `SPARQL Results (${rows.length} rows)`,
+        '⟨heading_close⟩',
+        `⟨strong⟩Variables:⟨/strong⟩ ${variables.join(', ')}`,
+        '⟨table_open⟩',
+        '⟨thead_open⟩',
+        '⟨tr_open⟩',
+        ...cells('th', variables),
+        '⟨tr_close⟩',
+        '⟨thead_close⟩',
+        '⟨tbody_open⟩',
+        ...rows.flatMap((row) => [
+          '⟨tr_open⟩',
+          ...cells('td', row.map(sparqlSyntax)),
+          '⟨tr_close⟩',
+        ]),
+        '⟨tbody_close⟩',
+        '⟨table_close⟩',
+      ].join('\n\n');
+    }
+
+    /** format() over `rows`, one binding per row keyed by `variables`; an undefined term is unbound. */
+    function render(variables: string[], rows: (TermFixture | undefined)[][]): string {
+      const bindings = rows.map((row) =>
+        Object.fromEntries(
+          variables.flatMap((v, i) => (row[i] === undefined ? [] : [[v, row[i]]])),
+        ),
+      );
+      return formatText({ bindings, variables, total: rows.length });
+    }
+
+    it('reads hostile variable names and every term shape back exactly', () => {
+      const variables = ['_x_', 'a*b*', 'c|d', 'e`f`'];
+      const rows: (TermFixture | undefined)[][] = [
+        [
+          { type: 'uri', value: 'http://example.org/a_b?q=<1>&amp;x|y' },
+          { type: 'bnode', value: '*b0*' },
+          { type: 'literal', value: '# head\n- item\n1. one | <b>x</b> [l](u) ~s~ \\' },
+          undefined,
+        ],
+        [
+          { type: 'literal', value: '*v*', 'xml:lang': 'en' },
+          { type: 'literal', value: 'x', datatype: 'http://example.org/t_|<y>' },
+          { type: 'literal', value: '2016-04-27', datatype: `${XSD}date` },
+          { type: 'uri', value: 'http://x/line\nbreak' },
+        ],
+      ];
+
+      expect(readCommonMark(render(variables, rows))).toBe(readBack(variables, rows));
+    });
+
+    it('keeps CELLAR identifiers copyable byte for byte', () => {
+      const text = render(
+        ['work', 'celex'],
+        [
+          [
+            { type: 'uri', value: 'http://publications.europa.eu/resource/cellar/abc_def.0001' },
+            { type: 'literal', value: '72022L2555ROU_202405184', datatype: `${XSD}string` },
+          ],
+        ],
+      );
+
+      expect(text).toContain(
+        '| \\<http://publications.europa.eu/resource/cellar/abc_def.0001> | "72022L2555ROU_202405184"^^xsd:string |',
+      );
+    });
+
+    it('reads 3,000 random results over a hostile alphabet back exactly', () => {
+      /** mulberry32: a seeded generator, so a failure replays from its seed. */
+      let seed = 0x5eed_0192;
+      const random = () => {
+        seed = (seed + 0x6d2b79f5) | 0;
+        let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4_294_967_296;
+      };
+      const pick = <T>(items: readonly T[]): T => items[Math.floor(random() * items.length)] as T;
+      /** Single characters plus the multi-character openers that form syntax only together. */
+      const pieces = [
+        ...'aZ9é_*`\\[]()|<>!#&;~-+=.:@"\' \t\n^{}/?%',
+        '&amp;',
+        '&#10;',
+        '&#x41;',
+        '<b>',
+        '</i>',
+        '<!--',
+        '](',
+        '```',
+        '- ',
+        '1. ',
+        '# ',
+        '\\|',
+        '***',
+        '__',
+        '<a@b.io>',
+        '<http://x>',
+        '---',
+        '===',
+        ':-:',
+      ];
+      // Literals also carry CR, which their SPARQL escape keeps distinct from LF.
+      const literalPieces = [...pieces, '\r', '\r\n'];
+      const text = (from: readonly string[], max: number, min = 0) =>
+        Array.from({ length: min + Math.floor(random() * (max - min + 1)) }, () => pick(from)).join(
+          '',
+        );
+      const term = (): TermFixture | undefined => {
+        switch (Math.floor(random() * 7)) {
+          case 0:
+            return;
+          case 1:
+            return { type: 'uri', value: text(pieces, 10) };
+          case 2:
+            return { type: 'bnode', value: text(pieces, 6, 1) };
+          case 3:
+            return { type: 'literal', value: text(literalPieces, 12) };
+          case 4:
+            return {
+              type: 'literal',
+              value: text(literalPieces, 8),
+              'xml:lang': text(pieces, 4, 1),
+            };
+          case 5:
+            return {
+              type: 'literal',
+              value: text(literalPieces, 8),
+              datatype: `${XSD}${text(pieces, 4, 1)}`,
+            };
+          default:
+            return {
+              type: 'literal',
+              value: text(literalPieces, 8),
+              datatype: text(pieces, 10, 1),
+            };
+        }
+      };
+
+      let firstMismatch: Record<string, unknown> | undefined;
+      for (let i = 0; i < 3_000 && !firstMismatch; i++) {
+        // A SELECT head names each variable once, and a binding row keys on the name.
+        const names = new Set<string>();
+        const count = 1 + Math.floor(random() * 3);
+        while (names.size < count) names.add(text(pieces, 6, 1));
+        const variables = [...names];
+        const rows = Array.from({ length: 1 + Math.floor(random() * 2) }, () =>
+          variables.map(term),
+        );
+        const markdown = render(variables, rows);
+        const read = readCommonMark(markdown);
+        const expected = readBack(variables, rows);
+        if (read !== expected) firstMismatch = { i, variables, rows, markdown, read, expected };
+      }
+      expect(firstMismatch).toBeUndefined();
+    });
+
+    it('reads the untyped-literal notice back as structuredContent carries it', async () => {
+      mockQueryWithVars.mockResolvedValue({ variables: ['w'], bindings: [] });
+
+      const result = await runToolContract(eurlex_query_sparql, {
+        sparql_query: 'SELECT ?w WHERE { ?w cdm:p "*a* [x](y) <b>z</b>\n- item" }',
+      });
+
+      const notice = (result.structuredContent as { notice: string }).notice;
+      expect(notice).toContain('"*a* [x](y) <b>z</b>\n- item"');
+      expect(readCommonMark(contentText(result))).toBe(
+        [
+          '⟨heading_open⟩',
+          'SPARQL Results (0 rows)',
+          '⟨heading_close⟩',
+          '⟨strong⟩Variables:⟨/strong⟩ w',
+          '⟨em⟩No bindings returned.⟨/em⟩',
+          '⟨blockquote_open⟩',
+          notice,
+          '⟨blockquote_close⟩',
+        ].join('\n\n'),
+      );
+    });
   });
 });

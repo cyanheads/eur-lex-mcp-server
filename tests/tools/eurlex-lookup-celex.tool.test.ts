@@ -13,6 +13,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_lookup_celex } from '@/mcp-server/tools/definitions/eurlex-lookup-celex.tool.js';
 import { escapeSparqlLiteral } from '@/services/cellar-sparql/eli-resolution.js';
 import { CELEX_WORKS, CELLAR, canonicalWork, celexWorkRows } from '../fixtures/cellar-works.js';
+import { readCommonMark } from '../helpers/commonmark.js';
+import { bestCpuMs, CPU_TIMED_TEST_TIMEOUT_MS } from '../helpers/cpu-time.js';
 
 // --- Service mock ---
 const mockQuery = vi.fn();
@@ -1144,6 +1146,365 @@ describe('eurlex_lookup_celex', () => {
       const structured = result.structuredContent as Record<string, unknown>;
       expect(structured).not.toHaveProperty('notice');
       expect(structured).toMatchObject({ found: true, celex_number: '32016R0679' });
+    });
+
+    // --- #171: a citation followed by its parenthesized OJ reference ---
+
+    it.each([
+      ['Directive 95/46/EC (OJ L 281, 23.11.1995, p. 31)', 'Directive 95/46/EC', '31995L0046'],
+      [
+        'Regulation (EU) 2016/679 (OJ L 119, 4.5.2016, p. 1)',
+        'Regulation (EU) 2016/679',
+        '32016R0679',
+      ],
+      [
+        'Regulation (EU) 2016/679 (oj l 119, 4.5.2016, p. 1–88)',
+        'Regulation (EU) 2016/679',
+        '32016R0679',
+      ],
+    ])(
+      'resolves %j as the bare citation, ignoring the reference (#171)',
+      async (citation, bare, celex) => {
+        holds(celex);
+        const withReference = await runToolContract(eurlex_lookup_celex, { identifier: citation });
+        const referenceQueries = mockQuery.mock.calls.map((c) => c[0] as string);
+        mockQuery.mockClear();
+        const bareCitation = await runToolContract(eurlex_lookup_celex, { identifier: bare });
+
+        expect(withReference.structuredContent).toMatchObject({ found: true, celex_number: celex });
+        expect(withReference.structuredContent).toEqual(bareCitation.structuredContent);
+        expect(withReference.content).toEqual(bareCitation.content);
+        expect(referenceQueries).toEqual(mockQuery.mock.calls.map((c) => c[0] as string));
+        expect(referenceQueries).toHaveLength(1);
+      },
+    );
+
+    it('keeps resolving a reference after the act title (#171)', async () => {
+      holds('32016R0679');
+      const { result, queries } = await resolve(
+        'Regulation (EU) 2016/679 of 27 April 2016 (OJ L 119, 4.5.2016, p. 1)',
+      );
+
+      expect(result).toMatchObject({ found: true, celex_number: '32016R0679' });
+      expect(queries).toHaveLength(1);
+    });
+
+    it.each([
+      'Directive 95/46/EC and Directive 2002/58/EC',
+      'Directive 95/46/EC (OJ L 281, 23.11.1995, p. 31) and Directive 2002/58/EC',
+      'Directive 95/46/EC (L 281, 23.11.1995, p. 31)',
+      'Directive 95/46/EC (OJ L 281, 23.11.1995, p. 31',
+      'Directive 95/46/EC (OJ L 281 (corrigendum), p. 31)',
+    ])('still raises ambiguous_identifier for %j (#171)', async (identifier) => {
+      await expect(resolve(identifier)).rejects.toMatchObject({
+        data: { reason: 'ambiguous_identifier' },
+      });
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    /**
+     * The citation numbers pattern now admits a parenthesized reference after the
+     * numbers. Timed through the handler, which runs every auto-branch parser on the
+     * input, across a 64× span on a reference opener with no closer, a whitespace run
+     * before the parenthesis, and the two line-break shapes.
+     */
+    it.each<[string, (n: number) => string]>([
+      ['an unclosed reference', (n) => `Directive 95/46/EC (OJ ${'x'.repeat(n)}`],
+      ['a whitespace run before an opener', (n) => `Directive 95/46/EC${' '.repeat(n)}(`],
+      ['nested openers', (n) => `Directive 95/46/EC (OJ ${'('.repeat(n)})`],
+      [
+        'one long line ending in a break',
+        (n) => `Directive 95/46/EC (OJ ${'§1 x'.repeat(n / 4)}\ny`,
+      ],
+      ['breaks throughout', (n) => `Directive 95/46/EC (OJ ${'  \r\n'.repeat(n / 4)}`],
+    ])(
+      'parses a citation in linear time: %s (#171)',
+      async (_label, shape) => {
+        const ctx = createMockContext({ errors: eurlex_lookup_celex.errors });
+        const timings: number[] = [];
+        for (const size of [5_000, 10_000, 20_000, 40_000, 80_000, 160_000, 320_000]) {
+          const input = eurlex_lookup_celex.input.parse({ identifier: shape(size) });
+          const cpu = await bestCpuMs(() =>
+            Promise.resolve(eurlex_lookup_celex.handler(input, ctx)).catch(() => undefined),
+          );
+          expect(cpu, `${size} characters: ${cpu.toFixed(3)} ms CPU`).toBeLessThan(150);
+          timings.push(cpu);
+        }
+        const [first = 0] = timings;
+        const last = timings.at(-1) ?? 0;
+        expect(last / Math.max(first, 0.01), JSON.stringify(timings)).toBeLessThan(256);
+        expect(mockQuery).not.toHaveBeenCalled();
+      },
+      CPU_TIMED_TEST_TIMEOUT_MS,
+    );
+  });
+
+  // --- #170: Official Journal references ---
+
+  describe('Official Journal references (#170)', () => {
+    const literal = (value: string) => ({ type: 'literal', value });
+
+    /** A grouped issue row, as the OJ issue query returns it. */
+    function issueRow(published: string, celex?: string, english = true, englishPaged = true) {
+      return {
+        published: literal(published),
+        englishPaged: literal(englishPaged ? '1' : '0'),
+        ...(celex ? { celex: literal(celex), english: literal(english ? '1' : '0') } : {}),
+      };
+    }
+
+    /**
+     * OJ issues as CELLAR holds them (measured live, 2026-10-24): the rows the issue
+     * query returns for `page`, the one first page each holds here. Any other page
+     * answers the issue's date with no CELEX.
+     */
+    const OJ_ISSUES: Record<string, { page: number; rows: ReturnType<typeof issueRow>[] }> = {
+      'oj:JOL_1995_281_R': { page: 31, rows: [issueRow('1995-11-23', '31995L0046')] },
+      'oj:JOL_1996_281_R': { page: 0, rows: [issueRow('1996-10-31')] },
+      'oj:JOL_2016_119_R': { page: 1, rows: [issueRow('2016-05-04', '32016R0679')] },
+      'oj:JOL_2022_042_I': { page: 1, rows: [issueRow('2022-02-23', '32022R0259')] },
+      'oj:JOC_2012_326_R': { page: 47, rows: [issueRow('2012-10-26', '12012E/TXT')] },
+      'oj:JOP_1962_013_R': {
+        page: 204,
+        rows: [issueRow('1962-02-21', '31962R0017', false, false)],
+      },
+      'oj:JOL_2018_127_R': {
+        page: 2,
+        rows: [
+          issueRow('2018-05-23', '32016R0679R(02)'),
+          issueRow('2018-05-23', '32017R0821R(01)', false),
+        ],
+      },
+      'oj:JOL_2018_012_R': {
+        page: 1,
+        rows: [issueRow('2018-01-17', '22018X0117(01)'), issueRow('2018-01-17', '22018X0117(02)')],
+      },
+    };
+    const ACT_RECORDS: Record<string, { celex: string; published: string }> = {
+      'oj:L_202401689': { celex: '32024R1689', published: '2024-07-12' },
+      'oj:C_202402664': { celex: '52023AP0365', published: '2024-04-29' },
+    };
+    const HELD_CELEX = new Set([
+      ...Object.values(OJ_ISSUES).flatMap(({ rows }) => rows.flatMap((r) => r.celex?.value ?? [])),
+      ...Object.values(ACT_RECORDS).map((act) => act.celex),
+    ]);
+
+    /**
+     * CELLAR answering the OJ issue query for the cited page only (the query filters
+     * on it), the act-by-act query, and the typed CELEX lookup for every CELEX above.
+     */
+    function holdsOj(): void {
+      mockQuery.mockImplementation(async (q: string) => {
+        const id = /cdm:work_id_document "(oj:[^"]+)"\^\^xsd:string/.exec(q)?.[1];
+        if (id) {
+          const act = ACT_RECORDS[id];
+          if (act) return [{ celex: literal(act.celex), published: literal(act.published) }];
+          const issue = OJ_ISSUES[id];
+          if (!issue) return [];
+          const page = Number(/FILTER\(xsd:integer\(\?page\) = (\d+)\)/.exec(q)?.[1]);
+          if (page === issue.page) return issue.rows;
+          const [{ published, englishPaged } = issueRow('')] = issue.rows;
+          return [{ published, englishPaged }];
+        }
+        const celex = /resource_legal_id_celex "([^"]+)"\^\^xsd:string/.exec(q)?.[1];
+        return celex && HELD_CELEX.has(celex)
+          ? [
+              makeBinding(celex, {
+                type: `${RESOURCE_TYPE}REG`,
+                date: '2016-04-27',
+                canonical: true,
+              }),
+            ]
+          : [];
+      });
+    }
+
+    async function lookup(identifier: string, identifierType?: 'auto' | 'celex') {
+      const result = await runToolContract(eurlex_lookup_celex, {
+        identifier,
+        ...(identifierType ? { identifier_type: identifierType } : {}),
+      });
+      const structured = result.structuredContent as Record<string, unknown> & {
+        error?: { data?: { reason?: string; recovery?: { hint?: string } } };
+      };
+      const queries = mockQuery.mock.calls.map((c) => c[0] as string);
+      return { result, structured, queries };
+    }
+
+    beforeEach(holdsOj);
+
+    it.each([
+      ['OJ L 281, 23.11.1995, p. 31', '31995L0046'],
+      ['OJ L 281 of 23.11.1995, p. 31–50', '31995L0046'],
+      ['OJ L 42I, 23.2.2022, p. 1', '32022R0259'],
+      ['OJ C 326, 26.10.2012, p. 47', '12012E/TXT'],
+      ['OJ 13, 21.2.1962, p. 204/62', '31962R0017'],
+      ['OJ 13, 21.2.1962, p. 204–211', '31962R0017'],
+      ['OJ 1995 L 281, p. 31', '31995L0046'],
+      ['OJ 1995 L 281/31', '31995L0046'],
+      ['OJ L 119, 4.5.2016, p. 1–88', '32016R0679'],
+      ['OJ L, 2024/1689, 12.7.2024', '32024R1689'],
+      ['OJ C, C/2024/2664, 29.4.2024', '52023AP0365'],
+      ['(OJ L 281, 23.11.1995, p. 31).', '31995L0046'],
+      ['oj l 281, 23.11.1995, p. 31', '31995L0046'],
+      ['OJ L 127, 23.5.2018, p. 2', '32016R0679R(02)'],
+    ])('resolves %j to %s with the output of that CELEX lookup', async (reference, celex) => {
+      const viaReference = await lookup(reference);
+      mockQuery.mockClear();
+      const viaCelex = await lookup(celex);
+
+      expect(viaReference.structured).toMatchObject({ found: true, celex_number: celex });
+      expect(viaReference.structured).toEqual(viaCelex.structured);
+      expect(viaReference.result.content).toEqual(viaCelex.result.content);
+      // One OJ query, then exactly the query the CELEX lookup sends.
+      expect(viaReference.queries).toHaveLength(2);
+      expect(viaReference.queries[0]).toContain('cdm:work_id_document');
+      expect(viaReference.queries[1]).toBe(viaCelex.queries[0]);
+    });
+
+    it('names each CELEX when the page starts several acts, on both surfaces', async () => {
+      const { result, structured, queries } = await lookup('OJ L 12, 17.1.2018, p. 1');
+
+      expect(result.isError).toBeFalsy();
+      expect(Object.keys(structured).sort()).toEqual(['found', 'notice']);
+      expect(structured.found).toBe(false);
+      expect(structured.notice).toBe(
+        'OJ reference "OJ L 12, 17.1.2018, p. 1" names the first page of 2 acts: 22018X0117(01), 22018X0117(02). Pass the CELEX of the one you want here or to eurlex_get_document.',
+      );
+      const text = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+      expect(readCommonMark(text)).toContain(structured.notice as string);
+      expect(queries).toHaveLength(1);
+    });
+
+    it.each([
+      [
+        'a date that is not the issue’s',
+        'OJ L 281, 23.11.1996, p. 31',
+        'that issue was published on 1996-10-31, not on the date cited',
+      ],
+      [
+        'a page no act starts on',
+        'OJ L 281, 23.11.1995, p. 35',
+        'no act with a CELEX starts on that page of the issue',
+      ],
+      ['an issue CELLAR does not hold', 'OJ L 999, 1.1.2018, p. 1', 'CELLAR holds no such issue'],
+      [
+        'an act-by-act date that is not the act’s',
+        'OJ L, 2024/1689, 13.7.2024',
+        'that act was published on 2024-07-12, not on the date cited',
+      ],
+      [
+        'an act-by-act number no act carries',
+        'OJ L, 2024/9999',
+        'CELLAR holds no act under that number',
+      ],
+    ])('returns found: false with the notice for %s', async (_label, reference, reason) => {
+      const { result, structured, queries } = await lookup(reference);
+
+      expect(result.isError).toBeFalsy();
+      expect(Object.keys(structured).sort()).toEqual(['found', 'notice']);
+      const notice = String(structured.notice);
+      expect(notice).toContain(`No CELLAR work matches OJ reference "${reference}": ${reason}.`);
+      expect(notice).toContain('"OJ L 119, 4.5.2016, p. 1"');
+      expect(notice).toContain('eurlex_search_documents with keyword');
+      const text = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+      expect(readCommonMark(text)).toContain(notice);
+      expect(queries).toHaveLength(1);
+    });
+
+    it.each(['OJ L 281', 'OJ L 119/1', 'OJ:L:2016:119:TOC', 'OJ 281, 23.11.1995, p. 31'])(
+      'raises ambiguous_identifier for %j with no CELLAR call, naming the OJ reference form',
+      async (identifier) => {
+        const { structured, queries } = await lookup(identifier);
+
+        expect(structured.error?.data?.reason).toBe('ambiguous_identifier');
+        expect(structured.error?.data?.recovery?.hint).toContain('"OJ L 119, 4.5.2016, p. 1"');
+        expect(queries).toEqual([]);
+      },
+    );
+
+    it('parses an OJ reference only under auto', async () => {
+      const { structured, queries } = await lookup('OJ L 281, 23.11.1995, p. 31', 'celex');
+
+      expect(structured.found).toBe(false);
+      expect(queries.join('\n')).not.toContain('work_id_document');
+    });
+  });
+
+  // --- Markdown safety of content[] ---
+
+  describe('content[] reads back as structuredContent', () => {
+    function contentText(result: { content: unknown[] }): string[] {
+      return result.content.map((b) => (b as { text?: string }).text ?? '');
+    }
+
+    it('escapes CELLAR values in the resolved-work block', async () => {
+      const values = {
+        celex: '3*2016*R_0679 `x`',
+        ecli: 'ECLI:EU:C:2014:317 [x](y) <b>z</b>',
+        work: 'http://publications.europa.eu/resource/cellar/a_b|c\\',
+        type: '# Heading | 1. *x*',
+        date: '- 2016-04-27 ~~x~~',
+      };
+      mockQuery.mockResolvedValue([
+        {
+          celexNumber: { type: 'literal', value: values.celex },
+          work: { type: 'uri', value: values.work },
+          type: { type: 'uri', value: `${RESOURCE_TYPE}${values.type}` },
+          date: { type: 'literal', value: values.date },
+          ecli: { type: 'literal', value: values.ecli },
+        },
+      ]);
+
+      const result = await runToolContract(eurlex_lookup_celex, { identifier: '32016R0679' });
+      const [block = ''] = contentText(result);
+      const read = readCommonMark(block);
+
+      expect(result.structuredContent).toMatchObject({
+        celex_number: values.celex,
+        ecli: values.ecli,
+        work_uri: values.work,
+        resource_type: values.type,
+        date: values.date,
+      });
+      expect(read).toContain(`⟨strong⟩CELEX:⟨/strong⟩ ${values.celex}\n`);
+      expect(read).toContain(`⟨strong⟩ECLI:⟨/strong⟩ ${values.ecli}\n`);
+      expect(read).toContain(`⟨strong⟩Work URI:⟨/strong⟩ ${values.work}\n`);
+      expect(read).toContain(`⟨strong⟩Type:⟨/strong⟩ ${values.type}\n`);
+      expect(read).toContain(`⟨strong⟩Date:⟨/strong⟩ ${values.date}`);
+    });
+
+    it('leaves the parentheses and hyphens of real identifiers unescaped', async () => {
+      mockQuery.mockResolvedValue([
+        makeBinding('32016R0679R(02)', {
+          workUri:
+            'http://publications.europa.eu/resource/cellar/3e485e15-11bd-11e6-ba9a-01aa75ed71a1',
+        }),
+      ]);
+
+      const result = await runToolContract(eurlex_lookup_celex, {
+        identifier: '32016R0679R(02)',
+      });
+      const [block = ''] = contentText(result);
+
+      expect(block).toContain('**CELEX:** 32016R0679R(02)');
+      expect(block).toContain(
+        '**Work URI:** http://publications.europa.eu/resource/cellar/3e485e15-11bd-11e6-ba9a-01aa75ed71a1',
+      );
+    });
+
+    it.each([
+      ['a citation miss', 'Regulation (EU) 2016/9999 of *the* [x](y) <b>Council</b> | _a_ \\'],
+      ['a case number', 'Case C-131/12'],
+      ['an OJ reference over two lines', 'OJ L 999,\n1.1.2018, p. 1'],
+    ])('renders the notice of %s so it reads back as written', async (_label, identifier) => {
+      mockQuery.mockResolvedValue([]);
+      const result = await runToolContract(eurlex_lookup_celex, { identifier });
+      const notice = String((result.structuredContent as { notice?: string }).notice);
+      const trailer = contentText(result).at(-1) ?? '';
+
+      expect(notice).toContain(`"${identifier.trim()}"`);
+      expect(readCommonMark(trailer)).toBe(`⟨blockquote_open⟩\n\n${notice}\n\n⟨blockquote_close⟩`);
     });
   });
 

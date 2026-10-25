@@ -5,6 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { echoValue } from '@/mcp-server/tools/echo-value.js';
 import { enumInput } from '@/mcp-server/tools/enum-input.js';
 import {
@@ -13,6 +14,10 @@ import {
   limitClampTrailer,
   ROW_LIMIT_CEILING,
 } from '@/mcp-server/tools/limit-clamp.js';
+import {
+  escapeMarkdownHeading,
+  renderNoticeBlockquote,
+} from '@/mcp-server/tools/markdown-render.js';
 import {
   canonicalEurovocConceptUri,
   ENG_LANGUAGE_URI,
@@ -313,7 +318,13 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
       ),
     limit_clamp: limitClampEnrichment,
   },
-  enrichmentTrailer: { limit_clamp: limitClampTrailer },
+  enrichmentTrailer: {
+    limit_clamp: limitClampTrailer,
+    // The notice quotes caller filters and a CELLAR date, so it is escaped whole and reads back as written.
+    notice: {
+      render: (notice?: string) => renderNoticeBlockquote(String(notice)),
+    },
+  },
 
   errors: [
     {
@@ -779,17 +790,18 @@ ${projection('?date')} WHERE {
     lines.push('');
     const echoEntries = Object.entries(result.query_echo);
     if (echoEntries.length > 0) {
-      lines.push(
-        `*Filters: ${echoEntries.map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(', ')}*\n`,
-      );
+      const filters = echoEntries.map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(', ');
+      lines.push(`*Filters: ${escapeMarkdownInline(filters)}*\n`);
     }
     for (const doc of result.documents) {
-      lines.push(`### ${doc.celex_number}${doc.title ? ` — ${doc.title}` : ''}`);
-      if (doc.date) lines.push(`**Date:** ${doc.date}`);
-      if (doc.resource_type) lines.push(`**Type:** ${doc.resource_type}`);
+      lines.push(
+        `### ${escapeMarkdownHeading(doc.celex_number)}${doc.title ? ` — ${escapeMarkdownHeading(doc.title)}` : ''}`,
+      );
+      if (doc.date) lines.push(`**Date:** ${escapeMarkdownInline(doc.date)}`);
+      if (doc.resource_type) lines.push(`**Type:** ${escapeMarkdownInline(doc.resource_type)}`);
       lines.push(`**Consolidated:** ${doc.is_consolidated}`);
       lines.push(`**Corrigendum:** ${doc.is_corrigendum}`);
-      lines.push(`**Work URI:** ${doc.work_uri}`);
+      lines.push(`**Work URI:** ${escapeMarkdownInline(doc.work_uri)}`);
       lines.push('');
     }
     return [{ type: 'text', text: lines.join('\n') }];

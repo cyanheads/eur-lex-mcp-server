@@ -5,6 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { echoValue } from '@/mcp-server/tools/echo-value.js';
 import {
   clampLimit,
@@ -12,6 +13,10 @@ import {
   limitClampTrailer,
   ROW_LIMIT_CEILING,
 } from '@/mcp-server/tools/limit-clamp.js';
+import {
+  escapeMarkdownHeading,
+  renderNoticeBlockquote,
+} from '@/mcp-server/tools/markdown-render.js';
 import { EUROVOC_CONCEPT_NAMESPACE } from '@/services/cellar-sparql/cdm-labels.js';
 import {
   CellarSparqlService,
@@ -120,7 +125,13 @@ export const eurlex_browse_subjects = tool('eurlex_browse_subjects', {
       ),
     limit_clamp: limitClampEnrichment,
   },
-  enrichmentTrailer: { limit_clamp: limitClampTrailer },
+  enrichmentTrailer: {
+    limit_clamp: limitClampTrailer,
+    // The notice quotes the caller's keyword, so it is escaped whole and reads back as written.
+    notice: {
+      render: (notice?: string) => renderNoticeBlockquote(String(notice)),
+    },
+  },
 
   errors: [
     {
@@ -307,11 +318,11 @@ SELECT ?concept ?label
     if (result.next_offset !== undefined) lines.push(`**Next offset:** ${result.next_offset}`);
     lines.push('');
     for (const c of result.concepts) {
-      lines.push(`### ${c.pref_label}`);
-      lines.push(`**URI:** ${c.concept_uri}`);
-      if (c.concept_code) lines.push(`**Code:** ${c.concept_code}`);
-      if (c.broader_label) lines.push(`**Broader:** ${c.broader_label}`);
-      if (c.matched_label) lines.push(`**Matched via:** ${c.matched_label}`);
+      lines.push(`### ${escapeMarkdownHeading(c.pref_label)}`);
+      lines.push(`**URI:** ${escapeMarkdownInline(c.concept_uri)}`);
+      if (c.concept_code) lines.push(`**Code:** ${escapeMarkdownInline(c.concept_code)}`);
+      if (c.broader_label) lines.push(`**Broader:** ${escapeMarkdownInline(c.broader_label)}`);
+      if (c.matched_label) lines.push(`**Matched via:** ${escapeMarkdownInline(c.matched_label)}`);
       lines.push('');
     }
     return [{ type: 'text', text: lines.join('\n') }];

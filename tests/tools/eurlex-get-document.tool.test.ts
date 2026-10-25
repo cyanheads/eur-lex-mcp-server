@@ -50,6 +50,7 @@ import { AI_ACT_HEADINGS, actHtml } from '../fixtures/eurlex-act-headings.js';
 import { AMENDING_FORMEX, AMENDING_HTML } from '../fixtures/eurlex-amending-act.js';
 import { CONSOLIDATED_ACT_HTML } from '../fixtures/eurlex-consolidated-act.js';
 import { LEGACY_ACT_HTML, LEGACY_TWO_CHAPTER_ACT_HTML } from '../fixtures/eurlex-legacy-act.js';
+import { readCommonMark, readCommonMarkTarget } from '../helpers/commonmark.js';
 
 // --- Service mocks ---
 const mockSparqlQuery = vi.fn();
@@ -262,6 +263,38 @@ describe('eurlex_get_document', () => {
     expect(mockFetchContent).not.toHaveBeenCalled();
   });
 
+  it('a national measure lists its untyped date of effect, with no ELI or OJ reference, beside its citation (#169)', async () => {
+    const lit = (value: string) => ({ type: 'literal', value });
+    mockSparqlQuery.mockImplementation(async (query: string) => {
+      if (query.includes('measure_national_implementing_name_official_journal')) {
+        return [{ field: lit('journal'), value: lit('Landesgesetzblatt (Länder)') }];
+      }
+      return [
+        {
+          ...makeMetaBinding({ celex: '72000L0060DEU_128773' }),
+          // The aggregates CELLAR returns for this work (2026-10-24).
+          datesOfEffect: lit('2006-02-15|'),
+          transposition: lit(''),
+          ojIssue: lit('|||'),
+          ojAct: lit('|||'),
+          ojEnglishPages: lit('|'),
+        },
+      ];
+    });
+    const response = await runToolContract(eurlex_get_document, {
+      celex_number: '72000L0060DEU_128773',
+      content_mode: 'metadata_only',
+    });
+    const structured = eurlex_get_document.output.parse(response.structuredContent);
+    expect(structured.dates_of_effect).toEqual([{ date: '2006-02-15' }]);
+    expect(structured).not.toHaveProperty('eli');
+    expect(structured).not.toHaveProperty('oj_reference');
+    expect(structured.national_measure).toEqual({ journal: 'Landesgesetzblatt (Länder)' });
+    const text = response.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+    expect(text).toContain('**Dates of effect:** 2006-02-15');
+    expect(text).toContain('**National official journal:** Landesgesetzblatt (Länder)');
+  });
+
   it('composes omission notices with fallback and paging and preserves verified PDF links on both surfaces', async () => {
     mockSparqlQuery.mockResolvedValue([makeMetaBinding({ celex: '32000L0060' })]);
     const url = 'http://publications.europa.eu/resource/cellar/example.0004.02/DOC_1';
@@ -291,7 +324,12 @@ describe('eurlex_get_document', () => {
     expect((response.structuredContent as { notice: string }).notice).toContain('32 table');
     const text = response.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
     expect(text).toContain('32 table');
-    expect(text).toContain(`[pdf (EN)](${url})`);
+    // The link renders through markdownLink and parses back to the same URL.
+    const linkLine = text.split('\n').find((l) => l.startsWith('**Alternative representation:** '));
+    expect(linkLine).toBe(`**Alternative representation:** [pdf (EN)](<${url}>)`);
+    expect(
+      readCommonMarkTarget((linkLine as string).slice('**Alternative representation:** '.length)),
+    ).toEqual({ kind: 'link', text: 'pdf (EN)', title: null, url });
     expect(text).toContain('Requested language FR unavailable');
   });
 
@@ -2866,6 +2904,9 @@ describe('eurlex_get_document', () => {
     }) => {
       mockSparqlQuery.mockImplementation((query: string) => {
         if (isResolutionQuery(query)) return Promise.resolve(resolutionRows(query));
+        // The core query also reads the ELI and the OJ pages' manifestations (#169),
+        // so it is told apart by its earliest-entry aggregate before those routes.
+        if (query.includes('AS ?entryIntoForce)')) return Promise.resolve(routes.core ?? []);
         if (query.includes('cdm:resource_legal_eli')) return Promise.resolve(routes.eli ?? []);
         if (query.includes('cdm:act_consolidated_based_on_resource_legal'))
           return Promise.resolve(routes.consolidation ?? []);
@@ -3124,9 +3165,11 @@ describe('eurlex_get_document', () => {
       expect(mockSparqlQuery.mock.calls.some((c) => (c[0] as string).includes('?p ?o'))).toBe(
         false,
       );
+      // The owner lookup is the query that tells an expression from a manifestation;
+      // the core query reads manifestations too, for the OJ pages (#169).
       expect(
         mockSparqlQuery.mock.calls.some((c) =>
-          (c[0] as string).includes('cdm:manifestation_manifests_expression'),
+          (c[0] as string).includes('BIND("manifestation" AS ?kind)'),
         ),
       ).toBe(false);
     });
@@ -3551,9 +3594,12 @@ describe('eurlex_get_document', () => {
       const result = await runToolContract(eurlex_get_document, { work_uri: uri });
       expect(result.isError).toBe(true);
       // The message names the whole rejected set, not only whitespace and quotes.
+      // content[] carries it Markdown-escaped (`\|`), so the set is read from the
+      // raw message on structuredContent.
       const text = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
       expect(text).toContain('control characters');
-      expect(text).toContain('{ } | ^');
+      const { error } = result.structuredContent as { error: { message: string } };
+      expect(error.message).toContain('{ } | ^');
       expect(mockSparqlQuery).not.toHaveBeenCalled();
     });
 
@@ -4451,6 +4497,349 @@ describe('eurlex_get_document', () => {
         .find((q) => q.includes('cdm:expression_belongs_to_work'));
       expect(core).toMatch(/MIN\(STR\(\?\w+\)\) AS \?entryIntoForce/);
       expect(core).toMatch(/MAX\(STR\(\?\w+\)\) AS \?endOfValidity/);
+    });
+  });
+
+  // --- #169: ELI, OJ reference, dates of effect, transposition deadlines ---
+
+  describe('citation facts (#169)', () => {
+    const getDocument = (celex: string) => {
+      mockSparqlQuery.mockImplementation(fakeConsolidationCellar);
+      return runToolContract(eurlex_get_document, {
+        celex_number: celex,
+        content_mode: 'metadata_only',
+      });
+    };
+    const structuredOf = (result: Awaited<ReturnType<typeof getDocument>>) =>
+      eurlex_get_document.output.parse(result.structuredContent);
+    const textOf = (result: Awaited<ReturnType<typeof getDocument>>) =>
+      result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+    const coreQuery = () =>
+      mockSparqlQuery.mock.calls
+        .map((c) => c[0] as string)
+        .find((q) => q.includes('AS ?entryIntoForce)')) as string;
+    const CITATION_LINES = [
+      '**ELI:**',
+      '**OJ reference:**',
+      '**Dates of effect:**',
+      '**Transposition deadlines:**',
+    ];
+
+    it.each([
+      {
+        celex: '32016R0679',
+        eli: 'http://data.europa.eu/eli/reg/2016/679/oj',
+        oj: 'OJ L 119, 4.5.2016, p. 1–88',
+        dates: [
+          { date: '2016-05-24', type: 'entry_into_force' },
+          { date: '2018-05-25', type: 'application' },
+        ],
+        datesLine: '2016-05-24 (entry_into_force), 2018-05-25 (application)',
+        transposition: undefined,
+      },
+      {
+        celex: '32024R1689',
+        eli: 'http://data.europa.eu/eli/reg/2024/1689/oj',
+        oj: 'OJ L, 2024/1689, 12.7.2024',
+        dates: [
+          { date: '2024-08-01', type: 'entry_into_force' },
+          { date: '2025-02-02', type: 'application' },
+          { date: '2025-08-02', type: 'application' },
+          { date: '2026-08-02', type: 'application' },
+          { date: '2027-08-02', type: 'application' },
+        ],
+        datesLine:
+          '2024-08-01 (entry_into_force), 2025-02-02 (application), 2025-08-02 (application), 2026-08-02 (application), 2027-08-02 (application)',
+        transposition: undefined,
+      },
+      {
+        celex: '32019L1937',
+        eli: 'http://data.europa.eu/eli/dir/2019/1937/oj',
+        oj: 'OJ L 305, 26.11.2019, p. 17–56',
+        dates: [{ date: '2019-12-16', type: 'entry_into_force' }],
+        datesLine: '2019-12-16 (entry_into_force)',
+        transposition: ['2021-12-17', '2023-12-17'],
+      },
+    ])(
+      '$celex returns its four citation facts on both surfaces, and no entry_into_force, in the same query count',
+      async (row) => {
+        const result = await getDocument(row.celex);
+        const structured = structuredOf(result);
+        expect(structured.eli).toBe(row.eli);
+        expect(structured.oj_reference).toBe(row.oj);
+        expect(structured.dates_of_effect).toEqual(row.dates);
+        expect(structured.transposition_deadlines).toEqual(row.transposition);
+        expect(structured).not.toHaveProperty('entry_into_force');
+
+        const text = textOf(result);
+        expect(text).toContain(`**ELI:** ${row.eli}`);
+        expect(text).toContain(`**OJ reference:** ${row.oj}`);
+        expect(text).toContain(`**Dates of effect:** ${row.datesLine}`);
+        if (row.transposition) {
+          expect(text).toContain(`**Transposition deadlines:** ${row.transposition.join(', ')}`);
+        } else {
+          expect(text).not.toContain('**Transposition deadlines:**');
+        }
+        expect(text).not.toContain('**Entry into force:**');
+        // The facts ride the core query: resolution, consolidation lookup, core,
+        // agents, legal bases, EuroVoc — the same six queries as without them.
+        expect(mockSparqlQuery).toHaveBeenCalledTimes(6);
+      },
+    );
+
+    it('31995L0046: the repealed directive keeps its repeal and end of validity beside the new fields', async () => {
+      const result = await getDocument('31995L0046');
+      const structured = structuredOf(result);
+      expect(structured.oj_reference).toBe('OJ L 281, 23.11.1995, p. 31–50');
+      expect(structured.transposition_deadlines).toEqual(['1998-10-24']);
+      expect(structured.dates_of_effect).toEqual([
+        { date: '1995-12-13', type: 'entry_into_force' },
+      ]);
+      expect(structured.repealed_by).toEqual(['32016R0679']);
+      expect(structured.end_of_validity).toBe('2018-05-24');
+      expect(structured).not.toHaveProperty('entry_into_force');
+    });
+
+    it('31962R0017: before the English edition, cites the original-language pages without a series letter', async () => {
+      const result = await getDocument('31962R0017');
+      expect(structuredOf(result).oj_reference).toBe('OJ 13, 21.2.1962, p. 204–211');
+      expect(textOf(result)).toContain('**OJ reference:** OJ 13, 21.2.1962, p. 204–211');
+    });
+
+    it('32016L0680R(01): the corrigendum cites the English edition’s single page and its own ELI', async () => {
+      const structured = structuredOf(await getDocument('32016L0680R(01)'));
+      expect(structured.oj_reference).toBe('OJ L 127, 23.5.2018, p. 6');
+      expect(structured.eli).toBe(
+        'http://data.europa.eu/eli/dir/2016/680/corrigendum/2018-05-23/oj',
+      );
+      expect(structured).not.toHaveProperty('dates_of_effect');
+      // A post-1973 act skips the costly original-language page join.
+      expect(coreQuery()).not.toContain('ojOriginal');
+    });
+
+    it('32004D0752: cites the earliest of its three issues and ends with a partial effect', async () => {
+      const structured = structuredOf(await getDocument('32004D0752'));
+      expect(structured.oj_reference).toBe('OJ L 333, 9.11.2004, p. 7–11');
+      expect(structured.dates_of_effect?.at(-1)).toEqual({
+        date: '2005-12-12',
+        type: 'takes_partial_effect',
+      });
+      expect(structured.repealed_by).toEqual(['32016R1192']);
+    });
+
+    it('31983R2215: one date carrying two types is listed once per type, entry into force first', async () => {
+      const result = await getDocument('31983R2215');
+      expect(structuredOf(result).dates_of_effect).toEqual([
+        { date: '1983-08-07', type: 'entry_into_force' },
+        { date: '1983-08-07', type: 'application' },
+      ]);
+      expect(textOf(result)).toContain(
+        '**Dates of effect:** 1983-08-07 (entry_into_force), 1983-08-07 (application)',
+      );
+    });
+
+    it("02016R0679-20160504: a consolidated text carries its own ELI and its base act's other three", async () => {
+      const result = await getDocument('02016R0679-20160504');
+      const structured = structuredOf(result);
+      expect(structured.base_act_celex).toBe('32016R0679');
+      expect(structured.eli).toBe('http://data.europa.eu/eli/reg/2016/679/2016-05-04');
+      expect(structured.oj_reference).toBe('OJ L 119, 4.5.2016, p. 1–88');
+      // Not its own entry into force (the consolidation date, 2016-05-04).
+      expect(structured.dates_of_effect).toEqual([
+        { date: '2016-05-24', type: 'entry_into_force' },
+        { date: '2018-05-25', type: 'application' },
+      ]);
+    });
+
+    it.each(['62012CJ0131', '52012PC0011'])(
+      '%s carries none of the four, on either surface',
+      async (celex) => {
+        const result = await getDocument(celex);
+        const structured = structuredOf(result);
+        for (const field of ['eli', 'oj_reference', 'dates_of_effect', 'transposition_deadlines']) {
+          expect(structured).not.toHaveProperty(field);
+        }
+        for (const line of CITATION_LINES) expect(textOf(result)).not.toContain(line);
+      },
+    );
+  });
+
+  // --- add-tool 2.35: upstream text in content[] reads back as written ---
+
+  describe('Markdown safety of content[]', () => {
+    /** Real-shaped hostile values: emphasis, code, links, HTML, table pipes, block markers, backslashes. */
+    const HOSTILE = [
+      'Regulation *(EU)* 2016/679 _draft_',
+      'Directive `95/46/EC` [x](https://evil.example) <b>bold</b>',
+      '# Heading-like',
+      '- list-like | piped',
+      '1. numbered \\ backslash',
+    ];
+    const lineOf = (text: string, label: string) =>
+      text.split('\n').find((l) => l.startsWith(label)) as string;
+    const baseResult = {
+      celex_number: '32016R0679',
+      content_mode: 'metadata_only',
+      content_available: false,
+      content_status: 'not_requested',
+      has_more: false,
+      language: 'EN',
+      content_format: 'html',
+    } as const;
+
+    it.each(HOSTILE)('metadata labels and upstream values read back as written: %s', (value) => {
+      const result = eurlex_get_document.output.parse({
+        ...baseResult,
+        title: value,
+        resource_type: value,
+        author_institution: value,
+        author_institutions: [value, 'Council of the European Union'],
+        advocates_general: [value],
+        formation: value,
+        referring_court: value,
+        subject_matter: value,
+        case_reference: value,
+        national_measure: { journal: value, number: value, pages: value },
+        eurovoc_subjects: [{ concept_uri: 'http://eurovoc.europa.eu/1234', label: value }],
+        oj_reference: value,
+      });
+      const text = (eurlex_get_document.format!(result)[0] as { text: string }).text;
+
+      expect(readCommonMark(lineOf(text, '## '))).toBe(
+        `⟨heading_open⟩\n\n32016R0679 — ${value}\n\n⟨heading_close⟩`,
+      );
+      for (const label of [
+        'Type',
+        'Author',
+        'Formation',
+        'Referring court',
+        'Subject matter',
+        'Case reference',
+        'National official journal',
+        'Journal number',
+        'Journal pages',
+        'OJ reference',
+      ]) {
+        expect(readCommonMark(lineOf(text, `**${label}:** `))).toBe(
+          `⟨strong⟩${label}:⟨/strong⟩ ${value}`,
+        );
+      }
+      expect(readCommonMark(lineOf(text, '**Authors:** '))).toBe(
+        `⟨strong⟩Authors:⟨/strong⟩ ${value}, Council of the European Union`,
+      );
+      expect(readCommonMark(lineOf(text, '**Advocates General:** '))).toBe(
+        `⟨strong⟩Advocates General:⟨/strong⟩ ${value}`,
+      );
+      expect(readCommonMark(lineOf(text, '**EuroVoc Subjects:** '))).toBe(
+        `⟨strong⟩EuroVoc Subjects:⟨/strong⟩ ${value} (http://eurovoc.europa.eu/1234)`,
+      );
+    });
+
+    it('a title with a line break leaves the heading and reads back on its own line', () => {
+      const title = 'First line *a*\nSecond line';
+      const result = eurlex_get_document.output.parse({ ...baseResult, title });
+      const text = (eurlex_get_document.format!(result)[0] as { text: string }).text;
+      expect(text.split('\n')[0]).toBe('## 32016R0679');
+      expect(readCommonMark(text)).toContain(
+        `⟨heading_open⟩\n\n32016R0679\n\n⟨heading_close⟩\n\n⟨strong⟩Title:⟨/strong⟩ ${title}\n⟨strong⟩Language:`,
+      );
+    });
+
+    // The ELI, OJ reference, and date lines render raw in the citation-facts tests.
+    it('identifiers callers copy render unchanged', () => {
+      const result = eurlex_get_document.output.parse({
+        ...baseResult,
+        celex_number: '72000L0060DEU_128773',
+        work_uri:
+          'http://publications.europa.eu/resource/cellar/3e485e15-11bd-11e6-ba9a-01aa75ed71a1',
+        repealed_by: ['32016R0679R(02)'],
+      });
+      const text = (eurlex_get_document.format!(result)[0] as { text: string }).text;
+      expect(text).toContain('## 72000L0060DEU_128773');
+      expect(text).toContain(
+        '**Work URI:** http://publications.europa.eu/resource/cellar/3e485e15-11bd-11e6-ba9a-01aa75ed71a1',
+      );
+      expect(text).toContain('**Repealed by:** 32016R0679R(02)');
+    });
+
+    it.each(HOSTILE)('outline and selection labels read back as written: %s', (value) => {
+      const result = eurlex_get_document.output.parse({
+        ...baseResult,
+        content_mode: 'paged',
+        content_available: true,
+        content_status: 'available',
+        content_chars_total: 100,
+        content_chars_returned: 0,
+        outline: [{ kind: 'article', number: '5', label: value, title: value, offset: 0 }],
+        selection: { requested: [value], matched: [value], missed: [value] },
+        selected_sections: [{ label: value, offset: 0, chars: 10 }],
+        structure_detected: true,
+      });
+      const text = (eurlex_get_document.format!(result)[0] as { text: string }).text;
+      const outlineLine = lineOf(text, '- `offset 0`');
+      expect(readCommonMark(outlineLine)).toBe(
+        `⟨bullet_list_open⟩\n\n⟨list_item_open⟩\n\n⟨code_inline:offset 0⟩ — [article 5] ${value}: ${value}\n\n⟨list_item_close⟩\n\n⟨bullet_list_close⟩`,
+      );
+      expect(readCommonMark(lineOf(text, '**Selection** — requested: '))).toBe(
+        `⟨strong⟩Selection⟨/strong⟩ — requested: ${value}.`,
+      );
+      expect(readCommonMark(lineOf(text, 'Returned: '))).toBe(`Returned: ${value}.`);
+      expect(readCommonMark(lineOf(text, 'Not found: '))).toBe(
+        `Not found: ${value} — no such section in this act. Use offset/limit or content_mode "full" to read the act.`,
+      );
+      expect(readCommonMark(lineOf(text, 'Section addresses '))).toBe(
+        `Section addresses (content_mode "paged", offset/limit): ${value} — offset 0, 10 chars.`,
+      );
+    });
+
+    it('a notice built from an upstream journal name reads back as written; structuredContent keeps it raw', async () => {
+      const journal = 'Staatsblad *[x](https://evil.example)* <b>|</b> \\';
+      mockSparqlQuery.mockImplementation(async (query: string) =>
+        query.includes('measure_national_implementing_name_official_journal')
+          ? [
+              {
+                field: { type: 'literal', value: 'journal' },
+                value: { type: 'literal', value: journal },
+              },
+            ]
+          : [makeMetaBinding({ celex: '72000L0060DEU_128773' })],
+      );
+      mockFetchContent.mockResolvedValue({
+        content: '',
+        contentAvailable: false,
+        language: 'EN',
+        format: 'html',
+        unavailabilityReason: 'no_representation',
+      });
+      const response = await runToolContract(eurlex_get_document, {
+        celex_number: '72000L0060DEU_128773',
+      });
+      const notice = (response.structuredContent as { notice: string }).notice;
+      expect(notice).toBe(
+        `Retrieve this national measure from ${journal} using the publication citation returned here. Notification does not establish complete transposition.`,
+      );
+      const trailer = response.content
+        .map((b) => (b as { text?: string }).text ?? '')
+        .find(
+          (t) => t.includes('Retrieve this national measure from') && t.trimStart().startsWith('>'),
+        ) as string;
+      expect(readCommonMark(trailer.trim())).toBe(
+        `⟨blockquote_open⟩\n\n${notice}\n\n⟨blockquote_close⟩`,
+      );
+      const body = (response.content[0] as { text: string }).text;
+      expect(readCommonMark(lineOf(body, 'Retrieve this national measure from '))).toBe(
+        `Retrieve this national measure from ${journal} using the publication citation above. Notification does not establish complete transposition.`,
+      );
+    });
+
+    it('a multi-line notice stays inside one blockquote', () => {
+      const render = eurlex_get_document.enrichmentTrailer?.notice?.render as (
+        v: unknown,
+      ) => string;
+      const notice = 'Line one *a*\n- Line two';
+      expect(readCommonMark(render(notice))).toBe(
+        `⟨blockquote_open⟩\n\n${notice}\n\n⟨blockquote_close⟩`,
+      );
     });
   });
 

@@ -93,12 +93,19 @@ function routeQuery(handlers: {
   interpretedBy?: Row[];
   consolidated?: Row[];
   nationalTransposition?: Row[];
+  adopts?: Row[];
+  adoptedBy?: Row[];
 }) {
   return async (q: string): Promise<Row[]> => {
     // Tolerate any unrecognized call shape (e.g. a stray no-arg call from the
     // test harness's async cleanup) — an unmatched query yields no rows.
     if (typeof q !== 'string') return [];
     if (isResolutionQuery(q)) return resolveRowsFor(q, handlers.resolve);
+    if (q.includes('cdm:resource_legal_adopts_resource_legal')) {
+      return q.includes('?relatedWork cdm:resource_legal_adopts_resource_legal <')
+        ? (handlers.adoptedBy ?? [])
+        : (handlers.adopts ?? []);
+    }
     if (q.includes('cdm:work_cites_work')) return handlers.cites ?? [];
     if (q.includes('cdm:act_consolidated_based_on_resource_legal'))
       return handlers.consolidated ?? [];
@@ -576,6 +583,92 @@ describe('eurlex_document_relations_resource', () => {
     // The 26th based-on work is the private sentinel proving more exist.
     expect(result.truncated).toBe(true);
     expect(result.continuation).toMatchObject({ tool: 'eurlex_get_relations' });
+  });
+
+  // --- #167: the proposal an act adopts ---
+
+  it('summarizes adopts and adopted_by beside the other thirteen types (#167)', async () => {
+    const ctx = createMockContext({
+      tenantId: 'test-tenant',
+      errors: eurlex_document_relations_resource.errors,
+    });
+    const proposal = `${CELLAR}7e878960-1254-4cff-951d-9c7b5a04bc0c`;
+    mockQuery.mockImplementation(
+      routeQuery({
+        resolve: [makeResolveBinding(GDPR_WORK_URI)],
+        adopts: [
+          makeRelationBinding({
+            relatedWork: proposal,
+            direction: 'outgoing',
+            relatedCelex: '52012PC0011',
+          }),
+        ],
+      }),
+    );
+
+    const params = eurlex_document_relations_resource.params!.parse({ celexNumber: '32016R0679' });
+    const result = (await eurlex_document_relations_resource.handler(params, ctx)) as Record<
+      string,
+      unknown
+    >;
+
+    expect(result.relations).toEqual([
+      {
+        relation_type: 'adopts',
+        direction: 'outgoing',
+        related_work_uri: proposal,
+        related_celex_number: '52012PC0011',
+      },
+    ]);
+    const queries = mockQuery.mock.calls
+      .map((c) => c[0] as string)
+      .filter((q) => q.includes('?relatedWork'));
+    // Fifteen relation queries, the adopts predicate once in each direction.
+    expect(queries).toHaveLength(15);
+    for (const edge of [
+      `<${GDPR_WORK_URI}> cdm:resource_legal_adopts_resource_legal ?relatedWork`,
+      `?relatedWork cdm:resource_legal_adopts_resource_legal <${GDPR_WORK_URI}>`,
+    ]) {
+      expect(queries.filter((q) => q.includes(edge))).toHaveLength(1);
+    }
+  });
+
+  it('sends no provisions follow-up and returns its rows unchanged, annotated types included (#168)', async () => {
+    const ctx = createMockContext({
+      tenantId: 'test-tenant',
+      errors: eurlex_document_relations_resource.errors,
+    });
+    mockQuery.mockImplementation(
+      routeQuery({
+        resolve: [makeResolveBinding(GDPR_WORK_URI)],
+        interpretedBy: [
+          makeRelationBinding({
+            relatedWork: `${CELLAR}ruling`,
+            direction: 'incoming',
+            relatedCelex: '62022CJ0026',
+          }),
+        ],
+        amendedBy: [
+          makeRelationBinding({
+            relatedWork: `${CELLAR}amender`,
+            direction: 'incoming',
+            relatedCelex: '32024R1623',
+          }),
+        ],
+      }),
+    );
+
+    const params = eurlex_document_relations_resource.params!.parse({ celexNumber: '32016R0679' });
+    const result = (await eurlex_document_relations_resource.handler(params, ctx)) as {
+      relations: Record<string, unknown>[];
+    };
+
+    expect(result.relations).toHaveLength(2);
+    expect(result.relations.some((r) => 'provisions' in r)).toBe(false);
+    const calls = mockQuery.mock.calls.map((c) => c[0] as string);
+    expect(calls.some((q) => q.includes('reference_to_modified_location'))).toBe(false);
+    // The resolution query plus one query per relation type.
+    expect(calls).toHaveLength(16);
   });
 
   // --- #32/#109: the resource inherits the consolidated_version CELEX requirement ---

@@ -1,6 +1,6 @@
 # eur-lex-mcp-server - Directory Structure
 
-Generated on: 2026-10-23 05:13:48
+Generated on: 2026-10-25 07:32:28
 
 ```text
 eur-lex-mcp-server/
@@ -177,13 +177,16 @@ eur-lex-mcp-server/
 │   │       │   └── index.ts
 │   │       ├── echo-value.ts
 │   │       ├── enum-input.ts
-│   │       └── limit-clamp.ts
+│   │       ├── limit-clamp.ts
+│   │       └── markdown-render.ts
 │   ├── services/
 │   │   ├── cellar-sparql/
+│   │   │   ├── act-citation.ts
 │   │   │   ├── cdm-labels.ts
 │   │   │   ├── cellar-sparql-service.ts
 │   │   │   ├── eli-resolution.ts
 │   │   │   ├── keyword-match.ts
+│   │   │   ├── oj-reference.ts
 │   │   │   ├── relation-traversal.ts
 │   │   │   ├── sort-window.ts
 │   │   │   ├── types.ts
@@ -196,6 +199,8 @@ eur-lex-mcp-server/
 │   │       └── html-to-markdown.ts
 │   └── index.ts
 ├── tests/
+│   ├── config/
+│   │   └── server-config.test.ts
 │   ├── fixtures/
 │   │   ├── aws-waf-challenge.ts
 │   │   ├── cellar-consolidations.ts
@@ -210,6 +215,7 @@ eur-lex-mcp-server/
 │   │   ├── eurlex-legacy-act.ts
 │   │   └── formex-zip.ts
 │   ├── helpers/
+│   │   ├── commonmark.ts
 │   │   ├── cpu-time.ts
 │   │   └── sort-window.ts
 │   ├── prompts/
@@ -220,6 +226,7 @@ eur-lex-mcp-server/
 │   ├── services/
 │   │   ├── __snapshots__/
 │   │   │   └── html-to-markdown.test.ts.snap
+│   │   ├── act-citation.test.ts
 │   │   ├── act-structure.case-law.test.ts
 │   │   ├── act-structure.test.ts
 │   │   ├── cdm-labels.test.ts
@@ -229,6 +236,7 @@ eur-lex-mcp-server/
 │   │   ├── formex-package.test.ts
 │   │   ├── html-to-markdown.test.ts
 │   │   ├── keyword-match.test.ts
+│   │   ├── oj-reference.test.ts
 │   │   ├── sort-window.test.ts
 │   │   ├── work-agents.test.ts
 │   │   └── work-resolution.test.ts

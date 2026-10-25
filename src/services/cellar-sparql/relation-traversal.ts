@@ -7,9 +7,10 @@
  */
 
 import type { Context } from '@cyanheads/mcp-ts-core';
+import { McpError } from '@cyanheads/mcp-ts-core/errors';
 import { ENG_LANGUAGE_URI } from './cdm-labels.js';
 import { CellarSparqlService } from './cellar-sparql-service.js';
-import { celexLiteral } from './eli-resolution.js';
+import { celexLiteral, escapeSparqlLiteral, isSafeSparqlIri } from './eli-resolution.js';
 import { readWindowedPage, windowedLimit } from './sort-window.js';
 import type { SparqlBinding, WorkRelation } from './types.js';
 
@@ -28,6 +29,8 @@ export const RELATION_TYPES = [
   'interpreted_by',
   'consolidated_version',
   'national_transposition',
+  'adopts',
+  'adopted_by',
 ] as const;
 
 export type RelationType = (typeof RELATION_TYPES)[number];
@@ -73,34 +76,253 @@ const CONSOLIDATION_BASE_PREDICATE = 'cdm:act_consolidated_based_on_resource_leg
  *  - `interprets` is the outgoing side of `…case-law_interpretes…`, whose subject is
  *    always sector-6 case law (what a ruling interprets); `interpreted_by` is its
  *    incoming side, the rulings interpreting this act.
+ *  - `adopts` is the outgoing side of `…adopts…`, whose subject is the adopting act:
+ *    usually the Commission proposal it adopts, but also the international agreement
+ *    a concluding decision adopts or the joint-committee decision a regulation
+ *    implements; `adopted_by` is its incoming side, the act that adopted this work.
+ *    Like `basis_for`, both are unfiltered: callers tell targets apart by CELEX.
  *
  * Each of these types is one direction only; `cites` is symmetric ("citation
  * graph"), so both directions are surfaced and tagged via `?direction`.
+ *
+ * `annotated` marks the types whose predicate CELLAR reifies with location axioms
+ * ({@link locationAxiom}) naming a provision of the edge's object: amendment,
+ * explicit and implicit repeal, interpretation, and adoption (2026-10-24: 203,244,
+ * 978, 1,156, 19,539, and 4 axioms). Citation, legal basis, consolidation, and
+ * national transposition carry none, so their rows never read provisions.
  */
-const RELATION_SPECS: Record<RelationType, { predicate: string; direction: Direction }> = {
+const RELATION_SPECS: Record<
+  RelationType,
+  { predicate: string; direction: Direction; annotated?: true }
+> = {
   cites: { predicate: 'cdm:work_cites_work', direction: 'both' },
-  amends: { predicate: 'cdm:resource_legal_amends_resource_legal', direction: 'outgoing' },
-  amended_by: { predicate: 'cdm:resource_legal_amends_resource_legal', direction: 'incoming' },
-  repeals: { predicate: 'cdm:resource_legal_repeals_resource_legal', direction: 'outgoing' },
-  repealed_by: { predicate: 'cdm:resource_legal_repeals_resource_legal', direction: 'incoming' },
+  amends: {
+    predicate: 'cdm:resource_legal_amends_resource_legal',
+    direction: 'outgoing',
+    annotated: true,
+  },
+  amended_by: {
+    predicate: 'cdm:resource_legal_amends_resource_legal',
+    direction: 'incoming',
+    annotated: true,
+  },
+  repeals: {
+    predicate: 'cdm:resource_legal_repeals_resource_legal',
+    direction: 'outgoing',
+    annotated: true,
+  },
+  repealed_by: {
+    predicate: 'cdm:resource_legal_repeals_resource_legal',
+    direction: 'incoming',
+    annotated: true,
+  },
   implicitly_repeals: {
     predicate: 'cdm:resource_legal_implicitly_repeals_resource_legal',
     direction: 'outgoing',
+    annotated: true,
   },
   implicitly_repealed_by: {
     predicate: 'cdm:resource_legal_implicitly_repeals_resource_legal',
     direction: 'incoming',
+    annotated: true,
   },
   legal_basis: { predicate: 'cdm:resource_legal_based_on_resource_legal', direction: 'outgoing' },
   basis_for: { predicate: 'cdm:resource_legal_based_on_resource_legal', direction: 'incoming' },
-  interprets: { predicate: 'cdm:case-law_interpretes_resource_legal', direction: 'outgoing' },
-  interpreted_by: { predicate: 'cdm:case-law_interpretes_resource_legal', direction: 'incoming' },
+  interprets: {
+    predicate: 'cdm:case-law_interpretes_resource_legal',
+    direction: 'outgoing',
+    annotated: true,
+  },
+  interpreted_by: {
+    predicate: 'cdm:case-law_interpretes_resource_legal',
+    direction: 'incoming',
+    annotated: true,
+  },
   consolidated_version: { predicate: CONSOLIDATION_BASE_PREDICATE, direction: 'incoming' },
   national_transposition: {
     predicate: 'cdm:measure_national_implementing_implements_resource_legal',
     direction: 'incoming',
   },
+  adopts: {
+    predicate: 'cdm:resource_legal_adopts_resource_legal',
+    direction: 'outgoing',
+    annotated: true,
+  },
+  adopted_by: {
+    predicate: 'cdm:resource_legal_adopts_resource_legal',
+    direction: 'incoming',
+    annotated: true,
+  },
 };
+
+const OWL = 'http://www.w3.org/2002/07/owl#';
+const MODIFIED_LOCATION =
+  '<http://publications.europa.eu/ontology/annotation#reference_to_modified_location>';
+
+/**
+ * The `owl:Axiom` CELLAR reifies an edge `source predicate target` with, binding
+ * the provision designator it records to `location`. The axiom's annotated source
+ * and target are the edge's own work URIs; one edge carries one axiom per
+ * designator, and CELLAR records some twice. Full IRIs, since the service's prefix
+ * block declares neither vocabulary.
+ */
+function locationAxiom(
+  axiom: string,
+  source: string,
+  predicate: string,
+  target: string,
+  location: string,
+): string {
+  return `${axiom} <${OWL}annotatedSource> ${source} ; <${OWL}annotatedProperty> ${predicate} ; <${OWL}annotatedTarget> ${target} ; ${MODIFIED_LOCATION} ${location} .`;
+}
+
+/** An edge's two ends: the related work's variable on one side, the source work on the other. */
+function edgeEnds(
+  workUri: string,
+  related: string,
+  direction: 'outgoing' | 'incoming',
+): [source: string, target: string] {
+  return direction === 'outgoing' ? [`<${workUri}>`, related] : [related, `<${workUri}>`];
+}
+
+/**
+ * Collapse each `{CODE|…/CODE}` authority token of a recorded designator to its
+ * code, the token's last URI segment repeated: `{AR|…/fd_370/AR} 43 {PA|…/fd_370/PA} 4`
+ * reads `AR 43 PA 4`. A token whose code differs from its URI's last segment
+ * (`{TIRE |…/fd_370/TIRE}`), and any other brace text, stays verbatim. The pattern
+ * cannot backtrack across a brace or a bar, so the pass is linear in the value.
+ */
+export function compactProvision(value: string): string {
+  return value.replace(/\{([^{}|]+)\|([^{}|]*)\}/g, (token, code: string, uri: string) =>
+    uri.endsWith(`/${code}`) ? code : token,
+  );
+}
+
+/**
+ * The `article` input as callers type it: an article number with at most one letter
+ * (`17`, `6a`), optionally prefixed `Article`, `Art.`, or `Art`, in any case, or a
+ * blank value. Nothing after the number is admitted — no paragraph (`17(1)`), range,
+ * or Roman numeral — so a parsed value carries no SPARQL-significant character. No
+ * quantifier can trade characters with its neighbour, so matching is linear. Case
+ * classes are spelled out rather than flagged, because the JSON Schema pattern
+ * clients validate against carries no flags.
+ */
+export const ARTICLE_INPUT_PATTERN =
+  /^\s*(?:(?:[Aa][Rr][Tt][Ii][Cc][Ll][Ee]|[Aa][Rr][Tt]\.?)\s*)?\d{1,4}[A-Za-z]?\s*$|^\s*$/;
+
+/** An article of the interpreted act: its number without leading zeros, and its letter in lower case. */
+export interface ArticleFilter {
+  letter?: string;
+  number: string;
+}
+
+/**
+ * The article a value matching {@link ARTICLE_INPUT_PATTERN} names, or `undefined`
+ * for a blank one.
+ */
+export function parseArticle(value: string): ArticleFilter | undefined {
+  const core = value.trim().replace(/^(?:article|art\.?)\s*/i, '');
+  if (!core) return;
+  const letter = /[a-z]$/i.test(core) ? core.slice(-1).toLowerCase() : undefined;
+  const number = (letter ? core.slice(0, -1) : core).replace(/^0+(?=\d)/, '');
+  return letter ? { number, letter } : { number };
+}
+
+/** An article as the tool echoes it: `17`, `28c`. */
+export function articleLabel(article: ArticleFilter): string {
+  return `${article.number}${article.letter ?? ''}`;
+}
+
+/**
+ * The Latin ordinals CELLAR's legacy codes write a lettered article with, following
+ * the French numbering: Article 28a is `A28BIS`, 28c is `A28QUATER`. Index 0 is `a`.
+ */
+const LATIN_ORDINALS = [
+  'BIS',
+  'TER',
+  'QUATER',
+  'QUINQUIES',
+  'SEXIES',
+  'SEPTIES',
+  'OCTIES',
+  'NONIES',
+  'DECIES',
+  'UNDECIES',
+  'DUODECIES',
+  'TERDECIES',
+  'QUATERDECIES',
+  'QUINDECIES',
+  'SEXDECIES',
+  'SEPTDECIES',
+  'OCTODECIES',
+  'NOVODECIES',
+  'VICIES',
+];
+
+/** The short ordinals authority-token designators carry (`AR 10BI`, `AR 28TR.2`, `AR 10QT`). */
+const TOKEN_ORDINALS: Readonly<Record<string, string>> = { a: 'BI', b: 'TR', c: 'QT' };
+
+/**
+ * Letters that open a sub-article segment in a compact code (`P` paragraph, `L`
+ * point letter or subparagraph, `T` indent, `SNT`), so `A17P1` is Article 17(1),
+ * never Article 17p: a lettered article with one of these is matched by its
+ * ordinal alone in the compact form.
+ */
+const COMPACT_SEGMENT_LETTERS = new Set(['l', 'p', 's', 't']);
+
+/**
+ * The REGEX a recorded designator matches when it lies in `article`, at any depth.
+ * Two forms carry the article (2026-10-24, interprets axioms):
+ *  - compact codes (80%): `A`, the number with optional zero padding, then the
+ *    end or a segment — `A17`, `A17P1LC`, `A067SNT2` (Article 67) — and never a
+ *    longer number or another article's suffix (`A170`, `A17BIS`, `A17TER`);
+ *  - authority tokens (5%): `{AR|…} 17`, then the end, a space, or a dot —
+ *    `AR 17.6 L2`, `AR 17 .6` — and never `AR 17a`.
+ * A letter matches itself and its Latin ordinal (`28c`: `A28QUATER…`, `AR 28c`,
+ * `AR 28QT`). The pattern is built from the parsed digits and letter alone.
+ */
+export function articleLocationPattern(article: ArticleFilter): string {
+  const { number, letter } = article;
+  const alternation = (options: string[]) => (options.length ? `(${options.join('|')})` : '');
+  const ordinal = letter ? LATIN_ORDINALS[letter.charCodeAt(0) - 97] : undefined;
+  const compact = letter
+    ? [
+        ...(COMPACT_SEGMENT_LETTERS.has(letter) ? [] : [letter.toUpperCase()]),
+        ...(ordinal ? [ordinal] : []),
+      ]
+    : [];
+  const token = letter
+    ? [
+        letter,
+        letter.toUpperCase(),
+        ...(ordinal ? [ordinal] : []),
+        ...(TOKEN_ORDINALS[letter] ? [TOKEN_ORDINALS[letter]] : []),
+      ]
+    : [];
+  const branches = [
+    ...(letter && compact.length === 0
+      ? []
+      : [`A0*${number}${alternation(compact)}(P|L|T[0-9]|SNT|$)`]),
+    `\\{AR\\|[^}]*\\} 0*${number}${alternation(token)}([ .]|$)`,
+  ];
+  return `^(${branches.join('|')})`;
+}
+
+/**
+ * `FILTER EXISTS` keeping an `interpreted_by` row only when one of its recorded
+ * provisions lies in `article`, pushed into the paged query so LIMIT, OFFSET, and
+ * the sentinel row count matching rulings alone.
+ */
+function articleFilterClause(
+  workUri: string,
+  related: string,
+  predicate: string,
+  direction: 'outgoing' | 'incoming',
+  article: ArticleFilter,
+): string {
+  const [source, target] = edgeEnds(workUri, related, direction);
+  return `FILTER EXISTS { ${locationAxiom('?articleAxiom', source, predicate, target, '?articleLocation')} FILTER(REGEX(STR(?articleLocation), "${escapeSparqlLiteral(articleLocationPattern(article))}")) }`;
+}
 
 /**
  * Default per-direction result cap. Each relation type is queried independently
@@ -130,6 +352,7 @@ function relationArm(
   predicate: string,
   direction: 'outgoing' | 'incoming',
   celex?: CelexConstraint,
+  article?: ArticleFilter,
 ): string {
   const edge =
     direction === 'outgoing'
@@ -143,11 +366,14 @@ function relationArm(
   const celexFilter = celex?.pattern
     ? `\n    FILTER(REGEX(STR(?relatedCelex), "${celex.pattern}"))`
     : '';
+  const articleFilter = article
+    ? `\n    ${articleFilterClause(workUri, '?relatedWork', predicate, direction, article)}`
+    : '';
   // `?relatedDate` drives the per-direction ordering below; it stays OPTIONAL so
   // related works without a document date still return (they sort last under DESC).
   return `${edge}
     ${celexTriple}${celexFilter}
-    OPTIONAL { ?relatedWork cdm:work_date_document ?relatedDate . }
+    OPTIONAL { ?relatedWork cdm:work_date_document ?relatedDate . }${articleFilter}
     BIND("${direction}" AS ?direction)`;
 }
 
@@ -199,13 +425,14 @@ function buildRelationQuery(
   limit: number,
   offset: number,
   celex?: CelexConstraint,
+  article?: ArticleFilter,
 ): string {
   const projection =
     'SELECT ?relatedWork (SAMPLE(?relatedCelex) AS ?relatedCelexSample) ?direction (MAX(STR(?relatedDate)) AS ?relatedDateMax)';
   const paging = `GROUP BY ?relatedWork ?direction ORDER BY DESC(?relatedDateMax) ?relatedWork LIMIT ${limit} OFFSET ${offset}`;
   const subquery = (direction: 'outgoing' | 'incoming') =>
     `{ ${projection} WHERE {
-    ${relationArm(workUri, spec.predicate, direction, celex)}
+    ${relationArm(workUri, spec.predicate, direction, celex, article)}
   } ${paging} }`;
   const page =
     spec.direction === 'both'
@@ -493,7 +720,8 @@ export interface RelationWindowEnd {
  * Ungrouped by design: CELLAR evaluates a grouped `MAX` over the date wrongly (see
  * {@link buildRelationQuery}), so a work with several dates or CELEX numbers repeats
  * rather than being aggregated. The CELEX constraint of the relation type carries
- * over, so the rows are the ones the traversal would have returned.
+ * over, and so does an `article` filter, so the rows are the ones the traversal
+ * would have returned.
  */
 function continuationQuery(
   workUri: string,
@@ -501,14 +729,17 @@ function continuationQuery(
   direction: 'outgoing' | 'incoming',
   lastDate: string | undefined,
   celex?: CelexConstraint,
+  article?: ArticleFilter,
 ): string {
   const edge =
     direction === 'outgoing'
       ? `<${workUri}> ${predicate} ?work .`
       : `?work ${predicate} <${workUri}> .`;
-  const celexPattern = celex
-    ? `?work cdm:resource_legal_id_celex ?celex .${celex.pattern ? ` FILTER(REGEX(STR(?celex), "${celex.pattern}"))` : ''}`
-    : 'OPTIONAL { ?work cdm:resource_legal_id_celex ?celex }';
+  const celexPattern = `${
+    celex
+      ? `?work cdm:resource_legal_id_celex ?celex .${celex.pattern ? ` FILTER(REGEX(STR(?celex), "${celex.pattern}"))` : ''}`
+      : 'OPTIONAL { ?work cdm:resource_legal_id_celex ?celex }'
+  }${article ? ` ${articleFilterClause(workUri, '?work', predicate, direction, article)}` : ''}`;
   return lastDate
     ? `SELECT ?work ?celex ?date WHERE { ${edge} ?work cdm:work_date_document ?date . ${celexPattern} FILTER(?date <= "${lastDate}"^^xsd:date) } ORDER BY DESC(?date) ?work`
     : `SELECT ?work ?celex WHERE { ${edge} ${celexPattern} FILTER NOT EXISTS { ?work cdm:work_date_document ?date } } ORDER BY ?work`;
@@ -557,17 +788,49 @@ function continuationQuery(
  * Each relation carries the related work's date — the value its page is ordered
  * by — and its English title (#119), each omitted when the work has none; no
  * other language stands in for a missing English title.
+ *
+ * `article` narrows `interpreted_by` to the rulings with a recorded provision in
+ * that article ({@link articleLocationPattern}), pushed into the paged query and its
+ * window-end continuation; every other type ignores it.
+ *
+ * With `provisions` set, each page row of an annotated type (see
+ * {@link RELATION_SPECS}) carries the distinct designators its edge's location
+ * axioms record, compacted ({@link compactProvision}) and sorted; a row with none
+ * carries no `provisions`. They are read by one follow-up query per annotated type
+ * with rows on the page, keyed on those rows (`VALUES`) and ungrouped: a
+ * `GROUP_CONCAT` inside the paged query fails once an edge's designators pass
+ * about 4 KB (Virtuoso SR319, HTTP 500). The follow-up runs after the page query,
+ * so it adds one round-trip to the call. A follow-up CELLAR fails is reported in
+ * `provisionsUnavailable` and its rows are returned without provisions; the
+ * caller's cancellation still ends the call.
  */
 export async function traverseRelations(
-  svc: Pick<CellarSparqlService, 'queryWithContinuation'>,
+  svc: Pick<CellarSparqlService, 'query' | 'queryWithContinuation'>,
   workUri: string,
   types: readonly RelationType[],
   ctx: Context,
-  sourceCelex?: string,
-  perTypeLimit: number = DEFAULT_PER_TYPE_LIMIT,
-  offset = 0,
-  memberStates?: readonly MemberStateCode[],
-): Promise<{ relations: WorkRelation[]; hasMore: boolean; windowEnds: RelationWindowEnd[] }> {
+  options: {
+    article?: ArticleFilter | undefined;
+    memberStates?: readonly MemberStateCode[] | undefined;
+    offset?: number;
+    perTypeLimit?: number;
+    provisions?: boolean;
+    sourceCelex?: string | undefined;
+  } = {},
+): Promise<{
+  hasMore: boolean;
+  provisionsUnavailable: RelationType[];
+  relations: WorkRelation[];
+  windowEnds: RelationWindowEnd[];
+}> {
+  const {
+    article,
+    memberStates,
+    offset = 0,
+    perTypeLimit = DEFAULT_PER_TYPE_LIMIT,
+    sourceCelex,
+  } = options;
+  const articleFor = (type: RelationType) => (type === 'interpreted_by' ? article : undefined);
   const sourceActCore = sourceCelex ? celexActCore(sourceCelex) : undefined;
   const fetchLimit = windowedLimit(offset, perTypeLimit);
   const perType = await Promise.all(
@@ -593,7 +856,14 @@ export async function traverseRelations(
         return {
           type,
           bindings: await svc.queryWithContinuation(
-            buildRelationQuery(workUri, RELATION_SPECS[type], fetchLimit, offset, celex),
+            buildRelationQuery(
+              workUri,
+              RELATION_SPECS[type],
+              fetchLimit,
+              offset,
+              celex,
+              articleFor(type),
+            ),
             ctx,
           ),
           ...(celex ? { celex } : {}),
@@ -607,6 +877,7 @@ export async function traverseRelations(
     : undefined;
   const relations: WorkRelation[] = [];
   const windowEnds: RelationWindowEnd[] = [];
+  const pageRowsByType = new Map<RelationType, WorkRelation[]>();
   let hasMore = false;
   for (const { type, bindings, celex } of perType) {
     const rowsByDirection = new Map<'outgoing' | 'incoming', Omit<WorkRelation, 'direction'>[]>();
@@ -655,8 +926,9 @@ export async function traverseRelations(
 
     for (const [direction, rows] of rowsByDirection) {
       if (rows.length > perTypeLimit) hasMore = true;
-      const page = rows.slice(0, perTypeLimit);
-      for (const row of page) relations.push({ ...row, direction });
+      const page = rows.slice(0, perTypeLimit).map((row) => ({ ...row, direction }));
+      relations.push(...page);
+      pageRowsByType.set(type, [...(pageRowsByType.get(type) ?? []), ...page]);
       const fetched = fetchedByDirection.get(direction) ?? 0;
       if (readWindowedPage(fetched, offset, perTypeLimit).atWindowEnd) {
         const lastDate = page.at(-1)?.relatedDate;
@@ -670,10 +942,72 @@ export async function traverseRelations(
             direction,
             lastDate,
             celex,
+            articleFor(type),
           ),
         });
       }
     }
   }
-  return { relations, hasMore, windowEnds };
+
+  const provisionsUnavailable: RelationType[] = [];
+  if (options.provisions) {
+    await Promise.all(
+      [...pageRowsByType]
+        .filter(([type]) => RELATION_SPECS[type].annotated)
+        .map(async ([type, rows]) => {
+          let byWork: Map<string, string[]>;
+          try {
+            byWork = await readProvisions(svc, workUri, type, rows, ctx);
+          } catch (error) {
+            // Best effort: rows stay, without provisions, and the type is reported.
+            // Cancellation and anything that is not a CELLAR failure still end the call.
+            if (ctx.signal.aborted || !(error instanceof McpError)) throw error;
+            ctx.log.warning('Provisions follow-up failed; rows returned without them', {
+              relationType: type,
+              error: error.message,
+            });
+            provisionsUnavailable.push(type);
+            return;
+          }
+          for (const row of rows) {
+            const provisions = byWork.get(row.relatedWorkUri);
+            if (provisions) row.provisions = provisions;
+          }
+        }),
+    );
+  }
+  return { relations, hasMore, windowEnds, provisionsUnavailable };
+}
+
+/**
+ * The compacted, de-duplicated, sorted designators each page row of an annotated
+ * type records, by related work URI: one ungrouped query keyed on the rows. Only a
+ * URI the IRI guard accepts is keyed; CELLAR's own work URIs always pass.
+ */
+async function readProvisions(
+  svc: Pick<CellarSparqlService, 'query'>,
+  workUri: string,
+  type: RelationType,
+  rows: readonly WorkRelation[],
+  ctx: Context,
+): Promise<Map<string, string[]>> {
+  const keys = [...new Set(rows.map((row) => row.relatedWorkUri))].filter(isSafeSparqlIri);
+  if (keys.length === 0) return new Map();
+  const { predicate, direction } = RELATION_SPECS[type];
+  // Annotated types are one-directional by construction.
+  const [source, target] = edgeEnds(workUri, '?relatedWork', direction as 'outgoing' | 'incoming');
+  const bindings = await svc.query(
+    `SELECT DISTINCT ?relatedWork ?location WHERE { VALUES ?relatedWork { ${keys.map((key) => `<${key}>`).join(' ')} } ${locationAxiom('?axiom', source, predicate, target, '?location')} }`,
+    ctx,
+  );
+  const sets = new Map<string, Set<string>>();
+  for (const binding of bindings) {
+    const work = CellarSparqlService.bindingValue(binding, 'relatedWork');
+    const location = CellarSparqlService.bindingValue(binding, 'location');
+    if (!work || location === undefined) continue;
+    const set = sets.get(work) ?? new Set<string>();
+    set.add(compactProvision(location));
+    sets.set(work, set);
+  }
+  return new Map([...sets].map(([work, set]) => [work, [...set].sort()]));
 }

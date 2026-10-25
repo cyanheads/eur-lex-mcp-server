@@ -5,6 +5,7 @@
 
 import { resource, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { actCitationQueryParts, readActCitation } from '@/services/cellar-sparql/act-citation.js';
 import { ENG_LANGUAGE_URI, resolveResourceTypeLabel } from '@/services/cellar-sparql/cdm-labels.js';
 import {
   CellarSparqlService,
@@ -41,7 +42,7 @@ function collectResolved(
 export const eurlex_document_resource = resource('eurlex://document/{celexNumber}', {
   name: 'EUR-Lex document metadata',
   description:
-    "Metadata snapshot for a CELLAR work by CELEX number — human-readable document type, authors by English authority label (an EU institution or body, a member state, an MEP, or a national court; each usable as the author_institution filter of eurlex_search_documents), Advocates General of a case-law record, date, English title, in-force flag, legal basis acts (work URI plus CELEX), and EuroVoc subjects (concept URI plus English label). A consolidated text keeps its own type, date, and title, and reports its base act (base_act_celex) with that act's authors, in-force flag, legal bases, and subjects.",
+    "Metadata snapshot for a CELLAR work by CELEX number — human-readable document type, authors by English authority label (an EU institution or body, a member state, an MEP, or a national court; each usable as the author_institution filter of eurlex_search_documents), Advocates General of a case-law record, date, English title, in-force flag, ELI (eli), Official Journal reference (oj_reference, e.g. OJ L 119, 4.5.2016, p. 1–88), every date of effect with its type (dates_of_effect: [{ date, type? }], type one of entry_into_force, application, partial_application, provisional_application, takes_effect, takes_partial_effect), a directive's transposition deadlines (transposition_deadlines), legal basis acts (work URI plus CELEX), and EuroVoc subjects (concept URI plus English label). A consolidated text keeps its own type, date, title, and ELI, and reports its base act (base_act_celex) with that act's authors, in-force flag, OJ reference, dates of effect, transposition deadlines, legal bases, and subjects.",
   mimeType: 'application/json',
   params: z.object({
     celexNumber: z
@@ -106,8 +107,13 @@ export const eurlex_document_resource = resource('eurlex://document/{celexNumber
     const baseAct = consolidation?.base;
     const actWork = baseAct?.workUri ?? workUri;
 
+    // The citation facts (#169) ride the core query as aggregates, read the way
+    // eurlex_get_document reads them: the served work's ELI, the act's OJ
+    // reference, typed dates of effect, and transposition deadlines.
+    const citation = actCitationQueryParts(workUri, actWork, baseAct ? baseAct.celex : celexNumber);
     const sparql = `
-SELECT ?type ?date ?title ?inForce WHERE {
+SELECT ?type ?date ?title ?inForce${citation.select}
+WHERE {
   OPTIONAL { <${workUri}> cdm:work_has_resource-type ?type . }
   OPTIONAL { <${workUri}> cdm:work_date_document ?date . }
   OPTIONAL {
@@ -115,8 +121,8 @@ SELECT ?type ?date ?title ?inForce WHERE {
     ?expr cdm:expression_uses_language <${ENG_LANGUAGE_URI}> .
     ?expr cdm:expression_title ?title .
   }
-  OPTIONAL { <${actWork}> cdm:resource_legal_in-force ?inForce . }
-} LIMIT 5`;
+  OPTIONAL { <${actWork}> cdm:resource_legal_in-force ?inForce . }${citation.patterns}
+} GROUP BY ?type ?date ?title ?inForce LIMIT 5`;
 
     // Legal bases and EuroVoc subjects are fetched per dimension (never a
     // cross-product with the core rows) with their identifying literal joined as
@@ -161,6 +167,7 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
       CellarSparqlService.bindingValue(first, 'inForce'),
     );
     if (inForce !== undefined) result.in_force = inForce;
+    Object.assign(result, readActCitation(first));
 
     // The first institution is the primary author_institution, the full set is
     // author_institutions; Advocates General are listed on their own (#96).

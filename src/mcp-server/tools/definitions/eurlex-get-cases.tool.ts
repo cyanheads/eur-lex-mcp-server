@@ -5,6 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { echoValue } from '@/mcp-server/tools/echo-value.js';
 import { enumInput } from '@/mcp-server/tools/enum-input.js';
 import {
@@ -13,6 +14,10 @@ import {
   limitClampTrailer,
   ROW_LIMIT_CEILING,
 } from '@/mcp-server/tools/limit-clamp.js';
+import {
+  escapeMarkdownHeading,
+  renderNoticeBlockquote,
+} from '@/mcp-server/tools/markdown-render.js';
 import {
   DERIVATIVE_RESOURCE_TYPES,
   ENG_LANGUAGE_URI,
@@ -401,7 +406,13 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
       ),
     limit_clamp: limitClampEnrichment,
   },
-  enrichmentTrailer: { limit_clamp: limitClampTrailer },
+  enrichmentTrailer: {
+    limit_clamp: limitClampTrailer,
+    // The notice quotes caller filters and a CELLAR date, so it is escaped whole and reads back as written.
+    notice: {
+      render: (notice?: string) => renderNoticeBlockquote(String(notice)),
+    },
+  },
 
   errors: [
     {
@@ -784,28 +795,30 @@ SELECT
     lines.push('');
     const echoEntries = Object.entries(result.query_echo);
     if (echoEntries.length > 0) {
-      lines.push(
-        `*Filters: ${echoEntries.map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(', ')}*\n`,
-      );
+      const filters = echoEntries.map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(', ');
+      lines.push(`*Filters: ${escapeMarkdownInline(filters)}*\n`);
     }
+    const field = (label: string, value: string) => `**${label}:** ${escapeMarkdownInline(value)}`;
     for (const c of result.cases) {
       // Prefer the clean parsed display title; fall back to the raw title (already
       // clean for the plain, non-"#"-delimited titles that don't parse).
       const heading = c.display_title ?? c.title;
-      lines.push(`### ${c.celex_number}${heading ? ` — ${heading}` : ''}`);
-      if (c.date) lines.push(`**Date:** ${c.date}`);
-      if (c.ecli) lines.push(`**ECLI:** ${c.ecli}`);
-      if (c.resource_type) lines.push(`**Type:** ${c.resource_type}`);
-      if (c.formation) lines.push(`**Formation:** ${c.formation}`);
-      if (c.advocate_general) lines.push(`**Advocate General:** ${c.advocate_general}`);
+      lines.push(
+        `### ${escapeMarkdownHeading(c.celex_number)}${heading ? ` — ${escapeMarkdownHeading(heading)}` : ''}`,
+      );
+      if (c.date) lines.push(field('Date', c.date));
+      if (c.ecli) lines.push(field('ECLI', c.ecli));
+      if (c.resource_type) lines.push(field('Type', c.resource_type));
+      if (c.formation) lines.push(field('Formation', c.formation));
+      if (c.advocate_general) lines.push(field('Advocate General', c.advocate_general));
       // The heading already shows the parties when they are the display title.
-      if (c.parties && c.parties !== heading) lines.push(`**Parties:** ${c.parties}`);
-      if (c.referring_court) lines.push(`**Referring court:** ${c.referring_court}`);
-      if (c.subject_matter) lines.push(`**Subject matter:** ${c.subject_matter}`);
-      if (c.case_reference) lines.push(`**Case reference:** ${c.case_reference}`);
+      if (c.parties && c.parties !== heading) lines.push(field('Parties', c.parties));
+      if (c.referring_court) lines.push(field('Referring court', c.referring_court));
+      if (c.subject_matter) lines.push(field('Subject matter', c.subject_matter));
+      if (c.case_reference) lines.push(field('Case reference', c.case_reference));
       // Raw CELLAR title, present only when the parsed fields miss part of it.
-      if (c.title) lines.push(`**Full title:** ${c.title}`);
-      lines.push(`**Work URI:** ${c.work_uri}`);
+      if (c.title) lines.push(field('Full title', c.title));
+      lines.push(field('Work URI', c.work_uri));
       lines.push('');
     }
     return [{ type: 'text', text: lines.join('\n') }];

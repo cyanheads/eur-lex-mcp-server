@@ -5,7 +5,9 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { echoValue } from '@/mcp-server/tools/echo-value.js';
+import { renderNoticeBlockquote } from '@/mcp-server/tools/markdown-render.js';
 import { getCellarSparqlService } from '@/services/cellar-sparql/cellar-sparql-service.js';
 import type { SparqlBinding, SparqlTerm } from '@/services/cellar-sparql/types.js';
 
@@ -23,36 +25,17 @@ function formatDatatype(datatype: string): string {
     : `<${datatype}>`;
 }
 
-/** A letter or digit — the only neighbours that keep a `_` from delimiting emphasis. */
-const WORD_CHAR = /[\p{L}\p{N}]/u;
-
 /**
- * Encode a literal lexical form for the Markdown layer after applying the
- * SPARQL string escapes that preserve its term identity. Only lexical content
- * is encoded; term delimiters, datatype suffixes, and language tags are added
- * afterward and remain ordinary SPARQL/Turtle syntax.
- *
- * A `_` with a letter or digit on both sides is left bare: CommonMark (§6.2)
- * lets such an underscore neither open nor close emphasis, so a backslash there
- * only corrupts identifiers agents copy (`72022L2555ROU_202405184`). Every other
- * `_` — beside punctuation, whitespace, or a string edge — stays escaped (#76).
+ * A literal lexical form with the SPARQL string escapes that keep its term
+ * identity: `\` and `"`, so the delimiters stay unambiguous, and CR and LF, so a
+ * multi-line value stays one table cell and CR stays distinct from LF.
  */
-function formatLiteralLexical(value: string): string {
-  const sparqlEscaped = value
+function escapeLexical(value: string): string {
+  return value
     .replace(/\\/g, '\\\\')
     .replace(/"/g, '\\"')
-    .replace(/\r\n/g, '\\r\\n')
     .replace(/\r/g, '\\r')
     .replace(/\n/g, '\\n');
-
-  return sparqlEscaped
-    .replace(/\\/g, '\\\\')
-    .replace(/\|/g, '\\|')
-    .replace(/[<>&*_[\]`~]/g, (ch, offset: number, text: string) =>
-      ch === '_' && WORD_CHAR.test(text[offset - 1] ?? '') && WORD_CHAR.test(text[offset + 1] ?? '')
-        ? ch
-        : `\\${ch}`,
-    );
 }
 
 /**
@@ -71,11 +54,23 @@ function formatSparqlTerm(term: SparqlTerm | undefined): string {
   if (term.type === 'uri') return `<${term.value}>`;
   if (term.type === 'bnode') return `_:${term.value}`;
 
-  const lexical = `"${formatLiteralLexical(term.value)}"`;
+  const lexical = `"${escapeLexical(term.value)}"`;
   const lang = term['xml:lang'];
   if (lang) return `${lexical}@${lang}`;
   if (term.datatype) return `${lexical}^^${formatDatatype(term.datatype)}`;
   return lexical;
+}
+
+/**
+ * `text` encoded for one GFM table cell, which a CommonMark parse reads back as
+ * `text`: Markdown-active characters escaped (`|` included, `_` left bare
+ * between letters or digits so identifiers stay copyable), and each line break,
+ * which a row cannot hold, written as `&#10;` in place of the escaper's hard
+ * break. Header names and every term — the `<`, `_:`, and `^^<…>` of its syntax
+ * included — go through it whole.
+ */
+function markdownTableCell(text: string): string {
+  return escapeMarkdownInline(text).replaceAll('\\\n', '&#10;');
 }
 
 /**
@@ -294,6 +289,12 @@ export const eurlex_query_sparql = tool('eurlex_query_sparql', {
         'On a truncated result: how to page past the row cap with ORDER BY and OFFSET, and the 10,000-row limit on a sorted query. On a zero-row result whose query has an untyped string literal as a triple object: how to type or language-tag it, since CELLAR stores identifiers as typed literals that an untyped one never matches.',
       ),
   },
+  // The notice quotes a literal from the caller's query, so it is escaped whole and reads back as written.
+  enrichmentTrailer: {
+    notice: {
+      render: (notice?: string) => renderNoticeBlockquote(String(notice)),
+    },
+  },
 
   errors: [
     {
@@ -406,7 +407,9 @@ export const eurlex_query_sparql = tool('eurlex_query_sparql', {
   format: (result) => {
     const lines: string[] = [`## SPARQL Results (${result.total} rows)\n`];
     if (result.variables.length > 0) {
-      lines.push(`**Variables:** ${result.variables.join(', ')}\n`);
+      lines.push(
+        `**Variables:** ${result.variables.map((v) => escapeMarkdownInline(v)).join(', ')}\n`,
+      );
     }
     if (result.total === 0) {
       lines.push('*No bindings returned.*');
@@ -415,12 +418,14 @@ export const eurlex_query_sparql = tool('eurlex_query_sparql', {
       // only by the service-side maxSparqlResults cap), so the text channel must
       // render all of it too — a fixed 20-row slice left content[]-only clients
       // blind to rows 21+ that structuredContent clients could see (#50).
-      const header = `| ${result.variables.join(' | ')} |`;
+      const header = `| ${result.variables.map(markdownTableCell).join(' | ')} |`;
       const sep = `| ${result.variables.map(() => '---').join(' | ')} |`;
       lines.push(header);
       lines.push(sep);
       for (const row of result.bindings) {
-        const cells = result.variables.map((v) => formatSparqlTerm((row as SparqlBinding)[v]));
+        const cells = result.variables.map((v) =>
+          markdownTableCell(formatSparqlTerm((row as SparqlBinding)[v])),
+        );
         lines.push(`| ${cells.join(' | ')} |`);
       }
     }

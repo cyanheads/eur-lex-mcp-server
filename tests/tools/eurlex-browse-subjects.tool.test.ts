@@ -12,6 +12,7 @@ import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mc
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_browse_subjects } from '@/mcp-server/tools/definitions/eurlex-browse-subjects.tool.js';
 import { escapeSparqlLiteral } from '@/services/cellar-sparql/eli-resolution.js';
+import { readCommonMark } from '../helpers/commonmark.js';
 import { assertInSortWindow, pageSpan, pagingClauses } from '../helpers/sort-window.js';
 
 // --- Service mock ---
@@ -983,6 +984,145 @@ describe('eurlex_browse_subjects', () => {
       expect(() => eurlex_browse_subjects.input.parse({ keyword: 'law', limit: 10_001 })).toThrow();
       expect(eurlex_browse_subjects.input.parse({ keyword: 'law', limit: 10_000 }).limit).toBe(
         10_000,
+      );
+    });
+  });
+
+  // --- content[] reads back as structuredContent carries it (add-tool 2.35) ---
+
+  describe('Markdown round-trip of content[]', () => {
+    type Concept = {
+      concept_uri: string;
+      pref_label: string;
+      concept_code?: string;
+      broader_label?: string;
+      matched_label?: string;
+    };
+
+    /** The content[] text format() renders for a one-concept page. */
+    const formatConcept = (concept: Concept) =>
+      (
+        eurlex_browse_subjects.format!({
+          concepts: [concept],
+          total: 1,
+          offset: 0,
+          has_more: false,
+        })[0] as { text: string }
+      ).text;
+
+    /** The CommonMark read of that page when every value reads back as written. */
+    const readBack = (concept: Concept) =>
+      [
+        '⟨heading_open⟩',
+        'EuroVoc Concepts (1 found, offset 0)',
+        '⟨heading_close⟩',
+        '⟨strong⟩Has more:⟨/strong⟩ false',
+        '⟨heading_open⟩',
+        concept.pref_label,
+        '⟨heading_close⟩',
+        [
+          `⟨strong⟩URI:⟨/strong⟩ ${concept.concept_uri}`,
+          ...(concept.concept_code ? [`⟨strong⟩Code:⟨/strong⟩ ${concept.concept_code}`] : []),
+          ...(concept.broader_label ? [`⟨strong⟩Broader:⟨/strong⟩ ${concept.broader_label}`] : []),
+          ...(concept.matched_label
+            ? [`⟨strong⟩Matched via:⟨/strong⟩ ${concept.matched_label}`]
+            : []),
+        ].join('\n'),
+      ].join('\n\n');
+
+    it('reads hostile EuroVoc labels back exactly in the heading and every field line', () => {
+      const concept = {
+        concept_uri: 'http://eurovoc.europa.eu/c_1*<b>',
+        pref_label: '*privacy* & <b>data</b> [EU](x) | `c` ~s~ #',
+        concept_code: '_2830_',
+        broader_label: '# information\n- technology',
+        matched_label: '1. product \\ liability',
+      };
+      expect(readCommonMark(formatConcept(concept))).toBe(readBack(concept));
+    });
+
+    it('keeps a multi-line label inside its heading and a plain URI byte for byte', () => {
+      const concept = {
+        concept_uri: 'http://eurovoc.europa.eu/2830',
+        pref_label: 'data\n- protection',
+      };
+      const text = formatConcept(concept);
+      expect(readCommonMark(text)).toBe(readBack(concept));
+      expect(text).toContain('**URI:** http://eurovoc.europa.eu/2830');
+    });
+
+    it('reads 2,000 random concepts over a hostile alphabet back exactly', () => {
+      /** mulberry32: a seeded generator, so a failure replays from its seed. */
+      let seed = 0x5eed_0113;
+      const random = () => {
+        seed = (seed + 0x6d2b79f5) | 0;
+        let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4_294_967_296;
+      };
+      /** Single characters plus the multi-character openers that form syntax only together. */
+      const pieces = [
+        ...'aZ9é_*`\\[]()|<>!#&;~-+=.:@"\' \t\n^{}/?%',
+        '&amp;',
+        '<b>',
+        '](',
+        '```',
+        '- ',
+        '1. ',
+        '# ',
+        ' #',
+        '##',
+        '***',
+        '__',
+        '<a@b.io>',
+        '<http://x>',
+        '---',
+        '===',
+        '    ',
+        '> ',
+      ];
+      // A field line holds a non-empty value; a heading may hold an empty label.
+      const text = (max: number, min = 1) =>
+        Array.from(
+          { length: min + Math.floor(random() * (max - min + 1)) },
+          () => pieces[Math.floor(random() * pieces.length)],
+        ).join('');
+
+      let firstMismatch: Record<string, unknown> | undefined;
+      for (let i = 0; i < 2_000 && !firstMismatch; i++) {
+        const concept = {
+          concept_uri: text(6),
+          pref_label: text(10, 0),
+          concept_code: text(5),
+          broader_label: text(8),
+          matched_label: text(8),
+        };
+        const markdown = formatConcept(concept);
+        const expected = readBack(concept);
+        const read = readCommonMark(markdown);
+        if (read !== expected) firstMismatch = { i, concept, markdown, read, expected };
+      }
+      expect(firstMismatch).toBeUndefined();
+    });
+
+    it('reads the empty-page notice back as structuredContent carries it', async () => {
+      mockQuery.mockResolvedValue([]);
+      const keyword = '*privacy* [x](y) <b>z</b>\n- item';
+
+      const result = await runToolContract(eurlex_browse_subjects, { keyword });
+
+      const notice = (result.structuredContent as { notice: string }).notice;
+      expect(notice).toContain(`"${keyword}"`);
+      expect(readCommonMark(contentText(result))).toBe(
+        [
+          '⟨heading_open⟩',
+          'EuroVoc Concepts (0 found, offset 0)',
+          '⟨heading_close⟩',
+          '⟨strong⟩Has more:⟨/strong⟩ false',
+          '⟨blockquote_open⟩',
+          notice,
+          '⟨blockquote_close⟩',
+        ].join('\n\n'),
       );
     });
   });

@@ -1,12 +1,14 @@
 /**
- * @fileoverview eurlex_lookup_celex — Resolve an EU legal citation (CELEX number, ELI URI, ECLI, or OJ citation) to a canonical CELLAR work.
+ * @fileoverview eurlex_lookup_celex — Resolve an EU legal citation (CELEX number, ELI URI, ECLI, OJ citation, or Official Journal reference) to a canonical CELLAR work.
  * @module mcp-server/tools/definitions/eurlex-lookup-celex
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { echoValue } from '@/mcp-server/tools/echo-value.js';
 import { enumInput } from '@/mcp-server/tools/enum-input.js';
+import { renderNoticeBlockquote } from '@/mcp-server/tools/markdown-render.js';
 import {
   DERIVATIVE_RESOURCE_TYPES,
   resolveResourceTypeLabel,
@@ -26,6 +28,12 @@ import {
   normalizeEli,
   resolveEliToWork,
 } from '@/services/cellar-sparql/eli-resolution.js';
+import {
+  type OjReference,
+  type OjResolution,
+  parseOjReference,
+  resolveOjReference,
+} from '@/services/cellar-sparql/oj-reference.js';
 import type { SparqlBinding } from '@/services/cellar-sparql/types.js';
 import {
   canonicalAliasPattern,
@@ -97,12 +105,16 @@ const CITATION_ACT_TYPE =
 
 /**
  * What follows the act type: an optional `(domain)`, an optional `No` marker, the
- * two numbers, an optional `/domain` suffix, and optionally the ` of …` that opens
- * the act's full title. Anything else after the numbers — a second citation joined
- * by "and", a stray character — leaves the citation unparsed.
+ * two numbers, an optional `/domain` suffix, and optionally either the ` of …` that
+ * opens the act's full title or the act's parenthesized OJ reference
+ * (`Directive 95/46/EC (OJ L 281, 23.11.1995, p. 31)`, #171), whose content is not
+ * read: the citation already names one act. Anything else after the numbers — a
+ * second citation joined by "and", a stray character — leaves the citation
+ * unparsed. The reference's `[^()]*` stops at the first parenthesis and the pattern
+ * is anchored, so a reference with no closer fails in one linear pass.
  */
 const CITATION_NUMBERS =
-  /^\s*(?:\((EU|EC|EEC|Euratom|CFSP|JHA|ECSC)\)\s*)?(No\.?\s*)?(\d{1,4})\/(\d{1,4})(?:\/(EU|EC|EEC|Euratom|CFSP|JHA|ECSC))?(?:\s+of\s.*)?$/i;
+  /^\s*(?:\((EU|EC|EEC|Euratom|CFSP|JHA|ECSC)\)\s*)?(No\.?\s*)?(\d{1,4})\/(\d{1,4})(?:\/(EU|EC|EEC|Euratom|CFSP|JHA|ECSC))?(?:\s+of\s.*|\s*\(OJ\s[^()]*\))?$/i;
 
 /** CELEX type letter per act type; an ECSC Decision is `S` instead (see {@link citationCelex}). */
 const CITATION_TYPE_LETTER: Record<string, string> = {
@@ -149,6 +161,43 @@ function citationCelex(identifier: string): string | undefined {
 
 /** The identifier a miss notice names: the CELEX, ELI, or ECLI looked up. */
 const IDENTIFIER_LABEL = { celex: 'CELEX', eli: 'ELI', ecli: 'ECLI' } as const;
+
+/** Why an OJ reference matched nothing, for its miss notice. */
+function ojMissReason(
+  reference: OjReference,
+  resolution: Exclude<OjResolution, { kind: 'one' | 'several' }>,
+): string {
+  const subject = reference.kind === 'act' ? 'act' : 'issue';
+  switch (resolution.kind) {
+    case 'not_held':
+      return reference.kind === 'act'
+        ? 'CELLAR holds no act under that number'
+        : 'CELLAR holds no such issue';
+    case 'other_date':
+      return resolution.publishedOn
+        ? `that ${subject} was published on ${resolution.publishedOn}, not on the date cited`
+        : `no ${subject} it can name was published on the date cited`;
+    case 'no_act_on_page':
+      return 'no act with a CELEX starts on that page of the issue';
+  }
+}
+
+/**
+ * The notice of an OJ reference that names no single act (#170): the CELEX of each
+ * act starting on the cited page, or why nothing matched — no such issue or act, a
+ * cited date that is not its publication date, or no act starting on that page.
+ */
+function ojReferenceNotice(
+  citation: string,
+  reference: OjReference,
+  resolution: Exclude<OjResolution, { kind: 'one' }>,
+): string {
+  const quoted = `"${echoValue(citation)}"`;
+  if (resolution.kind === 'several') {
+    return `OJ reference ${quoted} names the first page of ${resolution.celex.length} acts: ${resolution.celex.join(', ')}. Pass the CELEX of the one you want here or to eurlex_get_document.`;
+  }
+  return `No CELLAR work matches OJ reference ${quoted}: ${ojMissReason(reference, resolution)}. An OJ reference resolves when it names the issue, its publication date, and the first page of an act (e.g. "OJ L 119, 4.5.2016, p. 1"), or an act-by-act number (e.g. "OJ L, 2024/1689, 12.7.2024"). To find the act by title words, use eurlex_search_documents with keyword.`;
+}
 
 /**
  * ECLI lookup query. CELLAR stores `cdm:case-law_ecli` as an `xsd:string`-typed
@@ -220,14 +269,14 @@ function selectEcliCelexRows(bindings: SparqlBinding[], exactEcli: string): Spar
 export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
   title: 'Resolve EU Legal Citation',
   description:
-    'Resolve an EU legal citation — a CELEX number, ELI URI, ECLI, or an OJ citation naming its act type and year (e.g. "Regulation (EU) 2016/679", "Directive 95/46/EC") — to its canonical CELLAR work, confirming it exists before you fetch or traverse it. Returns the work URI, confirmed CELEX number, document type, date, and the ECLI of a case that carries one. A CELEX that CELLAR holds under several works resolves to the one the EUR-Lex content resolver serves. An ECLI shared by several records (a judgment and its abstract or extract, or a joined AG opinion) resolves to the primary record with the lowest CELEX.',
+    'Resolve an EU legal citation — a CELEX number, ELI URI, ECLI, an OJ citation naming its act type and year (e.g. "Regulation (EU) 2016/679", "Directive 95/46/EC"), or an Official Journal reference naming its issue, date, and first page (e.g. "OJ L 119, 4.5.2016, p. 1") — to its canonical CELLAR work, confirming it exists before you fetch or traverse it. Returns the work URI, confirmed CELEX number, document type, date, and the ECLI of a case that carries one. A CELEX that CELLAR holds under several works resolves to the one the EUR-Lex content resolver serves. An ECLI shared by several records (a judgment and its abstract or extract, or a joined AG opinion) resolves to the primary record with the lowest CELEX. An OJ reference whose first page starts several acts returns found false, its notice naming each CELEX.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     identifier: z
       .string()
       .min(1)
       .describe(
-        'The EU legal citation to resolve: a CELEX number (e.g. 32016R0679), a work-level ELI URI (e.g. http://data.europa.eu/eli/reg/2016/679, with or without the /oj suffix), an ECLI (e.g. ECLI:EU:C:2014:317), or an OJ citation that names its act type and year, resolved to the CELEX it names under identifier_type "auto": Regulation (EU) 2016/679, Regulation (EC) No 1049/2001, Directive 95/46/EC, Decision No 1313/2013/EU, Council Framework Decision 2002/584/JHA, Council Joint Action 2008/124/CFSP, Common Position 2003/444/CFSP. "No" before the numbers means number/year, otherwise year/number; a two-digit year is 19YY. A citation without its act type (95/46/EC) or year (Regulation No 17) is not parsed. A CELEX is also read in lowercase, after a CELEX: prefix, from a EUR-Lex page URL carrying uri=CELEX:… (e.g. https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX:32016R0679), or from a publications.europa.eu/resource/celex/ URI; an ELI over https, on the eur-lex.europa.eu host, without a scheme, with a trailing slash, or with a language segment after /oj or a date (…/oj/eng). A case number (C-131/12) names several records rather than one work and returns found false with a pointer to eurlex_get_cases.',
+        'The EU legal citation to resolve: a CELEX number (e.g. 32016R0679), a work-level ELI URI (e.g. http://data.europa.eu/eli/reg/2016/679, with or without the /oj suffix), an ECLI (e.g. ECLI:EU:C:2014:317), or an OJ citation that names its act type and year, resolved to the CELEX it names under identifier_type "auto": Regulation (EU) 2016/679, Regulation (EC) No 1049/2001, Directive 95/46/EC, Decision No 1313/2013/EU, Council Framework Decision 2002/584/JHA, Council Joint Action 2008/124/CFSP, Common Position 2003/444/CFSP. "No" before the numbers means number/year, otherwise year/number; a two-digit year is 19YY. A citation without its act type (95/46/EC) or year (Regulation No 17) is not parsed; one followed by its parenthesized OJ reference (Directive 95/46/EC (OJ L 281, 23.11.1995, p. 31)) resolves as the citation. An Official Journal reference resolves, also under "auto", to the act starting on the page it cites: OJ L 281, 23.11.1995, p. 31 (also "of 23.11.1995", a page range, a class letter as in OJ L 42I, OJ C, and before 1968 the series-less OJ 13, 21.2.1962, p. 204/62), the year-first OJ 1995 L 281, p. 31, and the act-by-act OJ L, 2024/1689, 12.7.2024 or OJ C, C/2024/2664, 29.4.2024; the cited date must be the publication date. A reference without its year or first page (OJ L 281, OJ L 119/1) is not parsed. A CELEX is also read in lowercase, after a CELEX: prefix, from a EUR-Lex page URL carrying uri=CELEX:… (e.g. https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX:32016R0679), or from a publications.europa.eu/resource/celex/ URI; an ELI over https, on the eur-lex.europa.eu host, without a scheme, with a trailing slash, or with a language segment after /oj or a date (…/oj/eng). A case number (C-131/12) names several records rather than one work and returns found false with a pointer to eurlex_get_cases.',
       ),
     identifier_type: enumInput(
       IDENTIFIER_TYPES,
@@ -235,7 +284,7 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
         .enum(IDENTIFIER_TYPES)
         .default('auto')
         .describe(
-          'Format of the identifier. "auto" detects a CELEX, an ELI URI, an ECLI (by its ECLI: prefix, in any letter case), or an OJ citation; "celex", "eli", or "ecli" forces that lookup. An OJ citation is recognized only under "auto".',
+          'Format of the identifier. "auto" detects a CELEX, an ELI URI, an ECLI (by its ECLI: prefix, in any letter case), an OJ citation, or an Official Journal reference; "celex", "eli", or "ecli" forces that lookup. An OJ citation or reference is recognized only under "auto".',
         ),
     ),
   }),
@@ -243,7 +292,7 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
     found: z
       .boolean()
       .describe(
-        'True when the identifier resolves to a CELLAR work; false when a well-formed CELEX, ELI, ECLI, or OJ citation matches no work in the corpus, or the identifier is a case number, with a notice naming what was tried. Only an identifier_type "auto" value that, after trimming, is neither an ECLI, an ELI, a CELEX in any accepted form, nor an OJ citation naming its act type and year raises ambiguous_identifier instead.',
+        'True when the identifier resolves to a CELLAR work; false when a well-formed CELEX, ELI, ECLI, OJ citation, or Official Journal reference matches no work in the corpus, when an OJ reference\'s first page starts several acts, or when the identifier is a case number, with a notice naming what was tried. Only an identifier_type "auto" value that, after trimming, is neither an ECLI, an ELI, a CELEX in any accepted form, an OJ citation naming its act type and year, nor an OJ reference naming its issue, year, and first page raises ambiguous_identifier instead.',
       ),
     work_uri: z.string().optional().describe('CELLAR work URI (stable resource identifier).'),
     celex_number: z.string().optional().describe('Confirmed CELEX number for the resolved work.'),
@@ -268,17 +317,18 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
       .string()
       .optional()
       .describe(
-        'Present only when found is false: the CELEX, ELI, or ECLI looked up, the accepted forms, and the search to use instead.',
+        'Present only when found is false: the CELEX, ELI, ECLI, or OJ reference looked up, the accepted forms, and the search to use instead; for an OJ reference whose first page starts several acts, the CELEX of each.',
       ),
   },
+  enrichmentTrailer: { notice: { render: (notice) => renderNoticeBlockquote(String(notice)) } },
 
   errors: [
     {
       reason: 'ambiguous_identifier',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'identifier_type is "auto" and the identifier, after trimming, is neither an ECLI (ECLI: prefix), an ELI, a CELEX (bare, after a CELEX: prefix, or in a EUR-Lex URL), a prefixed case number, nor an OJ citation naming its act type and year (e.g. "Regulation No 17" names no year), so no lookup branch applies.',
+      when: 'identifier_type is "auto" and the identifier, after trimming, is neither an ECLI (ECLI: prefix), an ELI, a CELEX (bare, after a CELEX: prefix, or in a EUR-Lex URL), a prefixed case number, an OJ citation naming its act type and year (e.g. "Regulation No 17" names no year), nor an Official Journal reference naming its issue, year, and first page (e.g. "OJ L 281" names neither), so no lookup branch applies.',
       recovery:
-        'Pass a CELEX (32016R0679), an ELI URI (http://data.europa.eu/eli/reg/2016/679), an ECLI (ECLI:EU:C:2014:317), or an OJ citation with its act type and year ("Regulation (EU) 2016/679", "Directive 95/46/EC"); to find an act by title words, use eurlex_search_documents with keyword.',
+        'Pass a CELEX (32016R0679), an ELI URI (http://data.europa.eu/eli/reg/2016/679), an ECLI (ECLI:EU:C:2014:317), an OJ citation with its act type and year ("Regulation (EU) 2016/679", "Directive 95/46/EC"), or an OJ reference with its issue, date, and first page ("OJ L 119, 4.5.2016, p. 1"); to find an act by title words, use eurlex_search_documents with keyword.',
     },
     {
       reason: 'sparql_error',
@@ -318,11 +368,27 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
       const detected = detectIdentifierType(identifier);
       // An OJ citation resolves through the CELEX branch, under the CELEX it names.
       const citedCelex = detected ? undefined : citationCelex(identifier);
+      // An OJ reference is tried last: every pattern opens on `OJ `, which no other form starts with.
+      const ojReference = detected || citedCelex ? undefined : parseOjReference(identifier);
       if (detected) {
         effectiveType = detected;
       } else if (citedCelex) {
         effectiveType = 'celex';
         identifier = citedCelex;
+      } else if (ojReference) {
+        /**
+         * One act on the cited page resolves through the CELEX branch, so the output
+         * is that CELEX lookup's; several, or none, is a result naming what CELLAR
+         * holds (#170).
+         */
+        const resolution = await resolveOjReference(svc, ojReference, ctx);
+        if (resolution.kind !== 'one') {
+          ctx.log.info('OJ reference lookup', { citation, resolution: resolution.kind });
+          ctx.enrich.notice(ojReferenceNotice(citation, ojReference, resolution));
+          return { found: false };
+        }
+        effectiveType = 'celex';
+        identifier = resolution.celex;
       } else {
         throw ctx.fail(
           'ambiguous_identifier',
@@ -415,13 +481,17 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
     };
   },
 
+  // Every value is CELLAR's, escaped so a CommonMark parse reads it back as written.
   format: (result) => {
     const lines: string[] = [`## CELLAR Work Resolved\n**Found:** ${result.found}`];
-    if (result.celex_number) lines.push(`**CELEX:** ${result.celex_number}`);
-    if (result.ecli) lines.push(`**ECLI:** ${result.ecli}`);
-    if (result.work_uri) lines.push(`**Work URI:** ${result.work_uri}`);
-    if (result.resource_type) lines.push(`**Type:** ${result.resource_type}`);
-    if (result.date) lines.push(`**Date:** ${result.date}`);
+    const field = (label: string, value: string | undefined) => {
+      if (value) lines.push(`**${label}:** ${escapeMarkdownInline(value)}`);
+    };
+    field('CELEX', result.celex_number);
+    field('ECLI', result.ecli);
+    field('Work URI', result.work_uri);
+    field('Type', result.resource_type);
+    field('Date', result.date);
     return [{ type: 'text', text: lines.join('\n') }];
   },
 });

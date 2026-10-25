@@ -23,6 +23,7 @@ import {
   isResolutionQuery,
   requestedCelex,
 } from '../fixtures/cellar-works.js';
+import { readCommonMark } from '../helpers/commonmark.js';
 import { bestCpuMs, CPU_TIMED_TEST_TIMEOUT_MS } from '../helpers/cpu-time.js';
 import { assertInSortWindow, pageSpan, pagingClauses } from '../helpers/sort-window.js';
 
@@ -2542,7 +2543,15 @@ describe('eurlex_get_cases', () => {
         query_echo: { case_number: 'C-9999/24', celex_fragment: '2024C*9999' },
       });
       expect(structured.notice).toContain('celex_fragment=2024C*9999');
-      expect(contentText(result)).toContain(`> ${structured.notice as string}`);
+      // The fragment's `*` is data on both surfaces: it neither ends the filter
+      // summary's emphasis nor opens any in the notice.
+      const read = readCommonMark(contentText(result));
+      expect(read).toContain(
+        '⟨em⟩Filters: case_number="C-9999/24", celex_fragment="2024C*9999", include_derivative=false, date_from="2024-03-01"⟨/em⟩',
+      );
+      expect(read).toContain(
+        `⟨blockquote_open⟩\n\n${structured.notice as string}\n\n⟨blockquote_close⟩`,
+      );
       expect(mockQuery.mock.calls[0]?.[0]).toContain('FILTER(?date >= "2024-03-01"^^xsd:date)');
       expect(mockQuery).toHaveBeenCalledTimes(1);
     });
@@ -3198,6 +3207,118 @@ describe('eurlex_get_cases', () => {
         );
         expect(sparql.match(/bif:contains/g)?.length, suffix).toBe(1);
       }
+    });
+  });
+
+  // --- content[] reads back as structuredContent carries it (add-tool 2.35) ---
+
+  describe('Markdown round-trip of content[]', () => {
+    /** The first content[] block format() renders for one result page. */
+    function formatPage(
+      cases: Parameters<NonNullable<typeof eurlex_get_cases.format>>[0]['cases'],
+      query_echo: Parameters<NonNullable<typeof eurlex_get_cases.format>>[0]['query_echo'],
+    ): string {
+      return (
+        eurlex_get_cases.format!({
+          cases,
+          total: cases.length,
+          offset: 0,
+          has_more: false,
+          query_echo,
+        })[0] as {
+          text: string;
+        }
+      ).text;
+    }
+
+    it('reads hostile CELLAR title fields and echoed filters back exactly', () => {
+      const c = {
+        work_uri: 'http://publications.europa.eu/resource/cellar/a_b*c',
+        celex_number: '62023CJ0097_RES',
+        ecli: 'ECLI:EU:C:2023:*1*',
+        resource_type: '<b>Judgment</b>',
+        date: '2023-10-05',
+        title: 'Judgment #Parties#\n# Subject #',
+        formation: '_Grand_ Chamber',
+        advocate_general: 'Jääskinen [AG](x)',
+        display_title: '*Google* Spain SL v AEPD | `x` ~y~ #',
+        parties: 'WhatsApp Ireland Ltd v <i>EDPB</i>.',
+        referring_court: '- Audiencia Nacional',
+        subject_matter: '1. Appeal – Protection \\ of natural persons\n> quoted',
+        case_reference: 'Case C-97/23 P. &copy;',
+      };
+      const query_echo = {
+        case_number: 'C-97/23 P',
+        keyword: '*data* [x](y) <b>z</b> \\ "q"',
+        include_derivative: false,
+      };
+
+      expect(readCommonMark(formatPage([c], query_echo))).toBe(
+        [
+          '⟨heading_open⟩',
+          'CJEU/GC Case Law (1 results, offset 0)',
+          '⟨heading_close⟩',
+          '⟨strong⟩Has more:⟨/strong⟩ false',
+          `⟨em⟩Filters: case_number="C-97/23 P", keyword=${JSON.stringify(query_echo.keyword)}, include_derivative=false⟨/em⟩`,
+          '⟨heading_open⟩',
+          `${c.celex_number} — ${c.display_title}`,
+          '⟨heading_close⟩',
+          [
+            `⟨strong⟩Date:⟨/strong⟩ ${c.date}`,
+            `⟨strong⟩ECLI:⟨/strong⟩ ${c.ecli}`,
+            `⟨strong⟩Type:⟨/strong⟩ ${c.resource_type}`,
+            `⟨strong⟩Formation:⟨/strong⟩ ${c.formation}`,
+            `⟨strong⟩Advocate General:⟨/strong⟩ ${c.advocate_general}`,
+            `⟨strong⟩Parties:⟨/strong⟩ ${c.parties}`,
+            `⟨strong⟩Referring court:⟨/strong⟩ ${c.referring_court}`,
+            `⟨strong⟩Subject matter:⟨/strong⟩ ${c.subject_matter}`,
+            `⟨strong⟩Case reference:⟨/strong⟩ ${c.case_reference}`,
+            `⟨strong⟩Full title:⟨/strong⟩ ${c.title}`,
+            `⟨strong⟩Work URI:⟨/strong⟩ ${c.work_uri}`,
+          ].join('\n'),
+        ].join('\n\n'),
+      );
+    });
+
+    it('keeps a multi-line raw title, the heading fallback, inside the heading and the CELEX byte for byte', () => {
+      const title = 'Order of the Court #\n# Parties #';
+      const text = formatPage(
+        [
+          {
+            work_uri: 'http://publications.europa.eu/resource/cellar/w',
+            celex_number: '62023CJ0097_RES',
+            title,
+          },
+        ],
+        { include_derivative: false },
+      );
+
+      expect(readCommonMark(text)).toContain(
+        `⟨heading_open⟩\n\n62023CJ0097_RES — ${title}\n\n⟨heading_close⟩`,
+      );
+      expect(text).toContain('### 62023CJ0097_RES — ');
+    });
+
+    it('reads the empty-page notice back as structuredContent carries it', async () => {
+      mockQuery.mockResolvedValue([]);
+      const keyword = '*Google* [Spain](x) <b>v</b>\n- item';
+
+      const result = await runToolContract(eurlex_get_cases, { keyword });
+
+      const notice = (result.structuredContent as { notice: string }).notice;
+      expect(notice).toContain(`keyword=${keyword}`);
+      expect(readCommonMark(contentText(result))).toBe(
+        [
+          '⟨heading_open⟩',
+          'CJEU/GC Case Law (0 results, offset 0)',
+          '⟨heading_close⟩',
+          '⟨strong⟩Has more:⟨/strong⟩ false',
+          `⟨em⟩Filters: keyword=${JSON.stringify(keyword)}, include_derivative=false⟨/em⟩`,
+          '⟨blockquote_open⟩',
+          notice,
+          '⟨blockquote_close⟩',
+        ].join('\n\n'),
+      );
     });
   });
 });

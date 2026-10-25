@@ -833,4 +833,85 @@ describe('eurlex_document_resource', () => {
       expect(result.resource_type).toBe('Consolidated Text');
     });
   });
+
+  // --- #169: the citation facts, read as eurlex_get_document reads them ---
+
+  describe('citation facts (#169)', () => {
+    const read = async (celex: string) => {
+      mockQuery.mockImplementation(fakeConsolidationCellar);
+      const ctx = createMockContext({ errors: eurlex_document_resource.errors });
+      const params = eurlex_document_resource.params!.parse({ celexNumber: celex });
+      return (await eurlex_document_resource.handler(params, ctx)) as Record<string, unknown>;
+    };
+
+    const FIELDS = ['eli', 'oj_reference', 'dates_of_effect', 'transposition_deadlines'];
+    const AI_ACT_DATES = [
+      { date: '2024-08-01', type: 'entry_into_force' },
+      { date: '2025-02-02', type: 'application' },
+      { date: '2025-08-02', type: 'application' },
+      { date: '2026-08-02', type: 'application' },
+      { date: '2027-08-02', type: 'application' },
+    ];
+
+    it.each<[string, Record<string, unknown>]>([
+      [
+        '32019L1937',
+        {
+          eli: 'http://data.europa.eu/eli/dir/2019/1937/oj',
+          oj_reference: 'OJ L 305, 26.11.2019, p. 17–56',
+          dates_of_effect: [{ date: '2019-12-16', type: 'entry_into_force' }],
+          transposition_deadlines: ['2021-12-17', '2023-12-17'],
+        },
+      ],
+      [
+        '32024R1689',
+        {
+          eli: 'http://data.europa.eu/eli/reg/2024/1689/oj',
+          oj_reference: 'OJ L, 2024/1689, 12.7.2024',
+          dates_of_effect: AI_ACT_DATES,
+        },
+      ],
+      /*
+       * Consolidated texts: the ELI is the served text's own, the other three its
+       * base act's — the fixture answers each pattern from the work it names.
+       */
+      [
+        '01995L0046-20180525',
+        {
+          oj_reference: 'OJ L 281, 23.11.1995, p. 31–50',
+          dates_of_effect: [{ date: '1995-12-13', type: 'entry_into_force' }],
+          transposition_deadlines: ['1998-10-24'],
+        },
+      ],
+      [
+        '02024R1689-20260727',
+        { oj_reference: 'OJ L, 2024/1689, 12.7.2024', dates_of_effect: AI_ACT_DATES },
+      ],
+      [
+        '02016R0679-20160504',
+        {
+          eli: 'http://data.europa.eu/eli/reg/2016/679/2016-05-04',
+          oj_reference: 'OJ L 119, 4.5.2016, p. 1–88',
+          dates_of_effect: [
+            { date: '2016-05-24', type: 'entry_into_force' },
+            { date: '2018-05-25', type: 'application' },
+          ],
+        },
+      ],
+      ['52012PC0011', {}],
+    ])('%s returns the citation facts eurlex_get_document returns', async (celex, expected) => {
+      const result = await read(celex);
+      const facts = Object.fromEntries(
+        FIELDS.filter((f) => f in result).map((f) => [f, result[f]]),
+      );
+      expect(facts).toEqual(expected);
+    });
+
+    it('folds the facts into the core query: resolution plus the same four metadata queries', async () => {
+      const result = await read('32016R0679');
+      expect(result.oj_reference).toBe('OJ L 119, 4.5.2016, p. 1–88');
+      // Resolution, core, agents, legal bases, EuroVoc.
+      expect(mockQuery).toHaveBeenCalledTimes(5);
+    });
+  });
 });

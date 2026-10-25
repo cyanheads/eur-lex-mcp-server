@@ -12,6 +12,7 @@ import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mc
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_search_documents } from '@/mcp-server/tools/definitions/eurlex-search-documents.tool.js';
 import { canonicalWork, celexWorkRows, fixtureWork } from '../fixtures/cellar-works.js';
+import { readCommonMark } from '../helpers/commonmark.js';
 import { assertInSortWindow, pageSpan, pagingClauses } from '../helpers/sort-window.js';
 
 const RESOURCE_TYPE_BASE = 'http://publications.europa.eu/resource/authority/resource-type/';
@@ -1524,7 +1525,9 @@ describe('eurlex_search_documents', () => {
         const result = await runToolContract(eurlex_search_documents, { eurovoc_concept: uri });
         expect(result.isError).toBe(true);
         expect(contentText(result)).toContain('control characters');
-        expect(contentText(result)).toContain('{ } | ^');
+        // content[] carries the message Markdown-escaped (`\|`); the raw set is on structuredContent.
+        const { error } = result.structuredContent as { error: { message: string } };
+        expect(error.message).toContain('{ } | ^');
         expect(mockQuery).not.toHaveBeenCalled();
       },
     );
@@ -2587,6 +2590,107 @@ describe('eurlex_search_documents', () => {
       // #137: an OJ C year/number fragment is indexed; one with a short number scans.
       expect(description).toMatch(/2024\/01469[^;]*matches every CELEX holding it/);
       expect(description).toMatch(/2017\/111[^;]*tests every CELEX/);
+    });
+  });
+
+  // --- content[] reads back as structuredContent carries it (add-tool 2.35) ---
+
+  describe('Markdown round-trip of content[]', () => {
+    type Page = Parameters<NonNullable<typeof eurlex_search_documents.format>>[0];
+
+    /** The first content[] block format() renders for one result page. */
+    function formatPage(documents: Page['documents'], query_echo: Page['query_echo']): string {
+      return (
+        eurlex_search_documents.format!({
+          documents,
+          total: documents.length,
+          offset: 0,
+          has_more: false,
+          query_echo,
+        })[0] as { text: string }
+      ).text;
+    }
+
+    it('reads hostile CELLAR titles and echoed filters back exactly', () => {
+      const doc = {
+        work_uri: 'http://publications.europa.eu/resource/cellar/a_b*c',
+        celex_number: '72022L2555ROU_202405184',
+        is_consolidated: false,
+        is_corrigendum: false,
+        resource_type: '<b>Regulation</b> | *x*',
+        date: '2016-04-27',
+        title:
+          'Regulation (EU) 2016/679 on the *protection* of [natural persons](x) `GDPR` ~a~ \\ #',
+      };
+      const query_echo = {
+        keyword: '*data* [x](y) <b>z</b> \\ "q"',
+        include_consolidated: false,
+        include_corrigenda: false,
+        author_institution: '_European_ Parliament',
+      };
+
+      expect(readCommonMark(formatPage([doc], query_echo))).toBe(
+        [
+          '⟨heading_open⟩',
+          'EU Documents (1 results, offset 0)',
+          '⟨heading_close⟩',
+          '⟨strong⟩Has more:⟨/strong⟩ false',
+          `⟨em⟩Filters: keyword=${JSON.stringify(query_echo.keyword)}, include_consolidated=false, include_corrigenda=false, author_institution="_European_ Parliament"⟨/em⟩`,
+          '⟨heading_open⟩',
+          `${doc.celex_number} — ${doc.title}`,
+          '⟨heading_close⟩',
+          [
+            `⟨strong⟩Date:⟨/strong⟩ ${doc.date}`,
+            `⟨strong⟩Type:⟨/strong⟩ ${doc.resource_type}`,
+            '⟨strong⟩Consolidated:⟨/strong⟩ false',
+            '⟨strong⟩Corrigendum:⟨/strong⟩ false',
+            `⟨strong⟩Work URI:⟨/strong⟩ ${doc.work_uri}`,
+          ].join('\n'),
+        ].join('\n\n'),
+      );
+    });
+
+    it('keeps a multi-line title inside its heading and an underscored CELEX byte for byte', () => {
+      const title = 'Directive (EU) 2022/2555\n# NIS 2 #';
+      const text = formatPage(
+        [
+          {
+            work_uri: 'http://publications.europa.eu/resource/cellar/w',
+            celex_number: '72022L2555ROU_202405184',
+            is_consolidated: false,
+            is_corrigendum: false,
+            title,
+          },
+        ],
+        { include_consolidated: false, include_corrigenda: false },
+      );
+
+      expect(readCommonMark(text)).toContain(
+        `⟨heading_open⟩\n\n72022L2555ROU_202405184 — ${title}\n\n⟨heading_close⟩`,
+      );
+      expect(text).toContain('### 72022L2555ROU_202405184 — ');
+    });
+
+    it('reads the empty-page notice back as structuredContent carries it', async () => {
+      mockQuery.mockResolvedValue([]);
+      const author = '*European* [Parliament](x) <b>v</b>\n- item';
+
+      const result = await runToolContract(eurlex_search_documents, { author_institution: author });
+
+      const notice = (result.structuredContent as { notice: string }).notice;
+      expect(notice).toContain(`author_institution=${author}`);
+      expect(readCommonMark(contentText(result))).toBe(
+        [
+          '⟨heading_open⟩',
+          'EU Documents (0 results, offset 0)',
+          '⟨heading_close⟩',
+          '⟨strong⟩Has more:⟨/strong⟩ false',
+          `⟨em⟩Filters: include_consolidated=false, include_corrigenda=false, author_institution=${JSON.stringify(author)}⟨/em⟩`,
+          '⟨blockquote_open⟩',
+          notice,
+          '⟨blockquote_close⟩',
+        ].join('\n\n'),
+      );
     });
   });
 });

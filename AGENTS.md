@@ -2,7 +2,7 @@
 
 **Server:** eur-lex-mcp-server
 **Version:** 0.19.1
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.15`
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.16`
 **Engines:** Bun ≥1.4.0, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/server` ^2.3.1
 **Zod:** ^4.6.7
@@ -229,10 +229,12 @@ src/
     server-config.ts                    # Server-specific env vars (Zod schema)
   services/
     cellar-sparql/
-      cellar-sparql-service.ts          # CELLAR SPARQL POST client, binding mapper, LIMIT enforcement
+      cellar-sparql-service.ts          # CELLAR SPARQL POST client, binding mapper, LIMIT enforcement, per-call query budget
+      act-citation.ts                   # ELI, Official Journal reference, typed dates of effect, transposition deadlines of an act
       cdm-labels.ts                     # CDM authority URI → label maps, case-law title parser
       eli-resolution.ts                 # ELI → work resolution, CELEX/ELI/work-URI normalizers, case-number grammar, SPARQL-safety and input-validity primitives
       keyword-match.ts                  # Keyword title phrase and CELEX arm by keyword shape
+      oj-reference.ts                   # Official Journal reference parser and resolution to the act's CELEX
       relation-traversal.ts             # Relation-type model and paged per-type traversal
       sort-window.ts                    # CELLAR's 10,000-row sort window (page sizing, window-end reading) and the date_to-only date floor
       work-agents.ts                    # Institutions and Advocates General of a work
@@ -248,6 +250,7 @@ src/
       echo-value.ts                     # Bounded quoting of caller values in notices and errors
       enum-input.ts                     # Case/separator-tolerant enum inputs (#143)
       limit-clamp.ts                    # limit_clamp enrichment: over-maximum limits served at the maximum (#151)
+      markdown-render.ts                # Heading escaper and escaped-blockquote notice render for content[]
     tools/definitions/
       eurlex-browse-subjects.tool.ts    # EuroVoc thesaurus search
       eurlex-get-cases.tool.ts          # CJEU/GC case law search

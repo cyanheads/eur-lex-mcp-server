@@ -10,16 +10,22 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { eurlex_get_relations } from '@/mcp-server/tools/definitions/eurlex-get-relations.tool.js';
 import { initCellarSparqlService } from '@/services/cellar-sparql/cellar-sparql-service.js';
 import { RELATION_TYPES } from '@/services/cellar-sparql/relation-traversal.js';
+import { readCommonMark } from '../helpers/commonmark.js';
 
 afterEach(() => vi.unstubAllGlobals());
 
-it('walks actual-service multi-direction pages to exhaustion and preserves omitted/all equivalence', async () => {
+/** The actual CELLAR service, pointed at a stubbed endpoint with a 100-row ceiling. */
+function initService() {
   initCellarSparqlService({} as AppConfig, {} as StorageService, {
     cellarSparqlEndpoint: 'http://cellar.test/sparql',
     eurLexContentBaseUrl: 'http://content.test',
     sparqlQueryTimeoutMs: 5000,
     maxSparqlResults: 100,
   });
+}
+
+it('walks actual-service multi-direction pages to exhaustion and preserves omitted/all equivalence', async () => {
+  initService();
   const title = 'é漢😀"\\\r\n'.repeat(300);
   const bindings = (direction: string, count: number) =>
     Array.from({ length: count }, (_, i) => ({
@@ -73,8 +79,13 @@ it('walks actual-service multi-direction pages to exhaustion and preserves omitt
     for (const row of page.relations) {
       keys.push(`${row.direction}:${row.related_work_uri}`);
       expect(row.related_title).toBe(title);
+      // content[] carries the title escaped; a CommonMark reader gets it back, CRLF as LF.
       expect(
-        result.content.some((block) => block.type === 'text' && block.text.includes(title)),
+        result.content.some(
+          (block) =>
+            block.type === 'text' &&
+            readCommonMark(block.text).includes(title.replace(/\r\n/g, '\n')),
+        ),
       ).toBe(true);
     }
     if (offset >= 4) expect(page.relations.every((row) => row.direction === 'incoming')).toBe(true);
@@ -93,4 +104,58 @@ it('walks actual-service multi-direction pages to exhaustion and preserves omitt
   );
   expect(new Set(keys).size).toBe(35);
   expect(queries.every((query) => query.startsWith('PREFIX'))).toBe(true);
+});
+
+it('reads all of an edge’s provisions through the actual service, past its row ceiling (#168)', async () => {
+  initService();
+  const fd = 'http://publications.europa.eu/resource/authority/fd_370';
+  const amended = 'http://example.test/32013R0575';
+  // 755 designators on one edge, each recorded twice, as 32024R1623 amends 32013R0575.
+  const locations = Array.from(
+    { length: 755 },
+    (_, i) => `{AR|${fd}/AR} ${i + 1} {PA|${fd}/PA} ${(i % 9) + 1}`,
+  );
+  const sent: string[] = [];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (url: string, init: RequestInit) => {
+      if (new URL(url).hostname !== 'cellar.test') throw new Error(`Unexpected host: ${url}`);
+      const query = new URLSearchParams(String(init.body)).get('query') ?? '';
+      sent.push(query);
+      const bindings = query.includes('?location')
+        ? [...locations, ...locations].map((location) => ({
+            relatedWork: { type: 'uri', value: amended },
+            location: { type: 'literal', value: location },
+          }))
+        : query.includes('cdm:resource_legal_amends_resource_legal ?relatedWork')
+          ? [
+              {
+                relatedWork: { type: 'uri', value: amended },
+                direction: { type: 'literal', value: 'outgoing' },
+                relatedCelexSample: { type: 'literal', value: '32013R0575' },
+              },
+            ]
+          : [];
+      return new Response(JSON.stringify({ head: { vars: [] }, results: { bindings } }));
+    }),
+  );
+
+  const result = await runToolContract(eurlex_get_relations, {
+    work_uri: 'http://example.test/32024R1623',
+    relation_types: ['amends'],
+  });
+
+  const page = eurlex_get_relations.output.parse(result.structuredContent);
+  const provisions = page.relations[0]?.provisions ?? [];
+  expect(provisions).toHaveLength(755);
+  expect(provisions).toContain('AR 43 PA 7');
+  expect(provisions.some((p) => p.includes('{'))).toBe(false);
+  const followUp = sent.find((query) => query.includes('?location')) ?? '';
+  // The internal path leaves the LIMIT-less follow-up uncapped.
+  expect(followUp).not.toMatch(/LIMIT/);
+  expect(followUp.startsWith('PREFIX')).toBe(true);
+  expect(Buffer.byteLength(JSON.stringify(result.structuredContent), 'utf8')).toBeLessThanOrEqual(
+    64000,
+  );
+  expect(Buffer.byteLength(JSON.stringify(result.content), 'utf8')).toBeLessThanOrEqual(64000);
 });

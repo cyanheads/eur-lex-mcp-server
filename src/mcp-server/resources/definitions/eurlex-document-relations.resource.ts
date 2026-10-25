@@ -22,7 +22,7 @@ export const eurlex_document_relations_resource = resource(
   {
     name: 'EUR-Lex document relations',
     description:
-      'One-hop CDM relationship summary for a CELLAR work by CELEX number: amendment and repeal chain, consolidations, national transposition measures, legal basis and the works adopted under it, interpreting rulings (or, for a ruling, what it interprets), and citations — the newest 25 per relation type and direction. Each related work carries its CELEX, its document date, and its English title where it has them.',
+      'One-hop CDM relationship summary for a CELLAR work by CELEX number: amendment and repeal chain, consolidations, national transposition measures, legal basis and the works adopted under it, the proposal it adopts (or, for a proposal, the act that adopted it), interpreting rulings (or, for a ruling, what it interprets), and citations — the newest 25 per relation type and direction. Each related work carries its CELEX, its document date, and its English title where it has them.',
     mimeType: 'application/json',
     params: z.object({
       celexNumber: z
@@ -83,14 +83,17 @@ export const eurlex_document_relations_resource = resource(
       // edges come ordered newest-first, so this lightweight summary keeps the
       // most recent within its per-direction cap. See relation-traversal.ts. The
       // cap is clamped to the service ceiling so both sides of a symmetric query
-      // stay capped consistently.
+      // stay capped consistently. Provisions stay with the tool: this summary has no
+      // byte budget to hold them (#168), so it sends no follow-up query.
       const { relations: workRelations, hasMore } = await traverseRelations(
         svc,
         workUri,
         RELATION_TYPES,
         ctx,
-        celexNumber,
-        Math.min(SUMMARY_PER_TYPE_LIMIT, svc.maxResults),
+        {
+          sourceCelex: celexNumber,
+          perTypeLimit: Math.min(SUMMARY_PER_TYPE_LIMIT, svc.maxResults),
+        },
       );
       const relations = workRelations.map((r) => ({
         relation_type: r.relationType,

@@ -38,24 +38,47 @@ export interface FixtureAct {
   /** `cdm:work_created_by_agent` authority codes. */
   creators: string[];
   date: string;
+  /** `fd_335` codes (`EV`, `MA`, `PE/PART`, …) annotating each entry-into-force date. */
+  effectTypes?: Record<string, string[]>;
+  /** `cdm:resource_legal_eli` values. */
+  eli?: string[];
   /**
    * `cdm:resource_legal_date_end-of-validity` values; a few acts carry a real date
    * alongside the open-ended placeholder.
    */
   endOfValidity?: string[];
-  /** `cdm:resource_legal_date_entry-into-force` values; an act can enter into force in stages. */
+  /**
+   * `cdm:resource_legal_date_entry-into-force` values; an act can enter into force in stages.
+   * Each is typed by the `annotation:type_of_date` codes in `effectTypes`, if any.
+   */
   entryIntoForce?: string[];
   eurovoc: string[];
   inForce?: '0' | '1';
   legalBases: string[];
+  /** Official Journal publication facts (#169). */
+  oj?: FixtureOj;
   /**
    * CELEX of each work whose `cdm:resource_legal_repeals_resource_legal` names this
    * one; `null` for a repealing work that carries no CELEX.
    */
   repealedBy?: (string | null)[];
   title: string;
+  /** `cdm:directive_date_transposition` values. */
+  transposition?: string[];
   type: string;
   uri: string;
+}
+
+/** An act's Official Journal facts, as CELLAR records them (pages zero-padded). */
+interface FixtureOj {
+  /** Act-by-act publication: `official-journal-act_*` on the work itself. */
+  act?: { collection: 'OJ-C' | 'OJ-L'; date: string; number: string; year: string };
+  /** `page_first`/`page_last` of each English manifestation carrying pages. */
+  englishPages?: [string, string?][];
+  /** Issues linked by `resource_legal_published_in_official-journal`. */
+  issues?: { class?: string; collection: 'OJ-C' | 'OJ-L' | 'OJ-P'; date: string; number: string }[];
+  /** Pages of each DEU, FRA, ITA, and NLD manifestation carrying pages. */
+  originalPages?: [string, string?][];
 }
 
 const base = (
@@ -117,7 +140,20 @@ export const WORK = {
   expired2024: `${CELLAR}fixture-32020D1531`,
   pendingWithEnd: `${CELLAR}fixture-32026R1975`,
   pendingConsolidationOnly: `${CELLAR}fixture-32021D1442`,
+  whistleblower: `${CELLAR}cc54a8ef-1036-11ea-8c1f-01aa75ed71a1`,
+  regulation17: `${CELLAR}7b33d160-973d-4e05-aa52-9272aa2006cc`,
+  policeDirectiveCorrigendum: `${CELLAR}dffb55fb-5e52-11e8-ab9c-01aa75ed71a1`,
+  civilServiceTribunal: `${CELLAR}ebd52787-ce9a-4764-acd6-91fe032b5b7e`,
+  reg2215: `${CELLAR}59fa99c2-8079-4783-9e1b-36ff3092624f`,
+  googleSpain: `${CELLAR}fixture-62012CJ0131`,
+  proposal: `${CELLAR}fixture-52012PC0011`,
 } as const;
+
+/** The Official Journal reference facts of an act (#169), as CELLAR held them on 2026-10-24. */
+const withCitation = (
+  act: FixtureAct,
+  citation: Pick<FixtureAct, 'effectTypes' | 'eli' | 'entryIntoForce' | 'oj' | 'transposition'>,
+): FixtureAct => ({ ...act, ...citation });
 
 /** An act's in-force reasons (#111): entry into force, end of validity, repealers. */
 const withReasons = (
@@ -130,7 +166,19 @@ const OPEN_ENDED = '9999-12-31';
 
 /** Every fixture work, keyed by CELEX. */
 export const ACTS: Record<string, FixtureAct> = {
-  '32024R1689': base(WORK.aiAct, '2024-06-13', '1', ['EP', 'CONSIL'], 7, 2),
+  /** Published act by act, in force in five stages. */
+  '32024R1689': withCitation(base(WORK.aiAct, '2024-06-13', '1', ['EP', 'CONSIL'], 7, 2), {
+    eli: ['http://data.europa.eu/eli/reg/2024/1689/oj'],
+    entryIntoForce: ['2025-02-02', '2024-08-01', '2027-08-02', '2025-08-02', '2026-08-02'],
+    effectTypes: {
+      '2024-08-01': ['EV'],
+      '2025-02-02': ['MA'],
+      '2025-08-02': ['MA'],
+      '2026-08-02': ['MA'],
+      '2027-08-02': ['MA'],
+    },
+    oj: { act: { collection: 'OJ-L', date: '2024-07-12', year: '2024', number: '1689' } },
+  }),
   '02024R1689-20260727': consolidation(
     `${CELLAR}b1730fb2-8f1c-11f1-9262-01aa75ed71a1`,
     WORK.aiAct,
@@ -141,11 +189,29 @@ export const ACTS: Record<string, FixtureAct> = {
     WORK.aiAct,
     '2024-07-12',
   ),
-  '32016R0679': withReasons(base(WORK.gdpr, '2016-04-27', '1', ['EP', 'CONSIL'], 5, 1), {
-    entryIntoForce: ['2018-05-25', '2016-05-24'],
-    endOfValidity: [OPEN_ENDED],
-  }),
-  '02016R0679-20160504': consolidation(`${CELLAR}fixture-02016R0679`, WORK.gdpr, '2016-05-04'),
+  '32016R0679': withCitation(
+    withReasons(base(WORK.gdpr, '2016-04-27', '1', ['EP', 'CONSIL'], 5, 1), {
+      entryIntoForce: ['2018-05-25', '2016-05-24'],
+      endOfValidity: [OPEN_ENDED],
+    }),
+    {
+      eli: ['http://data.europa.eu/eli/reg/2016/679/oj'],
+      effectTypes: { '2016-05-24': ['EV'], '2018-05-25': ['MA'] },
+      oj: {
+        issues: [{ collection: 'OJ-L', date: '2016-05-04', number: '119', class: 'R' }],
+        englishPages: [['0001', '0088']],
+        originalPages: [
+          ['0001', '0088'],
+          ['0001', '0088'],
+        ],
+      },
+    },
+  ),
+  /** Its own ELI and entry into force (the consolidation date); no OJ publication. */
+  '02016R0679-20160504': withCitation(
+    consolidation(`${CELLAR}fixture-02016R0679`, WORK.gdpr, '2016-05-04'),
+    { eli: ['http://data.europa.eu/eli/reg/2016/679/2016-05-04'], entryIntoForce: ['2016-05-04'] },
+  ),
   '22006A0901(01)': base(WORK.schengen, '2006-09-01', '1', ['CONSIL'], 4, 1, 'AGREE_INTERNATION'),
   '02006A0901(01)-20090301': consolidation(
     `${CELLAR}fixture-02006A0901(01)`,
@@ -184,9 +250,20 @@ export const ACTS: Record<string, FixtureAct> = {
     endOfValidity: [OPEN_ENDED],
   }),
   /** Repealed by the GDPR. */
-  '31995L0046': withReasons(
-    base(WORK.dataProtectionDirective, '1995-10-24', '0', ['EP', 'CONSIL'], 6, 2, 'DIR'),
-    { entryIntoForce: ['1995-12-13'], endOfValidity: ['2018-05-24'], repealedBy: ['32016R0679'] },
+  '31995L0046': withCitation(
+    withReasons(
+      base(WORK.dataProtectionDirective, '1995-10-24', '0', ['EP', 'CONSIL'], 6, 2, 'DIR'),
+      { entryIntoForce: ['1995-12-13'], endOfValidity: ['2018-05-24'], repealedBy: ['32016R0679'] },
+    ),
+    {
+      eli: ['http://data.europa.eu/eli/dir/1995/46/oj'],
+      effectTypes: { '1995-12-13': ['EV'] },
+      transposition: ['1998-10-24'],
+      oj: {
+        issues: [{ collection: 'OJ-L', date: '1995-11-23', number: '281', class: 'R' }],
+        englishPages: [['0031', '0050']],
+      },
+    },
   ),
   '01995L0046-20180525': consolidation(
     `${CELLAR}fixture-01995L0046`,
@@ -236,6 +313,85 @@ export const ACTS: Record<string, FixtureAct> = {
     WORK.celexlessBase,
     '2020-01-01',
   ),
+  /** Two transposition deadlines, recorded out of order. */
+  '32019L1937': withCitation(
+    base(WORK.whistleblower, '2019-10-23', '1', ['EP', 'CONSIL'], 3, 1, 'DIR'),
+    {
+      eli: ['http://data.europa.eu/eli/dir/2019/1937/oj'],
+      entryIntoForce: ['2019-12-16'],
+      effectTypes: { '2019-12-16': ['EV'] },
+      transposition: ['2023-12-17', '2021-12-17'],
+      oj: {
+        issues: [{ collection: 'OJ-L', date: '2019-11-26', number: '305', class: 'R' }],
+        englishPages: [['0017', '0056']],
+      },
+    },
+  ),
+  /** Published in 1962, before the English edition: pages only in the four original languages. */
+  '31962R0017': withCitation(base(WORK.regulation17, '1962-02-06', '1', ['CONSIL'], 2, 1), {
+    eli: ['http://data.europa.eu/eli/reg/1962/17/oj'],
+    entryIntoForce: ['1962-03-13'],
+    effectTypes: { '1962-03-13': ['EV'] },
+    oj: {
+      issues: [{ collection: 'OJ-P', date: '1962-02-21', number: '13', class: 'R' }],
+      originalPages: [
+        ['0204', '0211'],
+        ['0204', '0211'],
+        ['0204', '0211'],
+        ['0204', '0211'],
+      ],
+    },
+  }),
+  /** Its pages differ by language edition; the English edition's is p. 6. */
+  '32016L0680R(01)': withCitation(
+    base(WORK.policeDirectiveCorrigendum, '2018-05-23', '1', ['EP', 'CONSIL'], 0, 0, 'DIR'),
+    {
+      eli: ['http://data.europa.eu/eli/dir/2016/680/corrigendum/2018-05-23/oj'],
+      oj: {
+        issues: [{ collection: 'OJ-L', date: '2018-05-23', number: '127', class: 'R' }],
+        englishPages: [['0006', '0006']],
+        originalPages: [
+          ['0009', '0009'],
+          ['0007', '0007'],
+          ['0019', '0019'],
+          ['0014', '0014'],
+        ],
+      },
+    },
+  ),
+  /** Reprinted in two class M issues of 2006; cited by its first, 2004 issue. */
+  '32004D0752': withCitation(
+    withReasons(base(WORK.civilServiceTribunal, '2004-11-02', '0', ['CONSIL'], 2, 1, 'DEC'), {
+      endOfValidity: ['2016-07-31'],
+      repealedBy: ['32016R1192'],
+    }),
+    {
+      eli: ['http://data.europa.eu/eli/dec/2004/752/oj'],
+      entryIntoForce: ['2004-11-10', '2005-12-12'],
+      effectTypes: { '2004-11-10': ['EV'], '2005-12-12': ['PE/PART'] },
+      oj: {
+        issues: [
+          { collection: 'OJ-L', date: '2006-06-07', number: '153', class: 'M' },
+          { collection: 'OJ-L', date: '2004-11-09', number: '333', class: 'R' },
+          { collection: 'OJ-L', date: '2006-10-26', number: '296', class: 'M' },
+        ],
+        englishPages: [['0007', '0011']],
+      },
+    },
+  ),
+  /** Enters into force and applies on the same day. */
+  '31983R2215': withCitation(base(WORK.reg2215, '1983-08-02', '0', ['COM'], 2, 1), {
+    eli: ['http://data.europa.eu/eli/reg/1983/2215/oj'],
+    entryIntoForce: ['1983-08-07'],
+    effectTypes: { '1983-08-07': ['MA', 'EV'] },
+    oj: {
+      issues: [{ collection: 'OJ-L', date: '1983-08-04', number: '213', class: 'R' }],
+      englishPages: [['0024', '0025']],
+    },
+  }),
+  /** Case law and a proposal record none of the citation facts. */
+  '62012CJ0131': base(WORK.googleSpain, '2014-05-13', '1', ['CJ'], 3, 0, 'JUDG'),
+  '52012PC0011': base(WORK.proposal, '2012-01-25', '1', ['COM'], 3, 1, 'PROP_REG'),
 };
 
 /** A base work with no CELEX: reachable only by IRI. */
@@ -418,7 +574,85 @@ function coreRow(sparql: string): Row {
     title: literal(served.title),
     ...(status?.inForce ? { inForce: literal(status.inForce) } : {}),
     ...reasonColumns(sparql),
+    ...citationColumns(sparql),
   };
+}
+
+const FD_335 = 'http://publications.europa.eu/resource/authority/fd_335/';
+const DOCUMENT_COLLECTION = 'http://publications.europa.eu/resource/authority/document-collection/';
+const LANGUAGE = 'http://publications.europa.eu/resource/authority/language/';
+
+/** The fixture act a pattern `<work> predicate ?variable` reads, when the query carries it. */
+function actReadBy(sparql: string, predicate: string): FixtureAct | undefined {
+  const work = new RegExp(`<([^>]+)> ${predicate} \\?\\w+`).exec(sparql)?.[1];
+  return work ? byUri.get(work)?.act : undefined;
+}
+
+/** `"first|last"` page pairs, space-joined as `GROUP_CONCAT(DISTINCT …)` returns them. */
+const pagePairs = (pages: [string, string?][] | undefined) =>
+  [...new Set((pages ?? []).map(([first, last]) => `${first}|${last ?? ''}`))].join(' ') || '|';
+
+/**
+ * The citation aggregates (#169), each answered only when the query projects it and
+ * from the work its own pattern reads, as CELLAR returns them for an act with no
+ * value: an unbound `MIN(STR())`, `"|"` for a `GROUP_CONCAT` of an empty `CONCAT`,
+ * `"|||"` for a `MIN` over an empty composite. A date's types are read only when the
+ * entry-into-force pattern joins the `type_of_date` annotation; the original-language
+ * pages only when the query carries their pattern.
+ */
+function citationColumns(sparql: string): Row {
+  const columns: Row = {};
+  const projects = (name: string) => sparql.includes(`AS ?${name})`);
+
+  const eli = actReadBy(sparql, 'cdm:resource_legal_eli')?.eli?.toSorted()[0];
+  if (projects('eli') && eli) columns.eli = literal(eli);
+
+  const effects = actReadBy(sparql, 'cdm:resource_legal_date_entry-into-force');
+  if (projects('datesOfEffect') && effects) {
+    const typed = sparql.includes('annotation#type_of_date> ?effectType');
+    const items = (effects.entryIntoForce ?? []).flatMap((date) => {
+      const codes = typed ? (effects.effectTypes?.[date] ?? []) : [];
+      return codes.length > 0 ? codes.map((c) => `${date}|{${c}|${FD_335}${c}}`) : [`${date}|`];
+    });
+    columns.datesOfEffect = literal([...new Set(items)].join(' ') || '|');
+  }
+
+  const transposition = actReadBy(sparql, 'cdm:directive_date_transposition');
+  if (projects('transposition') && transposition) {
+    columns.transposition = literal((transposition.transposition ?? []).join(' '));
+  }
+
+  const issueAct = actReadBy(sparql, 'cdm:resource_legal_published_in_official-journal');
+  if (projects('ojIssue') && issueAct) {
+    const [earliest] = (issueAct.oj?.issues ?? [])
+      .map((i) => `${i.date}|${DOCUMENT_COLLECTION}${i.collection}|${i.number}|${i.class ?? ''}`)
+      .toSorted();
+    columns.ojIssue = literal(earliest ?? '|||');
+  }
+
+  const byAct = actReadBy(sparql, 'cdm:official-journal-act_date_publication');
+  if (projects('ojAct') && byAct) {
+    const a = byAct.oj?.act;
+    columns.ojAct = literal(
+      a ? `${a.date}|${DOCUMENT_COLLECTION}${a.collection}|${a.year}|${a.number}` : '|||',
+    );
+  }
+
+  const english = new RegExp(
+    `\\?\\w+ cdm:expression_belongs_to_work <([^>]+)> ;\\s*cdm:expression_uses_language <${LANGUAGE}ENG> \\.\\s*\\?\\w+ cdm:manifestation_manifests_expression`,
+  ).exec(sparql)?.[1];
+  if (projects('ojEnglishPages') && english) {
+    columns.ojEnglishPages = literal(pagePairs(byUri.get(english)?.act.oj?.englishPages));
+  }
+
+  const original =
+    /\?(\w+) cdm:expression_belongs_to_work <([^>]+)> ;\s*cdm:expression_uses_language \?(\w+) \.\s*FILTER\(\?\3 IN \(/.exec(
+      sparql,
+    )?.[2];
+  if (projects('ojOriginalPages') && original) {
+    columns.ojOriginalPages = literal(pagePairs(byUri.get(original)?.act.oj?.originalPages));
+  }
+  return columns;
 }
 
 /**

@@ -5,12 +5,20 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline, markdownLink } from '@cyanheads/mcp-ts-core/utils';
 import { enumInput } from '@/mcp-server/tools/enum-input.js';
 import {
   clampLimit,
   limitClampEnrichment,
   limitClampTrailer,
 } from '@/mcp-server/tools/limit-clamp.js';
+import { renderNoticeBlockquote } from '@/mcp-server/tools/markdown-render.js';
+import {
+  actCitationQueryParts,
+  type DateOfEffect,
+  EFFECT_TYPE_VALUES,
+  readActCitation,
+} from '@/services/cellar-sparql/act-citation.js';
 import {
   ENG_LANGUAGE_URI,
   LANGUAGE_AUTHORITY_URI,
@@ -148,7 +156,7 @@ function unavailableBodyNote(
 export const eurlex_get_document = tool('eurlex_get_document', {
   title: 'Get EU Document',
   description:
-    'Fetch the metadata and full text of an EU act or case-law record by CELEX number, ELI URI, or work URI. Returns structured metadata (title, date, type, author institution, Advocates General, legal basis, EuroVoc subjects, in-force status and, for an act not in force, its repealing acts, end of validity, or pending entry into force; for case law, the ECLI and the formation, referring court, subject matter, and case reference parsed from the title) plus the body as HTML, Markdown, or Formex4 XML, defaulting to English with automatic fallback. Every body returned in one call is capped at 100,000 characters — paged and full windows page onward with offset/limit; use outline: true for a heading map and select to pull specific articles, chapters, recitals, or annexes of an act, or the headed sections and operative part of a judgment or order, reading a selected section on its own from the offset and chars in selected_sections.',
+    'Fetch the metadata and full text of an EU act or case-law record by CELEX number, ELI URI, or work URI. Returns structured metadata (title, date, type, ELI, Official Journal reference, typed dates of effect, transposition deadlines, author institution, Advocates General, legal basis, EuroVoc subjects, in-force status and, for an act not in force, its repealing acts, end of validity, or pending entry into force; for case law, the ECLI and the formation, referring court, subject matter, and case reference parsed from the title) plus the body as HTML, Markdown, or Formex4 XML, defaulting to English with automatic fallback. Every body returned in one call is capped at 100,000 characters — paged and full windows page onward with offset/limit; use outline: true for a heading map and select to pull specific articles, chapters, recitals, or annexes of an act, or the headed sections and operative part of a judgment or order, reading a selected section on its own from the offset and chars in selected_sections.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     celex_number: z
@@ -325,6 +333,18 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .optional()
       .describe('Case law: the case reference from the title (e.g. "Case C-131/12.").'),
     date: z.string().optional().describe('Document date in ISO 8601 format (YYYY-MM-DD).'),
+    eli: z
+      .string()
+      .optional()
+      .describe(
+        'European Legislation Identifier of the work served (e.g. "http://data.europa.eu/eli/reg/2016/679/oj"); a consolidated text carries its own point-in-time ELI (e.g. "http://data.europa.eu/eli/reg/2016/679/2016-05-04"), a corrigendum its own. Absent when CELLAR records none, as for case law, proposals, and national measures.',
+      ),
+    oj_reference: z
+      .string()
+      .optional()
+      .describe(
+        'Official Journal reference the act was published under, e.g. "OJ L 119, 4.5.2016, p. 1–88", "OJ 13, 21.2.1962, p. 204–211" (before 1968, no series letter), "OJ L 42I, …" (an issue class other than R), or for act-by-act publication "OJ L, 2024/1689, 12.7.2024" and "OJ C, C/2024/2664, 29.4.2024". Pages are the English edition\'s, or before 1973 the original-language edition\'s; an act also reprinted in a later issue cites the earliest. For a consolidated text, its base act\'s. Absent when CELLAR records no publication.',
+      ),
     national_measure: NationalMeasureSchema.optional().describe(
       'National implementing measure publication citation and notification facts recorded on the served work. Missing facts are omitted; no source URL is inferred.',
     ),
@@ -412,13 +432,37 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .string()
       .optional()
       .describe(
-        "Earliest entry-into-force date (YYYY-MM-DD) of an act not yet in force. Present only when in_force is false and that date is after today (UTC); for a consolidated text, its base act's.",
+        "Earliest entry-into-force date (YYYY-MM-DD) of an act not yet in force. Present only when in_force is false and that date is after today (UTC); for a consolidated text, its base act's. Every recorded date, typed, is in dates_of_effect.",
+      ),
+    dates_of_effect: z
+      .array(
+        z
+          .object({
+            date: z.string().describe('Date (YYYY-MM-DD).'),
+            type: z
+              .enum(EFFECT_TYPE_VALUES)
+              .optional()
+              .describe(
+                'What takes effect on that date: "entry_into_force", "application", "partial_application", "provisional_application", "takes_effect", or "takes_partial_effect". Absent when CELLAR records no type, or one outside these.',
+              ),
+          })
+          .describe('One date of effect.'),
+      )
+      .optional()
+      .describe(
+        "Every date of effect CELLAR records for the act, sorted by date, one entry per date and type (a date can carry two, e.g. entry into force and application), whether past or ahead and whatever in_force says. For a consolidated text, its base act's. Absent when none is recorded.",
       ),
     end_of_validity: z
       .string()
       .optional()
       .describe(
         "Date (YYYY-MM-DD) the act's validity ends or ended: past for an expired act, and possibly in the future for one not yet in force (read it with entry_into_force), so on its own it does not mean the act expired. Present only when in_force is false and CELLAR records an actual date rather than its open-ended 9999-12-31; for a consolidated text, its base act's.",
+      ),
+    transposition_deadlines: z
+      .array(z.string().describe('Deadline (YYYY-MM-DD).'))
+      .optional()
+      .describe(
+        "A directive's deadlines for transposition into national law, sorted. For a consolidated text, its base act's. Absent when none is recorded.",
       ),
     base_act_celex: z
       .string()
@@ -643,7 +687,14 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       ),
     limit_clamp: limitClampEnrichment,
   },
-  enrichmentTrailer: { limit_clamp: limitClampTrailer },
+  enrichmentTrailer: {
+    limit_clamp: limitClampTrailer,
+    // The notice can carry upstream text (a journal name, section labels, work
+    // URIs), so content[] escapes it whole; structuredContent keeps it as written.
+    notice: {
+      render: (notice) => renderNoticeBlockquote(String(notice)),
+    },
+  },
 
   errors: [
     {
@@ -864,11 +915,19 @@ export const eurlex_get_document = tool('eurlex_get_document', {
     ?languageExpr cdm:expression_uses_language <${LANGUAGE_AUTHORITY_URI}${LANGUAGE_TO_ISO_639_2[language].toUpperCase()}> .
     ?languageExpr cdm:expression_title ?languageTitleValue .
   }`;
+      // The citation facts (#169) ride it as well: the served work's ELI, and the
+      // act's OJ reference, typed dates of effect, and transposition deadlines,
+      // with the entry-into-force pattern feeding both the earliest date and them.
+      const citationQuery = actCitationQueryParts(
+        workUri,
+        actWork,
+        baseAct ? baseAct.celex : celex,
+      );
       const coreQuery = `
 SELECT ?type ?date ?title ?inForce
   (MIN(STR(?entryIntoForceDate)) AS ?entryIntoForce)
   (MAX(STR(?endOfValidityDate)) AS ?endOfValidity)
-  (GROUP_CONCAT(DISTINCT STR(?repealerCelex); separator=" ") AS ?repealedBy)${ecliSelect}${languageTitleSelect}
+  (GROUP_CONCAT(DISTINCT STR(?repealerCelex); separator=" ") AS ?repealedBy)${citationQuery.select}${ecliSelect}${languageTitleSelect}
 WHERE {${ecliPatterns}
   OPTIONAL { <${workUri}> cdm:work_has_resource-type ?type . }
   OPTIONAL { <${workUri}> cdm:work_date_document ?date . }
@@ -877,8 +936,7 @@ WHERE {${ecliPatterns}
     ?expr cdm:expression_uses_language <${ENG_LANGUAGE_URI}> .
     ?expr cdm:expression_title ?title .
   }${languageTitlePattern}
-  OPTIONAL { <${actWork}> cdm:resource_legal_in-force ?inForce . }
-  OPTIONAL { <${actWork}> cdm:resource_legal_date_entry-into-force ?entryIntoForceDate . }
+  OPTIONAL { <${actWork}> cdm:resource_legal_in-force ?inForce . }${citationQuery.patterns}
   OPTIONAL {
     <${actWork}> cdm:resource_legal_date_end-of-validity ?endOfValidityDate .
     FILTER(STR(?endOfValidityDate) != "${OPEN_ENDED_VALIDITY}")
@@ -971,6 +1029,7 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
           .split(' ')
           .filter(Boolean)
           .sort(),
+        citation: readActCitation(first),
         agents,
         legalBases: collectResolved(legalBasisBindings, 'legalBasis', 'celex').map(
           ({ uri, literal }) => ({ work_uri: uri, ...(literal ? { celex_number: literal } : {}) }),
@@ -1047,6 +1106,8 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
       subject_matter?: string;
       case_reference?: string;
       date?: string;
+      eli?: string;
+      oj_reference?: string;
       national_measure?: z.infer<typeof NationalMeasureSchema>;
       resource_type?: string;
       author_institution?: string;
@@ -1057,7 +1118,9 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
       in_force?: boolean;
       repealed_by?: string[];
       entry_into_force?: string;
+      dates_of_effect?: DateOfEffect[];
       end_of_validity?: string;
+      transposition_deadlines?: string[];
       base_act_celex?: string;
       is_superseded?: boolean;
       current_consolidated_celex?: string;
@@ -1152,6 +1215,14 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
         result.entry_into_force = metaResult.entryIntoForce;
       }
       if (metaResult.endOfValidity) result.end_of_validity = metaResult.endOfValidity;
+    }
+    // #169: the citation facts hold whatever in_force says.
+    const { citation } = metaResult;
+    if (citation.eli) result.eli = citation.eli;
+    if (citation.oj_reference) result.oj_reference = citation.oj_reference;
+    if (citation.dates_of_effect) result.dates_of_effect = citation.dates_of_effect;
+    if (citation.transposition_deadlines) {
+      result.transposition_deadlines = citation.transposition_deadlines;
     }
 
     // #109: staleness describes the served text. It is current when it is the
@@ -1348,19 +1419,30 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
   },
 
   format: (result) => {
+    // Every value the tool did not author renders through escapeMarkdownInline,
+    // so a CommonMark parse of content[] reads it back as structuredContent
+    // carries it; the labels, separators, and list markers around it stay live.
+    const esc = escapeMarkdownInline;
+    const escList = (values: string[], separator = ', ') => values.map(esc).join(separator);
+    // A heading holds one line, so a title with a line break gets its own line.
+    const multiLineTitle =
+      result.title !== undefined && (result.title.includes('\n') || result.title.includes('\r'));
     const lines: string[] = [
-      `## ${result.celex_number}${result.title ? ` — ${result.title}` : ''}\n`,
+      `## ${esc(result.celex_number)}${result.title && !multiLineTitle ? ` — ${esc(result.title)}` : ''}\n`,
     ];
-    if (result.date) lines.push(`**Date:** ${result.date}`);
+    if (multiLineTitle) lines.push(`**Title:** ${esc(result.title as string)}`);
+    if (result.date) lines.push(`**Date:** ${esc(result.date)}`);
+    if (result.eli) lines.push(`**ELI:** ${esc(result.eli)}`);
+    if (result.oj_reference) lines.push(`**OJ reference:** ${esc(result.oj_reference)}`);
     if (result.national_measure) {
       const citation = result.national_measure;
-      if (citation.journal) lines.push(`**National official journal:** ${citation.journal}`);
-      if (citation.number) lines.push(`**Journal number:** ${citation.number}`);
-      if (citation.pages) lines.push(`**Journal pages:** ${citation.pages}`);
+      if (citation.journal) lines.push(`**National official journal:** ${esc(citation.journal)}`);
+      if (citation.number) lines.push(`**Journal number:** ${esc(citation.number)}`);
+      if (citation.pages) lines.push(`**Journal pages:** ${esc(citation.pages)}`);
       if (citation.publication_date)
-        lines.push(`**Journal publication date:** ${citation.publication_date}`);
+        lines.push(`**Journal publication date:** ${esc(citation.publication_date)}`);
       if (citation.notification_date)
-        lines.push(`**Notification date:** ${citation.notification_date}`);
+        lines.push(`**Notification date:** ${esc(citation.notification_date)}`);
     }
     if (result.content_omissions)
       lines.push(
@@ -1369,33 +1451,45 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
     if (result.alternative_representations) {
       for (const representation of result.alternative_representations)
         lines.push(
-          `**Alternative representation:** [${representation.format} (${representation.language})](${representation.url})`,
+          `**Alternative representation:** ${markdownLink(`${representation.format} (${representation.language})`, representation.url)}`,
         );
     }
-    if (result.ecli) lines.push(`**ECLI:** ${result.ecli}`);
-    if (result.resource_type) lines.push(`**Type:** ${result.resource_type}`);
-    if (result.base_act_celex) lines.push(`**Base act:** ${result.base_act_celex}`);
-    if (result.author_institution) lines.push(`**Author:** ${result.author_institution}`);
+    if (result.ecli) lines.push(`**ECLI:** ${esc(result.ecli)}`);
+    if (result.resource_type) lines.push(`**Type:** ${esc(result.resource_type)}`);
+    if (result.base_act_celex) lines.push(`**Base act:** ${esc(result.base_act_celex)}`);
+    if (result.author_institution) lines.push(`**Author:** ${esc(result.author_institution)}`);
     if (result.author_institutions && result.author_institutions.length > 0) {
-      lines.push(`**Authors:** ${result.author_institutions.join(', ')}`);
+      lines.push(`**Authors:** ${escList(result.author_institutions)}`);
     }
     if (result.advocates_general && result.advocates_general.length > 0) {
-      lines.push(`**Advocates General:** ${result.advocates_general.join(', ')}`);
+      lines.push(`**Advocates General:** ${escList(result.advocates_general)}`);
     }
-    if (result.formation) lines.push(`**Formation:** ${result.formation}`);
-    if (result.referring_court) lines.push(`**Referring court:** ${result.referring_court}`);
-    if (result.subject_matter) lines.push(`**Subject matter:** ${result.subject_matter}`);
-    if (result.case_reference) lines.push(`**Case reference:** ${result.case_reference}`);
+    if (result.formation) lines.push(`**Formation:** ${esc(result.formation)}`);
+    if (result.referring_court) lines.push(`**Referring court:** ${esc(result.referring_court)}`);
+    if (result.subject_matter) lines.push(`**Subject matter:** ${esc(result.subject_matter)}`);
+    if (result.case_reference) lines.push(`**Case reference:** ${esc(result.case_reference)}`);
     if (typeof result.in_force === 'boolean') lines.push(`**In Force:** ${result.in_force}`);
     if (result.repealed_by && result.repealed_by.length > 0) {
-      lines.push(`**Repealed by:** ${result.repealed_by.join(', ')}`);
+      lines.push(`**Repealed by:** ${escList(result.repealed_by)}`);
     }
-    if (result.end_of_validity) lines.push(`**End of validity:** ${result.end_of_validity}`);
-    if (result.entry_into_force) lines.push(`**Entry into force:** ${result.entry_into_force}`);
+    if (result.end_of_validity) lines.push(`**End of validity:** ${esc(result.end_of_validity)}`);
+    if (result.entry_into_force) {
+      lines.push(`**Entry into force:** ${esc(result.entry_into_force)}`);
+    }
+    if (result.dates_of_effect && result.dates_of_effect.length > 0) {
+      lines.push(
+        `**Dates of effect:** ${result.dates_of_effect
+          .map(({ date, type }) => (type ? `${esc(date)} (${type})` : esc(date)))
+          .join(', ')}`,
+      );
+    }
+    if (result.transposition_deadlines && result.transposition_deadlines.length > 0) {
+      lines.push(`**Transposition deadlines:** ${escList(result.transposition_deadlines)}`);
+    }
     // #29/#109 staleness — each field renders in its own block so the
     // format-parity sentinel walk sees every one.
     if (typeof result.is_superseded === 'boolean') {
-      const current = `${result.current_consolidated_celex} (${result.consolidated_as_of})`;
+      const current = `${esc(result.current_consolidated_celex ?? '')} (${esc(result.consolidated_as_of ?? '')})`;
       lines.push(
         result.is_superseded
           ? `**Superseded:** true — consolidated version ${current} is newer than this text; not a repeal (see In Force).`
@@ -1405,21 +1499,23 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
       );
     }
     if (result.current_consolidated_celex) {
-      lines.push(`**Current consolidated:** ${result.current_consolidated_celex}`);
+      lines.push(`**Current consolidated:** ${esc(result.current_consolidated_celex)}`);
     }
     if (result.consolidated_as_of) {
-      lines.push(`**Consolidated as of:** ${result.consolidated_as_of}`);
+      lines.push(`**Consolidated as of:** ${esc(result.consolidated_as_of)}`);
     }
     if (result.requested_celex) {
       lines.push(
-        `**Requested CELEX:** ${result.requested_celex} (served ${result.celex_number} instead)`,
+        `**Requested CELEX:** ${esc(result.requested_celex)} (served ${esc(result.celex_number)} instead)`,
       );
     }
-    if (result.work_uri) lines.push(`**Work URI:** ${result.work_uri}`);
+    if (result.work_uri) lines.push(`**Work URI:** ${esc(result.work_uri)}`);
     if (result.legal_basis && result.legal_basis.length > 0) {
       lines.push(
         `**Legal Basis:** ${result.legal_basis
-          .map((lb) => (lb.celex_number ? `${lb.celex_number} (${lb.work_uri})` : lb.work_uri))
+          .map((lb) =>
+            lb.celex_number ? `${esc(lb.celex_number)} (${esc(lb.work_uri)})` : esc(lb.work_uri),
+          )
           .join('; ')}`,
       );
     }
@@ -1429,7 +1525,7 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
       // there is no length reason to cut it (previously truncated to 5).
       lines.push(
         `**EuroVoc Subjects:** ${result.eurovoc_subjects
-          .map((s) => (s.label ? `${s.label} (${s.concept_uri})` : s.concept_uri))
+          .map((s) => (s.label ? `${esc(s.label)} (${esc(s.concept_uri)})` : esc(s.concept_uri)))
           .join('; ')}`,
       );
     }
@@ -1516,9 +1612,9 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
           );
           lines.push('');
           for (const h of result.outline) {
-            const tag = h.kind === 'operative_part' ? h.kind : `${h.kind} ${h.number}`;
+            const tag = h.kind === 'operative_part' ? h.kind : `${h.kind} ${esc(h.number)}`;
             lines.push(
-              `- \`offset ${h.offset}\` — [${tag}] ${h.label}${h.title ? `: ${h.title}` : ''}`,
+              `- \`offset ${h.offset}\` — [${tag}] ${esc(h.label)}${h.title ? `: ${esc(h.title)}` : ''}`,
             );
           }
         } else {
@@ -1534,15 +1630,15 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
       if (result.selection) {
         lines.push('');
         lines.push(
-          `**Selection** — requested: ${result.selection.requested.join(', ') || '(none)'}.`,
+          `**Selection** — requested: ${escList(result.selection.requested) || '(none)'}.`,
         );
         if (result.selection.matched.length > 0) {
-          lines.push(`Returned: ${result.selection.matched.join(', ')}.`);
+          lines.push(`Returned: ${escList(result.selection.matched)}.`);
         }
         if (result.selection.missed.length > 0) {
           const work = isCaseLawCelex(result.celex_number) ? 'document' : 'act';
           lines.push(
-            `Not found: ${result.selection.missed.join(', ')} — ${result.structure_detected ? `no such section in this ${work}` : `no ${work} structure detected`}. ` +
+            `Not found: ${escList(result.selection.missed)} — ${result.structure_detected ? `no such section in this ${work}` : `no ${work} structure detected`}. ` +
               `Use offset/limit or content_mode "full" to read the ${work}.`,
           );
         }
@@ -1553,7 +1649,7 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
       if (result.selected_sections && result.selected_sections.length > 0) {
         lines.push(
           `Section addresses (content_mode "paged", offset/limit): ${result.selected_sections
-            .map((s) => `${s.label} — offset ${s.offset}, ${s.chars} chars`)
+            .map((s) => `${esc(s.label)} — offset ${s.offset}, ${s.chars} chars`)
             .join('; ')}.`,
         );
       }
@@ -1577,7 +1673,7 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
       lines.push('');
       if (result.national_measure?.journal)
         lines.push(
-          `Retrieve this national measure from ${result.national_measure.journal} using the publication citation above. Notification does not establish complete transposition.`,
+          `Retrieve this national measure from ${esc(result.national_measure.journal)} using the publication citation above. Notification does not establish complete transposition.`,
         );
       lines.push(
         unavailableBodyNote(
