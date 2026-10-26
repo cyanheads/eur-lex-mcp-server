@@ -1,0 +1,33 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "eur-lex-mcp-server",
+  "version": "0.19.2",
+  "description": "Search EU legislation, CJEU case law, and treaties; traverse the CELLAR relationship graph; resolve EuroVoc concepts via MCP. STDIO or Streamable HTTP.",
+  "author": {
+    "name": "Casey Hand",
+    "email": "casey@caseyjhand.com",
+    "url": "https://caseyjhand.com"
+  },
+  "homepage": "https://github.com/cyanheads/eur-lex-mcp-server#readme",
+  "repository": "git+https://github.com/cyanheads/eur-lex-mcp-server.git",
+  "license": "Apache-2.0",
+  "keywords": [
+    "eur-lex",
+    "eu-law",
+    "european-union",
+    "cellar",
+    "sparql",
+    "cjeu",
+    "eurovoc",
+    "legislation",
+    "legal",
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "typescript",
+    "bun",
+    "stdio",
+    "streamable-http",
+    "ai-agent"
+  ]
+}
