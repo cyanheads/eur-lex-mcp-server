@@ -438,9 +438,9 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
     filters.push(...dateRangeFilters(dateFrom, dateTo));
     /**
      * In-force filter, applied for either polarity. CELLAR expresses the negative:
-     * Virtuoso serialises `cdm:resource_legal_in-force` as an xsd:integer `0`/`1`,
-     * and the comparison against the xsd:boolean coerces, so `FILTER(?inForce =
-     * false)` returns the no-longer-in-force works. Gating on `=== true` built no
+     * Virtuoso serialises `cdm:resource_legal_in-force` as an xsd:boolean with
+     * lexical form `0`/`1`, and the comparison against the `true`/`false` literal
+     * matches it, so `FILTER(?inForce = false)` returns the no-longer-in-force works. Gating on `=== true` built no
      * clause for `false`, so the negative ran the same query as omitting the filter
      * while query_echo still reported it as applied (issue #82).
      */
