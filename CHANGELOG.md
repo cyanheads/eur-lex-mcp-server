@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.20.0](changelog/0.20.x/0.20.0.md) — 2026-10-26
+
+Publishes the eur-lex-guide Agent Skill over MCP (skills/list and skill:// resources carrying identifier chains, conclusion gates, and CELLAR SPARQL vocabulary) and moves to mcp-ts-core 0.13.18, which ends the 0.13.16 per-request HTTP memory leak and escapes a trailing space-hash in Markdown output.
+
 ## [0.19.2](changelog/0.19.x/0.19.2.md) — 2026-10-25
 
 Adds adopts/adopted_by relations, per-edge provisions with an article filter on interpreted_by, ELI and Official Journal facts on documents, and Official Journal reference lookup; content[] output is Markdown-escaped.

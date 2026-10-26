@@ -1,6 +1,6 @@
 # eur-lex-mcp-server - Directory Structure
 
-Generated on: 2026-10-25 07:32:28
+Generated on: 2026-10-26 07:16:53
 
 ```text
 eur-lex-mcp-server/
@@ -36,6 +36,7 @@ eur-lex-mcp-server/
 │   ├── 0.18.x/
 │   ├── 0.19.x/
 │   ├── 0.2.x/
+│   ├── 0.20.x/
 │   ├── 0.3.x/
 │   ├── 0.4.x/
 │   ├── 0.5.x/
@@ -55,6 +56,8 @@ eur-lex-mcp-server/
 │   ├── add-resource/
 │   │   └── SKILL.md
 │   ├── add-service/
+│   │   └── SKILL.md
+│   ├── add-skill/
 │   │   └── SKILL.md
 │   ├── add-test/
 │   │   └── SKILL.md
@@ -152,6 +155,11 @@ eur-lex-mcp-server/
 │   ├── prune-musl-packages.ts
 │   ├── release-github.ts
 │   └── tree.ts
+├── skills/
+│   └── eur-lex-guide/
+│       ├── references/
+│       │   └── sparql-cdm.md
+│       └── SKILL.md
 ├── src/
 │   ├── config/
 │   │   └── server-config.ts
@@ -253,6 +261,7 @@ eur-lex-mcp-server/
 │   │   ├── eurlex-lookup-celex.tool.test.ts
 │   │   ├── eurlex-query-sparql.tool.test.ts
 │   │   └── eurlex-search-documents.tool.test.ts
+│   ├── published-skills.test.ts
 │   └── sparql-lexical-safety.test.ts
 ├── .dockerignore
 ├── .env.example
@@ -270,7 +279,9 @@ eur-lex-mcp-server/
 ├── Dockerfile
 ├── LICENSE
 ├── manifest.json
+├── mcp.json
 ├── package.json
+├── plugin.json
 ├── README.md
 ├── server.json
 ├── tsconfig.build.json
