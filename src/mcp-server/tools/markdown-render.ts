@@ -8,13 +8,12 @@ import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 
 /**
  * `text` encoded for an ATX heading, which a CommonMark parse reads back as
- * `text`: escaped as running text, each line break written as `&#10;` in place
- * of the escaper's hard break (a heading holds one line), and a final `#`
- * escaped so it cannot close the heading.
+ * `text`: escaped as running text, which already keeps a trailing ` #` from
+ * closing the heading, with each line break written as `&#10;` in place of the
+ * escaper's hard break (a heading holds one line).
  */
 export function escapeMarkdownHeading(text: string): string {
-  const encoded = escapeMarkdownInline(text).replaceAll('\\\n', '&#10;');
-  return encoded.endsWith('#') && !encoded.endsWith('\\#') ? `${encoded.slice(0, -1)}\\#` : encoded;
+  return escapeMarkdownInline(text).replaceAll('\\\n', '&#10;');
 }
 
 /**
