@@ -4,7 +4,7 @@ description: Identifier chains, conclusion gates, and CELLAR SPARQL vocabulary f
 license: Apache-2.0
 metadata:
   author: cyanheads
-  version: "1.0"
+  version: "1.1"
 ---
 
 ## Scope
