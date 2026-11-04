@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.20.1](changelog/0.20.x/0.20.1.md) — 2026-11-03
+
+Reports legislative procedure status and the provision behind each date of effect, filters case law by member state, procedure type and outcome, and subject, resolves COM numbers and procedure references, and counts transposition per member state. eurlex_get_relations pages by limit alone, default 10.
+
 ## [0.20.0](changelog/0.20.x/0.20.0.md) — 2026-10-26
 
 Publishes the eur-lex-guide Agent Skill over MCP (skills/list and skill:// resources carrying identifier chains, conclusion gates, and CELLAR SPARQL vocabulary) and moves to mcp-ts-core 0.13.18, which ends the 0.13.16 per-request HTTP memory leak and escapes a trailing space-hash in Markdown output.
