@@ -29,12 +29,13 @@ const CLIENT_INFO_META_KEY = 'io.modelcontextprotocol/clientInfo';
 
 // --- Service mock ---
 const mockQuery = vi.fn();
+let mockMaxResults = 100;
 // maxResults mirrors the real service ceiling; the handler clamps the summary cap to it.
 vi.mock('@/services/cellar-sparql/cellar-sparql-service.js', () => ({
   getCellarSparqlService: () => ({
     query: mockQuery,
     queryWithContinuation: mockQuery,
-    maxResults: 100,
+    maxResults: mockMaxResults,
   }),
   CellarSparqlService: {
     bindingValue: (binding: Record<string, { value?: string }> | undefined, field: string) =>
@@ -202,6 +203,7 @@ async function readOverWire(uri: string): Promise<WireRead> {
 describe('eurlex_document_relations_resource', () => {
   beforeEach(() => {
     mockQuery.mockReset();
+    mockMaxResults = 100;
   });
 
   // --- Happy path ---
@@ -300,12 +302,38 @@ describe('eurlex_document_relations_resource', () => {
 
     expect(result.truncated).toBe(true);
     expect(result.relations).toHaveLength(25);
+    // The tool's own default page is smaller, so the continuation starts past the 25
+    // rows each arm already returned (#183).
     expect(result.continuation).toEqual({
       kind: 'expanded_traversal',
       tool: 'eurlex_get_relations',
-      input: { celex_number: '32016R0679' },
+      input: { celex_number: '32016R0679', offset: 25 },
     });
-    expect(JSON.stringify(result.continuation)).not.toContain('offset');
+  });
+
+  it('continues at the operator ceiling when it caps the summary below 25 rows (#183)', async () => {
+    mockMaxResults = 20;
+    const manyAmenders = Array.from({ length: 21 }, (_, i) =>
+      makeRelationBinding({
+        relatedWork: `http://publications.europa.eu/resource/cellar/amender-${i}`,
+        direction: 'incoming',
+        relatedCelex: `3202${i % 10}R${1000 + i}`,
+      }),
+    );
+    mockQuery.mockImplementation(
+      routeQuery({ resolve: [makeResolveBinding(GDPR_WORK_URI)], amendedBy: manyAmenders }),
+    );
+
+    const params = eurlex_document_relations_resource.params!.parse({ celexNumber: '32016R0679' });
+    const result = (await eurlex_document_relations_resource.handler(
+      params,
+      createMockContext({ errors: eurlex_document_relations_resource.errors }),
+    )) as Record<string, unknown>;
+
+    expect(result.relations).toHaveLength(20);
+    expect(result.continuation).toMatchObject({
+      input: { celex_number: '32016R0679', offset: 20 },
+    });
   });
 
   // --- #19: amendment + consolidation relations now surface on the resource ---
@@ -1072,6 +1100,66 @@ describe('eurlex_document_relations_resource', () => {
       .map((c) => c[0] as string)
       .find((q) => q.includes('cdm:work_cites_work')) as string;
     expect(cites).toContain('(MAX(STR(?relatedTitle)) AS ?relatedTitleMax)');
+  });
+
+  it('reads CELLAR’s undated placeholder as no related_date, in the result and over the wire (#184)', async () => {
+    const placeholder = `${CELLAR}placeholder-measure`;
+    mockQuery.mockImplementation(
+      routeQuery({
+        resolve: [makeResolveBinding(DIRECTIVE_680_WORK_URI)],
+        nationalTransposition: [
+          {
+            ...makeRelationBinding({
+              relatedWork: CZECH_MEASURE_WORK_URI,
+              direction: 'incoming',
+              relatedCelex: '72016L0680CZE_225030',
+            }),
+            relatedDateMax: { type: 'literal', value: '2019-02-27' },
+          },
+          {
+            ...makeRelationBinding({
+              relatedWork: placeholder,
+              direction: 'incoming',
+              relatedCelex: '72016L0680BEL_100000',
+            }),
+            relatedDateMax: { type: 'literal', value: '1001-01-01' },
+          },
+        ],
+      }),
+    );
+    const expected = [
+      {
+        relation_type: 'national_transposition',
+        direction: 'incoming',
+        related_work_uri: CZECH_MEASURE_WORK_URI,
+        related_celex_number: '72016L0680CZE_225030',
+        related_member_state: 'CZE',
+        related_date: '2019-02-27',
+      },
+      {
+        relation_type: 'national_transposition',
+        direction: 'incoming',
+        related_work_uri: placeholder,
+        related_celex_number: '72016L0680BEL_100000',
+        related_member_state: 'BEL',
+      },
+    ];
+
+    const params = eurlex_document_relations_resource.params!.parse({ celexNumber: '32016L0680' });
+    const result = (await eurlex_document_relations_resource.handler(
+      params,
+      createMockContext({
+        tenantId: 'test-tenant',
+        errors: eurlex_document_relations_resource.errors,
+      }),
+    )) as { relations: Record<string, string>[] };
+    expect(result.relations).toEqual(expected);
+
+    const { result: read, error } = await readOverWire('eurlex://document/32016L0680/relations');
+    expect(error).toBeUndefined();
+    const text = read?.contents[0]?.text ?? '';
+    expect(JSON.parse(text).relations).toEqual(expected);
+    expect(text).not.toContain('1001-01-01');
   });
 
   // --- #100: the summary is newest-first and identical on every read ---

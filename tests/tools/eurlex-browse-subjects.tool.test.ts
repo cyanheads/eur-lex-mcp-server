@@ -723,6 +723,11 @@ describe('eurlex_browse_subjects', () => {
     });
   });
 
+  it('routes case law by subject to eurlex_get_cases, since CELLAR tags no CJEU ruling with EuroVoc (#176)', () => {
+    expect(eurlex_browse_subjects.description).toContain('only EFTA Court judgments carry one');
+    expect(eurlex_browse_subjects.description).toContain('eurlex_get_cases subject');
+  });
+
   // --- #112: an empty first page is an empty page, not an error ---
 
   describe('empty first page (#112)', () => {

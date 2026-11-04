@@ -80,6 +80,25 @@ describe('eurlex_lookup_celex', () => {
     expect(result.date).toBe('2016-04-27');
   });
 
+  it('reads CELLAR’s undated placeholder as no date on both surfaces (#184)', async () => {
+    mockQuery.mockResolvedValue([
+      makeBinding('71995L0046BEL_101325', { date: '1001-01-01', canonical: true }),
+    ]);
+
+    const result = await runToolContract(eurlex_lookup_celex, {
+      identifier: '71995L0046BEL_101325',
+    });
+
+    expect(result.isError).toBeFalsy();
+    const structured = eurlex_lookup_celex.output.parse(result.structuredContent);
+    expect(structured).toMatchObject({ found: true, celex_number: '71995L0046BEL_101325' });
+    expect(structured.date).toBeUndefined();
+    const text = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+    expect(text).toContain('**CELEX:**');
+    expect(text).not.toContain('**Date:**');
+    expect(text).not.toContain('1001-01-01');
+  });
+
   describe('resource_type label (#58)', () => {
     it('resolves a mapped CDM resource-type URI to its label on both surfaces', async () => {
       const ctx = createMockContext({ errors: eurlex_lookup_celex.errors });
@@ -1179,6 +1198,49 @@ describe('eurlex_lookup_celex', () => {
       },
     );
 
+    // --- #172: a citation ending its sentence ---
+
+    it.each([
+      ['Directive 95/46/EC.', 'Directive 95/46/EC', '31995L0046'],
+      ['Regulation (EC) No 1049/2001.', 'Regulation (EC) No 1049/2001', '32001R1049'],
+      ['Regulation (EU) 2016/679.', 'Regulation (EU) 2016/679', '32016R0679'],
+      ['Directive 95/46/EC (OJ L 281, 23.11.1995, p. 31).', 'Directive 95/46/EC', '31995L0046'],
+    ])(
+      'resolves %j as the citation without its closing period (#172)',
+      async (citation, bare, celex) => {
+        holds(celex);
+        const withPeriod = await runToolContract(eurlex_lookup_celex, { identifier: citation });
+        const periodQueries = mockQuery.mock.calls.map((c) => c[0] as string);
+        mockQuery.mockClear();
+        const bareCitation = await runToolContract(eurlex_lookup_celex, { identifier: bare });
+
+        expect(withPeriod.structuredContent).toMatchObject({ found: true, celex_number: celex });
+        expect(withPeriod.structuredContent).toEqual(bareCitation.structuredContent);
+        expect(withPeriod.content).toEqual(bareCitation.content);
+        expect(periodQueries).toEqual(mockQuery.mock.calls.map((c) => c[0] as string));
+      },
+    );
+
+    it('names the citation as given, period included, in the notice of a miss (#172)', async () => {
+      mockQuery.mockResolvedValue([]);
+      const { result, ctx } = await resolve('Regulation (EU) 2016/9999.');
+
+      expect(result).toEqual({ found: false });
+      expect(getEnrichment(ctx).notice).toContain(
+        'CELEX 32016R9999 (parsed from "Regulation (EU) 2016/9999.")',
+      );
+    });
+
+    it.each(['Regulation No 17.', 'Directive 95/46/E.C.', 'Directive 95/46/EC..'])(
+      'still raises ambiguous_identifier for %j once its one closing period is dropped (#172)',
+      async (identifier) => {
+        await expect(resolve(identifier)).rejects.toMatchObject({
+          data: { reason: 'ambiguous_identifier' },
+        });
+        expect(mockQuery).not.toHaveBeenCalled();
+      },
+    );
+
     it('keeps resolving a reference after the act title (#171)', async () => {
       holds('32016R0679');
       const { result, queries } = await resolve(
@@ -1279,6 +1341,7 @@ describe('eurlex_lookup_celex', () => {
         page: 1,
         rows: [issueRow('2018-01-17', '22018X0117(01)'), issueRow('2018-01-17', '22018X0117(02)')],
       },
+      'oj:JOC_1990_277_R': { page: 3, rows: [issueRow('1990-11-05', '51990PC0314(01)')] },
     };
     const ACT_RECORDS: Record<string, { celex: string; published: string }> = {
       'oj:L_202401689': { celex: '32024R1689', published: '2024-07-12' },
@@ -1348,6 +1411,12 @@ describe('eurlex_lookup_celex', () => {
       ['(OJ L 281, 23.11.1995, p. 31).', '31995L0046'],
       ['oj l 281, 23.11.1995, p. 31', '31995L0046'],
       ['OJ L 127, 23.5.2018, p. 2', '32016R0679R(02)'],
+      // #172: the spellings EUR-Lex act texts and the Court use.
+      ['OJ No L 281, 23. 11. 1995, p. 31.', '31995L0046'],
+      ['[1995] OJ L281/31', '31995L0046'],
+      ['OJ L 119, 4.5.2016, pp. 1–88', '32016R0679'],
+      ['OJ L 2024/1689', '32024R1689'],
+      ['OJ No C 277, 5. 11. 1990, p. 3', '51990PC0314(01)'],
     ])('resolves %j to %s with the output of that CELEX lookup', async (reference, celex) => {
       const viaReference = await lookup(reference);
       mockQuery.mockClear();
@@ -1428,6 +1497,278 @@ describe('eurlex_lookup_celex', () => {
 
       expect(structured.found).toBe(false);
       expect(queries.join('\n')).not.toContain('work_id_document');
+    });
+  });
+
+  // --- Outcomes the OJ spelling (#172) and Commission document (#179) readers keep ---
+
+  describe('outcomes kept beside the newer readers (#172, #179)', () => {
+    async function lookup(identifier: string, identifierType?: 'auto' | 'celex') {
+      mockQuery.mockResolvedValue([]);
+      const result = await runToolContract(eurlex_lookup_celex, {
+        identifier,
+        ...(identifierType ? { identifier_type: identifierType } : {}),
+      });
+      const structured = result.structuredContent as Record<string, unknown> & {
+        error?: { data?: { reason?: string } };
+      };
+      return { structured, queries: mockQuery.mock.calls.map((c) => c[0] as string) };
+    }
+
+    it.each([
+      ['a CELEX with a trailing period', '32016R0679.'],
+      ['an OJ reference with no page', 'OJ No C 166, 3. 7. 1995'],
+      [
+        'two OJ references joined by "and"',
+        'OJ No C 277, 5. 11. 1990, p. 3 and OJ No C 159, 17. 6. 1991, p 38',
+      ],
+      ['a year in round brackets', '(1995) OJ L281/31'],
+      ['a bracketed year and a date', '[1995] OJ L 281, 23.11.1995, p. 31'],
+      ['a slashed date', 'OJ L 281, 23/11/1995, p. 31'],
+      ['a month-name date', 'OJ L 281, 23 November 1995, p. 31'],
+      ['an issue and page with no year', 'OJ L 119/1'],
+      ['an L-style number under C', 'OJ C 2024/2664'],
+      ['a Commission decision number', 'C(2021) 4500 final'],
+      ['a document number and a procedure together', 'COM(2021) 206 final – 2021/0106(COD)'],
+    ])('raises ambiguous_identifier for %s with no CELLAR call', async (_label, identifier) => {
+      const { structured, queries } = await lookup(identifier);
+
+      expect(structured.error?.data?.reason).toBe('ambiguous_identifier');
+      expect(queries).toEqual([]);
+    });
+
+    it('looks up an ECLI with a trailing period as typed, period included', async () => {
+      const { structured, queries } = await lookup('ECLI:EU:C:2014:317.');
+
+      expect(structured.found).toBe(false);
+      expect(queries).toHaveLength(1);
+      expect(queries[0]).toContain('"ECLI:EU:C:2014:317."^^xsd:string');
+    });
+
+    it.each([
+      ['C(2021)4500', undefined],
+      ['2021/0106', undefined],
+      ['CELEX:COM(2021)206', undefined],
+      ['COM(2021)206', 'celex' as const],
+      ['COM/2021/206', 'celex' as const],
+      ['2021/0106(COD)', 'celex' as const],
+    ])(
+      'looks %s (identifier_type %s) up as a CELEX, a miss',
+      async (identifier, identifierType) => {
+        const { structured, queries } = await lookup(identifier, identifierType);
+        const celex = identifier.replace(/^CELEX:/, '');
+
+        expect(structured.found).toBe(false);
+        expect(structured.notice).toContain(`No CELLAR work matches CELEX ${celex}`);
+        expect(queries).toHaveLength(1);
+        expect(queries[0]).toContain(`?work cdm:resource_legal_id_celex "${celex}"^^xsd:string .`);
+      },
+    );
+  });
+
+  // --- #179: Commission document numbers and procedure references ---
+
+  describe('Commission document numbers and procedure references (#179)', () => {
+    /** The `comnat:` document ids CELLAR holds here, with the CELEX of the work carrying each. */
+    const DOCUMENT_IDS: Record<string, string> = {
+      'comnat:COM_2021_0206_FIN': '52021PC0206',
+      'comnat:COM_2020_0066_FIN': '52020DC0066',
+      'comnat:SWD_2021_0084_FIN': '52021SC0084',
+      'comnat:JOIN_2020_0018_FIN': '52020JC0018',
+      'comnat:SEC_2008_0085_FIN': '52008SC0085',
+      'comnat:COM_2021_0278_FIN': '52021PC0278',
+      'comnat:COM_2021_0278_FIN2': '52021PC0278R(01)',
+      'comnat:COM_1990_0314_FIN': '51990DC0314',
+      'comnat:COM_1990_0314(01)_FIN': '51990PC0314(01)',
+      'comnat:COM_1990_0314(02)_FIN': '51990PC0314(02)',
+      'comnat:COM_1990_0314(03)_FIN': '51990PC0314(03)',
+      'comnat:COM_1990_0314(04)_FIN': '51990PC0314(04)',
+    };
+    /**
+     * The procedure reference literals CELLAR holds here: one dossier each, with its
+     * initiating act's CELEX, in the order CELLAR returns them, which is not CELEX order.
+     */
+    const PROCEDURES: Record<string, (string | undefined)[]> = {
+      '2021/0106/COD': ['52021PC0206'],
+      '2008/0264/CNS': ['52008PC0889'],
+      '2008/0264/COD': ['52006PC0812'],
+      '2000/0247/ACC': ['52000PC0641', '52000PC0609', '52000PC0640', '52000PC0616'],
+      '2013/2145(BUD)': ['52013DC0450'],
+      '2023/0077B/COD': ['52023PC0177'],
+      '2022/132A/COD': [undefined],
+      '2021/0053/COD': [undefined],
+    };
+    const HELD_CELEX = new Set([
+      ...Object.values(DOCUMENT_IDS),
+      ...Object.values(PROCEDURES).flatMap((initiators) => initiators.flatMap((c) => c ?? [])),
+    ]);
+
+    /**
+     * CELLAR matching typed literals exactly, as it does for each of these lookups. Neither
+     * query sorts, so the rows arrive in no CELEX order: a document number's opposite the
+     * VALUES list, a procedure's as `PROCEDURES` lists them.
+     */
+    function holdsPreparatory(): void {
+      mockQuery.mockImplementation(async (q: string) => {
+        const literals = [...q.matchAll(/"([^"]+)"\^\^xsd:string/g)].map((m) => m[1] ?? '');
+        if (q.includes('cdm:work_id_document ?documentId')) {
+          return literals
+            .flatMap((id) =>
+              DOCUMENT_IDS[id] ? [{ celex: { type: 'literal', value: DOCUMENT_IDS[id] } }] : [],
+            )
+            .reverse();
+        }
+        if (q.includes('cdm:procedure_code_interinstitutional_reference_procedure')) {
+          return literals.flatMap((reference) =>
+            (PROCEDURES[reference] ?? []).map((celex, i) => ({
+              dossier: {
+                type: 'uri',
+                value: `http://publications.europa.eu/resource/cellar/${reference}-${i}`,
+              },
+              ...(celex ? { celex: { type: 'literal', value: celex } } : {}),
+            })),
+          );
+        }
+        const [celex] = literals;
+        return celex && HELD_CELEX.has(celex)
+          ? [
+              makeBinding(celex, {
+                type: `${RESOURCE_TYPE}PROP_REG`,
+                date: '2021-04-21',
+                canonical: true,
+              }),
+            ]
+          : [];
+      });
+    }
+
+    async function lookup(identifier: string) {
+      const result = await runToolContract(eurlex_lookup_celex, { identifier });
+      const structured = result.structuredContent as Record<string, unknown> & {
+        error?: { data?: { reason?: string } };
+      };
+      const text = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+      return { result, structured, text, queries: mockQuery.mock.calls.map((c) => c[0] as string) };
+    }
+
+    beforeEach(holdsPreparatory);
+
+    it.each([
+      ['COM(2021) 206 final', '52021PC0206'],
+      ['COM(2021)206', '52021PC0206'],
+      ['COM/2021/206 final', '52021PC0206'],
+      ['COM/2021/206', '52021PC0206'],
+      ['COM (2021) 0206', '52021PC0206'],
+      ['com(2021) 206 final.', '52021PC0206'],
+      ['COM(2020) 66', '52020DC0066'],
+      ['SWD(2021) 84 final', '52021SC0084'],
+      ['JOIN(2020) 18 final', '52020JC0018'],
+      ['SEC(2008) 85', '52008SC0085'],
+      ['COM(2021) 278 final/2', '52021PC0278R(01)'],
+      ['2021/0106(COD)', '52021PC0206'],
+      ['2021/106 (COD)', '52021PC0206'],
+      ['2021/0106/COD', '52021PC0206'],
+      ['2021/0106(COD).', '52021PC0206'],
+      ['2008/0264(CNS)', '52008PC0889'],
+      ['2008/0264(COD)', '52006PC0812'],
+      ['2013/2145(BUD)', '52013DC0450'],
+      ['2023/0077B(COD)', '52023PC0177'],
+    ])(
+      'resolves %j to %s with the output of that CELEX lookup and no notice',
+      async (identifier, celex) => {
+        const viaReference = await lookup(identifier);
+        mockQuery.mockClear();
+        const viaCelex = await lookup(celex);
+
+        expect(viaReference.structured).toMatchObject({ found: true, celex_number: celex });
+        expect(viaReference.structured).not.toHaveProperty('notice');
+        expect(viaReference.structured).toEqual(viaCelex.structured);
+        expect(viaReference.result.content).toEqual(viaCelex.result.content);
+        // One lookup of the number or reference, then exactly the query the CELEX lookup sends.
+        expect(viaReference.queries).toHaveLength(2);
+        expect(viaReference.queries[0]).toMatch(
+          /cdm:work_id_document \?documentId|cdm:procedure_code_interinstitutional_reference_procedure/,
+        );
+        expect(viaReference.queries[1]).toBe(viaCelex.queries[0]);
+      },
+    );
+
+    it.each([
+      [
+        'COM(90) 314 final',
+        'Commission document "COM(90) 314 final" (read as COM(1990) 314 final) names 5 works: 51990DC0314, 51990PC0314(01), 51990PC0314(02), 51990PC0314(03), 51990PC0314(04). Pass the CELEX of the one you want here or to eurlex_get_document.',
+      ],
+      [
+        '2000/0247(ACC)',
+        'Procedure "2000/0247(ACC)" names 4 initiating acts: 52000PC0609, 52000PC0616, 52000PC0640, 52000PC0641. Pass the CELEX of the one you want here or to eurlex_get_document.',
+      ],
+    ])(
+      'names each CELEX %j reaches, on both surfaces, in one query',
+      async (identifier, notice) => {
+        const { result, structured, text, queries } = await lookup(identifier);
+
+        expect(result.isError).toBeFalsy();
+        expect(Object.keys(structured).sort()).toEqual(['found', 'notice']);
+        expect(structured.found).toBe(false);
+        expect(structured.notice).toBe(notice);
+        expect(readCommonMark(text)).toContain(notice);
+        expect(queries).toHaveLength(1);
+      },
+    );
+
+    it.each([
+      [
+        'a document number no work carries',
+        'COM(2021) 9999 final',
+        'Commission document "COM(2021) 9999 final": CELLAR holds no work under that number',
+      ],
+      [
+        'a procedure CELLAR holds no dossier for',
+        '2021/2040(INI)',
+        'procedure "2021/2040(INI)": CELLAR holds no such procedure',
+      ],
+      [
+        'a procedure with no initiating act',
+        '2021/0053(COD)',
+        'procedure "2021/0053(COD)": CELLAR records no initiating act with a CELEX for that procedure',
+      ],
+      [
+        'a lettered procedure with no initiating act',
+        '2022/132A(COD)',
+        'procedure "2022/132A(COD)" (read as 2022/0132A(COD)): CELLAR records no initiating act with a CELEX for that procedure',
+      ],
+    ])('returns found: false with the notice for %s', async (_label, identifier, reason) => {
+      const { result, structured, text, queries } = await lookup(identifier);
+
+      expect(result.isError).toBeFalsy();
+      expect(Object.keys(structured).sort()).toEqual(['found', 'notice']);
+      const notice = String(structured.notice);
+      expect(notice).toContain(`No CELLAR work matches ${reason}.`);
+      expect(notice).toContain('"COM(2021) 206 final"');
+      expect(notice).toContain('"2021/0106(COD)"');
+      expect(notice).toContain('eurlex_search_documents with keyword');
+      expect(readCommonMark(text)).toContain(notice);
+      expect(queries).toHaveLength(1);
+    });
+
+    it('sends the typed reference literals, never the procedure alias', async () => {
+      const { queries } = await lookup('2021/106 (COD)');
+
+      expect(queries[0]).toContain(
+        'VALUES ?reference { "2021/0106/COD"^^xsd:string "2021/0106(COD)"^^xsd:string }',
+      );
+      expect(queries[0]).not.toContain('resource/procedure');
+    });
+
+    it('names the Commission document and procedure forms in the ambiguous_identifier recovery', async () => {
+      const { structured } = await lookup('C(2021) 4500 final');
+      const hint =
+        (structured.error?.data as { recovery?: { hint?: string } } | undefined)?.recovery?.hint ??
+        '';
+
+      expect(structured.error?.data?.reason).toBe('ambiguous_identifier');
+      expect(hint).toContain('"COM(2021) 206 final"');
+      expect(hint).toContain('"2021/0106(COD)"');
     });
   });
 
@@ -1696,15 +2037,6 @@ describe('eurlex_lookup_celex CELLAR failures', () => {
           retryable: false,
         }),
     ],
-    [
-      'sparql_timeout',
-      JsonRpcErrorCode.ServiceUnavailable,
-      () =>
-        serviceUnavailable('CELLAR SPARQL query timed out on Virtuoso', {
-          reason: 'sparql_timeout',
-          retryable: false,
-        }),
-    ],
   ])('fails %s with recovery naming identifier_type', async (reason, code, failure) => {
     mockQuery.mockRejectedValue(failure());
 
@@ -1723,5 +2055,70 @@ describe('eurlex_lookup_celex CELLAR failures', () => {
     expect(hint).toBe(eurlex_lookup_celex.errors?.find((e) => e.reason === reason)?.recovery);
     const text = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
     expect(text).toContain(hint);
+  });
+});
+
+// --- #177: a timeout is retryable, and identifier_type "celex" is offered only to another form ---
+
+describe('eurlex_lookup_celex sparql_timeout recovery (#177)', () => {
+  const CONTRACT = eurlex_lookup_celex.errors?.find((e) => e.reason === 'sparql_timeout')?.recovery;
+  const CELEX_ALTERNATIVE =
+    ' When you know its CELEX, pass it with identifier_type "celex" for a single exact-match query.';
+  const BUDGET_SPENT = 'CELLAR SPARQL queries for this request ran past the time budget they share';
+  const budgetSpent = () =>
+    serviceUnavailable(BUDGET_SPENT, { reason: 'sparql_timeout', retryable: true });
+
+  beforeEach(() => {
+    mockQuery.mockReset();
+  });
+
+  /** The wire error data and content[] text of one lookup. */
+  async function timedOut(identifier: string) {
+    const result = await runToolContract(eurlex_lookup_celex, { identifier });
+    expect(result.isError).toBe(true);
+    const error = (
+      result.structuredContent as {
+        error: { data: { reason: string; retryable?: boolean; recovery?: { hint?: string } } };
+      }
+    ).error;
+    const text = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+    return { data: error.data, text };
+  }
+
+  it.each([
+    ['a CELEX', '32016R0679', ''],
+    ['an OJ citation, looked up as the CELEX it names', 'Regulation (EU) 2016/679', ''],
+    ['an ELI', 'http://data.europa.eu/eli/reg/2016/679', CELEX_ALTERNATIVE],
+    ['an ECLI', 'ECLI:EU:C:2014:317', CELEX_ALTERNATIVE],
+    ['an Official Journal reference', 'OJ L 119, 4.5.2016, p. 1', CELEX_ALTERNATIVE],
+    ['a Commission document number', 'COM(2021) 206 final', CELEX_ALTERNATIVE],
+  ])('answers %s', async (_label, identifier, alternative) => {
+    mockQuery.mockRejectedValue(budgetSpent());
+
+    const { data, text } = await timedOut(identifier);
+
+    expect(data).toMatchObject({ reason: 'sparql_timeout', retryable: true });
+    expect(data.recovery?.hint).toBe(`${CONTRACT}${alternative}`);
+    expect(text).toContain(`Recovery: ${CONTRACT}${alternative}`);
+    expect(text.trimEnd().endsWith('(reason sparql_timeout · retryable)')).toBe(true);
+  });
+
+  it('never offers identifier_type in the hint every caller receives', () => {
+    expect(CONTRACT).not.toContain('identifier_type');
+  });
+
+  it('keeps the contract recovery for the CELEX query an ECLI resolves to', async () => {
+    // The ECLI's only row is not the CELEX's canonical work, so its CELEX is looked up next.
+    mockQuery.mockImplementation((query: string) =>
+      query.includes('VALUES ?ecli')
+        ? Promise.resolve([makeBinding('62012CJ0131', { ecli: 'ECLI:EU:C:2014:317' })])
+        : Promise.reject(budgetSpent()),
+    );
+
+    const { data } = await timedOut('ECLI:EU:C:2014:317');
+
+    expect(mockQuery).toHaveBeenCalledTimes(2);
+    expect(data).toMatchObject({ reason: 'sparql_timeout', retryable: true });
+    expect(data.recovery?.hint).toBe(CONTRACT);
   });
 });

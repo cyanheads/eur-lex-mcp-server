@@ -199,13 +199,22 @@ function datedRow(opts: {
   };
 }
 
-/** The relation page queries sent: no CELEX resolution, source lookup, or provisions follow-up. */
+/** The per-member-state transposition count: one grouped query beside a first page (#182). */
+const isSummaryQuery = (q: string) => q.includes('GROUP BY ?memberState');
+
+/**
+ * The relation page queries sent: no CELEX resolution, source lookup, provisions
+ * follow-up, or transposition summary.
+ */
 const pageQueries = () =>
   mockQuery.mock.calls
     .map((c) => c[0] as string)
     .filter(
       (q) =>
-        !isResolutionQuery(q) && !q.includes('SELECT ?sourceCelex WHERE') && !isProvisionsQuery(q),
+        !isResolutionQuery(q) &&
+        !q.includes('SELECT ?sourceCelex WHERE') &&
+        !isProvisionsQuery(q) &&
+        !isSummaryQuery(q),
     );
 
 /** Every text block of a tool result's content[], joined. */
@@ -230,42 +239,80 @@ describe('eurlex_get_relations', () => {
 
   // --- Happy path ---
 
-  it(
-    'cuts a page of 100 long titles to the budget within its CPU bound',
-    async () => {
-      const title = 'Whole ruling 😀 *quoted* [x](y)\\\n'.repeat(300);
-      const rows = Array.from({ length: 100 }, (_, i) => ({
-        ...makeRelationBinding({
-          relatedWork: `http://example.test/long-${i}`,
-          direction: 'incoming',
-        }),
-        relatedTitleMax: { type: 'literal', value: title },
-      }));
-      mockQuery.mockImplementation(async (q: string) => {
-        const clause = pagingClauses(q)[0];
-        if (!clause) throw new Error('Expected relation paging clause');
-        return q.includes('cdm:work_cites_work')
-          ? rows.slice(clause.offset, clause.offset + clause.limit)
-          : [];
-      });
-      const call = () =>
-        runToolContract(eurlex_get_relations, {
-          work_uri: GDPR_WORK_URI,
-          relation_types: ['cites'],
-        });
-      const result = await call();
-      const page = result.structuredContent as { total: number; has_more: boolean };
-      // The cut ran: far fewer than the 100 fetched rows fit 64,000 bytes.
-      expect(page.has_more).toBe(true);
-      expect(page.total).toBeLessThan(10);
-      expect(Buffer.byteLength(JSON.stringify(result.content), 'utf8')).toBeLessThanOrEqual(64000);
-      const cpu = await bestCpuMs(call, 3);
-      expect(cpu, `budget cut over 100 long titles: ${cpu} ms CPU`).toBeLessThan(600);
-    },
-    CPU_TIMED_TEST_TIMEOUT_MS,
-  );
+  // --- #183: limit is the only page boundary ---
 
-  it('walks a finite multi-direction budgeted graph without skips or repeated exhausted arms', async () => {
+  /** The continuation-only notice of a page with more rows. */
+  const continueAt = (offset: number) =>
+    `At least one relation type or direction has more related works; call again with offset=${offset}.`;
+
+  it('serves 10 rows per type and direction by default and continues at offset 10 (#183)', async () => {
+    const related = (type: string, direction: 'outgoing' | 'incoming') =>
+      Array.from({ length: 30 }, (_, i) =>
+        makeRelationBinding({ relatedWork: `${CELLAR}${type}-${direction}-${i}`, direction }),
+      );
+    mockQuery.mockImplementation(
+      routeQuery({
+        resolve: [makeResolveBinding(GDPR_WORK_URI)],
+        cites: [...related('cites', 'outgoing'), ...related('cites', 'incoming')],
+        interpretedBy: related('ruling', 'incoming'),
+      }),
+    );
+    expect(eurlex_get_relations.input.parse({ celex_number: '32016R0679' }).limit).toBe(10);
+
+    const result = await runToolContract(eurlex_get_relations, { celex_number: '32016R0679' });
+
+    const page = eurlex_get_relations.output.parse(result.structuredContent);
+    const arm = (type: string, direction: string) =>
+      page.relations.filter((r) => r.relation_type === type && r.direction === direction);
+    expect(arm('cites', 'outgoing')).toHaveLength(10);
+    expect(arm('cites', 'incoming')).toHaveLength(10);
+    expect(arm('interpreted_by', 'incoming')).toHaveLength(10);
+    expect(result.structuredContent).toMatchObject({
+      total: 30,
+      has_more: true,
+      next_offset: 10,
+      truncated: true,
+      shown: 30,
+      cap: 10,
+      notice: continueAt(10),
+    });
+    // Each paged subquery asks for the page plus its sentinel row.
+    const clauses = pageQueries().flatMap(pagingClauses);
+    expect(clauses.length).toBeGreaterThan(0);
+    for (const clause of clauses) expect(clause).toEqual({ limit: 11, offset: 0 });
+    expect(contentText(result)).toContain('**Next offset:** 10');
+  });
+
+  it('returns every requested row whole, however long its title, with no response-size cut (#183)', async () => {
+    const title = 'Whole ruling 😀 *quoted* [x](y)\\\n'.repeat(300);
+    mockQuery.mockImplementation(
+      routeQuery({
+        cites: Array.from({ length: 101 }, (_, i) => ({
+          ...makeRelationBinding({
+            relatedWork: `http://example.test/long-${i}`,
+            direction: 'incoming',
+          }),
+          relatedTitleMax: { type: 'literal', value: title },
+        })),
+      }),
+    );
+
+    const result = await runToolContract(eurlex_get_relations, {
+      work_uri: GDPR_WORK_URI,
+      relation_types: ['cites'],
+      limit: 100,
+    });
+
+    const page = eurlex_get_relations.output.parse(result.structuredContent);
+    expect(page).toMatchObject({ total: 100, has_more: true, next_offset: 100 });
+    expect(page.relations.every((r) => r.related_title === title)).toBe(true);
+    expect(result.structuredContent).toMatchObject({ cap: 100, notice: continueAt(100) });
+    // Every title reads back whole from content[], though the page runs past 640,000 bytes.
+    expect(readCommonMark(contentText(result)).split(title)).toHaveLength(101);
+    expect(Buffer.byteLength(JSON.stringify(result.content), 'utf8')).toBeGreaterThan(640_000);
+  });
+
+  it('walks a multi-direction graph to exhaustion at the default limit without skips or repeats (#183)', async () => {
     const title = 'Whole ruling 😀 "quoted"\\\n'.repeat(300);
     const incoming = Array.from({ length: 47 }, (_, i) => ({
       ...makeRelationBinding({
@@ -297,19 +344,18 @@ describe('eurlex_get_relations', () => {
         relations: { direction: string; related_work_uri: string }[];
         next_offset?: number;
         has_more: boolean;
+        cap?: number;
       };
       expect(result.isError).not.toBe(true);
-      expect(
-        Buffer.byteLength(JSON.stringify(result.structuredContent), 'utf8'),
-      ).toBeLessThanOrEqual(64000);
-      expect(Buffer.byteLength(JSON.stringify(result.content), 'utf8')).toBeLessThanOrEqual(64000);
       actual.push(...page.relations.map((row) => `${row.direction}:${row.related_work_uri}`));
       if (!page.has_more) break;
-      expect(page.next_offset).toBeGreaterThan(offset);
+      expect(page.cap).toBe(10);
+      expect(page.next_offset).toBe(offset + 10);
       if (page.next_offset === undefined) throw new Error('Missing continuation offset');
       offset = page.next_offset;
       if (calls === 49) throw new Error('Traversal did not exhaust');
     }
+    expect(offset).toBe(40);
     const expected = [
       ...Array.from({ length: 47 }, (_, i) => `incoming:http://example.test/shared-${i}`),
       ...Array.from({ length: 3 }, (_, i) => `outgoing:http://example.test/shared-${i}`),
@@ -329,7 +375,7 @@ describe('eurlex_get_relations', () => {
     expect(exhausted.structuredContent).not.toHaveProperty('notice');
   });
 
-  it('returns an oversize depth-1 page whole with disclosure on both surfaces', async () => {
+  it('returns a single row of any size whole, with no notice (#183)', async () => {
     const title = '😀'.repeat(20_000);
     mockQuery.mockImplementation(
       routeQuery({
@@ -354,37 +400,11 @@ describe('eurlex_get_relations', () => {
       relations: [{ related_title: title }],
     });
     expect(result.structuredContent).not.toHaveProperty('next_offset');
+    expect(result.structuredContent).not.toHaveProperty('notice');
     expect(contentText(result)).toContain(title);
-    expect(contentText(result)).toContain('applied limit 1; 0 rows withheld');
-    expect(contentText(result)).toContain('minimum depth of 1');
   });
 
-  it('keeps continuation after a budget cut before the sort-window boundary', async () => {
-    const title = 'é'.repeat(3000);
-    mockQuery.mockImplementation(
-      routeQuery({
-        basisFor: Array.from({ length: 50 }, (_, i) => ({
-          ...makeRelationBinding({
-            relatedWork: `http://example.test/${i}`,
-            direction: 'incoming',
-          }),
-          relatedTitleMax: { type: 'literal', value: title },
-        })),
-      }),
-    );
-    const result = await runToolContract(eurlex_get_relations, {
-      work_uri: GDPR_WORK_URI,
-      relation_types: ['basis_for'],
-      offset: 9950,
-    });
-    const page = result.structuredContent as { next_offset: number; cap: number; notice: string };
-    expect(page.next_offset).toBe(9950 + page.cap);
-    expect(page.next_offset).toBeLessThan(10000);
-    expect(page.notice).not.toContain('This page reaches row 10,000');
-    expect(contentText(result)).toContain(`offset=${page.next_offset}`);
-  });
-
-  it('budgets both complete UTF-8 surfaces and keeps a common whole-row depth', async () => {
+  it('serves an over-maximum limit at 100 per type and direction with every heavy row (#183)', async () => {
     const title = 'é漢😀"\\\n'.repeat(150);
     const rows = Array.from({ length: 101 }, (_, i) => ({
       ...makeRelationBinding({ relatedWork: `http://example.test/${i}`, direction: 'incoming' }),
@@ -404,28 +424,17 @@ describe('eurlex_get_relations', () => {
       limit: 1000,
     });
     expect(result.isError).not.toBe(true);
-    expect(Buffer.byteLength(JSON.stringify(result.structuredContent), 'utf8')).toBeLessThanOrEqual(
-      64000,
-    );
-    expect(Buffer.byteLength(JSON.stringify(result.content), 'utf8')).toBeLessThanOrEqual(64000);
-    const page = result.structuredContent as {
-      relations: { direction: string; related_title: string }[];
-      next_offset: number;
-      total: number;
-      notice: string;
-      cap: number;
-    };
-    expect(page.cap).toBeGreaterThan(0);
-    expect(page.cap).toBeLessThan(100);
-    expect(page.next_offset).toBe(page.cap);
-    expect(page.total).toBe(page.cap * 2);
-    expect(page.relations.filter((row) => row.direction === 'incoming')).toHaveLength(page.cap);
+    const page = eurlex_get_relations.output.parse(result.structuredContent);
+    expect(page).toMatchObject({ total: 200, has_more: true, next_offset: 100 });
+    expect(page.relations.filter((row) => row.direction === 'incoming')).toHaveLength(100);
     expect(page.relations.every((row) => row.related_title === title)).toBe(true);
-    // Every kept title reads back whole from content[], its backslashes and breaks escaped.
-    expect(readCommonMark(contentText(result)).split(title)).toHaveLength(page.total + 1);
-    expect(page.notice).toContain(`${200 - page.total} rows withheld`);
-    expect(page.notice).toContain('requested limit 1000');
-    expect(page.notice).toContain(`applied limit ${page.cap}`);
+    expect(result.structuredContent).toMatchObject({
+      cap: 100,
+      limit_clamp: { requested: 1000, applied: 100 },
+      notice: continueAt(100),
+    });
+    // Every title reads back whole from content[], its backslashes and breaks escaped.
+    expect(readCommonMark(contentText(result)).split(title)).toHaveLength(201);
     expect(result.structuredContent).toHaveProperty('empty_relation_types', ['amends']);
     expect(contentText(result)).toContain('**Limit clamped:** 1000 → 100');
   });
@@ -1394,8 +1403,8 @@ describe('eurlex_get_relations', () => {
     // Ordering fix: the newest related works land within the cap, not an arbitrary subset.
     expect(relSparql).toContain('ORDER BY DESC(?relatedDateMax)');
     expect(relSparql).toContain('cdm:work_date_document ?relatedDate');
-    expect(relSparql).toContain('LIMIT 101');
-    expect(relSparql).toContain('OFFSET 0');
+    // The default page of 10 plus its private sentinel row (#183).
+    expect(relSparql).toContain('LIMIT 11 OFFSET 0');
   });
 
   it('splits the per-direction cap for the symmetric cites relation (one LIMIT per direction)', async () => {
@@ -1681,6 +1690,7 @@ describe('eurlex_get_relations', () => {
     const input = eurlex_get_relations.input.parse({
       celex_number: '32016R0679',
       relation_types: ['cites', 'legal_basis'],
+      limit: 100,
     });
     const result = await eurlex_get_relations.handler(input, ctx);
 
@@ -1928,11 +1938,18 @@ describe('eurlex_get_relations', () => {
     });
     const result = await eurlex_get_relations.handler(input, ctx);
 
-    // Source identity + traversal; no CELEX→work lookup is needed.
-    expect(mockQuery).toHaveBeenCalledTimes(2);
-    expect(mockQuery.mock.calls.map((call) => call[0] as string)).toContainEqual(
-      expect.stringContaining('SELECT ?sourceCelex WHERE'),
-    );
+    // Source identity, traversal, and the first page's per-member-state count (#182);
+    // no CELEX→work lookup is needed.
+    expect(mockQuery).toHaveBeenCalledTimes(3);
+    const sent = mockQuery.mock.calls.map((call) => call[0] as string);
+    expect(sent.filter((q) => q.includes('SELECT ?sourceCelex WHERE'))).toHaveLength(1);
+    expect(sent.filter(isSummaryQuery)).toHaveLength(1);
+    expect(sent.some(isResolutionQuery)).toBe(false);
+    // The third query is the national_transposition page itself.
+    expect(pageQueries()).toEqual([
+      expect.stringContaining('cdm:measure_national_implementing_implements_resource_legal'),
+    ]);
+    expect(result.relations.map((r) => r.related_celex_number)).toEqual(['72016L0680CZE_225030']);
     // The resolved identity reaches structuredContent…
     expect(result.celex_number).toBe('32016L0680');
     expect(result.work_uri).toBe(DIRECTIVE_680_WORK_URI);
@@ -3112,6 +3129,55 @@ describe('eurlex_get_relations', () => {
       expect(text).toContain(`- ${undated} · An undated act\n`);
     });
 
+    it('reads CELLAR’s undated placeholder as no date, keeping the row where it sorted, on both surfaces (#184)', async () => {
+      const dated = `${CELLAR}dated-measure`;
+      const placeholder = `${CELLAR}placeholder-measure`;
+      const undated = `${CELLAR}undated-measure`;
+      mockQuery.mockImplementation(
+        routeQuery({
+          resolve: [makeResolveBinding(DIRECTIVE_680_WORK_URI)],
+          // Newest first as CELLAR sorts them: the placeholder after every real date,
+          // before the works with no date at all.
+          nationalTransposition: [
+            datedRow({
+              relatedWork: dated,
+              direction: 'incoming',
+              relatedCelex: '72016L0680BEL_100001',
+              date: '2018-12-05',
+            }),
+            datedRow({
+              relatedWork: placeholder,
+              direction: 'incoming',
+              relatedCelex: '72016L0680BEL_100002',
+              date: '1001-01-01',
+            }),
+            datedRow({
+              relatedWork: undated,
+              direction: 'incoming',
+              relatedCelex: '72016L0680BEL_100003',
+            }),
+          ],
+        }),
+      );
+
+      const result = await runToolContract(eurlex_get_relations, {
+        celex_number: '32016L0680',
+        relation_types: ['national_transposition'],
+      });
+
+      const structured = eurlex_get_relations.output.parse(result.structuredContent);
+      expect(structured.relations.map((r) => [r.related_work_uri, r.related_date])).toEqual([
+        [dated, '2018-12-05'],
+        [placeholder, undefined],
+        [undated, undefined],
+      ]);
+      expect(structured.relations[1]).not.toHaveProperty('related_date');
+      const text = contentText(result);
+      expect(text).toContain(`- 72016L0680BEL_100001 (${dated}) — member state BEL · 2018-12-05\n`);
+      expect(text).toContain(`- 72016L0680BEL_100002 (${placeholder}) — member state BEL\n`);
+      expect(text).not.toContain('1001-01-01');
+    });
+
     it('cuts a related date carrying a zone or time to its day, on both surfaces', async () => {
       mockQuery.mockImplementation(
         routeQuery({
@@ -3556,6 +3622,7 @@ describe('eurlex_get_relations', () => {
       const first = await runToolContract(eurlex_get_relations, {
         celex_number: '32004R0139',
         relation_types: ['basis_for'],
+        limit: 100,
       });
       const page1 = eurlex_get_relations.output.parse(first.structuredContent);
       expect(page1).toMatchObject({ total: 100, has_more: true, next_offset: 100 });
@@ -3565,6 +3632,7 @@ describe('eurlex_get_relations', () => {
       const second = await runToolContract(eurlex_get_relations, {
         celex_number: '32004R0139',
         relation_types: ['basis_for'],
+        limit: 100,
         offset: page1.next_offset,
       });
       const page2 = eurlex_get_relations.output.parse(second.structuredContent);
@@ -4131,13 +4199,13 @@ describe('eurlex_get_relations', () => {
       ).rejects.toThrow(TypeError);
     });
 
-    // --- the #160 budget, with provisions counted ---
+    // --- every provision rides its row (#183) ---
 
     /** `n` distinct compact designators of about 16 bytes each. */
     const designators = (n: number, prefix = 'AR') =>
       Array.from({ length: n }, (_, i) => `${prefix} ${i} PA ${i}`);
 
-    it('cuts the common depth first: provisions count toward the budget as part of their row', async () => {
+    it('carries every provision of every row at the limit asked for, with no notice (#183)', async () => {
       const rows = Array.from({ length: 10 }, (_, i) =>
         datedRow({
           relatedWork: `${CELLAR}amender-${i}`,
@@ -4149,7 +4217,7 @@ describe('eurlex_get_relations', () => {
         routeQuery({
           resolve: [makeResolveBinding(GDPR_WORK_URI)],
           amendedBy: rows,
-          // About 9 KB of provisions a row: ten rows overrun the budget, a few fit.
+          // About 9 KB of provisions a row, some 90 KB on the page.
           provisions: Object.fromEntries(
             rows.map((_, i) => [`${CELLAR}amender-${i}`, designators(600, `R${i}`)]),
           ),
@@ -4161,26 +4229,16 @@ describe('eurlex_get_relations', () => {
         relation_types: ['amended_by'],
       });
 
-      expect(
-        Buffer.byteLength(JSON.stringify(result.structuredContent), 'utf8'),
-      ).toBeLessThanOrEqual(64000);
-      expect(Buffer.byteLength(JSON.stringify(result.content), 'utf8')).toBeLessThanOrEqual(64000);
-      const page = result.structuredContent as {
-        relations: { provisions?: string[]; provisions_withheld?: number }[];
-        cap: number;
-        next_offset: number;
-        notice: string;
-      };
-      expect(page.cap).toBeGreaterThan(1);
-      expect(page.cap).toBeLessThan(10);
-      expect(page.next_offset).toBe(page.cap);
-      expect(page.relations).toHaveLength(page.cap);
+      const page = eurlex_get_relations.output.parse(result.structuredContent);
+      expect(page).toMatchObject({ total: 10, has_more: false });
       expect(page.relations.every((r) => r.provisions?.length === 600)).toBe(true);
-      expect(page.relations.some((r) => 'provisions_withheld' in r)).toBe(false);
-      expect(page.notice).not.toContain('Provisions withheld');
+      expect(result.structuredContent).not.toHaveProperty('notice');
+      expect(readCommonMark(contentText(result))).toContain(
+        `provisions: ${designators(600, 'R9').sort().join(', ')}`,
+      );
     });
 
-    it('withholds provisions whole, largest first, only once a depth-1 page still exceeds the budget', async () => {
+    it('carries both rows’ provisions whole across two directions, however many (#183)', async () => {
       mockQuery.mockImplementation(
         routeQuery({
           resolve: [makeResolveBinding(EASA_WORK_URI)],
@@ -4210,33 +4268,25 @@ describe('eurlex_get_relations', () => {
         relation_types: ['amends', 'amended_by'],
       });
 
-      expect(
-        Buffer.byteLength(JSON.stringify(result.structuredContent), 'utf8'),
-      ).toBeLessThanOrEqual(64000);
-      expect(Buffer.byteLength(JSON.stringify(result.content), 'utf8')).toBeLessThanOrEqual(64000);
       const structured = eurlex_get_relations.output.parse(result.structuredContent);
       expect(structured.relations).toEqual([
         expect.objectContaining({
           relation_type: 'amends',
           provisions: designators(1500, 'X').sort(),
         }),
-        expect.objectContaining({ relation_type: 'amended_by', provisions_withheld: 3000 }),
+        expect.objectContaining({
+          relation_type: 'amended_by',
+          provisions: designators(3000, 'Y').sort(),
+        }),
       ]);
-      expect(structured.relations[1]).not.toHaveProperty('provisions');
       expect(structured).toMatchObject({ has_more: false, total: 2 });
-      const notice = (result.structuredContent as { notice: string }).notice;
-      expect(notice).toContain(
-        'Provisions withheld whole to fit the response budget, largest first: amended_by 32024R1623 (3000). Each row keeps its count in provisions_withheld; name fewer relation_types to receive them.',
-      );
-      const text = contentText(result);
-      expect(text).toContain('- 32024R1623');
-      expect(text).toContain('  - provisions withheld: 3000');
-      expect(readCommonMark(text)).toContain(
-        `provisions: ${designators(1500, 'X').sort().join(', ')}`,
-      );
+      expect(result.structuredContent).not.toHaveProperty('notice');
+      const text = readCommonMark(contentText(result));
+      expect(text).toContain(`provisions: ${designators(1500, 'X').sort().join(', ')}`);
+      expect(text).toContain(`provisions: ${designators(3000, 'Y').sort().join(', ')}`);
     });
 
-    it('withholds every provision before the oversize depth-1 exception returns a page whole', async () => {
+    it('keeps the provisions of a lone row of any size, and no row field withholds them (#183)', async () => {
       const title = '😀'.repeat(20_000);
       mockQuery.mockImplementation(
         routeQuery({
@@ -4257,14 +4307,21 @@ describe('eurlex_get_relations', () => {
 
       expect(result.structuredContent).toMatchObject({
         total: 1,
-        relations: [{ related_title: title, provisions_withheld: 2 }],
+        relations: [{ related_title: title, provisions: ['A17P1LC', 'A17P1LD'] }],
       });
-      expect((result.structuredContent as { relations: object[] }).relations[0]).not.toHaveProperty(
+      expect(result.structuredContent).not.toHaveProperty('notice');
+      expect(contentText(result)).toContain('  - provisions: A17P1LC, A17P1LD');
+      // The row shape declares provisions alone: nothing advertises a withheld count.
+      expect(Object.keys(eurlex_get_relations.output.shape.relations.element.shape)).toEqual([
+        'relation_type',
+        'direction',
+        'related_work_uri',
+        'related_celex_number',
+        'related_member_state',
+        'related_date',
+        'related_title',
         'provisions',
-      );
-      const notice = (result.structuredContent as { notice: string }).notice;
-      expect(notice).toContain('minimum depth of 1');
-      expect(notice).toContain(`interpreted_by ${RULING('1')} (2)`);
+      ]);
     });
 
     // --- article ---
@@ -4431,6 +4488,7 @@ describe('eurlex_get_relations', () => {
         celex_number: '31977L0388',
         relation_types: ['interpreted_by'],
         article: '13',
+        limit: 100,
       });
       expect(first.structuredContent).toMatchObject({
         total: 100,
@@ -4442,6 +4500,7 @@ describe('eurlex_get_relations', () => {
         celex_number: '31977L0388',
         relation_types: ['interpreted_by'],
         article: '13',
+        limit: 100,
         offset: 9_900,
       });
       const notice = (last.structuredContent as { notice: string }).notice;
@@ -4590,7 +4649,12 @@ describe('eurlex_get_relations', () => {
       return { result, structured: eurlex_get_relations.output.parse(result.structuredContent) };
     };
 
-    const NIS2_ONLY = { celex_number: '32022L2555', relation_types: ['national_transposition'] };
+    // Every fixture state fits one page of 100 measures.
+    const NIS2_ONLY = {
+      celex_number: '32022L2555',
+      relation_types: ['national_transposition'],
+      limit: 100,
+    };
 
     it('returns only the named state’s measures, pushed into the pattern, on both surfaces', async () => {
       mockQuery.mockImplementation(cellar());
@@ -4819,11 +4883,15 @@ describe('eurlex_get_relations', () => {
         }),
       );
       mockQuery.mockImplementation(cellar({ cites }));
-      const without = await call({ celex_number: '32022L2555' });
+      const without = await call({ celex_number: '32022L2555', limit: 100 });
       const withoutQueries = mockQuery.mock.calls.map((c) => c[0] as string);
 
       mockQuery.mockClear();
-      const filtered = await call({ celex_number: '32022L2555', member_states: ['IRL'] });
+      const filtered = await call({
+        celex_number: '32022L2555',
+        member_states: ['IRL'],
+        limit: 100,
+      });
       const filteredQueries = mockQuery.mock.calls.map((c) => c[0] as string);
 
       const others = (r: { relation_type: string }) => r.relation_type !== 'national_transposition';
@@ -4854,6 +4922,7 @@ describe('eurlex_get_relations', () => {
         work_uri: NIS2_WORK_URI,
         relation_types: ['national_transposition'],
         member_states: ['DEU', 'FRA'],
+        limit: 100,
       });
 
       expect(byWorkUri.structured.relations).toHaveLength(35);
@@ -4903,6 +4972,499 @@ describe('eurlex_get_relations', () => {
       },
       CPU_TIMED_TEST_TIMEOUT_MS,
     );
+  });
+
+  // --- #182: national transposition counted per member state ---
+
+  describe('transposition_summary (#182)', () => {
+    const MEASURE_PREDICATE = 'cdm:measure_national_implementing_implements_resource_legal';
+    const NT = ['national_transposition'];
+    /** Every code a sector-7 CELEX carries: the 27 member states and the United Kingdom. */
+    const ALL_28 = [
+      'AUT',
+      'BEL',
+      'BGR',
+      'CYP',
+      'CZE',
+      'DEU',
+      'DNK',
+      'ESP',
+      'EST',
+      'FIN',
+      'FRA',
+      'GBR',
+      'GRC',
+      'HRV',
+      'HUN',
+      'IRL',
+      'ITA',
+      'LTU',
+      'LUX',
+      'LVA',
+      'MLT',
+      'NLD',
+      'POL',
+      'PRT',
+      'ROU',
+      'SVK',
+      'SVN',
+      'SWE',
+    ];
+    const CURRENT_27 = ALL_28.filter((code) => code !== 'GBR');
+
+    interface Measure {
+      celex: string;
+      date?: string;
+      work: string;
+    }
+    /**
+     * One act and its measures, `counts[state]` of them, each state's newest first:
+     * the state at position `s` dated `{2000+s}-02-28` and a day earlier per measure,
+     * unless `dated` names its one date (`undefined` for none).
+     */
+    const act = (
+      core: string,
+      counts: Record<string, number>,
+      dated: Record<string, string | undefined> = {},
+    ) => ({
+      work: `${CELLAR}act-${core}`,
+      measures: Object.entries(counts).flatMap(([state, n], s): Measure[] =>
+        Array.from({ length: n }, (_, i) => {
+          const date =
+            state in dated ? dated[state] : `${2000 + s}-02-${String(28 - i).padStart(2, '0')}`;
+          return {
+            work: `${CELLAR}${core}-${state}-${i}`,
+            celex: `7${core}${state}_${100000 + i}`,
+            ...(date ? { date } : {}),
+          };
+        }),
+      ),
+    });
+    const per = (codes: string[], n: (code: string) => number) =>
+      Object.fromEntries(codes.map((code) => [code, n(code)]));
+
+    // NIS2: 25 member states, none for ESP or IRL; DEU has 20 measures.
+    const NIS2 = act(
+      '2022L2555',
+      per(
+        ALL_28.filter((code) => !['ESP', 'GBR', 'IRL'].includes(code)),
+        (code) =>
+          new Map([
+            ['CZE', 27],
+            ['DEU', 20],
+            ['HUN', 4],
+          ]).get(code) ?? 2,
+      ),
+    );
+    // Directive 95/46/EC: 26 codes, the United Kingdom's among them, none for ITA or
+    // MLT; BEL's one measure carries CELLAR's undated placeholder.
+    const DPD = act(
+      '1995L0046',
+      per(
+        ALL_28.filter((code) => !['ITA', 'MLT'].includes(code)),
+        (code) => (code === 'BEL' ? 1 : 2),
+      ),
+      { BEL: '1001-01-01' },
+    );
+    // The Habitats Directive: one measure for every code.
+    const HABITATS = act(
+      '1992L0043',
+      per(ALL_28, () => 1),
+    );
+    // The European Arrest Warrant framework decision; FRA's measures carry no date.
+    const EAW = act('2002F0584', { DEU: 3, FRA: 2 }, { FRA: undefined });
+    // Directive (EU) 2016/680, newest first as CELLAR sorts its measures: AUT's mix a
+    // real date with the undated placeholder, BEL's carry the placeholder alone.
+    const POLICE: ReturnType<typeof act> = {
+      work: `${CELLAR}act-2016L0680`,
+      measures: [
+        ['AUT', '2018-05-06'],
+        ['AUT', '1001-01-01'],
+        ['BEL', '1001-01-01'],
+        ['BEL', '1001-01-01'],
+      ].map(([state, date], i) => ({
+        work: `${CELLAR}2016L0680-${state}-${i}`,
+        celex: `72016L0680${state}_${100000 + i}`,
+        date: date as string,
+      })),
+    };
+    const ACTS: Record<string, ReturnType<typeof act>> = {
+      '32022L2555': NIS2,
+      '31995L0046': DPD,
+      '31992L0043': HABITATS,
+      '32002F0584': EAW,
+      '32016L0680': POLICE,
+      // The GDPR: no national measures at all.
+      '32016R0679': act('2016R0679', {}),
+    };
+
+    /**
+     * CELLAR over these acts. A page query gets the measures its pushed REGEX
+     * matches, then its LIMIT and OFFSET; a count query gets the measures its REGEX
+     * matches grouped on the three letters after the act core its STRAFTER names,
+     * each group keyed by the IRI prefix its CONCAT names, in reverse code order — so
+     * the query the tool builds decides every count, and the tool decides the order.
+     * `onCount` replaces the count query's answer.
+     */
+    function cellar(onCount?: () => Row[]) {
+      return async (q: string): Promise<Row[]> => {
+        if (typeof q !== 'string') return [];
+        if (isResolutionQuery(q)) {
+          const [celex = ''] = requestedCelex(q);
+          const target = ACTS[celex];
+          return target ? resolveRowsFor(q, [makeResolveBinding(target.work)]) : [];
+        }
+        const [celex = '', target] =
+          Object.entries(ACTS).find(([, candidate]) => q.includes(`<${candidate.work}>`)) ?? [];
+        if (!target) return [];
+        if (q.includes('SELECT ?sourceCelex WHERE')) return [makeSourceCelexBinding(celex)];
+        if (!q.includes(MEASURE_PREDICATE)) return [];
+        const pattern = new RegExp(/REGEX\(STR\(\?\w+\), "([^"]+)"\)/.exec(q)?.[1] ?? '(?!)');
+        const matching = target.measures.filter((m) => pattern.test(m.celex));
+        if (isSummaryQuery(q)) {
+          if (onCount) return onCount();
+          const core = /STRAFTER\(STR\(\?celex\), "([^"]+)"\)/.exec(q)?.[1] ?? '';
+          const prefix = /CONCAT\("([^"]+)"/.exec(q)?.[1] ?? '';
+          const groups = new Map<string, Measure[]>();
+          for (const m of matching) {
+            const code = m.celex.slice(core.length, core.length + 3);
+            groups.set(code, [...(groups.get(code) ?? []), m]);
+          }
+          return [...groups].reverse().map(([code, members]) => {
+            const latest = members
+              .flatMap((m) => m.date ?? [])
+              .sort()
+              .at(-1);
+            return {
+              memberState: { type: 'uri', value: `${prefix}${code}` },
+              measures: { type: 'literal', value: String(members.length) },
+              ...(latest ? { latestDate: { type: 'literal', value: latest } } : {}),
+            };
+          });
+        }
+        const [clause] = pagingClauses(q);
+        const start = clause?.offset ?? 0;
+        return matching.slice(start, start + (clause?.limit ?? 0)).map((m) =>
+          datedRow({
+            relatedWork: m.work,
+            direction: 'incoming',
+            relatedCelex: m.celex,
+            ...(m.date ? { date: m.date } : {}),
+          }),
+        );
+      };
+    }
+
+    const countQueries = () =>
+      mockQuery.mock.calls.map((c) => c[0] as string).filter(isSummaryQuery);
+    const call = async (args: Record<string, unknown>) => {
+      const result = await runToolContract(eurlex_get_relations, args);
+      expect(result.isError).toBeFalsy();
+      return { result, structured: eurlex_get_relations.output.parse(result.structuredContent) };
+    };
+    const WITHOUT_LABEL =
+      '**Member states without measures** (none recorded in CELLAR, which is not proof of non-transposition; the default 27 are listed whatever date each joined):';
+
+    it('counts every measure per member state and names the states with none, on both surfaces', async () => {
+      mockQuery.mockImplementation(cellar());
+
+      const { result, structured } = await call({ celex_number: '32022L2555', relation_types: NT });
+
+      const summary = structured.transposition_summary;
+      expect(summary?.by_member_state.map((e) => e.member_state)).toEqual(
+        ALL_28.filter((code) => !['ESP', 'GBR', 'IRL'].includes(code)),
+      );
+      expect(summary?.by_member_state.reduce((sum, e) => sum + e.measures, 0)).toBe(
+        NIS2.measures.length,
+      );
+      // One entry per state, however its measures' CELEX numbers run.
+      expect(summary?.by_member_state.filter((e) => e.member_state === 'CZE')).toEqual([
+        { member_state: 'CZE', measures: 27, latest_date: '2004-02-28' },
+      ]);
+      expect(summary?.by_member_state.filter((e) => e.member_state === 'HUN')).toEqual([
+        { member_state: 'HUN', measures: 4, latest_date: '2012-02-28' },
+      ]);
+      expect(summary?.member_states_without_measures).toEqual(['ESP', 'IRL']);
+      // The page keeps its own limit, and its total leaves the count out.
+      expect(structured).toMatchObject({ total: 10, has_more: true, next_offset: 10 });
+
+      const text = contentText(result);
+      expect(text).toContain(
+        '### National transposition by member state\n- AUT: 2 measures, latest 2000-02-28\n',
+      );
+      expect(text).toContain('- CZE: 27 measures, latest 2004-02-28\n');
+      expect(text.match(/^- [A-Z]{3}: \d+ measures?/gm)).toHaveLength(25);
+      expect(text).toContain(`\n\n${WITHOUT_LABEL} ESP, IRL\n`);
+      expect(text.indexOf('### National transposition by member state')).toBeLessThan(
+        text.indexOf('### national_transposition (incoming)'),
+      );
+    });
+
+    it('counts what member_states pages through: each entry’s measures and latest date match its rows', async () => {
+      mockQuery.mockImplementation(cellar());
+      const { structured: all } = await call({ celex_number: '32022L2555', relation_types: NT });
+      expect(all.transposition_summary?.by_member_state).toContainEqual({
+        member_state: 'DEU',
+        measures: 20,
+        latest_date: '2005-02-28',
+      });
+
+      for (const code of ['DEU', 'CZE', 'AUT']) {
+        const entry = all.transposition_summary?.by_member_state.find(
+          (e) => e.member_state === code,
+        );
+        const { structured } = await call({
+          celex_number: '32022L2555',
+          relation_types: NT,
+          member_states: [code],
+          limit: 100,
+        });
+        expect(structured.relations).toHaveLength(entry?.measures ?? -1);
+        expect(structured.relations[0]?.related_date).toBe(entry?.latest_date);
+        expect(structured.transposition_summary).toEqual({
+          by_member_state: [entry],
+          member_states_without_measures: [],
+        });
+      }
+    });
+
+    it.each([
+      [['FRA'], '(FRA)', ['FRA'], []],
+      [['de', 'IE', 'ESP', 'UK'], '(DEU|IRL|ESP|GBR)', ['DEU'], ['ESP', 'GBR', 'IRL']],
+    ])('scopes the count to member_states %j', async (states, alternation, listed, without) => {
+      mockQuery.mockImplementation(cellar());
+
+      const { structured } = await call({
+        celex_number: '32022L2555',
+        relation_types: NT,
+        member_states: states,
+      });
+
+      expect(structured.transposition_summary?.by_member_state.map((e) => e.member_state)).toEqual(
+        listed,
+      );
+      expect(structured.transposition_summary?.member_states_without_measures).toEqual(without);
+      expect(countQueries()[0]).toContain(`REGEX(STR(?celex), "^72022L2555${alternation}")`);
+    });
+
+    it('lists the United Kingdom where it has measures and never as missing, singular counts included', async () => {
+      mockQuery.mockImplementation(cellar());
+
+      const dpd = await call({ celex_number: '31995L0046', relation_types: NT });
+      const dpdSummary = dpd.structured.transposition_summary;
+      expect(dpdSummary?.by_member_state).toHaveLength(26);
+      expect(dpdSummary?.by_member_state.map((e) => e.member_state)).toContain('GBR');
+      expect(dpdSummary?.member_states_without_measures).toEqual(['ITA', 'MLT']);
+      // BEL's one measure carries CELLAR's undated placeholder: it counts, with no latest date (#184).
+      expect(dpdSummary?.by_member_state).toContainEqual({ member_state: 'BEL', measures: 1 });
+      expect(contentText(dpd.result)).toContain('- BEL: 1 measure\n');
+      expect(contentText(dpd.result)).not.toContain('1001-01-01');
+
+      const habitats = await call({ celex_number: '31992L0043', relation_types: NT });
+      expect(
+        habitats.structured.transposition_summary?.by_member_state.map((e) => e.member_state),
+      ).toEqual(ALL_28);
+      expect(habitats.structured.transposition_summary?.member_states_without_measures).toEqual([]);
+      expect(contentText(habitats.result)).toContain(`${WITHOUT_LABEL} none\n`);
+    });
+
+    it('counts a framework decision’s measures too, with no latest date for a state whose measures carry none', async () => {
+      mockQuery.mockImplementation(cellar());
+
+      const { result, structured } = await call({ celex_number: '32002F0584', relation_types: NT });
+
+      expect(structured.transposition_summary).toEqual({
+        by_member_state: [
+          { member_state: 'DEU', measures: 3, latest_date: '2000-02-28' },
+          { member_state: 'FRA', measures: 2 },
+        ],
+        member_states_without_measures: CURRENT_27.filter((code) => !['DEU', 'FRA'].includes(code)),
+      });
+      const text = contentText(result);
+      expect(text).toContain('- DEU: 3 measures, latest 2000-02-28\n');
+      expect(text).toContain('- FRA: 2 measures\n');
+    });
+
+    it('takes latest_date from real dates alone, beside a placeholder or omitted with only placeholders, as rows read them (#184)', async () => {
+      mockQuery.mockImplementation(cellar());
+
+      const { result, structured } = await call({ celex_number: '32016L0680', relation_types: NT });
+
+      expect(structured.transposition_summary?.by_member_state).toEqual([
+        { member_state: 'AUT', measures: 2, latest_date: '2018-05-06' },
+        { member_state: 'BEL', measures: 2 },
+      ]);
+      const text = contentText(result);
+      expect(text).toContain('- AUT: 2 measures, latest 2018-05-06\n');
+      expect(text).toContain('- BEL: 2 measures\n');
+      expect(text).not.toContain('1001-01-01');
+
+      // Each entry's latest_date is the related_date of its first row under member_states.
+      const aut = await call({
+        celex_number: '32016L0680',
+        relation_types: NT,
+        member_states: ['AUT'],
+      });
+      expect(aut.structured.relations.map((r) => r.related_date)).toEqual([
+        '2018-05-06',
+        undefined,
+      ]);
+      const bel = await call({
+        celex_number: '32016L0680',
+        relation_types: NT,
+        member_states: ['BEL'],
+      });
+      expect(bel.structured.relations.map((r) => r.related_date)).toEqual([undefined, undefined]);
+      expect(bel.structured.transposition_summary?.by_member_state).toEqual([
+        { member_state: 'BEL', measures: 2 },
+      ]);
+    });
+
+    it('returns no count when no member state in scope has a measure, keeping the notice that names the filter', async () => {
+      mockQuery.mockImplementation(cellar());
+
+      const { result, structured } = await call({
+        celex_number: '32022L2555',
+        relation_types: NT,
+        member_states: ['IRL'],
+      });
+
+      expect(countQueries()).toHaveLength(1);
+      expect(structured).not.toHaveProperty('transposition_summary');
+      expect((result.structuredContent as { notice?: string }).notice).toContain(
+        'No national_transposition measures of IRL were found for 32022L2555.',
+      );
+      expect(contentText(result)).not.toContain('National transposition by member state');
+    });
+
+    it('returns no count for an act with no measures, whether relation_types is omitted or names national_transposition', async () => {
+      mockQuery.mockImplementation(cellar());
+
+      for (const args of [
+        { celex_number: '32016R0679' },
+        { celex_number: '32016R0679', relation_types: NT },
+      ]) {
+        mockQuery.mockClear();
+        const { structured } = await call(args);
+        expect(countQueries()).toHaveLength(1);
+        expect(structured).not.toHaveProperty('transposition_summary');
+      }
+    });
+
+    it.each([
+      ['a later page', { celex_number: '32022L2555', relation_types: NT, offset: 10 }],
+      [
+        'relation_types without national_transposition',
+        { celex_number: '32022L2555', relation_types: ['cites'] },
+      ],
+    ])('sends no count query and returns no count on %s', async (_, args) => {
+      mockQuery.mockImplementation(cellar());
+
+      const { structured } = await call(args);
+
+      expect(countQueries()).toEqual([]);
+      expect(structured).not.toHaveProperty('transposition_summary');
+    });
+
+    it('sends no count query for a work_uri whose work carries several CELEX numbers', async () => {
+      mockQuery.mockImplementation(
+        routeQuery({
+          sourceCelex: [
+            makeSourceCelexBinding('72016L0680DEU_100000'),
+            makeSourceCelexBinding('72022L2555DEU_100000'),
+          ],
+        }),
+      );
+
+      const { structured } = await call({ work_uri: `${CELLAR}measure`, relation_types: NT });
+
+      expect(countQueries()).toEqual([]);
+      expect(structured).not.toHaveProperty('transposition_summary');
+      expect(structured).not.toHaveProperty('celex_number');
+    });
+
+    it('keys each group on an IRI, never a computed string, and sends the count beside the page query', async () => {
+      const route = cellar();
+      let pagesInFlight = 0;
+      let pagesInFlightAtCount: number | undefined;
+      mockQuery.mockImplementation(async (q: string) => {
+        if (isSummaryQuery(q)) pagesInFlightAtCount = pagesInFlight;
+        if (!q.includes(MEASURE_PREDICATE) || isSummaryQuery(q)) return route(q);
+        pagesInFlight++;
+        await new Promise((resolve) => setImmediate(resolve));
+        pagesInFlight--;
+        return route(q);
+      });
+
+      await call({ celex_number: '32022L2555', relation_types: NT });
+
+      // Sent while the page query was still open, not after it settled.
+      expect(pagesInFlightAtCount).toBe(1);
+      const [count = ''] = countQueries();
+      expect(count).toContain(`?measure ${MEASURE_PREDICATE} <${NIS2.work}> .`);
+      expect(count).toContain('FILTER(REGEX(STR(?celex), "^72022L2555[A-Z]{3}"))');
+      expect(count).toContain(
+        'BIND(IRI(CONCAT("urn:member-state:", SUBSTR(STRAFTER(STR(?celex), "72022L2555"), 1, 3))) AS ?memberState)',
+      );
+      expect(count).toContain(
+        'SELECT ?memberState (COUNT(DISTINCT ?measure) AS ?measures) (MAX(STR(?date)) AS ?latestDate)',
+      );
+      expect(count).toMatch(/GROUP BY \?memberState$/);
+      expect(count).not.toMatch(/LIMIT|OFFSET/);
+    });
+
+    it('serves the page without the count, and says so, when CELLAR fails the count query', async () => {
+      mockQuery.mockImplementation(
+        cellar(() => {
+          throw serviceUnavailable('CELLAR SPARQL query timed out on Virtuoso', {
+            reason: 'sparql_timeout',
+            retryable: false,
+          });
+        }),
+      );
+
+      const { result, structured } = await call({ celex_number: '32022L2555', relation_types: NT });
+
+      expect(structured).not.toHaveProperty('transposition_summary');
+      expect(structured.relations).toHaveLength(10);
+      const notice = (result.structuredContent as { notice?: string }).notice;
+      expect(notice).toBe(
+        'CELLAR did not return the per-member-state count of national_transposition measures, so this page carries no transposition_summary. Call again to retry. At least one relation type or direction has more related works; call again with offset=10.',
+      );
+      expect(contentText(result)).toContain(`> ${notice}`);
+    });
+
+    it('ends the call on cancellation during the count, and on a failure that is not CELLAR’s', async () => {
+      const controller = new AbortController();
+      mockQuery.mockImplementation(
+        cellar(() => {
+          controller.abort();
+          throw serviceUnavailable('CELLAR SPARQL request aborted', { reason: 'sparql_timeout' });
+        }),
+      );
+      const input = eurlex_get_relations.input.parse({
+        celex_number: '32022L2555',
+        relation_types: NT,
+      });
+      await expect(
+        eurlex_get_relations.handler(
+          input,
+          createMockContext({ errors: eurlex_get_relations.errors, signal: controller.signal }),
+        ),
+      ).rejects.toThrow('aborted');
+
+      mockQuery.mockImplementation(
+        cellar(() => {
+          throw new TypeError('bindings is not iterable');
+        }),
+      );
+      await expect(
+        eurlex_get_relations.handler(
+          input,
+          createMockContext({ errors: eurlex_get_relations.errors }),
+        ),
+      ).rejects.toThrow(TypeError);
+    });
   });
 });
 
@@ -4968,8 +5530,9 @@ describe('eurlex_get_relations CELLAR sort window (#154)', () => {
   const relationQueries = () =>
     mockQuery.mock.calls.map((c) => c[0] as string).filter((q) => !isResolutionQuery(q));
 
+  // A page of 100 meets the window's edge at offsets 9,900 and up.
   const call = (args: Record<string, unknown>) =>
-    runToolContract(eurlex_get_relations, { celex_number: '32004R0139', ...args });
+    runToolContract(eurlex_get_relations, { celex_number: '32004R0139', limit: 100, ...args });
 
   it('keeps the sentinel while the page and its sentinel fit (offset 9,899)', async () => {
     mockQuery.mockImplementation(windowedRelations({ basis_for: { incoming: 14_567 } }));
@@ -5067,6 +5630,33 @@ describe('eurlex_get_relations CELLAR sort window (#154)', () => {
     const continuation = `SELECT ?work ?celex WHERE { ?work cdm:resource_legal_based_on_resource_legal <${MERGER_WORK_URI}> . OPTIONAL { ?work cdm:resource_legal_id_celex ?celex } FILTER NOT EXISTS { ?work cdm:work_date_document ?date } } ORDER BY ?work`;
     expect(notice).toContain(`basis_for (incoming): ${continuation}`);
     expect(notice).not.toContain('xsd:date');
+    expect(readCommonMark(contentText(result))).toContain(continuation);
+  });
+
+  it('continues a window end among placeholder-dated works through them, reporting no date (#184)', async () => {
+    const route = windowedRelations({ basis_for: { incoming: 14_567 } });
+    mockQuery.mockImplementation(async (q: string) =>
+      (await route(q)).map((row) =>
+        row.relatedDateMax
+          ? { ...row, relatedDateMax: { type: 'literal', value: '1001-01-01' } }
+          : row,
+      ),
+    );
+
+    const result = await call({ relation_types: ['basis_for'], offset: 9_900 });
+
+    const structured = result.structuredContent as Record<string, unknown>;
+    expect(structured).toMatchObject({ total: 100, has_more: false });
+    expect(
+      (structured.relations as { related_date?: string }[]).every((r) => !r.related_date),
+    ).toBe(true);
+    const notice = structured.notice as string;
+    expect(notice).toContain('basis_for (incoming), ending among works with no date');
+    expect(notice).not.toContain('last related_date');
+    // Bounded by the placeholder the page sorted on: the undated-works continuation
+    // would skip every placeholder-dated work past row 10,000.
+    const continuation = `SELECT ?work ?celex ?date WHERE { ?work cdm:resource_legal_based_on_resource_legal <${MERGER_WORK_URI}> . ?work cdm:work_date_document ?date . OPTIONAL { ?work cdm:resource_legal_id_celex ?celex } FILTER(?date <= "1001-01-01"^^xsd:date) } ORDER BY DESC(?date) ?work`;
+    expect(notice).toContain(`basis_for (incoming): ${continuation}`);
     expect(readCommonMark(contentText(result))).toContain(continuation);
   });
 

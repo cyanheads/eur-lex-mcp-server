@@ -231,12 +231,15 @@ src/
     cellar-sparql/
       cellar-sparql-service.ts          # CELLAR SPARQL POST client, binding mapper, LIMIT enforcement, per-call query budget
       act-citation.ts                   # ELI, Official Journal reference, typed dates of effect, transposition deadlines of an act
-      cdm-labels.ts                     # CDM authority URI → label maps, case-law title parser
+      case-law-facts.ts                 # Countries, procedure types, subjects, and procedure languages of a case-law work
+      cdm-labels.ts                     # CDM authority URI → label maps, case-law procedure/outcome tables and subject matcher, case-law title parser
       eli-resolution.ts                 # ELI → work resolution, CELEX/ELI/work-URI normalizers, case-number grammar, SPARQL-safety and input-validity primitives
       keyword-match.ts                  # Keyword title phrase and CELEX arm by keyword shape
+      legislative-procedures.ts         # Interinstitutional procedures of an act: reference, status, withdrawal date, and the acts produced
       oj-reference.ts                   # Official Journal reference parser and resolution to the act's CELEX
-      relation-traversal.ts             # Relation-type model and paged per-type traversal
-      sort-window.ts                    # CELLAR's 10,000-row sort window (page sizing, window-end reading) and the date_to-only date floor
+      preparatory-reference.ts          # Commission document number and procedure reference parser and resolution to a CELEX
+      relation-traversal.ts             # Relation-type model, paged per-type traversal, and the per-member-state transposition count
+      sort-window.ts                    # CELLAR's 10,000-row sort window (page sizing, window-end reading), the date_to-only date floor, and the undated placeholder every date reader drops (cellarDate)
       work-agents.ts                    # Institutions and Advocates General of a work
       work-resolution.ts                # CELEX → canonical work resolution
       types.ts                          # SPARQL binding types
@@ -251,6 +254,7 @@ src/
       enum-input.ts                     # Case/separator-tolerant enum inputs (#143)
       limit-clamp.ts                    # limit_clamp enrichment: over-maximum limits served at the maximum (#151)
       markdown-render.ts                # Heading escaper and escaped-blockquote notice render for content[]
+      timeout-alternative.ts            # A sparql_timeout recovery extended with an input-dependent next move at the step it fits (#177)
     tools/definitions/
       eurlex-browse-subjects.tool.ts    # EuroVoc thesaurus search
       eurlex-get-cases.tool.ts          # CJEU/GC case law search

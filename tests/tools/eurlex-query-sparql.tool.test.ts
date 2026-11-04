@@ -3,7 +3,7 @@
  * @module tests/tools/eurlex-query-sparql.tool.test
  */
 
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_query_sparql } from '@/mcp-server/tools/definitions/eurlex-query-sparql.tool.js';
@@ -12,11 +12,16 @@ import { readCommonMark } from '../helpers/commonmark.js';
 // --- Service mock ---
 // The tool reads the projected SELECT variables (head.vars) via queryWithVars,
 // which returns { variables, bindings, limitEnforced } so the projection survives
-// an empty set and the LIMIT-ceiling decision is observable. maxResults mirrors
-// the real service ceiling (MAX_SPARQL_RESULTS).
+// an empty set and the LIMIT-ceiling decision is observable. maxResults and
+// timeoutMs mirror the real service's defaults (MAX_SPARQL_RESULTS,
+// SPARQL_QUERY_TIMEOUT_MS).
 const mockQueryWithVars = vi.fn();
 vi.mock('@/services/cellar-sparql/cellar-sparql-service.js', () => ({
-  getCellarSparqlService: () => ({ queryWithVars: mockQueryWithVars, maxResults: 100 }),
+  getCellarSparqlService: () => ({
+    queryWithVars: mockQueryWithVars,
+    maxResults: 100,
+    timeoutMs: 55_000,
+  }),
 }));
 
 /** `n` binding rows shaped like a CELLAR `?work` projection. */
@@ -1024,5 +1029,53 @@ describe('eurlex_query_sparql', () => {
         ].join('\n\n'),
       );
     });
+  });
+});
+
+// --- #177: a higher timeout_hint is offered only when one is accepted ---
+
+describe('eurlex_query_sparql sparql_timeout recovery (#177)', () => {
+  const CONTRACT = eurlex_query_sparql.errors?.find((e) => e.reason === 'sparql_timeout')?.recovery;
+  const QUERY = 'SELECT ?work WHERE { ?work ?p ?o }';
+
+  beforeEach(() => {
+    mockQueryWithVars.mockReset();
+    mockQueryWithVars.mockRejectedValue(
+      serviceUnavailable('CELLAR SPARQL request exceeded the 1000 ms client timeout', {
+        reason: 'sparql_timeout',
+        retryable: true,
+      }),
+    );
+  });
+
+  it.each([
+    [
+      'a timeout_hint below the most accepted',
+      1000,
+      ' Raising timeout_hint above the 1000 ms in effect, up to 55000, gives a query that ran past its timeout longer.',
+    ],
+    ['the most timeout_hint accepts', 55000, ''],
+    ['no timeout_hint, under the 55000 ms default', undefined, ''],
+  ])('answers %s', async (_label, timeout_hint, alternative) => {
+    const result = await runToolContract(eurlex_query_sparql, {
+      sparql_query: QUERY,
+      timeout_hint,
+    });
+
+    expect(result.isError).toBe(true);
+    const data = (
+      result.structuredContent as {
+        error: { data: { reason: string; retryable?: boolean; recovery?: { hint?: string } } };
+      }
+    ).error.data;
+    expect(data).toMatchObject({ reason: 'sparql_timeout', retryable: true });
+    expect(data.recovery?.hint).toBe(`${CONTRACT}${alternative}`);
+    const text = contentText(result);
+    expect(text).toContain(`Recovery: ${CONTRACT}${alternative}`);
+    expect(text.trimEnd().endsWith('(reason sparql_timeout · retryable)')).toBe(true);
+  });
+
+  it('never offers timeout_hint in the hint every caller receives', () => {
+    expect(CONTRACT).not.toContain('timeout_hint');
   });
 });

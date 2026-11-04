@@ -5,12 +5,37 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  cellarDate,
+  dateRangeFilters,
   isPastSortWindow,
   readWindowedPage,
   SORT_WINDOW,
+  UNDATED_PLACEHOLDER,
   windowEndRoute,
   windowedLimit,
 } from '@/services/cellar-sparql/sort-window.js';
+
+describe('CELLAR undated placeholder (#184)', () => {
+  it('is 1001-01-01, and the date_to-only floor sits below it', () => {
+    expect(UNDATED_PLACEHOLDER).toBe('1001-01-01');
+    expect(dateRangeFilters(undefined, '2020-12-31')[0]).toBe(
+      'FILTER(?date >= "1000-01-01"^^xsd:date)',
+    );
+  });
+
+  it.each([
+    ['1001-01-01', undefined],
+    ['1001-01-01+02:00', undefined],
+    ['1001-01-01T00:00:00', undefined],
+    ['1001-01-02', '1001-01-02'],
+    ['1000-12-31', '1000-12-31'],
+    ['2016-04-27', '2016-04-27'],
+    ['2016-04-27+02:00', '2016-04-27+02:00'],
+    [undefined, undefined],
+  ])('reports CELLAR date %j as %j', (value, reported) => {
+    expect(cellarDate(value)).toBe(reported);
+  });
+});
 
 describe('CELLAR sort window', () => {
   it('is 10,000 rows', () => {

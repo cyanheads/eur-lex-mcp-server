@@ -129,6 +129,61 @@ describe('parseOjReference', () => {
     });
   });
 
+  // #172: the spellings EUR-Lex act texts and the Court use for the same issue, date, and page.
+  it.each([
+    ['OJ No L 281, 23.11.1995, p. 31', 'OJ L 281, 23.11.1995, p. 31'],
+    ['OJ No. L 281, 23.11.1995, p. 31', 'OJ L 281, 23.11.1995, p. 31'],
+    ['oj no l 281, 23. 11. 1995, p. 31', 'OJ L 281, 23.11.1995, p. 31'],
+    ['OJ No L 281, 23. 11. 1995, p. 31.', 'OJ L 281, 23.11.1995, p. 31'],
+    ['(OJ No C 277, 5. 11. 1990, p. 3)', 'OJ C 277, 5.11.1990, p. 3'],
+    ['OJ No C 277, 5. 11. 1990, p. 3', 'OJ C 277, 5.11.1990, p. 3'],
+    ['OJ No 13, 21.2.1962, p. 204/62', 'OJ 13, 21.2.1962, p. 204/62'],
+    ['OJ L 281, 23. 11. 1995, p. 31', 'OJ L 281, 23.11.1995, p. 31'],
+    ['OJ L 281, 23.11.1995, p 31', 'OJ L 281, 23.11.1995, p. 31'],
+    ['OJ L 119, 4.5.2016, pp. 1-88', 'OJ L 119, 4.5.2016, p. 1'],
+    ['OJ L 119, 4.5.2016, pp. 1–88', 'OJ L 119, 4.5.2016, p. 1'],
+    ['OJ L 119, 4.5.2016, pp.1-88', 'OJ L 119, 4.5.2016, p. 1'],
+    ['O.J. L 281, 23.11.1995, p. 31', 'OJ L 281, 23.11.1995, p. 31'],
+    ['O. J. L 281, 23.11.1995, p. 31', 'OJ L 281, 23.11.1995, p. 31'],
+    ['O.J.L 281, 23.11.1995, p. 31', 'OJ L 281, 23.11.1995, p. 31'],
+    ['o.j. l 281, 23.11.1995, p. 31', 'OJ L 281, 23.11.1995, p. 31'],
+    ['OJ. L 281, 23.11.1995, p. 31', 'OJ L 281, 23.11.1995, p. 31'],
+    ['[1995] OJ L281/31', 'OJ 1995 L 281/31'],
+    ['[1995] OJ L 281/31', 'OJ 1995 L 281/31'],
+    ['[1995] O.J. L281/31', 'OJ 1995 L 281/31'],
+    ['[1995] OJ No L281/31', 'OJ 1995 L 281/31'],
+    ['[1995] OJ L281/31.', 'OJ 1995 L 281/31'],
+    ['[1995] OJ L281/31-50', 'OJ 1995 L 281/31'],
+    ['[1995] OJ L 281, p. 31', 'OJ 1995 L 281/31'],
+    ['[2016] OJ L119/1', 'OJ 2016 L 119/1'],
+    ['[2012] OJ C326/47', 'OJ 2012 C 326/47'],
+    ['[2002] OJ C77E/1', 'OJ 2002 C 77 E/1'],
+    ['[2022] OJ L42I/1', 'OJ 2022 L 42I/1'],
+    ['OJ L 2024/1689', 'OJ L, 2024/1689'],
+    ['OJ L 2024/1689, 12.7.2024', 'OJ L, 2024/1689, 12.7.2024'],
+    ['OJ L 2024/1689.', 'OJ L, 2024/1689'],
+    ['OJ L, 2024/1689, 12. 7. 2024', 'OJ L, 2024/1689, 12.7.2024'],
+    ['OJ C C/2024/2664', 'OJ C, C/2024/2664'],
+  ])('reads %j as %j (#172)', (text, canonical) => {
+    const expected = parseOjReference(canonical);
+    expect(expected).toBeDefined();
+    expect(parseOjReference(text)).toEqual(expected);
+  });
+
+  it('reads the spaced, No-marked footnote form of Directive 95/46/EC as its issue, date, and page (#172)', () => {
+    expect(parseOjReference('OJ No C 277, 5. 11. 1990, p. 3')).toEqual({
+      kind: 'issue',
+      issueIds: ['oj:JOC_1990_277_R'],
+      firstPage: 3,
+      publishedOn: '1990-11-05',
+    });
+    expect(parseOjReference('[2002] OJ C77E/1')).toEqual({
+      kind: 'issue',
+      issueIds: ['oj:JOC_2002_077_E'],
+      firstPage: 1,
+    });
+  });
+
   it.each([
     ['no year or page', 'OJ L 281'],
     ['no year', 'OJ L 119/1'],
@@ -148,6 +203,19 @@ describe('parseOjReference', () => {
     ['an act citation with its reference', 'Directive 95/46/EC (OJ L 281, 23.11.1995, p. 31)'],
     ['a citation without a year', 'Regulation No 17'],
     ['a case number', 'C-131/12'],
+    ['a No-marked reference with no page', 'OJ No C 166, 3. 7. 1995'],
+    [
+      'two references joined by "and"',
+      'OJ No C 277, 5. 11. 1990, p. 3 and OJ No C 159, 17. 6. 1991, p 38',
+    ],
+    ['a year in round brackets', '(1995) OJ L281/31'],
+    ['a bracketed year and a date', '[1995] OJ L 281, 23.11.1995, p. 31'],
+    ['a bracketed two-digit year', '[95] OJ L281/31'],
+    ['a bracketed year before another report', '[1995] ECR I-4165'],
+    ['a slashed date', 'OJ L 281, 23/11/1995, p. 31'],
+    ['a month-name date', 'OJ L 281, 23 November 1995, p. 31'],
+    ['an L-style number under C without its comma', 'OJ C 2024/2664'],
+    ['a dotted OJ run into its series', 'OJ.L 281, 23.11.1995, p. 31'],
   ])('does not parse %s', (_label, text) => {
     expect(parseOjReference(text)).toBeUndefined();
   });
@@ -335,8 +403,9 @@ describe('resolveOjReference', () => {
  * The parser runs on caller-sized text. Each shape is timed in thread CPU at every
  * doubling from 5k to 320k characters, bounded at each size before the next runs,
  * with the full 64× span held under 256×: a repeated opener with no closer,
- * overlapping prefixes, a whitespace run the normalizer collapses, and the two
- * line-break shapes.
+ * overlapping prefixes, a whitespace run the normalizer collapses, the two
+ * line-break shapes, and runs of each prefix the normalizer rewrites (`[1995] `,
+ * `O.J. `, `OJ No `).
  */
 describe('parseOjReference runs in linear time', () => {
   const SIZES = [5_000, 10_000, 20_000, 40_000, 80_000, 160_000, 320_000];
@@ -348,6 +417,9 @@ describe('parseOjReference runs in linear time', () => {
     ['an issue reference with no page', (n) => `OJ L 281, 23.11.1995, p. ${' '.repeat(n)}`],
     ['an act-by-act opener run', (n) => `OJ L, ${'2024/'.repeat(n / 5)}`],
     ['an unclosed parenthesis', (n) => `(OJ L 281, 23.11.1995, p. 31${'1'.repeat(n)}`],
+    ['a repeated bracketed year', (n) => '[1995] '.repeat(n / 7)],
+    ['a repeated O.J. opener', (n) => 'O.J. '.repeat(n / 5)],
+    ['a repeated OJ No opener', (n) => 'OJ No '.repeat(n / 6)],
   ];
   it.each(shapes)(
     '%s',

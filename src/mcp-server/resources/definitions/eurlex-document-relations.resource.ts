@@ -11,9 +11,9 @@ import { RELATION_TYPES, traverseRelations } from '@/services/cellar-sparql/rela
 import { resolveCelexWorks } from '@/services/cellar-sparql/work-resolution.js';
 
 /**
- * Per-type relation cap for the summary resource — lighter than the
- * eurlex_get_relations tool's default. This resource is injectable context, not
- * an exhaustive traversal.
+ * Per-type, per-direction relation cap for the summary resource. This resource is
+ * injectable context, not an exhaustive traversal; its continuation hands the rest
+ * to the eurlex_get_relations tool at the offset where this cap stopped.
  */
 const SUMMARY_PER_TYPE_LIMIT = 25;
 
@@ -56,9 +56,9 @@ export const eurlex_document_relations_resource = resource(
       {
         reason: 'sparql_timeout',
         code: JsonRpcErrorCode.ServiceUnavailable,
-        when: 'A query this summary sent to CELLAR ran past the client timeout, or CELLAR refused it as too costly to run. It is not retried.',
+        when: "A query this summary sent to CELLAR ran past the time budget its queries share (retryable: CELLAR's response time varies, so a later read can finish), or CELLAR refused it as too costly to run (not retryable: the same query is refused again). Neither is retried within the read.",
         recovery:
-          'Read the resource again shortly, or call the eurlex_get_relations tool with relation_types narrowed to the types you need.',
+          'When the error is retryable, read the resource again shortly; or call the eurlex_get_relations tool with relation_types narrowed to the types you need.',
         thrownBy: 'service',
       },
     ],
@@ -83,17 +83,16 @@ export const eurlex_document_relations_resource = resource(
       // edges come ordered newest-first, so this lightweight summary keeps the
       // most recent within its per-direction cap. See relation-traversal.ts. The
       // cap is clamped to the service ceiling so both sides of a symmetric query
-      // stay capped consistently. Provisions stay with the tool: this summary has no
-      // byte budget to hold them (#168), so it sends no follow-up query.
+      // stay capped consistently. Provisions stay with the tool (#168): they cost a
+      // follow-up query per annotated type and can run to hundreds of codes a row,
+      // more than injectable context needs.
+      const perTypeLimit = Math.min(SUMMARY_PER_TYPE_LIMIT, svc.maxResults);
       const { relations: workRelations, hasMore } = await traverseRelations(
         svc,
         workUri,
         RELATION_TYPES,
         ctx,
-        {
-          sourceCelex: celexNumber,
-          perTypeLimit: Math.min(SUMMARY_PER_TYPE_LIMIT, svc.maxResults),
-        },
+        { sourceCelex: celexNumber, perTypeLimit },
       );
       const relations = workRelations.map((r) => ({
         relation_type: r.relationType,
@@ -111,12 +110,14 @@ export const eurlex_document_relations_resource = resource(
         relations,
         total: relations.length,
         truncated: hasMore,
+        // The tool reads the same newest-first order per type and direction, so its
+        // offset continues every arm where this summary stopped (#183).
         ...(hasMore
           ? {
               continuation: {
                 kind: 'expanded_traversal' as const,
                 tool: 'eurlex_get_relations' as const,
-                input: { celex_number: celexNumber },
+                input: { celex_number: celexNumber, offset: perTypeLimit },
               },
             }
           : {}),

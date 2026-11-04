@@ -15,11 +15,18 @@ import { z } from '@cyanheads/mcp-ts-core';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { describe, expect, it, vi } from 'vitest';
 
-/** Every query a handler hands the CELLAR service during the current value's run. */
+/**
+ * Every query a handler hands the CELLAR service during the current value's run.
+ * eurlex_get_relations' source-identity lookup answers one CELEX, so a work_uri value
+ * also reaches the queries that identity gates: the national_transposition page and
+ * its per-member-state count (#182).
+ */
 const captured: string[] = [];
 const capture = async (query: string) => {
   captured.push(query);
-  return [];
+  return query.includes('SELECT ?sourceCelex WHERE')
+    ? [{ sourceCelex: { type: 'literal', value: '32022L2555' } }]
+    : [];
 };
 
 vi.mock('@/services/cellar-sparql/cellar-sparql-service.js', () => ({
@@ -97,6 +104,14 @@ const VARIANTS = [
   // Well-formed URIs carrying the marker, so the URI inputs provably reach a query.
   'http://eurovoc.europa.eu/zq7',
   'http://publications.europa.eu/resource/cellar/zq7-0000',
+  /*
+   * A Commission document number and procedure references (#179), so the typed-literal
+   * lists their lookups build are lexed. Their grammars admit only digits, a fixed
+   * series, and letters, so no marker-carrying value can reach those lookups.
+   */
+  'COM(2021) 206 final',
+  '2021/0106(COD)',
+  '2022/132A(COD)',
 ];
 
 /**
@@ -397,6 +412,21 @@ describe('SPARQL lexical safety of caller input', () => {
     if (MUST_REACH.includes(gateCase.id)) {
       expect(reached, `${gateCase.id} never reached a query`).toBe(true);
     }
+  });
+
+  it('lexes the per-member-state count eurlex_get_relations builds from a work_uri (#182)', async () => {
+    const target = targets.find((t) => t.name === 'eurlex_get_relations');
+    const workUri = 'http://publications.europa.eu/resource/cellar/zq7-0000';
+    const parsed = target?.schema.safeParse({ work_uri: workUri });
+    if (!target || !parsed?.success) throw new Error('eurlex_get_relations takes a work_uri');
+    captured.length = 0;
+    await target.handler(
+      parsed.data as never,
+      createMockContext({ errors: target.errors } as never) as never,
+    );
+    const count = captured.find((query) => query.includes('GROUP BY ?memberState')) ?? '';
+    expect(count).toContain(`<${workUri}>`);
+    expect(sparqlLexicalIssues(count)).toEqual([]);
   });
 });
 

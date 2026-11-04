@@ -1,8 +1,10 @@
 /**
  * @fileoverview Official Journal references (`OJ L 281, 23.11.1995, p. 31`,
- * `OJ L, 2024/1689, 12.7.2024`) parsed and resolved to the CELEX of the act they
- * name: an issue reference by the issue's CELLAR identifier, its publication date,
- * and the act's first page; an act-by-act reference by the act's own identifier.
+ * `OJ L, 2024/1689, 12.7.2024`, and the spellings EUR-Lex and the Court also use,
+ * such as `OJ No L 281, 23. 11. 1995, p. 31` and `[1995] OJ L281/31`) parsed and
+ * resolved to the CELEX of the act they name: an issue reference by the issue's
+ * CELLAR identifier, its publication date, and the act's first page; an act-by-act
+ * reference by the act's own identifier.
  * @module services/cellar-sparql/oj-reference
  */
 
@@ -37,8 +39,10 @@ export type OjResolution =
 /*
  * The grammar runs on the reference after `normalizeReference`, so every separator
  * is one space and no two quantifiers can claim the same characters: each pattern is
- * anchored at both ends and holds only bounded digit runs, so it runs in time linear
- * in the input. Case is ignored throughout.
+ * anchored at both ends and holds only bounded digit runs and single optional
+ * characters, so it runs in time linear in the input. Case is ignored throughout. A
+ * date may be spaced (`23. 11. 1995`, as EUR-Lex's own act texts write it), and a
+ * first page may read `p. 31`, `p.31`, `p 31`, or `pp. 1-88`.
  */
 
 /**
@@ -48,24 +52,51 @@ export type OjResolution =
  * page/year form (`p. 204/62`) are read past.
  */
 const ISSUE_REFERENCE =
-  /^oj (?:([lc]) ?(\d{1,4}) ?([aeim])?|(\d{1,4}))(?:, | of )(\d{1,2})\.(\d{1,2})\.(\d{4}), p\. ?(\d{1,4})(?: ?[-–] ?\d{1,4}|\/\d{2})?$/i;
+  /^oj (?:([lc]) ?(\d{1,4}) ?([aeim])?|(\d{1,4}))(?:, | of )(\d{1,2})\. ?(\d{1,2})\. ?(\d{4}), pp?\.? ?(\d{1,4})(?: ?[-–] ?\d{1,4}|\/\d{2})?$/i;
 
-/** Year first, the Court's form: `OJ 1995 L 281, p. 31` or `OJ 1995 L 281/31`. No date. */
+/**
+ * Year first, the Court's form: `OJ 1995 L 281, p. 31` or `OJ 1995 L 281/31`, which a
+ * bracketed year (`[1995] OJ L281/31`) is normalized to. No date.
+ */
 const YEAR_FIRST_REFERENCE =
-  /^oj (\d{4}) ([lc]) ?(\d{1,4}) ?([aeim])?(?:, p\. ?|\/)(\d{1,4})(?: ?[-–] ?\d{1,4}|\/\d{2})?$/i;
+  /^oj (\d{4}) ([lc]) ?(\d{1,4}) ?([aeim])?(?:, pp?\.? ?|\/)(\d{1,4})(?: ?[-–] ?\d{1,4}|\/\d{2})?$/i;
 
-/** The act-by-act OJ L, since October 2023: `OJ L, 2024/1689, 12.7.2024`, the date optional. */
-const ACT_L_REFERENCE = /^oj l, (\d{4})\/(\d{1,5})(?:, (\d{1,2})\.(\d{1,2})\.(\d{4}))?$/i;
+/**
+ * The act-by-act OJ L, since October 2023: `OJ L, 2024/1689, 12.7.2024`, the comma
+ * after the series and the date optional.
+ */
+const ACT_L_REFERENCE = /^oj l,? (\d{4})\/(\d{1,5})(?:, (\d{1,2})\. ?(\d{1,2})\. ?(\d{4}))?$/i;
 
-/** The act-by-act OJ C: `OJ C, C/2024/2664, 29.4.2024`. A `C/` number under L is no reference. */
-const ACT_C_REFERENCE = /^oj c, c\/(\d{4})\/(\d{1,5})(?:, (\d{1,2})\.(\d{1,2})\.(\d{4}))?$/i;
+/**
+ * The act-by-act OJ C: `OJ C, C/2024/2664, 29.4.2024`, the comma optional. A `C/`
+ * number under L, or an L-style number under C, is no reference.
+ */
+const ACT_C_REFERENCE = /^oj c,? c\/(\d{4})\/(\d{1,5})(?:, (\d{1,2})\. ?(\d{1,2})\. ?(\d{4}))?$/i;
 
-/** One space per whitespace run; a trailing period, then one pair of surrounding parentheses, dropped. */
+/** A leading bracketed year, the Court's `[1995] OJ L281/31`. */
+const BRACKETED_YEAR = /^\[(\d{4})\] /;
+
+/**
+ * One space per whitespace run; a trailing period, then one pair of surrounding
+ * parentheses, dropped. Then the journal's other spellings are rewritten to `OJ `,
+ * each an anchored prefix change: a bracketed year is lifted off and put back after
+ * `OJ ` (the year-first form, so `[1995] OJ L 281, 23.11.1995, p. 31` with its date
+ * stays unparsed), `O.J.`, `O. J.`, and `OJ.` become `OJ`, and `OJ No` / `OJ No.`
+ * before the series or number is dropped to `OJ`. A bracketed year before anything
+ * but the journal is restored as given.
+ */
 function normalizeReference(text: string): string {
   let value = text.trim().replace(/\s+/g, ' ');
   if (value.endsWith('.')) value = value.slice(0, -1);
   if (value.startsWith('(') && value.endsWith(')')) value = value.slice(1, -1).trim();
-  return value;
+  const bracketed = BRACKETED_YEAR.exec(value);
+  if (bracketed) value = value.slice(bracketed[0].length);
+  value = value
+    .replace(/^o\. ?j\. ?/i, 'OJ ')
+    .replace(/^oj\. /i, 'OJ ')
+    .replace(/^oj no\.? /i, 'OJ ');
+  if (!bracketed) return value;
+  return /^oj /i.test(value) ? `OJ ${bracketed[1]} ${value.slice(3)}` : `${bracketed[0]}${value}`;
 }
 
 function isoDate(day: string, month: string, year: string): string {
@@ -97,8 +128,10 @@ function seriesLessIssueIds(year: string, number: string): string[] {
 
 /**
  * The OJ reference `text` spells, or undefined when it is none this parser reads.
- * A reference without a year or a first page (`OJ L 281`, `OJ L 119/1`), a special
- * edition, and the EUR-Lex `OJ:L:2016:119:TOC` form name no single act and are not
+ * The spellings `OJ No L 281`, `O.J. L 281`, `[1995] OJ L281/31`, and the comma-less
+ * `OJ L 2024/1689` read as their canonical forms. A reference without a year or a
+ * first page (`OJ L 281`, `OJ L 119/1`), a special edition, a slashed or month-name
+ * date, and the EUR-Lex `OJ:L:2016:119:TOC` form name no single act and are not
  * parsed.
  */
 export function parseOjReference(text: string): OjReference | undefined {

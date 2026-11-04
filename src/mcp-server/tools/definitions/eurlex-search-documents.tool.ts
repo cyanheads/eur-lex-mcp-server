@@ -31,9 +31,11 @@ import { isSafeSparqlIri, isValidCalendarDate } from '@/services/cellar-sparql/e
 import { keywordMatchPattern, keywordTitlePhrase } from '@/services/cellar-sparql/keyword-match.js';
 import { isConsolidatedCelex } from '@/services/cellar-sparql/relation-traversal.js';
 import {
+  cellarDate,
   dateRangeFilters,
   isPastSortWindow,
   readWindowedPage,
+  UNDATED_PLACEHOLDER,
   windowEndRoute,
   windowedLimit,
 } from '@/services/cellar-sparql/sort-window.js';
@@ -105,6 +107,21 @@ const CONS_TEXT_URI = `${RESOURCE_TYPE_BASE}CONS_TEXT`;
  */
 const CORRIGENDUM_URI = `${RESOURCE_TYPE_BASE}CORRIGENDUM`;
 
+/**
+ * Empty-page guidance for a EuroVoc search of `JUDG` or `OPIN_AG` (#176). CELLAR tags
+ * no Court of Justice, General Court, or Civil Service Tribunal ruling or AG opinion
+ * with a EuroVoc concept: the judgments that carry one are EFTA Court judgments
+ * (`E…J…`), and in sector 6 concepts sit only on Judicial Information Notices. No
+ * broader filter reaches the rulings, so the generic guidance would send the caller
+ * in circles; case law is classified by its own subject-matter authority instead.
+ * The notices sit among the concept's other documents, newest first (none in the
+ * first 32 rows of concept 5595), so dropping document_type alone does not list
+ * them; the title word "Case", which opens every single-case notice ("Case C-…"),
+ * does. Joined-case notices ("Joined Cases …") are the small remainder it misses.
+ */
+const CASE_LAW_EUROVOC_GUIDANCE =
+  'CELLAR indexes no judgment, order, or Advocate General opinion of the Court of Justice or General Court by EuroVoc concept; only EFTA Court judgments carry one. Search case law by subject with eurlex_get_cases subject (e.g. "personal data"), or omit document_type and pass keyword "Case" to list the Judicial Information Notices that announce cases under this concept, each naming the case number eurlex_get_cases takes.';
+
 export const eurlex_search_documents = tool('eurlex_search_documents', {
   title: 'Search EU Documents',
   description:
@@ -130,7 +147,7 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
         ])
         .optional()
         .describe(
-          'Document category: REG=Regulations, DIR=Directives, DEC=Decisions, TREATY=Treaties, JUDG=Judgments, OPIN_AG=AG Opinions, PROP=Proposals, REC=Recommendations. Each category includes its explicit CELLAR authority variants (for example, delegated and implementing regulations). Omit to search all types. Consolidated texts are excluded unless include_consolidated is true.',
+          'Document category: REG=Regulations, DIR=Directives, DEC=Decisions, TREATY=Treaties, JUDG=Judgments, OPIN_AG=AG Opinions, PROP=Proposals, REC=Recommendations. Each category includes its explicit CELLAR authority variants (for example, delegated and implementing regulations). Omit to search all types. Consolidated texts are excluded unless include_consolidated is true. Search case law by court, case number, or subject with eurlex_get_cases.',
         ),
     ),
     include_consolidated: z
@@ -194,7 +211,7 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
       ])
       .optional()
       .describe(
-        'EuroVoc concept URI to filter by subject (e.g. http://eurovoc.europa.eu/2828), obtained from eurlex_browse_subjects. Only EuroVoc concept URIs are accepted; https://eurovoc.europa.eu/… and an upper-case host are read as the http://eurovoc.europa.eu/… form CELLAR stores. Omit for no subject filter.',
+        'EuroVoc concept URI to filter by subject (e.g. http://eurovoc.europa.eu/2828), obtained from eurlex_browse_subjects. Only EuroVoc concept URIs are accepted; https://eurovoc.europa.eu/… and an upper-case host are read as the http://eurovoc.europa.eu/… form CELLAR stores. CELLAR indexes no judgment, order, or Advocate General opinion of the Court of Justice or General Court by EuroVoc concept; only EFTA Court judgments carry one. Search case law by subject with eurlex_get_cases subject. Omit for no subject filter.',
       ),
     author_institution: z
       .string()
@@ -249,7 +266,12 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
               .describe(
                 'Human-readable document type label (e.g. "Regulation", "Directive"). Works with several resource-types (e.g. corrigenda) list all, comma-separated. Absent for some older works.',
               ),
-            date: z.string().optional().describe('Document date in ISO 8601 format (YYYY-MM-DD).'),
+            date: z
+              .string()
+              .optional()
+              .describe(
+                `Document date in ISO 8601 format (YYYY-MM-DD). Absent when CELLAR records no real document date — none, or the ${UNDATED_PLACEHOLDER} it records for an undated work; such documents sort last.`,
+              ),
             title: z
               .string()
               .optional()
@@ -314,7 +336,7 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
       .string()
       .optional()
       .describe(
-        'Guidance for the next call: on an empty first page, the filters that matched nothing and how to broaden them; on a page with more rows, the offset to continue from; on a page ending at row 10,000, that no later page can be read and the closed date_from/date_to window that continues past it.',
+        'Guidance for the next call: on an empty first page, the filters that matched nothing and how to broaden them, or, for eurovoc_concept with document_type JUDG or OPIN_AG, how to search case law by subject with eurlex_get_cases instead; on a page with more rows, the offset to continue from; on a page ending at row 10,000, that no later page can be read and the closed date_from/date_to window that continues past it.',
       ),
     limit_clamp: limitClampEnrichment,
   },
@@ -373,7 +395,7 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
     {
       reason: 'sparql_timeout',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'The search ran past the client timeout, or CELLAR refused it as too costly to run. It is not retried.',
+      when: "The search ran past its time budget (retryable: CELLAR's response time varies, so a later search can finish), or CELLAR refused it as too costly to run (not retryable: the same search is refused again). Neither is retried within the call.",
       recovery:
         'Narrow the search with a closer date_from/date_to range, a document_type, or a more specific keyword, then search again.',
       thrownBy: 'service',
@@ -701,16 +723,19 @@ ${projection('?date')} WHERE {
     /**
      * Zero hits is an answer, not a failure (#112): an empty first page returns the
      * same shape as a page past the end, plus a notice naming the filters and how to
-     * broaden them. A page past the end stays silent — the caller already has rows.
-     * Each echoed value is bounded; query_echo keeps it whole.
+     * broaden them — or, for a EuroVoc search of case law, where case law is searched
+     * by subject (#176). A page past the end stays silent — the caller already has
+     * rows. Each echoed value is bounded; query_echo keeps it whole.
      */
     if (bindings.length === 0 && input.offset === 0) {
       const filterSummary = Object.entries(queryEcho)
         .map(([k, v]) => `${k}=${echoValue(String(v))}`)
         .join(', ');
-      ctx.enrich.notice(
-        `No documents matched the search criteria (${filterSummary}). Broaden the search by removing filters, trying a shorter keyword, or expanding the date range.`,
-      );
+      const guidance =
+        eurovocConcept && (input.document_type === 'JUDG' || input.document_type === 'OPIN_AG')
+          ? CASE_LAW_EUROVOC_GUIDANCE
+          : 'Broaden the search by removing filters, trying a shorter keyword, or expanding the date range.';
+      ctx.enrich.notice(`No documents matched the search criteria (${filterSummary}). ${guidance}`);
     }
 
     const { hasMore, atWindowEnd } = readWindowedPage(bindings.length, input.offset, pageLimit);
@@ -750,7 +775,7 @@ ${projection('?date')} WHERE {
       };
       const resourceType = resolveResourceTypeLabels(types);
       if (resourceType) doc.resource_type = resourceType;
-      const date = CellarSparqlService.bindingValue(b, 'docDate');
+      const date = cellarDate(CellarSparqlService.bindingValue(b, 'docDate'));
       if (date) doc.date = date;
       const title = CellarSparqlService.bindingValue(b, 'docTitle');
       if (title) doc.title = title;

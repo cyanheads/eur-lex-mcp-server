@@ -11,6 +11,7 @@ import {
 import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_get_cases } from '@/mcp-server/tools/definitions/eurlex-get-cases.tool.js';
+import { PROCEDURE_TYPES } from '@/services/cellar-sparql/cdm-labels.js';
 import { escapeSparqlLiteral } from '@/services/cellar-sparql/eli-resolution.js';
 import {
   CASE_LAW_WORKS,
@@ -20,6 +21,7 @@ import {
   celexWorkRows,
   type FixtureCaseWork,
   fixtureWork,
+  isCaseLawFactsQuery,
   isResolutionQuery,
   requestedCelex,
 } from '../fixtures/cellar-works.js';
@@ -207,6 +209,26 @@ describe('eurlex_get_cases', () => {
     expect(result.cases[0]?.date).toBe('2014-05-13');
     // resource_type should be resolved to a human-readable label
     expect(result.cases[0]?.resource_type).toBe('Judgment');
+  });
+
+  it('reads CELLAR’s undated placeholder as no date on both surfaces, keeping the row where it sorted (#184)', async () => {
+    mockQuery.mockResolvedValue([
+      makeCaseBinding('62013CJ0131', { date: '2014-05-13' }),
+      makeCaseBinding('61962CJ0026', { date: '1001-01-01' }),
+    ]);
+
+    const result = await runToolContract(eurlex_get_cases, { keyword: 'google' });
+
+    expect(result.isError).toBeFalsy();
+    const structured = eurlex_get_cases.output.parse(result.structuredContent);
+    expect(structured.cases.map((c) => [c.celex_number, c.date])).toEqual([
+      ['62013CJ0131', '2014-05-13'],
+      ['61962CJ0026', undefined],
+    ]);
+    expect(structured.cases[1]).not.toHaveProperty('date');
+    const text = contentText(result);
+    expect(text).toContain('**Date:** 2014-05-13');
+    expect(text).not.toContain('1001-01-01');
   });
 
   it('includes sector 6 filter in SPARQL for all case searches', async () => {
@@ -1367,7 +1389,7 @@ describe('eurlex_get_cases', () => {
       expect(text).toContain('**Parties:** USDAW and Wilson');
     });
 
-    it('adds formation, referring_court, and advocate_general as the only new optional row fields', () => {
+    it('carries exactly these row fields, the optional title facts and case-law facts included', () => {
       const row = eurlex_get_cases.output.shape.cases.element;
       expect(Object.keys(row.shape).sort()).toEqual(
         [
@@ -1384,9 +1406,23 @@ describe('eurlex_get_cases', () => {
           'subject_matter',
           'title',
           'work_uri',
+          // #178: CELLAR's case-law facts, read from the resolved work.
+          'countries',
+          'procedure_types',
+          'subjects',
+          'procedure_languages',
         ].sort(),
       );
-      for (const field of ['formation', 'referring_court', 'advocate_general', 'title'] as const) {
+      for (const field of [
+        'formation',
+        'referring_court',
+        'advocate_general',
+        'title',
+        'countries',
+        'procedure_types',
+        'subjects',
+        'procedure_languages',
+      ] as const) {
         expect(row.shape[field].safeParse(undefined).success).toBe(true);
       }
     });
@@ -1953,12 +1989,14 @@ describe('eurlex_get_cases', () => {
         ctx,
       );
 
-      // The search, then the page's work resolution (#97), which also reads the ECLI.
-      expect(mockQuery).toHaveBeenCalledTimes(2);
+      // The search, then the page's work resolution (#97), which also reads the ECLI,
+      // then the resolved works' case-law facts (#178).
+      expect(mockQuery).toHaveBeenCalledTimes(3);
       expect(mockQuery.mock.calls[0]?.[0] as string).not.toContain('case-law_ecli');
       expect(mockQuery.mock.calls[1]?.[0] as string).toContain(
         'OPTIONAL { ?work cdm:case-law_ecli ?ecli . }',
       );
+      expect(isCaseLawFactsQuery(mockQuery.mock.calls[2]?.[0] as string)).toBe(true);
       expect(result.cases[0]?.ecli).toBe('ECLI:EU:C:2026:81');
     });
 
@@ -2269,8 +2307,10 @@ describe('eurlex_get_cases', () => {
 
         await eurlex_get_cases.handler(eurlex_get_cases.input.parse(input), ctx());
 
-        expect(mockQuery).toHaveBeenCalledTimes(2);
-        const [search, followUp] = mockQuery.mock.calls.map((c) => c[0] as string);
+        // The third query reads the resolved works' case-law facts (#178).
+        expect(mockQuery).toHaveBeenCalledTimes(3);
+        const [search, followUp, facts] = mockQuery.mock.calls.map((c) => c[0] as string);
+        expect(isCaseLawFactsQuery(facts ?? '')).toBe(true);
         expect(search).toMatch(
           /^\nSELECT\n {2}\(SAMPLE\(\?celexNumber\) AS \?celex\)\n {2}\(SAMPLE\(\?date\) AS \?docDate\)\n {2}\(SAMPLE\(\?work\) AS \?pageWork\) WHERE \{/,
         );
@@ -2656,7 +2696,12 @@ describe('eurlex_get_cases', () => {
     function lookupQueries(): string[] {
       return mockQuery.mock.calls
         .map((c) => c[0] as string)
-        .filter((q) => !q.includes('GROUP BY ?celexNumber') && !q.includes('owl#sameAs'));
+        .filter(
+          (q) =>
+            !q.includes('GROUP BY ?celexNumber') &&
+            !q.includes('owl#sameAs') &&
+            !isCaseLawFactsQuery(q),
+        );
     }
 
     /**
@@ -2906,8 +2951,9 @@ describe('eurlex_get_cases', () => {
 
       expect(sparql).toContain(`?celexNumber bif:contains "'62014CJ0362*'" .`);
       expect(sparql).toContain('FILTER(CONTAINS(STR(?celexNumber), "62014CJ0362"))');
-      // The search and the page's work resolution (#97); no family lookup.
-      expect(mockQuery).toHaveBeenCalledTimes(2);
+      // The search, the page's work resolution (#97), and its facts (#178); no family lookup.
+      expect(mockQuery).toHaveBeenCalledTimes(3);
+      expect(isCaseLawFactsQuery(mockQuery.mock.calls[2]?.[0] as string)).toBe(true);
     });
 
     it('completes a year-and-letters opening to sector 6 alone', async () => {
@@ -3638,5 +3684,831 @@ describe('eurlex_get_cases over-maximum limit (#151)', () => {
     expect(() => eurlex_get_cases.input.parse({ limit: 0 })).toThrow();
     expect(() => eurlex_get_cases.input.parse({ limit: 10_001 })).toThrow();
     expect(eurlex_get_cases.input.parse({ limit: 10_000 }).limit).toBe(10_000);
+  });
+});
+
+// --- #178: member state, procedure type and outcome, and subject matter ---
+
+describe('eurlex_get_cases case-law facts (#178)', () => {
+  beforeEach(() => {
+    mockQuery.mockReset();
+    mockMaxResults = 100;
+  });
+
+  const RESOURCE_TYPE = 'http://publications.europa.eu/resource/authority/resource-type/';
+  const DERIVATIVE_EXCLUSION = `FILTER NOT EXISTS { ?work cdm:work_has_resource-type ?derivativeType . VALUES ?derivativeType { <${RESOURCE_TYPE}INFO_JUDICIAL> <${RESOURCE_TYPE}INFO_JUR> <${RESOURCE_TYPE}ABSTRACT_JUR> <${RESOURCE_TYPE}SUM_JUR> <${RESOURCE_TYPE}CORRIGENDUM> } }`;
+  const C_340_21_TITLE =
+    'Judgment of the Court (Third Chamber) of 14 December 2023.#VB v Natsionalna agentsia za prihodite.#Request for a preliminary ruling from the Varhoven administrativen sad.#Reference for a preliminary ruling – Protection of personal data – Regulation (EU) 2016/679 – Article 82 – Right to compensation.#Case C-340/21.';
+
+  /** The page query a search sends, from a page of one case. */
+  async function pageQueryFor(input: Record<string, unknown>): Promise<string> {
+    mockQuery.mockResolvedValue([makeCaseBinding('62023TJ0097', { date: '2024-03-15' })]);
+    await eurlex_get_cases.handler(
+      eurlex_get_cases.input.parse(input),
+      createMockContext({ errors: eurlex_get_cases.errors }),
+    );
+    return mockQuery.mock.calls[0]?.[0] as string;
+  }
+
+  describe('without the new inputs, the v0.20.0 page and rows (characterization)', () => {
+    it('sends the v0.20.0 page query for a default search', async () => {
+      expect(await pageQueryFor({})).toBe(
+        [
+          '',
+          'SELECT',
+          '  (SAMPLE(?celexNumber) AS ?celex)',
+          '  (SAMPLE(?date) AS ?docDate)',
+          '  (SAMPLE(?work) AS ?pageWork) WHERE {',
+          '  ?work cdm:resource_legal_id_celex ?celexNumber .',
+          '  ',
+          '  OPTIONAL { ?work cdm:work_date_document ?date . }',
+          '  ',
+          '  FILTER(STRSTARTS(STR(?celexNumber), "6"))',
+          `  ${DERIVATIVE_EXCLUSION}`,
+          '} GROUP BY ?celexNumber ORDER BY DESC(?docDate) ?celexNumber LIMIT 21 OFFSET 0',
+        ].join('\n'),
+      );
+    });
+
+    it('sends the v0.20.0 page query with every earlier filter but keyword', async () => {
+      const sparql = await pageQueryFor({
+        case_number: 'T-97/23',
+        court: 'GC',
+        case_type: 'judgment',
+        date_from: '2024-01-01',
+        date_to: '2024-12-31',
+        offset: 20,
+        limit: 10,
+      });
+
+      expect(sparql).toBe(
+        [
+          '',
+          'SELECT',
+          '  (SAMPLE(?celexNumber) AS ?celex)',
+          '  (SAMPLE(?date) AS ?docDate)',
+          '  (SAMPLE(?work) AS ?pageWork) WHERE {',
+          '  ?work cdm:resource_legal_id_celex ?celexNumber .',
+          `  ?work cdm:work_has_resource-type <${RESOURCE_TYPE}JUDG> .`,
+          '  OPTIONAL { ?work cdm:work_date_document ?date . }',
+          '  ',
+          '  FILTER(STRSTARTS(STR(?celexNumber), "6"))',
+          `  ?celexNumber bif:contains "'62023TJ0097*' OR '62023TO0097*' OR '62023TC0097*' OR '62023TT0097*'" .`,
+          '    FILTER(REGEX(STR(?celexNumber), "2023T[JOCT]0097"))',
+          '  FILTER(SUBSTR(STR(?celexNumber), 6, 1) = "T")',
+          '  FILTER(?date >= "2024-01-01"^^xsd:date)',
+          '  FILTER(?date <= "2024-12-31"^^xsd:date)',
+          '} GROUP BY ?celexNumber ORDER BY DESC(?docDate) ?celexNumber LIMIT 11 OFFSET 20',
+        ].join('\n'),
+      );
+    });
+
+    it('serves the v0.20.0 rows when CELLAR records none of the facts', async () => {
+      mockQuery.mockResolvedValue([
+        makeCaseBinding('62021CJ0340', {
+          date: '2023-12-14',
+          types: `${RESOURCE_TYPE}JUDG`,
+          ecli: 'ECLI:EU:C:2023:986',
+          title: C_340_21_TITLE,
+        }),
+        makeCaseBinding('62022TO0001', { date: '2023-12-13', types: `${RESOURCE_TYPE}ORDER` }),
+      ]);
+
+      const result = await runToolContract(eurlex_get_cases, {});
+
+      expect(eurlex_get_cases.output.parse(result.structuredContent).cases).toEqual([
+        {
+          work_uri: `${CELLAR}62021CJ0340`,
+          celex_number: '62021CJ0340',
+          ecli: 'ECLI:EU:C:2023:986',
+          resource_type: 'Judgment',
+          date: '2023-12-14',
+          formation: 'Third Chamber',
+          display_title: 'VB v Natsionalna agentsia za prihodite.',
+          parties: 'VB v Natsionalna agentsia za prihodite.',
+          referring_court: 'Varhoven administrativen sad',
+          subject_matter:
+            'Reference for a preliminary ruling – Protection of personal data – Regulation (EU) 2016/679 – Article 82 – Right to compensation.',
+          case_reference: 'Case C-340/21.',
+        },
+        {
+          work_uri: `${CELLAR}62022TO0001`,
+          celex_number: '62022TO0001',
+          resource_type: 'Order',
+          date: '2023-12-13',
+        },
+      ]);
+      expect(result.structuredContent).toMatchObject({
+        total: 2,
+        offset: 0,
+        has_more: false,
+        query_echo: { include_derivative: false },
+      });
+    });
+  });
+
+  const AUTHORITY = 'http://publications.europa.eu/resource/authority/';
+  const SUBJECT_MATTER = `${AUTHORITY}case-law-subject-matter/`;
+
+  /** English labels of the subject-matter scheme as the lookup reads them, the placeholder included. */
+  const SUBJECT_ROWS: Binding[] = [
+    ['PDON', 'Protection of personal data'],
+    ['OP_DATPRO', 'Provisional data'],
+    ['MARQ', 'Trade marks'],
+    ['AID', 'State aid'],
+    ['AIDE', 'State aid'],
+    ['MAPU', 'Public procurement'],
+    ['PRIN', 'Principles of Union law'],
+  ].map(([code, label]) => ({
+    concept: { type: 'uri', value: `${SUBJECT_MATTER}${code}` },
+    label: { type: 'literal', value: label ?? '' },
+  }));
+
+  const isSubjectLookup = (sparql: string) => sparql.includes('skos:inScheme');
+
+  /** One row of the facts follow-up, on the work makeCaseBinding gives `celex`. */
+  const factRow = (celex: string, fact: string, code: string, label?: string): Binding => ({
+    work: { type: 'uri', value: `${CELLAR}${celex}` },
+    fact: { type: 'literal', value: fact },
+    code: { type: 'uri', value: `${AUTHORITY}${code}` },
+    ...(label ? { label: { type: 'literal', value: label } } : {}),
+  });
+
+  /** C-340/21's facts as CELLAR records them on its canonical work. */
+  const C_340_21_FACTS = [
+    factRow('62021CJ0340', 'countries', 'country/BGR'),
+    factRow('62021CJ0340', 'procedure_types', 'fd_100/PREJ', 'Reference for a preliminary ruling'),
+    factRow(
+      '62021CJ0340',
+      'subjects',
+      'case-law-subject-matter/PDON',
+      'Protection of personal data',
+    ),
+    factRow('62021CJ0340', 'subjects', 'case-law-subject-matter/PRIN', 'Principles of Union law'),
+    factRow('62021CJ0340', 'procedure_languages', 'language/BUL'),
+  ];
+
+  /** CELLAR answering the subject lookup, the page and its resolution, and the facts. */
+  function fakeCellar(page: Binding[], facts: Binding[] = []) {
+    mockQuery.mockImplementation(async (q: string) => {
+      if (isSubjectLookup(q)) return SUBJECT_ROWS;
+      if (isCaseLawFactsQuery(q)) return facts;
+      return page;
+    });
+  }
+
+  const sentQueries = () => mockQuery.mock.calls.map((c) => c[0] as string);
+  const pageQuery = () => sentQueries().find((q) => q.includes('GROUP BY ?celexNumber')) ?? '';
+  const defaultPageQuery = async () => {
+    const sparql = await pageQueryFor({});
+    mockQuery.mockReset();
+    return sparql;
+  };
+
+  describe('member_state', () => {
+    it.each(['de', 'DEU', ' De ', 'deu'])(
+      'builds the one country/DEU clause from %j and echoes DEU on both surfaces',
+      async (value) => {
+        fakeCellar([makeCaseBinding('62023CJ0002')]);
+
+        const result = await runToolContract(eurlex_get_cases, { member_state: value });
+
+        expect(pageQuery()).toContain(
+          `\n  ?work cdm:case-law_originates_in_country <${AUTHORITY}country/DEU> .\n`,
+        );
+        expect(pageQuery().match(/case-law_originates_in_country/g)).toHaveLength(1);
+        expect(result.structuredContent).toMatchObject({ query_echo: { member_state: 'DEU' } });
+        expect(readCommonMark(contentText(result))).toContain('member_state="DEU"');
+      },
+    );
+
+    it.each([
+      ['EL', 'GRC'],
+      ['gr', 'GRC'],
+      ['UK', 'GBR'],
+      ['gb', 'GBR'],
+      ['FRA', 'FRA'],
+    ])('reads %j as %s', async (value, code) => {
+      fakeCellar([]);
+
+      await eurlex_get_cases.handler(
+        eurlex_get_cases.input.parse({ member_state: value }),
+        createMockContext({ errors: eurlex_get_cases.errors }),
+      );
+
+      expect(pageQuery()).toContain(`<${AUTHORITY}country/${code}>`);
+    });
+
+    it.each(['USA', 'XX', 'Germany', 'D'])(
+      'rejects %j at the schema with the member-state message',
+      (value) => {
+        const parsed = eurlex_get_cases.input.safeParse({ member_state: value });
+
+        expect(parsed.success).toBe(false);
+        const issue = parsed.error?.issues[0];
+        expect(issue?.path).toEqual(['member_state']);
+        for (const part of [
+          'member_state takes a member-state code: ISO 3166-1 alpha-3 (AUT, BEL,',
+          'SWE; GBR is the United Kingdom) or the two-letter codes (DE, FR; EL or GR for Greece, UK or GB for the United Kingdom), in any case.',
+        ]) {
+          expect(issue?.message).toContain(part);
+        }
+      },
+    );
+
+    it.each(['', '   '])('reads %j as omitted: the v0.20.0 query, no echo', async (value) => {
+      const expected = await defaultPageQuery();
+      fakeCellar([makeCaseBinding('62023CJ0002')]);
+
+      const result = await eurlex_get_cases.handler(
+        eurlex_get_cases.input.parse({ member_state: value }),
+        createMockContext({ errors: eurlex_get_cases.errors }),
+      );
+
+      expect(pageQuery()).toBe(expected);
+      expect(result.query_echo).not.toHaveProperty('member_state');
+    });
+  });
+
+  // Every fd_100 code on a primary case-law record (live, 2026-11-03).
+  const PROCEDURE_CODES =
+    'ANNU ANNU%3DIL ANNU%3DNL ANNU%3DOB ANNU%3DRF ANNU%3DRI ASSI ASSI%3DNL ASSI%3DOB ASSI%3DRF ASSI%3DRI AVIS AVIS%3DDC AVIS%3DNC CARE CARE%3DNL CARE%3DOB CARE%3DRF CARE%3DRI COMP COMP%3DIL COMP%3DNL COMP%3DOB COMP%3DRF COMP%3DRI CONS CONS%3DAJ CONS%3DNL CONS%3DOB CONS%3DRF CONS%3DRI DPEN DPEN%3DOB DPEN%3DRF DPEN%3DRI EXEC%3DOB FONC FONC%3DAJ FONC%3DAMI FONC%3DAMP FONC%3DIL FONC%3DNL FONC%3DOB FONC%3DRF FONC%3DRI IMMU%3DIL IMMU%3DNL IMMU%3DOB IMMU%3DRF IMMU%3DRI INST INST%3DNL INST%3DOB INST%3DRF INST%3DRI INTE INTE%3DNL INTE%3DOB INTE%3DRF INTE%3DRI INTV INTV%3DNL INTV%3DOB INTV%3DRF INTV%3DRI OMST OMST%3DRF OPPO OPPO%3DOB OPPO%3DRF OPPO%3DRI OP_DATPRO PREJ PREJ%3DNL PREJ%3DRI PVOI PVOI%3DNL PVOI%3DOB PVOI%3DRF PVOI%3DRI RECT RECT%3DOB RECT%3DRI REEX REEX%3DOB REFE REFE%3DAJ REFE%3DIL REFE%3DNL REFE%3DOB REFE%3DRF REFE%3DRI REFER_PREL_URG REFER_PREL_URG%3DNL REFER_PREL_URG%3DRI RENV RENV%3DOB RENV%3DRF RESP RESP%3DAJ RESP%3DAMI RESP%3DAMP RESP%3DIL RESP%3DNL RESP%3DOB RESP%3DRF RESP%3DRI REVI REVI%3DOB REVI%3DRF REVI%3DRI RMEM%3DOB RMEM%3DRF SANC SANC%3DNL SANC%3DOB SANC%3DRF SANC%3DRI TIER TIER%3DRF TIER%3DRI'.split(
+      ' ',
+    );
+
+  /**
+   * Whether the page's procedure FILTER admits a procedure code, read the way CELLAR
+   * evaluates its atoms; an atom of any other shape throws.
+   */
+  function procedureAdmits(sparql: string, code: string): boolean {
+    const lines = sparql.split('\n').map((line) => line.trim());
+    const at = lines.indexOf(
+      '?work cdm:case-law_has_type_procedure_concept_type_procedure ?procedure .',
+    );
+    const filter = lines[at + 1];
+    if (at === -1 || !filter?.startsWith('FILTER(')) throw new Error('No procedure pattern');
+    const iri = `${AUTHORITY}fd_100/${code}`;
+    return filter
+      .slice('FILTER('.length, -1)
+      .split(' || ')
+      .some((atom) => {
+        const equals = /^\?procedure = <([^>]*)>$/.exec(atom);
+        if (equals) return iri === equals[1];
+        const starts = /^STRSTARTS\(STR\(\?procedure\), "([^"]*)"\)$/.exec(atom);
+        if (starts) return iri.startsWith(starts[1] ?? '');
+        const ends = /^STRENDS\(STR\(\?procedure\), "([^"]*)"\)$/.exec(atom);
+        if (ends) return iri.endsWith(ends[1] ?? '');
+        throw new Error(`Unrecognized procedure atom: ${atom}`);
+      });
+  }
+
+  /** The codes of {@link PROCEDURE_CODES} a procedure filter admits. */
+  async function admittedCodes(input: Record<string, unknown>): Promise<string[]> {
+    mockQuery.mockReset();
+    fakeCellar([]);
+    await eurlex_get_cases.handler(
+      eurlex_get_cases.input.parse(input),
+      createMockContext({ errors: eurlex_get_cases.errors }),
+    );
+    const sparql = pageQuery();
+    return PROCEDURE_CODES.filter((code) => procedureAdmits(sparql, code));
+  }
+
+  describe('procedure_type and outcome', () => {
+    it.each([
+      [
+        'interim_measures, never the urgent references sharing its start',
+        { procedure_type: 'interim_measures' },
+        ['REFE', 'REFE%3DAJ', 'REFE%3DIL', 'REFE%3DNL', 'REFE%3DOB', 'REFE%3DRF', 'REFE%3DRI'],
+      ],
+      [
+        'preliminary_ruling, urgent references included',
+        { procedure_type: 'preliminary_ruling' },
+        [
+          'PREJ',
+          'PREJ%3DNL',
+          'PREJ%3DRI',
+          'REFER_PREL_URG',
+          'REFER_PREL_URG%3DNL',
+          'REFER_PREL_URG%3DRI',
+        ],
+      ],
+      [
+        'annulment',
+        { procedure_type: 'annulment' },
+        ['ANNU', 'ANNU%3DIL', 'ANNU%3DNL', 'ANNU%3DOB', 'ANNU%3DRF', 'ANNU%3DRI'],
+      ],
+      [
+        'annulment with successful, on the same code',
+        { procedure_type: 'annulment', outcome: 'successful' },
+        ['ANNU%3DOB'],
+      ],
+      [
+        'preliminary_ruling with decision_unnecessary, on either root',
+        { procedure_type: 'preliminary_ruling', outcome: 'decision_unnecessary' },
+        ['PREJ%3DNL', 'REFER_PREL_URG%3DNL'],
+      ],
+      [
+        'successful alone, on any root',
+        { outcome: 'successful' },
+        [
+          'ANNU%3DOB',
+          'ASSI%3DOB',
+          'CARE%3DOB',
+          'COMP%3DOB',
+          'CONS%3DOB',
+          'DPEN%3DOB',
+          'EXEC%3DOB',
+          'FONC%3DOB',
+          'IMMU%3DOB',
+          'INST%3DOB',
+          'INTE%3DOB',
+          'INTV%3DOB',
+          'OPPO%3DOB',
+          'PVOI%3DOB',
+          'RECT%3DOB',
+          'REEX%3DOB',
+          'REFE%3DOB',
+          'RENV%3DOB',
+          'RESP%3DOB',
+          'REVI%3DOB',
+          'RMEM%3DOB',
+          'SANC%3DOB',
+        ],
+      ],
+    ])('admits exactly the codes of %s', async (_label, input, codes) => {
+      expect(await admittedCodes(input)).toEqual(codes);
+    });
+
+    it('gives every procedure type its own codes, no code under two types', async () => {
+      const seen = new Map<string, string>();
+      for (const type of PROCEDURE_TYPES) {
+        const codes = await admittedCodes({ procedure_type: type });
+        expect(codes.length, type).toBeGreaterThan(0);
+        for (const code of codes) {
+          expect(seen.get(code), `${code} under ${type}`).toBeUndefined();
+          seen.set(code, type);
+        }
+      }
+      expect(seen.size).toBeGreaterThan(50);
+    });
+
+    it('matches a case only when one of its procedures carries both the type and the outcome', async () => {
+      fakeCellar([]);
+      await eurlex_get_cases.handler(
+        eurlex_get_cases.input.parse({ procedure_type: 'annulment', outcome: 'successful' }),
+        createMockContext({ errors: eurlex_get_cases.errors }),
+      );
+      const query = pageQuery();
+      const caseMatches = (codes: string[]) => codes.some((code) => procedureAdmits(query, code));
+
+      expect(caseMatches(['ANNU%3DOB'])).toBe(true);
+      expect(caseMatches(['PVOI%3DRF', 'ANNU%3DOB'])).toBe(true);
+      expect(caseMatches(['ANNU%3DRF', 'PVOI%3DOB'])).toBe(false);
+      expect(caseMatches(['ANNU', 'PVOI%3DOB'])).toBe(false);
+    });
+
+    it('accepts the case and separator variants of both enums, and echoes the members', async () => {
+      fakeCellar([makeCaseBinding('62023TJ0001')]);
+
+      const result = await runToolContract(eurlex_get_cases, {
+        procedure_type: 'Failure-To-Fulfil-Obligations',
+        outcome: 'DECISION-UNNECESSARY',
+      });
+
+      expect(result.structuredContent).toMatchObject({
+        query_echo: {
+          procedure_type: 'failure_to_fulfil_obligations',
+          outcome: 'decision_unnecessary',
+        },
+      });
+      expect(pageQuery()).toContain(`?procedure = <${AUTHORITY}fd_100/CONS%3DNL>`);
+      expect(readCommonMark(contentText(result))).toContain(
+        'procedure_type="failure_to_fulfil_obligations", outcome="decision_unnecessary"',
+      );
+    });
+
+    it('reads "" for both as omitted, and rejects a value naming no member', async () => {
+      const expected = await defaultPageQuery();
+      fakeCellar([]);
+
+      await eurlex_get_cases.handler(
+        eurlex_get_cases.input.parse({ procedure_type: '', outcome: '' }),
+        createMockContext({ errors: eurlex_get_cases.errors }),
+      );
+
+      expect(pageQuery()).toBe(expected);
+      expect(eurlex_get_cases.input.safeParse({ procedure_type: 'infringement' }).success).toBe(
+        false,
+      );
+      expect(eurlex_get_cases.input.safeParse({ outcome: 'won' }).success).toBe(false);
+    });
+  });
+
+  describe('subject', () => {
+    it.each([
+      ['trade mark', ['MARQ'], ['Trade marks']],
+      ['data protection', ['PDON'], ['Protection of personal data']],
+      ['personal data', ['PDON'], ['Protection of personal data']],
+      ['data', ['PDON'], ['Protection of personal data']],
+      ['State Aid', ['AID', 'AIDE'], ['State aid']],
+    ])(
+      'resolves %j once, before the page, and joins its concepts there',
+      async (subject, codes, labels) => {
+        fakeCellar([makeCaseBinding('62023TJ0001')]);
+
+        const result = await runToolContract(eurlex_get_cases, { subject });
+
+        const [lookup, ...rest] = sentQueries();
+        expect(isSubjectLookup(lookup ?? '')).toBe(true);
+        expect(rest.filter(isSubjectLookup)).toEqual([]);
+        // The lookup reads the scheme's labels; no caller text reaches it.
+        expect(lookup).not.toContain(subject.split(' ')[0]?.toLowerCase());
+        expect(lookup).toContain(
+          `?concept skos:inScheme <http://publications.europa.eu/resource/authority/case-law-subject-matter> .`,
+        );
+        expect(lookup).not.toMatch(/LIMIT/);
+        expect(pageQuery()).toContain(
+          `VALUES ?subject { ${codes.map((code) => `<${SUBJECT_MATTER}${code}>`).join(' ')} }\n  ?work cdm:case-law_is-about_case-law-subject-matter ?subject .`,
+        );
+        expect(result.structuredContent).toMatchObject({
+          query_echo: { subject, subject_labels: labels },
+        });
+        expect(readCommonMark(contentText(result))).toContain(
+          `subject=${JSON.stringify(subject)}, subject_labels=${JSON.stringify(labels)}`,
+        );
+      },
+    );
+
+    it('sorts the concepts it joins and the labels it echoes, whatever order the lookup returns them in', async () => {
+      mockQuery.mockImplementation(async (q: string) => {
+        if (isSubjectLookup(q)) return [...SUBJECT_ROWS].reverse();
+        if (isCaseLawFactsQuery(q)) return [];
+        return [makeCaseBinding('62023TJ0001')];
+      });
+
+      // One letter matches inside longer words, so it names five concepts under four labels.
+      const result = await runToolContract(eurlex_get_cases, { subject: 'a' });
+
+      expect(pageQuery()).toContain(
+        `VALUES ?subject { ${['AID', 'AIDE', 'MARQ', 'PDON', 'PRIN'].map((code) => `<${SUBJECT_MATTER}${code}>`).join(' ')} }`,
+      );
+      expect(result.structuredContent).toMatchObject({
+        query_echo: {
+          subject_labels: [
+            'Principles of Union law',
+            'Protection of personal data',
+            'State aid',
+            'Trade marks',
+          ],
+        },
+      });
+    });
+
+    it('answers a subject matching no label with an empty page and a notice on both surfaces, sending no page query', async () => {
+      fakeCellar([makeCaseBinding('62023TJ0001')]);
+
+      const result = await runToolContract(eurlex_get_cases, {
+        subject: 'quantum chromodynamics',
+        member_state: 'DE',
+      });
+
+      expect(result.isError).toBeFalsy();
+      expect(sentQueries()).toHaveLength(1);
+      const structured = eurlex_get_cases.output.parse(result.structuredContent);
+      expect(structured).toMatchObject({
+        cases: [],
+        total: 0,
+        offset: 0,
+        has_more: false,
+        query_echo: {
+          subject: 'quantum chromodynamics',
+          subject_labels: [],
+          member_state: 'DEU',
+        },
+      });
+      const notice = (result.structuredContent as { notice: string }).notice;
+      expect(notice).toBe(
+        'No case-law subject label contains every word of subject "quantum chromodynamics", so no case was searched. Try fewer or other words — labels read like "Protection of personal data", "Trade marks", or "State aid" — or omit subject.',
+      );
+      expect(readCommonMark(contentText(result))).toContain(
+        `⟨blockquote_open⟩\n\n${notice}\n\n⟨blockquote_close⟩`,
+      );
+    });
+
+    it('bounds the subject quoted in the no-match notice', async () => {
+      fakeCellar([]);
+      const subject = `zz${'q'.repeat(4998)}`;
+
+      const result = await runToolContract(eurlex_get_cases, { subject });
+
+      const notice = (result.structuredContent as { notice: string }).notice;
+      expect(notice).toContain(`"${subject.slice(0, 100)}…"`);
+      expect(notice).not.toContain(subject.slice(0, 101));
+      expect(result.structuredContent).toMatchObject({ query_echo: { subject } });
+    });
+
+    it.each(['!!', ' -- ', '()'])(
+      'rejects the subject %j, which holds no letters or digits, as invalid_subject before any CELLAR call',
+      async (subject) => {
+        const declared = eurlex_get_cases.errors?.find((e) => e.reason === 'invalid_subject');
+
+        const result = await runToolContract(eurlex_get_cases, { subject, court: 'CJEU' });
+
+        expect(result.isError).toBe(true);
+        const error = (
+          result.structuredContent as {
+            error?: { code?: number; data?: { reason?: string; recovery?: { hint?: string } } };
+          }
+        ).error;
+        expect(error?.code).toBe(JsonRpcErrorCode.ValidationError);
+        expect(error?.data?.reason).toBe('invalid_subject');
+        expect(error?.data?.recovery?.hint).toBe(declared?.recovery);
+        expect(declared?.recovery).toContain('omit subject');
+        expect(contentText(result)).toContain(declared?.recovery ?? '<missing>');
+        expect(mockQuery).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each(['', '   '])('reads %j as omitted: no lookup, the v0.20.0 query', async (subject) => {
+      const expected = await defaultPageQuery();
+      fakeCellar([]);
+
+      const result = await eurlex_get_cases.handler(
+        eurlex_get_cases.input.parse({ subject }),
+        createMockContext({ errors: eurlex_get_cases.errors }),
+      );
+
+      expect(sentQueries().filter(isSubjectLookup)).toEqual([]);
+      expect(pageQuery()).toBe(expected);
+      expect(result.query_echo).not.toHaveProperty('subject');
+      expect(result.query_echo).not.toHaveProperty('subject_labels');
+    });
+  });
+
+  it('places every fact pattern after the keyword clause, ahead of the filters', async () => {
+    fakeCellar([]);
+
+    await eurlex_get_cases.handler(
+      eurlex_get_cases.input.parse({
+        member_state: 'ES',
+        procedure_type: 'preliminary_ruling',
+        subject: 'data protection',
+        court: 'CJEU',
+        date_from: '2010-01-01',
+      }),
+      createMockContext({ errors: eurlex_get_cases.errors }),
+    );
+
+    expect(pageQuery()).toBe(
+      [
+        '',
+        'SELECT',
+        '  (SAMPLE(?celexNumber) AS ?celex)',
+        '  (SAMPLE(?date) AS ?docDate)',
+        '  (SAMPLE(?work) AS ?pageWork) WHERE {',
+        '  ?work cdm:resource_legal_id_celex ?celexNumber .',
+        '  ',
+        '  OPTIONAL { ?work cdm:work_date_document ?date . }',
+        '  ',
+        `  ?work cdm:case-law_originates_in_country <${AUTHORITY}country/ESP> .`,
+        '  ?work cdm:case-law_has_type_procedure_concept_type_procedure ?procedure .',
+        `  FILTER(?procedure = <${AUTHORITY}fd_100/PREJ> || STRSTARTS(STR(?procedure), "${AUTHORITY}fd_100/PREJ%3D") || ?procedure = <${AUTHORITY}fd_100/REFER_PREL_URG> || STRSTARTS(STR(?procedure), "${AUTHORITY}fd_100/REFER_PREL_URG%3D"))`,
+        `  VALUES ?subject { <${SUBJECT_MATTER}PDON> }`,
+        '  ?work cdm:case-law_is-about_case-law-subject-matter ?subject .',
+        '  FILTER(STRSTARTS(STR(?celexNumber), "6"))',
+        '  FILTER(SUBSTR(STR(?celexNumber), 6, 1) = "C")',
+        `  ${DERIVATIVE_EXCLUSION}`,
+        '  FILTER(?date >= "2010-01-01"^^xsd:date)',
+        '} GROUP BY ?celexNumber ORDER BY DESC(?docDate) ?celexNumber LIMIT 21 OFFSET 0',
+      ].join('\n'),
+    );
+  });
+
+  describe('row facts', () => {
+    it('reports C-340/21 as BGR, a preliminary reference, two subjects, and BG, on both surfaces', async () => {
+      fakeCellar(
+        [
+          makeCaseBinding('62021CJ0340', {
+            date: '2023-12-14',
+            types: `${RESOURCE_TYPE}JUDG`,
+            title: C_340_21_TITLE,
+          }),
+        ],
+        C_340_21_FACTS,
+      );
+
+      const result = await runToolContract(eurlex_get_cases, { case_number: 'C-340/21' });
+
+      const [row] = eurlex_get_cases.output.parse(result.structuredContent).cases;
+      expect(row).toMatchObject({
+        referring_court: 'Varhoven administrativen sad',
+        countries: ['BGR'],
+        procedure_types: ['Reference for a preliminary ruling'],
+        subjects: ['Principles of Union law', 'Protection of personal data'],
+        procedure_languages: ['BG'],
+      });
+      const facts = sentQueries().filter(isCaseLawFactsQuery);
+      expect(facts).toHaveLength(1);
+      expect(facts[0]).toContain(`VALUES ?work { <${CELLAR}62021CJ0340> }`);
+      const text = contentText(result);
+      expect(text).toContain('**Countries:** BGR');
+      expect(text).toContain('**Procedure types:** Reference for a preliminary ruling');
+      expect(text).toContain('**Subjects:** Principles of Union law; Protection of personal data');
+      expect(text).toContain('**Procedure languages:** BG');
+    });
+
+    it('leaves each fact CELLAR records nothing for absent, never an empty list, on a partial page', async () => {
+      fakeCellar(
+        [
+          makeCaseBinding('62021CJ0340', { date: '2023-12-14' }),
+          makeCaseBinding('62022FJ0001', { date: '2023-12-13' }),
+          makeCaseBinding('62022TJ0002', { date: '2023-12-12' }),
+        ],
+        [
+          ...C_340_21_FACTS,
+          factRow('62022FJ0001', 'procedure_types', 'fd_100/FONC%3DRF', 'Staff cases - unfounded'),
+          factRow('62022FJ0001', 'procedure_languages', 'language/FRA'),
+        ],
+      );
+
+      const result = await runToolContract(eurlex_get_cases, {});
+
+      const { cases } = eurlex_get_cases.output.parse(result.structuredContent);
+      expect(cases[1]).toMatchObject({
+        procedure_types: ['Staff cases - unfounded'],
+        procedure_languages: ['FR'],
+      });
+      expect(cases[1]).not.toHaveProperty('countries');
+      expect(cases[1]).not.toHaveProperty('subjects');
+      for (const key of ['countries', 'procedure_types', 'subjects', 'procedure_languages']) {
+        expect(cases[2]).not.toHaveProperty(key);
+      }
+      const text = contentText(result);
+      expect(text.match(/\*\*Countries:\*\*/g)).toHaveLength(1);
+      expect(text.match(/\*\*Procedure languages:\*\*/g)).toHaveLength(2);
+    });
+
+    it('reads the facts of the resolved work, never its do_not_index copy', async () => {
+      const copy = fixtureWork('62012CJ0131', 0);
+      const main = canonicalWork('62012CJ0131');
+      mockQuery.mockImplementation(async (q: string) => {
+        if (q.includes('GROUP BY ?celexNumber')) return [makeCaseBinding('62012CJ0131')];
+        if (isResolutionQuery(q)) return celexWorkRows(q);
+        if (isCaseLawFactsQuery(q)) {
+          return [
+            { ...factRow('x', 'countries', 'country/ESP'), work: { type: 'uri', value: main } },
+            { ...factRow('x', 'countries', 'country/FRA'), work: { type: 'uri', value: copy } },
+          ];
+        }
+        return [];
+      });
+
+      const result = await runToolContract(eurlex_get_cases, { case_number: 'C-131/12' });
+
+      const [row] = eurlex_get_cases.output.parse(result.structuredContent).cases;
+      expect(row).toMatchObject({ work_uri: main, countries: ['ESP'] });
+      const [facts] = sentQueries().filter(isCaseLawFactsQuery);
+      expect(facts).toContain(`VALUES ?work { <${main}> }`);
+      expect(facts).not.toContain(copy);
+    });
+
+    it('sends no facts query for an empty page, and none for a row the resolution misses', async () => {
+      fakeCellar([]);
+      await runToolContract(eurlex_get_cases, { member_state: 'DE', offset: 400 });
+      expect(sentQueries().filter(isCaseLawFactsQuery)).toEqual([]);
+
+      mockQuery.mockReset();
+      mockQuery.mockImplementation(async (q: string) =>
+        q.includes('GROUP BY ?celexNumber')
+          ? [
+              {
+                celex: { type: 'literal', value: '62020CJ0999' },
+                pageWork: { type: 'uri', value: `${CELLAR}sampled` },
+              },
+            ]
+          : [],
+      );
+      const result = await runToolContract(eurlex_get_cases, {});
+      expect(sentQueries().filter(isCaseLawFactsQuery)).toEqual([]);
+      expect(eurlex_get_cases.output.parse(result.structuredContent).cases).toEqual([
+        { work_uri: `${CELLAR}sampled`, celex_number: '62020CJ0999' },
+      ]);
+    });
+
+    it('reads hostile fact labels back exactly from content[]', () => {
+      const c = {
+        work_uri: `${CELLAR}w`,
+        celex_number: '62021CJ0340',
+        countries: ['BGR', '*X*'],
+        procedure_types: ['Action for annulment - successful', '_Appeal_ [x](y)'],
+        subjects: ['<b>Trade</b> marks', 'State aid | `x`'],
+        procedure_languages: ['BG', '\\EN'],
+      };
+
+      const text = (
+        eurlex_get_cases.format!({
+          cases: [c],
+          total: 1,
+          offset: 0,
+          has_more: false,
+          query_echo: { include_derivative: false, subject_labels: ['*Trade* marks'] },
+        })[0] as { text: string }
+      ).text;
+
+      const read = readCommonMark(text);
+      expect(read).toContain(`⟨strong⟩Countries:⟨/strong⟩ ${c.countries.join(', ')}`);
+      expect(read).toContain(`⟨strong⟩Procedure types:⟨/strong⟩ ${c.procedure_types.join('; ')}`);
+      expect(read).toContain(`⟨strong⟩Subjects:⟨/strong⟩ ${c.subjects.join('; ')}`);
+      expect(read).toContain(
+        `⟨strong⟩Procedure languages:⟨/strong⟩ ${c.procedure_languages.join(', ')}`,
+      );
+      expect(read).toContain(
+        `⟨em⟩Filters: include_derivative=false, subject_labels=${JSON.stringify(['*Trade* marks'])}⟨/em⟩`,
+      );
+    });
+  });
+
+  describe('notices and recovery', () => {
+    it('names the fact filters to drop in the notice of an empty first page, on both surfaces', async () => {
+      fakeCellar([]);
+
+      const result = await runToolContract(eurlex_get_cases, {
+        member_state: 'mt',
+        subject: 'trade mark',
+        procedure_type: 'appeal',
+      });
+
+      const notice = (result.structuredContent as { notice: string }).notice;
+      expect(notice).toContain('member_state=MLT, procedure_type=appeal, subject=trade mark');
+      expect(notice).toContain(
+        'Try a different keyword, broader date range, or remove the court/case_type filter. Or drop one of member_state, procedure_type, subject: each matches only the cases CELLAR records its fact for.',
+      );
+      expect(readCommonMark(contentText(result))).toContain(
+        `⟨blockquote_open⟩\n\n${notice}\n\n⟨blockquote_close⟩`,
+      );
+    });
+
+    it('names a single fact filter to drop in the singular', async () => {
+      fakeCellar([]);
+
+      const result = await runToolContract(eurlex_get_cases, {
+        case_number: 'C-452/16',
+        procedure_type: 'interim_measures',
+      });
+
+      expect((result.structuredContent as { notice: string }).notice).toMatch(
+        /remove the court\/case_type filter\. Or drop procedure_type: it matches only the cases CELLAR records that fact for\.$/,
+      );
+    });
+
+    it('keeps the v0.20.0 empty-page notice when no fact filter is set', async () => {
+      fakeCellar([]);
+
+      const result = await runToolContract(eurlex_get_cases, { keyword: 'zzqx' });
+
+      expect((result.structuredContent as { notice: string }).notice).toMatch(
+        /remove the court\/case_type filter\.$/,
+      );
+    });
+
+    it('names the fact filters in the offset_past_window and sparql_error recoveries', () => {
+      for (const reason of ['offset_past_window', 'sparql_error']) {
+        const recovery = eurlex_get_cases.errors?.find((e) => e.reason === reason)?.recovery;
+        for (const filter of ['member_state', 'procedure_type', 'outcome', 'subject']) {
+          expect(recovery, reason).toContain(filter);
+        }
+      }
+    });
+
+    it('pages an annulment search to row 10,000 and returns the window-end notice', async () => {
+      mockQuery.mockImplementation(async (q: string) => {
+        if (isResolutionQuery(q)) return requestedCelex(q).map((celex) => makeCaseBinding(celex));
+        if (isCaseLawFactsQuery(q)) return [];
+        assertInSortWindow(q);
+        const [clause] = pagingClauses(q);
+        if (!clause) return [];
+        const { start, end } = pageSpan(clause, 15_785);
+        return Array.from({ length: end - start }, (_, i) =>
+          makeCaseBinding(`6${String(start + i).padStart(9, '0')}`, { date: '2015-06-30' }),
+        );
+      });
+
+      const result = await runToolContract(eurlex_get_cases, {
+        procedure_type: 'annulment',
+        offset: 9_980,
+        limit: 20,
+      });
+
+      expect(pageQuery()).toContain('LIMIT 20 OFFSET 9980');
+      expect(pageQuery()).toContain(`?procedure = <${AUTHORITY}fd_100/ANNU>`);
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured).toMatchObject({ total: 20, has_more: false });
+      expect(structured).not.toHaveProperty('next_offset');
+      const notice = structured.notice as string;
+      expect(notice).toContain('row 10,000');
+      expect(notice).toContain('date_from=2015-01-01, date_to=2015-06-30');
+      expect(contentText(result)).toContain(`> ${notice}`);
+    });
   });
 });

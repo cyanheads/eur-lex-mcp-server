@@ -1,6 +1,6 @@
 # eur-lex-mcp-server - Directory Structure
 
-Generated on: 2026-10-26 07:16:53
+Generated on: 2026-11-04 02:22:02
 
 ```text
 eur-lex-mcp-server/
@@ -186,15 +186,19 @@ eur-lex-mcp-server/
 │   │       ├── echo-value.ts
 │   │       ├── enum-input.ts
 │   │       ├── limit-clamp.ts
-│   │       └── markdown-render.ts
+│   │       ├── markdown-render.ts
+│   │       └── timeout-alternative.ts
 │   ├── services/
 │   │   ├── cellar-sparql/
 │   │   │   ├── act-citation.ts
+│   │   │   ├── case-law-facts.ts
 │   │   │   ├── cdm-labels.ts
 │   │   │   ├── cellar-sparql-service.ts
 │   │   │   ├── eli-resolution.ts
 │   │   │   ├── keyword-match.ts
+│   │   │   ├── legislative-procedures.ts
 │   │   │   ├── oj-reference.ts
+│   │   │   ├── preparatory-reference.ts
 │   │   │   ├── relation-traversal.ts
 │   │   │   ├── sort-window.ts
 │   │   │   ├── types.ts
@@ -225,6 +229,7 @@ eur-lex-mcp-server/
 │   ├── helpers/
 │   │   ├── commonmark.ts
 │   │   ├── cpu-time.ts
+│   │   ├── query-roles.ts
 │   │   └── sort-window.ts
 │   ├── prompts/
 │   │   └── eurlex-comparative-analysis.prompt.test.ts
@@ -237,6 +242,7 @@ eur-lex-mcp-server/
 │   │   ├── act-citation.test.ts
 │   │   ├── act-structure.case-law.test.ts
 │   │   ├── act-structure.test.ts
+│   │   ├── case-law-facts.test.ts
 │   │   ├── cdm-labels.test.ts
 │   │   ├── cellar-sparql-service.test.ts
 │   │   ├── eli-resolution.test.ts
@@ -244,7 +250,9 @@ eur-lex-mcp-server/
 │   │   ├── formex-package.test.ts
 │   │   ├── html-to-markdown.test.ts
 │   │   ├── keyword-match.test.ts
+│   │   ├── legislative-procedures.test.ts
 │   │   ├── oj-reference.test.ts
+│   │   ├── preparatory-reference.test.ts
 │   │   ├── sort-window.test.ts
 │   │   ├── work-agents.test.ts
 │   │   └── work-resolution.test.ts
@@ -256,11 +264,12 @@ eur-lex-mcp-server/
 │   │   ├── eurlex-get-document.case-law.test.ts
 │   │   ├── eurlex-get-document.formex-package.test.ts
 │   │   ├── eurlex-get-document.tool.test.ts
-│   │   ├── eurlex-get-relations-budget.test.ts
+│   │   ├── eurlex-get-relations.service.test.ts
 │   │   ├── eurlex-get-relations.tool.test.ts
 │   │   ├── eurlex-lookup-celex.tool.test.ts
 │   │   ├── eurlex-query-sparql.tool.test.ts
-│   │   └── eurlex-search-documents.tool.test.ts
+│   │   ├── eurlex-search-documents.tool.test.ts
+│   │   └── timeout-alternative.test.ts
 │   ├── published-skills.test.ts
 │   └── sparql-lexical-safety.test.ts
 ├── .dockerignore

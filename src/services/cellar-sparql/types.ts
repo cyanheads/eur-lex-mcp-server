@@ -66,7 +66,10 @@ export interface WorkRelation {
    */
   provisions?: string[];
   relatedCelexNumber?: string;
-  /** The related work's document date (`YYYY-MM-DD`), the value its page is ordered by. Absent when it has none. */
+  /**
+   * The related work's document date (`YYYY-MM-DD`), the value its page is ordered by.
+   * Absent when it has none, or only CELLAR's undated placeholder.
+   */
   relatedDate?: string;
   /**
    * ISO 3166-1 alpha-3 member-state code of a national implementing measure, read

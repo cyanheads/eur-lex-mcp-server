@@ -1,9 +1,8 @@
 /**
  * @fileoverview An act's citation facts — its ELI, Official Journal reference,
- * typed dates of effect, and transposition deadlines — read as aggregates inside
- * the grouped core metadata query that eurlex_get_document and the
- * eurlex://document/{celexNumber} resource already issue, so they cost no added
- * round trip.
+ * typed dates of effect, and transposition deadlines — read by one aggregate-only
+ * query that eurlex_get_document and the eurlex://document/{celexNumber} resource
+ * run beside their other metadata queries.
  * @module services/cellar-sparql/act-citation
  */
 
@@ -30,6 +29,8 @@ export const EFFECT_TYPE_VALUES = Object.values(EFFECT_TYPES) as [EffectType, ..
 /** One typed date of effect. */
 export interface DateOfEffect {
   date: string;
+  /** The clause that sets the date (`Article 113(a)`), numbered as CELLAR records it. */
+  provision?: string;
   type?: EffectType;
 }
 
@@ -41,7 +42,7 @@ export interface ActCitation {
   transposition_deadlines?: string[];
 }
 
-/** Official Journal facts as the core query aggregates them. */
+/** Official Journal facts as the citation query aggregates them. */
 export interface OjFacts {
   /** The act-by-act publication (OJ L from 2023-10, OJ C from 2023-10). */
   act?: { collection: string; date: string; number: string; year: string };
@@ -55,6 +56,7 @@ export interface OjFacts {
 
 const OWL = 'http://www.w3.org/2002/07/owl#';
 const TYPE_OF_DATE = '<http://publications.europa.eu/ontology/annotation#type_of_date>';
+const COMMENT_ON_DATE = '<http://publications.europa.eu/ontology/annotation#comment_on_date>';
 /** The languages of the Official Journal before the 1973 English edition. */
 const ORIGINAL_LANGUAGES = ['DEU', 'FRA', 'ITA', 'NLD'];
 /** The first day of the English edition, before which pages come from the original languages. */
@@ -63,7 +65,7 @@ const ENGLISH_EDITION_START = '1973-01-01';
 /**
  * Whether the act named by `actCelex` can predate the 1973 English edition: its
  * CELEX year is before 1973, or unknown. Only such an act reads the
- * original-language pages, a join that costs a measurable share of the core query.
+ * original-language pages, a join that costs a measurable share of the citation query.
  */
 function mayPredateEnglishEdition(actCelex: string | undefined): boolean {
   const year = actCelex?.slice(1, 5) ?? '';
@@ -71,34 +73,40 @@ function mayPredateEnglishEdition(actCelex: string | undefined): boolean {
 }
 
 /**
- * The projection and patterns that fold the citation facts into a grouped core
- * metadata query: the served work's ELI (a consolidated text's own point-in-time
- * ELI), and the act's typed entry-into-force dates, transposition deadlines, and
- * Official Journal facts — the issue it was published in, its act-by-act
- * publication, and the page ranges of its English and, for an act that can
- * predate the English edition, original-language manifestations. `actCelex` is
- * the act's CELEX, when known.
+ * The citation query: the served work's ELI (a consolidated text's own
+ * point-in-time ELI), and the act's typed entry-into-force dates, transposition
+ * deadlines, and Official Journal facts — the issue it was published in, its
+ * act-by-act publication, and the page ranges of its English and, for an act that
+ * can predate the English edition, original-language manifestations. `actCelex`
+ * is the act's CELEX, when known. Read the row with {@link readActCitation}.
  *
- * The patterns bind `?entryIntoForceDate`, each date joined to its `owl:Axiom`
- * annotation inside the same `OPTIONAL`, so the date also feeds an earliest-entry
- * aggregate the caller projects. Every composite is built with `STR()` and
- * `COALESCE()` inside `CONCAT`, so an unbound part reads as empty rather than
- * dropping the row; an act with no value yields `"|"`-only strings the reader
- * discards. The issue aggregate is a `MIN` over a date-led string, so the
- * earliest of several issues (a 2005–2011 class `M` reprint) is the one cited.
+ * It projects aggregates only, with no `GROUP BY`, so it returns exactly one row
+ * whatever the act records. Its `OPTIONAL`s multiply one another's rows; folded
+ * into the core metadata query they also multiplied that query's rows, which cost
+ * more than running the two apart, concurrently. Each entry-into-force date is
+ * joined to its `owl:Axiom` annotation inside the same `OPTIONAL`: the date's
+ * `type_of_date` and, when recorded, its `comment_on_date`, which names the clause
+ * setting the date. Each date aggregates as `date|type|comment`, the comment
+ * `ENCODE_FOR_URI`-encoded because it holds spaces and `|`, the separators the
+ * reader splits on. Every composite is built with `STR()` and `COALESCE()` inside
+ * `CONCAT`, so an unbound part reads as empty rather than dropping the row; an act
+ * with no value yields `"|"`-only strings the reader discards. The issue aggregate
+ * is a `MIN` over a date-led string, so the earliest of several issues (a
+ * 2005–2011 class `M` reprint) is the one cited.
  */
-export function actCitationQueryParts(
+export function actCitationQuery(
   servedWork: string,
   actWork: string,
   actCelex: string | undefined,
-): { patterns: string; select: string } {
+): string {
   const originalPages = mayPredateEnglishEdition(actCelex);
   const originalLanguages = ORIGINAL_LANGUAGES.map(
     (code) => `<${LANGUAGE_AUTHORITY_URI}${code}>`,
   ).join(', ');
-  const select = `
+  return `
+SELECT
   (MIN(STR(?eliValue)) AS ?eli)
-  (GROUP_CONCAT(DISTINCT CONCAT(STR(?entryIntoForceDate), "|", COALESCE(STR(?effectType), "")); separator=" ") AS ?datesOfEffect)
+  (GROUP_CONCAT(DISTINCT CONCAT(STR(?entryIntoForceDate), "|", COALESCE(STR(?effectType), ""), "|", COALESCE(ENCODE_FOR_URI(STR(?effectComment)), "")); separator=" ") AS ?datesOfEffect)
   (GROUP_CONCAT(DISTINCT STR(?transpositionDate); separator=" ") AS ?transposition)
   (MIN(CONCAT(COALESCE(STR(?ojIssueDate), ""), "|", COALESCE(STR(?ojIssueCollection), ""), "|", COALESCE(STR(?ojIssueNumber), ""), "|", COALESCE(STR(?ojIssueClass), ""))) AS ?ojIssue)
   (MIN(CONCAT(COALESCE(STR(?ojActDate), ""), "|", COALESCE(STR(?ojActCollection), ""), "|", COALESCE(STR(?ojActYear), ""), "|", COALESCE(STR(?ojActNumber), ""))) AS ?ojAct)
@@ -107,8 +115,8 @@ export function actCitationQueryParts(
       ? `
   (GROUP_CONCAT(DISTINCT CONCAT(STR(?ojOriginalFirst), "|", COALESCE(STR(?ojOriginalLast), "")); separator=" ") AS ?ojOriginalPages)`
       : ''
-  }`;
-  const patterns = `
+  }
+WHERE {
   OPTIONAL {
     <${actWork}> cdm:resource_legal_date_entry-into-force ?entryIntoForceDate .
     OPTIONAL {
@@ -116,6 +124,7 @@ export function actCitationQueryParts(
         <${OWL}annotatedProperty> cdm:resource_legal_date_entry-into-force ;
         <${OWL}annotatedTarget> ?entryIntoForceDate ;
         ${TYPE_OF_DATE} ?effectType .
+      OPTIONAL { ?effectAxiom ${COMMENT_ON_DATE} ?effectComment . }
     }
   }
   OPTIONAL { <${servedWork}> cdm:resource_legal_eli ?eliValue . }
@@ -151,8 +160,8 @@ export function actCitationQueryParts(
     OPTIONAL { ?ojOriginalManifestation cdm:manifestation_official-journal_part_page_last ?ojOriginalLast . }
   }`
       : ''
-  }`;
-  return { select, patterns };
+  }
+}`;
 }
 
 /** `"a|b|c"` split on `|`, or `undefined` when its leading part is empty. */
@@ -239,25 +248,100 @@ function effectTypeOf(raw: string): EffectType | undefined {
 }
 
 /**
- * The dated entries of the `?datesOfEffect` aggregate: one per date and type,
- * sorted by date and, on one date, in {@link EFFECT_TYPE_VALUES} order with an
- * untyped entry last. A date whose code maps to no type is listed without one.
+ * A `comment_on_date`'s `{CODE|uri}` tokens: `fd_335` codes (`{V|…/fd_335/V}`,
+ * "see") and references to other documents (`{32005D1212(01)|…/celex/…}`).
+ */
+const COMMENT_TOKEN = /\{([^{}|]*)\|[^{}]*\}/g;
+/** One dotted part of a provision number: `93`, `6a`. */
+const NUMBER_PART = /^\d+[a-z]{0,2}$/;
+/** One parenthesised subdivision with its `)` split off: `(a`, `(ii`. */
+const SUBDIVISION = /^\([a-z0-9]{1,4}$/;
+/** An annex number, arabic or roman, with an optional letter. */
+const ANNEX_NUMBER = /^[0-9IVXLC]+[a-z]?$/;
+/** Provisions compared with their numbers read as numbers: Article 2 before Article 10. */
+const PROVISION_ORDER = new Intl.Collator('en', { numeric: true });
+
+/**
+ * Whether `ref` is a provision number as CELLAR writes it: dotted numbers, each with
+ * up to two letters, then parenthesised subdivisions — `2`, `93.1`, `6a`,
+ * `113(a)`, `33.2(a)(ii)`. Each part is checked on its own, so no pattern nests a
+ * quantifier.
+ */
+function isProvisionNumber(ref: string): boolean {
+  const open = ref.indexOf('(');
+  const numbers = open === -1 ? ref : ref.slice(0, open);
+  if (!numbers.split('.').every((part) => NUMBER_PART.test(part))) return false;
+  if (open === -1) return true;
+  const subdivisions = ref.slice(open).split(')');
+  return subdivisions.pop() === '' && subdivisions.every((part) => SUBDIVISION.test(part));
+}
+
+/**
+ * The clause a comment names after its one `{V}` ("see") code, when the rest of the
+ * comment is exactly one article (`{ART} 113(a)`), the sole article
+ * (`{ARTUNIQUE}`), an annex (`{ANN}`, `{ANN} II`), or a point (`{PT} 3`); the number
+ * stays as CELLAR records it. Anything else names no single provision of the act —
+ * another act, an OJ reference, several provisions, "see the text" — and yields
+ * none. `comment` has its tokens reduced to `{CODE}`.
+ */
+function provisionOf(comment: string): string | undefined {
+  const sides = comment.split('{V}');
+  if (sides.length !== 2) return;
+  const [code, ref, ...rest] = (sides[1] as string).trim().split(/\s+/);
+  if (rest.length > 0) return;
+  if (code === '{ARTUNIQUE}') return ref === undefined ? 'Sole article' : undefined;
+  if (code === '{ANN}') {
+    if (ref === undefined) return 'Annex';
+    return ANNEX_NUMBER.test(ref) ? `Annex ${ref}` : undefined;
+  }
+  if (ref === undefined || !isProvisionNumber(ref)) return;
+  if (code === '{ART}') return `Article ${ref}`;
+  if (code === '{PT}') return `Point ${ref}`;
+  return;
+}
+
+/**
+ * The dated entries of the `?datesOfEffect` aggregate, each `date|type|comment`
+ * with the comment URI-encoded: one per date, type, and provision, sorted by date
+ * and, on one date, in {@link EFFECT_TYPE_VALUES} order with an untyped entry last,
+ * then by provision with an entry naming none last. A date whose code maps to no
+ * type is listed without one. An `MA` (application) date whose comment carries
+ * `{MA/PART}` is a partial application; no other comment changes a type, since
+ * other codes in a comment label the clause it cites rather than the date.
  */
 function readDatesOfEffect(value: string | undefined): DateOfEffect[] {
   const byKey = new Map<string, DateOfEffect>();
   for (const item of (value ?? '').split(' ')) {
-    const separator = item.indexOf('|');
-    const date = (separator === -1 ? item : item.slice(0, separator)).slice(0, 10);
+    const first = item.indexOf('|');
+    const date = (first === -1 ? item : item.slice(0, first)).slice(0, 10);
     if (!date) continue;
-    const type = separator === -1 ? undefined : effectTypeOf(item.slice(separator + 1));
-    byKey.set(`${date}|${type ?? ''}`, { date, ...(type ? { type } : {}) });
+    const last = item.lastIndexOf('|');
+    const comment =
+      first === -1 ? '' : decodeURIComponent(item.slice(last + 1)).replace(COMMENT_TOKEN, '{$1}');
+    const recorded = first === -1 ? undefined : effectTypeOf(item.slice(first + 1, last));
+    const type =
+      recorded === 'application' && comment.includes('{MA/PART}')
+        ? 'partial_application'
+        : recorded;
+    const provision = provisionOf(comment);
+    byKey.set(`${date}|${type ?? ''}|${provision ?? ''}`, {
+      date,
+      ...(type ? { type } : {}),
+      ...(provision ? { provision } : {}),
+    });
   }
   const rank = (entry: DateOfEffect) =>
     entry.type ? EFFECT_TYPE_VALUES.indexOf(entry.type) : EFFECT_TYPE_VALUES.length;
-  return [...byKey.values()].sort((a, b) => a.date.localeCompare(b.date) || rank(a) - rank(b));
+  const byProvision = (a: DateOfEffect, b: DateOfEffect) =>
+    a.provision === undefined || b.provision === undefined
+      ? Number(a.provision === undefined) - Number(b.provision === undefined)
+      : PROVISION_ORDER.compare(a.provision, b.provision);
+  return [...byKey.values()].sort(
+    (a, b) => a.date.localeCompare(b.date) || rank(a) - rank(b) || byProvision(a, b),
+  );
 }
 
-/** The citation facts of the core query's first row. */
+/** The citation facts of the citation query's row ({@link actCitationQuery}). */
 export function readActCitation(binding: SparqlBinding | undefined): ActCitation {
   const value = (name: string) => CellarSparqlService.bindingValue(binding, name);
   const issue = splitComposite(value('ojIssue'));

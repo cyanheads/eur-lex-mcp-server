@@ -155,6 +155,30 @@ describe('eurlex_search_documents', () => {
     expect(result.documents[1]?.resource_type).toBeUndefined();
   });
 
+  it('reads CELLAR’s undated placeholder as no date on both surfaces, keeping the row where it sorted (#184)', async () => {
+    // Newest first as CELLAR sorts them: the placeholder after every real date, before
+    // the works with no date at all, so moving the placeholder row shows.
+    mockQuery.mockResolvedValue([
+      makeDocBinding('31995L0046', { date: '1995-10-24' }),
+      makeDocBinding('71995L0046BEL_101325', { date: '1001-01-01' }),
+      makeDocBinding('71995L0046BEL_101326'),
+    ]);
+
+    const result = await runToolContract(eurlex_search_documents, { keyword: 'data' });
+
+    expect(result.isError).toBeFalsy();
+    const structured = eurlex_search_documents.output.parse(result.structuredContent);
+    expect(structured.documents.map((d) => [d.celex_number, d.date])).toEqual([
+      ['31995L0046', '1995-10-24'],
+      ['71995L0046BEL_101325', undefined],
+      ['71995L0046BEL_101326', undefined],
+    ]);
+    expect(structured.documents[1]).not.toHaveProperty('date');
+    const text = contentText(result);
+    expect(text).toContain('**Date:** 1995-10-24');
+    expect(text).not.toContain('1001-01-01');
+  });
+
   it('passes offset and limit to query', async () => {
     const ctx = createMockContext({ errors: eurlex_search_documents.errors });
     mockQuery.mockResolvedValue([makeDocBinding('32016R0679')]);
@@ -1983,6 +2007,125 @@ describe('eurlex_search_documents', () => {
       expect(result.structuredContent).toMatchObject({ total: 2, has_more: false });
       expect(result.structuredContent).not.toHaveProperty('notice');
       expect(contentText(result)).not.toMatch(/^> /m);
+    });
+
+    // --- #176: CELLAR indexes no CJEU or General Court ruling by EuroVoc concept ---
+
+    describe('EuroVoc search for case law (#176)', () => {
+      const CONCEPT = 'http://eurovoc.europa.eu/5595';
+      const GENERIC_GUIDANCE =
+        'Broaden the search by removing filters, trying a shorter keyword, or expanding the date range.';
+      const CASE_LAW_GUIDANCE =
+        'CELLAR indexes no judgment, order, or Advocate General opinion of the Court of Justice or General Court by EuroVoc concept; only EFTA Court judgments carry one. Search case law by subject with eurlex_get_cases subject (e.g. "personal data"), or omit document_type and pass keyword "Case" to list the Judicial Information Notices that announce cases under this concept, each naming the case number eurlex_get_cases takes.';
+
+      it.each(['JUDG', 'OPIN_AG'])(
+        'points an empty first page of %s under a concept to eurlex_get_cases subject on both surfaces',
+        async (documentType) => {
+          mockQuery.mockResolvedValue([]);
+
+          const result = await runToolContract(eurlex_search_documents, {
+            eurovoc_concept: CONCEPT,
+            document_type: documentType,
+          });
+
+          // The call still succeeds with an empty page; only the guidance changes.
+          expect(result.isError).toBeFalsy();
+          const structured = result.structuredContent as Record<string, unknown>;
+          expect(structured).toMatchObject({
+            documents: [],
+            total: 0,
+            offset: 0,
+            has_more: false,
+            query_echo: { document_type: documentType, eurovoc_concept: CONCEPT },
+          });
+          const notice = structured.notice as string;
+          expect(notice).toBe(
+            `No documents matched the search criteria (document_type=${documentType}, include_consolidated=false, include_corrigenda=false, eurovoc_concept=${CONCEPT}). ${CASE_LAW_GUIDANCE}`,
+          );
+          expect(notice).not.toContain('Broaden the search');
+
+          // content[] carries the same notice: a CommonMark parse reads it back as written.
+          expect(readCommonMark(contentText(result))).toBe(
+            [
+              '⟨heading_open⟩',
+              'EU Documents (0 results, offset 0)',
+              '⟨heading_close⟩',
+              '⟨strong⟩Has more:⟨/strong⟩ false',
+              `⟨em⟩Filters: document_type="${documentType}", include_consolidated=false, include_corrigenda=false, eurovoc_concept="${CONCEPT}"⟨/em⟩`,
+              '⟨blockquote_open⟩',
+              notice,
+              '⟨blockquote_close⟩',
+            ].join('\n\n'),
+          );
+        },
+      );
+
+      it('keeps the truncation guidance when a concept does tag judgments (EFTA Court)', async () => {
+        mockQuery.mockImplementation(async (q: string) =>
+          q.includes('GROUP BY ?celexNumber')
+            ? [
+                makeDocBinding('E2009J0003', { types: `${RESOURCE_TYPE_BASE}JUDG` }),
+                makeDocBinding('E2008J0006', { types: `${RESOURCE_TYPE_BASE}JUDG` }),
+                makeDocBinding('E2008J0002', { types: `${RESOURCE_TYPE_BASE}JUDG` }),
+              ]
+            : [],
+        );
+
+        const result = await runToolContract(eurlex_search_documents, {
+          eurovoc_concept: 'http://eurovoc.europa.eu/6101',
+          document_type: 'JUDG',
+          limit: 2,
+        });
+
+        const structured = result.structuredContent as Record<string, unknown>;
+        expect(structured).toMatchObject({ total: 2, has_more: true, next_offset: 2 });
+        expect(structured.notice).toBe(
+          'More documents match beyond this page; call again with offset=2.',
+        );
+        expect(contentText(result)).not.toContain('EuroVoc concept');
+      });
+
+      it('stays silent on a page past the end of a EuroVoc search for case law', async () => {
+        mockQuery.mockResolvedValue([]);
+
+        const result = await runToolContract(eurlex_search_documents, {
+          eurovoc_concept: CONCEPT,
+          document_type: 'JUDG',
+          offset: 20,
+        });
+
+        expect(result.isError).toBeFalsy();
+        expect(result.structuredContent).toMatchObject({ documents: [], offset: 20 });
+        expect(result.structuredContent).not.toHaveProperty('notice');
+        expect(contentText(result)).not.toMatch(/^> /m);
+      });
+
+      it.each([
+        ['JUDG without a concept', { document_type: 'JUDG', date_from: '2026-11-02' }],
+        ['OPIN_AG without a concept', { document_type: 'OPIN_AG', keyword: 'zzqx' }],
+        ['JUDG with a blank concept', { document_type: 'JUDG', eurovoc_concept: '' }],
+        ['a concept with REG', { document_type: 'REG', eurovoc_concept: CONCEPT }],
+        ['a concept with no document_type', { eurovoc_concept: CONCEPT }],
+      ])('keeps the generic broadening notice for %s', async (_label, args) => {
+        mockQuery.mockResolvedValue([]);
+
+        const result = await runToolContract(eurlex_search_documents, args);
+
+        const notice = (result.structuredContent as { notice?: string }).notice ?? '';
+        expect(notice).toMatch(/^No documents matched the search criteria \(.+\)\. /);
+        expect(notice.endsWith(`). ${GENERIC_GUIDANCE}`)).toBe(true);
+        expect(notice).not.toContain('eurlex_get_cases');
+      });
+
+      it('names the case-law route in the eurovoc_concept, document_type, and notice descriptions', () => {
+        const { document_type, eurovoc_concept } = eurlex_search_documents.input.shape;
+        expect(eurovoc_concept.description).toContain('only EFTA Court judgments carry one');
+        expect(eurovoc_concept.description).toContain('eurlex_get_cases subject');
+        expect(document_type.description).toContain('eurlex_get_cases');
+        expect(eurlex_search_documents.enrichment?.notice?.description).toContain(
+          'eurlex_get_cases',
+        );
+      });
     });
   });
 

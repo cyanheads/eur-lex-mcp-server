@@ -19,11 +19,7 @@ export function escapeMarkdownHeading(text: string): string {
 /**
  * The enrichment `notice` as a `content[]` blockquote. A notice quotes caller input
  * and upstream values, so it is escaped whole and every line keeps the quote marker.
- * `md` lets a caller that renders repeatedly pass a memoized escaper.
  */
-export function renderNoticeBlockquote(
-  notice: string,
-  md: (text: string) => string = escapeMarkdownInline,
-): string {
-  return `> ${md(notice).replaceAll('\n', '\n> ')}`;
+export function renderNoticeBlockquote(notice: string): string {
+  return `> ${escapeMarkdownInline(notice).replaceAll('\n', '\n> ')}`;
 }

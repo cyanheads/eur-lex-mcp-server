@@ -13,7 +13,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_get_document } from '@/mcp-server/tools/definitions/eurlex-get-document.tool.js';
 import { parseCaseLawTitle } from '@/services/cellar-sparql/cdm-labels.js';
 import { initEurLexContentService } from '@/services/eurlex-content/eurlex-content-service.js';
-import { isResolutionQuery, resolutionRows } from '../fixtures/cellar-works.js';
+import {
+  CELLAR,
+  canonicalWork,
+  celexWorkRows,
+  fixtureWork,
+  isCaseLawFactsQuery,
+  isResolutionQuery,
+  resolutionRows,
+} from '../fixtures/cellar-works.js';
 import { AI_ACT_HEADINGS, actHtml } from '../fixtures/eurlex-act-headings.js';
 import {
   AG_OPINION_COJ,
@@ -38,6 +46,10 @@ vi.mock('@/services/cellar-sparql/cellar-sparql-service.js', () => ({
 
 type Row = Record<string, { type: string; value: string }>;
 const literal = (value: string) => ({ type: 'literal', value });
+
+const AUTHORITY = 'http://publications.europa.eu/resource/authority/';
+/** The case-law facts eurlex_get_document reports from CELLAR (#178). */
+const FACT_FIELDS = ['countries', 'procedure_types', 'subjects', 'procedure_languages'];
 
 /** CELLAR's English title of `62012CJ0131`, read live. */
 const GOOGLE_SPAIN_TITLE =
@@ -78,13 +90,17 @@ describe('eurlex_get_document on case law (#117)', () => {
   const mockFetch = vi.fn();
   /** The core metadata row the next call's CELLAR answers with. */
   let core: Row;
+  /** The case-law facts rows (#178) the next call's CELLAR answers with. */
+  let facts: Row[];
 
   beforeEach(() => {
     core = {};
+    facts = [];
     mockSparqlQuery.mockReset();
     mockSparqlQuery.mockImplementation(async (q: string) => {
       if (isResolutionQuery(q)) return resolutionRows(q);
-      return q.includes('cdm:expression_belongs_to_work') ? [core] : [];
+      if (isCaseLawFactsQuery(q)) return facts;
+      return q.includes('cdm:work_has_resource-type') ? [core] : [];
     });
     mockFetch.mockReset();
     mockFetch.mockImplementation((url: string, init: { headers: Record<string, string> }) => {
@@ -115,7 +131,7 @@ describe('eurlex_get_document on case law (#117)', () => {
   const coreQuery = () =>
     mockSparqlQuery.mock.calls
       .map((c) => c[0] as string)
-      .find((q) => q.includes('cdm:expression_belongs_to_work')) ?? '';
+      .find((q) => q.includes('cdm:work_has_resource-type')) ?? '';
 
   describe('metadata', () => {
     it('returns the ECLI and the title parsed into parties and fields, in both channels', async () => {
@@ -226,10 +242,115 @@ describe('eurlex_get_document on case law (#117)', () => {
         'referring_court',
         'subject_matter',
         'case_reference',
+        ...FACT_FIELDS,
       ]) {
         expect(result).not.toHaveProperty(field);
       }
       expect(text).not.toContain('**ECLI:**');
+      // Legislation sends no case-law facts query (#178).
+      expect(mockSparqlQuery.mock.calls.some(([q]) => isCaseLawFactsQuery(q as string))).toBe(
+        false,
+      );
+    });
+  });
+
+  describe('case-law facts (#178)', () => {
+    /** One facts row as CELLAR returns it: the work, the fact its arm binds, the code, a label. */
+    const factRow = (work: string, fact: string, code: string, label?: string): Row => ({
+      work: { type: 'uri', value: work },
+      fact: literal(fact),
+      code: { type: 'uri', value: `${AUTHORITY}${code}` },
+      ...(label ? { label: literal(label) } : {}),
+    });
+    /** 62021CJ0340's facts as CELLAR records them on its canonical work (live, 2026-11-03). */
+    const C_340_21_ROWS = (work: string) => [
+      factRow(work, 'countries', 'country/BGR'),
+      factRow(work, 'procedure_types', 'fd_100/PREJ', 'Reference for a preliminary ruling'),
+      factRow(work, 'subjects', 'case-law-subject-matter/PDON', 'Protection of personal data'),
+      factRow(work, 'subjects', 'case-law-subject-matter/PRIN', 'Principles of Union law'),
+      factRow(work, 'procedure_languages', 'language/BUL'),
+    ];
+
+    it('62021CJ0340 reports BGR, a preliminary reference, two subjects, and BG on both surfaces', async () => {
+      facts = C_340_21_ROWS(`${CELLAR}62021CJ0340`);
+      const { result, text } = await call({
+        celex_number: '62021CJ0340',
+        content_mode: 'metadata_only',
+      });
+
+      expect(result).toMatchObject({
+        countries: ['BGR'],
+        procedure_types: ['Reference for a preliminary ruling'],
+        subjects: ['Principles of Union law', 'Protection of personal data'],
+        procedure_languages: ['BG'],
+      });
+      expect(result).not.toHaveProperty('procedures');
+      expect(text).toContain('**Countries:** BGR');
+      expect(text).toContain('**Procedure types:** Reference for a preliminary ruling');
+      expect(text).toContain('**Subjects:** Principles of Union law; Protection of personal data');
+      expect(text).toContain('**Procedure languages:** BG');
+
+      const queries = mockSparqlQuery.mock.calls.map(([q]) => q as string);
+      expect(queries.filter(isCaseLawFactsQuery)).toHaveLength(1);
+      expect(queries.find(isCaseLawFactsQuery)).toContain(
+        `VALUES ?work { <${CELLAR}62021CJ0340> }`,
+      );
+      // Case law belongs to no legislative procedure, so none is looked up (#180).
+      expect(
+        queries.some((q) => q.includes('procedure_code_interinstitutional_reference_procedure')),
+      ).toBe(false);
+    });
+
+    it('reads the facts from the canonical work, never the do_not_index copy', async () => {
+      const canonical = canonicalWork('62012CJ0131');
+      mockSparqlQuery.mockImplementation(async (q: string) => {
+        if (isResolutionQuery(q)) return celexWorkRows(q);
+        // CELLAR records the facts on the canonical work alone.
+        if (isCaseLawFactsQuery(q))
+          return q.includes(`<${canonical}>`) ? C_340_21_ROWS(canonical) : [];
+        return q.includes('cdm:work_has_resource-type') ? [core] : [];
+      });
+      const { result } = await call({ celex_number: '62012CJ0131', content_mode: 'metadata_only' });
+
+      expect(result.countries).toEqual(['BGR']);
+      const factsQuery = mockSparqlQuery.mock.calls
+        .map(([q]) => q as string)
+        .find(isCaseLawFactsQuery) as string;
+      expect(factsQuery).toContain(`VALUES ?work { <${canonical}> }`);
+      expect(factsQuery).not.toContain(fixtureWork('62012CJ0131', 0));
+    });
+
+    it('leaves out each fact CELLAR records nothing for, on both surfaces', async () => {
+      facts = [
+        factRow(
+          `${CELLAR}62012CJ0131`,
+          'procedure_types',
+          'fd_100/PREJ',
+          'Reference for a preliminary ruling',
+        ),
+      ];
+      const { result, text } = await call({
+        celex_number: '62012CJ0131',
+        content_mode: 'metadata_only',
+      });
+      expect(result.procedure_types).toEqual(['Reference for a preliminary ruling']);
+      for (const field of ['countries', 'subjects', 'procedure_languages']) {
+        expect(result).not.toHaveProperty(field);
+      }
+      expect(text).not.toContain('**Countries:**');
+      expect(text).not.toContain('**Subjects:**');
+      expect(text).not.toContain('**Procedure languages:**');
+    });
+
+    it('carries none of the fields for a case CELLAR records no facts for', async () => {
+      const { result, text } = await call({
+        celex_number: '62012CJ0131',
+        content_mode: 'metadata_only',
+      });
+      for (const field of FACT_FIELDS) expect(result).not.toHaveProperty(field);
+      for (const label of ['Countries', 'Procedure types', 'Subjects', 'Procedure languages']) {
+        expect(text).not.toContain(`**${label}:**`);
+      }
     });
   });
 

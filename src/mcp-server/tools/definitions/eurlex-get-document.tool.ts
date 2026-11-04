@@ -13,12 +13,14 @@ import {
   limitClampTrailer,
 } from '@/mcp-server/tools/limit-clamp.js';
 import { renderNoticeBlockquote } from '@/mcp-server/tools/markdown-render.js';
+import { withTimeoutAlternative } from '@/mcp-server/tools/timeout-alternative.js';
 import {
-  actCitationQueryParts,
+  actCitationQuery,
   type DateOfEffect,
   EFFECT_TYPE_VALUES,
   readActCitation,
 } from '@/services/cellar-sparql/act-citation.js';
+import { type CaseLawFacts, fetchCaseLawFacts } from '@/services/cellar-sparql/case-law-facts.js';
 import {
   ENG_LANGUAGE_URI,
   LANGUAGE_AUTHORITY_URI,
@@ -40,10 +42,16 @@ import {
   resolveEliToWork,
 } from '@/services/cellar-sparql/eli-resolution.js';
 import {
+  fetchLegislativeProcedures,
+  type LegislativeProcedure,
+  PROCEDURE_STATUS_VALUES,
+} from '@/services/cellar-sparql/legislative-procedures.js';
+import {
   type ConsolidationBase,
   findConsolidation,
   isConsolidatedCelex,
 } from '@/services/cellar-sparql/relation-traversal.js';
+import { cellarDate, UNDATED_PLACEHOLDER } from '@/services/cellar-sparql/sort-window.js';
 import type { SparqlBinding } from '@/services/cellar-sparql/types.js';
 import { fetchWorkAgents } from '@/services/cellar-sparql/work-agents.js';
 import { resolveCelexWorks } from '@/services/cellar-sparql/work-resolution.js';
@@ -123,12 +131,14 @@ const NationalMeasureSchema = z.object({
     .string()
     .optional()
     .describe(
-      'Publication date in the national official journal; distinct from the document date.',
+      `Publication date in the national official journal; distinct from the document date. Absent when CELLAR records no real date — none, or the ${UNDATED_PLACEHOLDER} it records for an unknown one.`,
     ),
   notification_date: z
     .string()
     .optional()
-    .describe('Date the national measure was notified; not proof of complete transposition.'),
+    .describe(
+      `Date the national measure was notified; not proof of complete transposition. Absent when CELLAR records no real date — none, or the ${UNDATED_PLACEHOLDER} it records for an unknown one.`,
+    ),
 });
 
 /**
@@ -153,10 +163,19 @@ function unavailableBodyNote(
   }
 }
 
+/**
+ * The `sparql_timeout` recovery's next move at the lookup an eli_uri or work_uri
+ * needs and a celex_number skips — added only there, so a celex_number caller is
+ * never offered the input it sent (#177).
+ */
+const ELI_LOOKUP_ALTERNATIVE = 'Passing celex_number in place of eli_uri skips the ELI lookup.';
+const WORK_LOOKUP_ALTERNATIVE =
+  'Passing celex_number in place of work_uri skips the work URI lookup.';
+
 export const eurlex_get_document = tool('eurlex_get_document', {
   title: 'Get EU Document',
   description:
-    'Fetch the metadata and full text of an EU act or case-law record by CELEX number, ELI URI, or work URI. Returns structured metadata (title, date, type, ELI, Official Journal reference, typed dates of effect, transposition deadlines, author institution, Advocates General, legal basis, EuroVoc subjects, in-force status and, for an act not in force, its repealing acts, end of validity, or pending entry into force; for case law, the ECLI and the formation, referring court, subject matter, and case reference parsed from the title) plus the body as HTML, Markdown, or Formex4 XML, defaulting to English with automatic fallback. Every body returned in one call is capped at 100,000 characters — paged and full windows page onward with offset/limit; use outline: true for a heading map and select to pull specific articles, chapters, recitals, or annexes of an act, or the headed sections and operative part of a judgment or order, reading a selected section on its own from the offset and chars in selected_sections.',
+    'Fetch the metadata and full text of an EU act or case-law record by CELEX number, ELI URI, or work URI. Returns structured metadata (title, date, type, ELI, Official Journal reference, typed dates of effect, transposition deadlines, author institution, Advocates General, legal basis, EuroVoc subjects, in-force status and, for an act not in force, its repealing acts, end of validity, or pending entry into force; the legislative procedures the act belongs to, each with its status — adopted, withdrawn, pending, or not adopted — and the acts it produced; for case law, the ECLI, the formation, referring court, subject matter, and case reference parsed from the title, and the countries, procedure types with their outcome, subjects, and procedure languages CELLAR records) plus the body as HTML, Markdown, or Formex4 XML, defaulting to English with automatic fallback. Every body returned in one call is capped at 100,000 characters — paged and full windows page onward with offset/limit; use outline: true for a heading map and select to pull specific articles, chapters, recitals, or annexes of an act, or the headed sections and operative part of a judgment or order, reading a selected section on its own from the offset and chars in selected_sections.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     celex_number: z
@@ -326,13 +345,44 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .string()
       .optional()
       .describe(
-        'Case law: the subject-matter keyword list from the title (e.g. "Personal data – Protection of individuals …").',
+        'Case law: the subject-matter keyword list from the title (e.g. "Personal data – Protection of individuals …"). Free text, unlike subjects, CELLAR\'s subject classification.',
       ),
     case_reference: z
       .string()
       .optional()
       .describe('Case law: the case reference from the title (e.g. "Case C-131/12.").'),
-    date: z.string().optional().describe('Document date in ISO 8601 format (YYYY-MM-DD).'),
+    countries: z
+      .array(z.string().describe('ISO 3166-1 alpha-3 country code, e.g. "BGR".'))
+      .optional()
+      .describe(
+        "Case law: countries CELLAR records the case as originating in, as ISO 3166-1 alpha-3 codes, sorted — the referring court's state on a preliminary reference, the defendant state on an action for failure to fulfil obligations, the applicant's state on a direct action; the values the member_state filter of eurlex_get_cases takes. Absent for legislation, and for case law with none recorded, as on Civil Service Tribunal staff cases.",
+      ),
+    procedure_types: z
+      .array(
+        z.string().describe('English procedure label, e.g. "Action for annulment - successful".'),
+      )
+      .optional()
+      .describe(
+        'Case law: the court procedure types CELLAR classifies the case under, as English labels with the outcome where recorded (e.g. "Reference for a preliminary ruling", "Appeal - unfounded"), sorted; what the procedure_type and outcome filters of eurlex_get_cases match. An appeal also lists the action appealed. Not a legislative procedure: those are in procedures. Absent for legislation, and for case law with none recorded.',
+      ),
+    subjects: z
+      .array(z.string().describe('English subject label, e.g. "Protection of personal data".'))
+      .optional()
+      .describe(
+        "Case law: subjects of CELLAR's case-law subject classification, as English labels, sorted; what the subject filter of eurlex_get_cases matches. A controlled vocabulary, unlike the title's subject_matter keywords. Absent for legislation, and for case law with none recorded.",
+      ),
+    procedure_languages: z
+      .array(z.string().describe('Two-letter EUR-Lex language code, e.g. "BG".'))
+      .optional()
+      .describe(
+        'Case law: languages of the case, as the two-letter codes language takes, sorted. Absent for legislation, and for case law with none recorded, as on about half of the Court of Justice AG opinions and records dated before 1990.',
+      ),
+    date: z
+      .string()
+      .optional()
+      .describe(
+        `Document date in ISO 8601 format (YYYY-MM-DD). Absent when CELLAR records no real document date — none, or the ${UNDATED_PLACEHOLDER} it records for an undated work.`,
+      ),
     eli: z
       .string()
       .optional()
@@ -443,14 +493,20 @@ export const eurlex_get_document = tool('eurlex_get_document', {
               .enum(EFFECT_TYPE_VALUES)
               .optional()
               .describe(
-                'What takes effect on that date: "entry_into_force", "application", "partial_application", "provisional_application", "takes_effect", or "takes_partial_effect". Absent when CELLAR records no type, or one outside these.',
+                'What takes effect on that date: "entry_into_force", "application", "partial_application", "provisional_application", "takes_effect", or "takes_partial_effect". "partial_application" is a date from which only some of the act\'s provisions apply; the clause in provision says which. Absent when CELLAR records no type, or one outside these.',
+              ),
+            provision: z
+              .string()
+              .optional()
+              .describe(
+                'The clause of the act that sets the date — e.g. "Article 113(a)", "Sole article", "Annex II", "Point 3" — numbered as CELLAR records it, so "Article 93.1" in an EU act is Article 93(1). Read it for which provisions the date covers. Absent when CELLAR names no single clause of the act: none at all, another act, an OJ reference, several provisions, or the text as a whole.',
               ),
           })
           .describe('One date of effect.'),
       )
       .optional()
       .describe(
-        "Every date of effect CELLAR records for the act, sorted by date, one entry per date and type (a date can carry two, e.g. entry into force and application), whether past or ahead and whatever in_force says. For a consolidated text, its base act's. Absent when none is recorded.",
+        "Every date of effect CELLAR records for the act, sorted by date, one entry per date, type, and provision (a date can carry several, e.g. entry into force and application), whether past or ahead and whatever in_force says. An act that applies in stages records its general date of application as application and each date from which only some provisions apply as partial_application. For a consolidated text, its base act's. Absent when none is recorded.",
       ),
     end_of_validity: z
       .string()
@@ -463,6 +519,40 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .optional()
       .describe(
         "A directive's deadlines for transposition into national law, sorted. For a consolidated text, its base act's. Absent when none is recorded.",
+      ),
+    procedures: z
+      .array(
+        z
+          .object({
+            reference: z
+              .string()
+              .describe(
+                'Procedure reference: year, number, and procedure type, e.g. "2021/0106(COD)" (COD ordinary legislative procedure, CNS consultation, NLE non-legislative), the number as CELLAR writes it (e.g. "2011/341A(COD)"). eurlex_lookup_celex resolves it to the act that initiated the procedure. A reference CELLAR records in another shape (e.g. "2008/0073/") is returned as recorded.',
+              ),
+            status: z
+              .enum(PROCEDURE_STATUS_VALUES)
+              .optional()
+              .describe(
+                'Where the procedure stands, from the flag CELLAR sets on it: "adopted", "withdrawn" (the proposal was withdrawn), "pending" (no outcome yet), or "not_adopted". Absent when CELLAR sets none, or more than one (some older procedures are flagged both adopted and withdrawn); an absent status is not "pending".',
+              ),
+            withdrawal_date: z
+              .string()
+              .optional()
+              .describe(
+                'Date the proposal was withdrawn (YYYY-MM-DD). Present when CELLAR flags the procedure withdrawn and records the date.',
+              ),
+            adopted_acts: z
+              .array(z.string().describe('CELEX number of an act the procedure produced.'))
+              .optional()
+              .describe(
+                'CELEX numbers of the acts the procedure produced, sorted — fetch each with eurlex_get_document. Present whatever the status; absent when CELLAR links no act with a CELEX.',
+              ),
+          })
+          .describe('One interinstitutional procedure.'),
+      )
+      .optional()
+      .describe(
+        "The interinstitutional (legislative) procedures the act belongs to, sorted by reference: a proposal's own procedure, or the procedure that adopted an act. A work can belong to several. Distinct from procedure_types, which classifies a court case. For a consolidated text, its base act's. Absent when the act belongs to none, as for case law and acts that predate CELLAR's procedure records.",
       ),
     base_act_celex: z
       .string()
@@ -729,9 +819,9 @@ export const eurlex_get_document = tool('eurlex_get_document', {
     {
       reason: 'sparql_timeout',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'A query this call sent to CELLAR ran past the client timeout, or CELLAR refused it as too costly to run. It is not retried.',
+      when: "A query this call sent to CELLAR ran past the time budget the call's queries share (retryable: CELLAR's response time varies, so a later call can finish), or CELLAR refused it as too costly to run (not retryable: the same query is refused again). Neither is retried within the call.",
       recovery:
-        'Retry the call shortly, passing celex_number in place of eli_uri or work_uri to skip the identifier lookup.',
+        "When the error is retryable, call again shortly: whether the call's queries finish inside their time budget turns on CELLAR's response time, not on the request.",
       thrownBy: 'service',
     },
   ],
@@ -768,7 +858,11 @@ export const eurlex_get_document = tool('eurlex_get_document', {
     } else if (celexInput) {
       requestedCelex = celexInput;
     } else if (eliInput) {
-      const binding = await resolveEliToWork(sparqlSvc, eliInput, ctx);
+      const binding = await withTimeoutAlternative(
+        ctx,
+        ELI_LOOKUP_ALTERNATIVE,
+        resolveEliToWork(sparqlSvc, eliInput, ctx),
+      );
       const resolvedCelex = binding && CellarSparqlService.bindingValue(binding, 'celexNumber');
       if (!resolvedCelex) {
         throw ctx.fail('not_found', `No CELLAR work found for ELI: ${eliInput}`);
@@ -791,9 +885,13 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       if (aliasCelex) {
         requestedCelex = aliasCelex;
       } else {
-        let [deref] = await sparqlSvc.query(
-          `SELECT (MIN(STR(?celexValue)) AS ?celex) (COUNT(DISTINCT ?celexValue) AS ?celexCount) WHERE {\n  <${safeWorkUri}> cdm:resource_legal_id_celex ?celexValue .\n}`,
+        let [deref] = await withTimeoutAlternative(
           ctx,
+          WORK_LOOKUP_ALTERNATIVE,
+          sparqlSvc.query(
+            `SELECT (MIN(STR(?celexValue)) AS ?celex) (COUNT(DISTINCT ?celexValue) AS ?celexCount) WHERE {\n  <${safeWorkUri}> cdm:resource_legal_id_celex ?celexValue .\n}`,
+            ctx,
+          ),
         );
         let ownerNotice: string | undefined;
         if (!CellarSparqlService.bindingValue(deref, 'celex')) {
@@ -877,12 +975,13 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       const workUri = resolved.get(celex);
       if (!workUri) return null;
       const actWork = baseAct?.workUri ?? workUri;
-      // The in-force reasons (#111) ride the core query as aggregates: the earliest
-      // entry into force, the latest end of validity, and the CELEX of every act
-      // explicitly repealing this one. The dates aggregate over STR(): CELLAR
-      // computes a grouped MIN/MAX over an OPTIONAL xsd:date wrongly. The open-ended
-      // placeholder is filtered inside its OPTIONAL, so the MAX sees only real dates
-      // on an act that records one alongside it.
+      // Two of the in-force reasons (#111) ride the core query as aggregates: the
+      // latest end of validity and the CELEX of every act explicitly repealing this
+      // one. The end date aggregates over STR(): CELLAR computes a grouped MIN/MAX
+      // over an OPTIONAL xsd:date wrongly. The open-ended placeholder is filtered
+      // inside its OPTIONAL, so the MAX sees only real dates on an act that records
+      // one alongside it. The third, the earliest entry into force, is the first of
+      // the dates of effect the citation query reads.
       //
       // A case-law record's ECLI rides it too (#117), by eurlex_lookup_celex's
       // rule: the resolved work's own, else the lowest any work of the CELEX
@@ -915,19 +1014,15 @@ export const eurlex_get_document = tool('eurlex_get_document', {
     ?languageExpr cdm:expression_uses_language <${LANGUAGE_AUTHORITY_URI}${LANGUAGE_TO_ISO_639_2[language].toUpperCase()}> .
     ?languageExpr cdm:expression_title ?languageTitleValue .
   }`;
-      // The citation facts (#169) ride it as well: the served work's ELI, and the
-      // act's OJ reference, typed dates of effect, and transposition deadlines,
-      // with the entry-into-force pattern feeding both the earliest date and them.
-      const citationQuery = actCitationQueryParts(
-        workUri,
-        actWork,
-        baseAct ? baseAct.celex : celex,
-      );
+      // The citation facts (#169) have their own query (#173), run beside the core
+      // one: the served work's ELI, and the act's OJ reference, typed dates of
+      // effect, and transposition deadlines. Folded into the core query, their
+      // OPTIONALs multiplied its rows and cost more than the two queries run apart.
+      const citationQuery = actCitationQuery(workUri, actWork, baseAct ? baseAct.celex : celex);
       const coreQuery = `
 SELECT ?type ?date ?title ?inForce
-  (MIN(STR(?entryIntoForceDate)) AS ?entryIntoForce)
   (MAX(STR(?endOfValidityDate)) AS ?endOfValidity)
-  (GROUP_CONCAT(DISTINCT STR(?repealerCelex); separator=" ") AS ?repealedBy)${citationQuery.select}${ecliSelect}${languageTitleSelect}
+  (GROUP_CONCAT(DISTINCT STR(?repealerCelex); separator=" ") AS ?repealedBy)${ecliSelect}${languageTitleSelect}
 WHERE {${ecliPatterns}
   OPTIONAL { <${workUri}> cdm:work_has_resource-type ?type . }
   OPTIONAL { <${workUri}> cdm:work_date_document ?date . }
@@ -936,7 +1031,7 @@ WHERE {${ecliPatterns}
     ?expr cdm:expression_uses_language <${ENG_LANGUAGE_URI}> .
     ?expr cdm:expression_title ?title .
   }${languageTitlePattern}
-  OPTIONAL { <${actWork}> cdm:resource_legal_in-force ?inForce . }${citationQuery.patterns}
+  OPTIONAL { <${actWork}> cdm:resource_legal_in-force ?inForce . }
   OPTIONAL {
     <${actWork}> cdm:resource_legal_date_end-of-validity ?endOfValidityDate .
     FILTER(STR(?endOfValidityDate) != "${OPEN_ENDED_VALIDITY}")
@@ -974,14 +1069,29 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
   }
   <${workUri}> ?predicate ?rawValue .
 } GROUP BY ?field LIMIT 5`;
-      const [coreBindings, agents, legalBasisBindings, eurovocBindings, nationalBindings] =
-        await Promise.all([
-          sparqlSvc.query(coreQuery, ctx),
-          fetchWorkAgents(sparqlSvc, actWork, ctx),
-          sparqlSvc.query(legalBasisQuery, ctx),
-          sparqlSvc.query(eurovocQuery, ctx),
-          celex.startsWith('7') ? sparqlSvc.query(nationalQuery, ctx) : Promise.resolve([]),
-        ]);
+      // A case-law record reads the facts CELLAR records on the case (#178), from
+      // its resolved work; any other act the legislative procedures it belongs to
+      // (#180), from its base act for a consolidated text. No case-law work links
+      // to a procedure dossier, so each kind sends only the query that can match.
+      const [
+        coreBindings,
+        citationBindings,
+        agents,
+        legalBasisBindings,
+        eurovocBindings,
+        nationalBindings,
+        caseLawFacts,
+        procedures,
+      ] = await Promise.all([
+        sparqlSvc.query(coreQuery, ctx),
+        sparqlSvc.query(citationQuery, ctx),
+        fetchWorkAgents(sparqlSvc, actWork, ctx),
+        sparqlSvc.query(legalBasisQuery, ctx),
+        sparqlSvc.query(eurovocQuery, ctx),
+        celex.startsWith('7') ? sparqlSvc.query(nationalQuery, ctx) : Promise.resolve([]),
+        caseLaw ? fetchCaseLawFacts(sparqlSvc, [workUri], ctx) : Promise.resolve(undefined),
+        caseLaw ? Promise.resolve([]) : fetchLegislativeProcedures(sparqlSvc, actWork, ctx),
+      ]);
 
       /** One entry per distinct URI, carrying the companion literal when bound. */
       const collectResolved = (
@@ -1000,11 +1110,14 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
       };
 
       const first = coreBindings[0];
+      const citation = readActCitation(citationBindings[0]);
       const nationalMeasure = NationalMeasureSchema.parse(
         Object.fromEntries(
           nationalBindings.flatMap((binding) => {
             const field = CellarSparqlService.bindingValue(binding, 'field');
-            const value = CellarSparqlService.bindingValue(binding, 'value');
+            const raw = CellarSparqlService.bindingValue(binding, 'value');
+            // publication_date and notification_date carry CELLAR's undated placeholder too.
+            const value = field?.endsWith('_date') ? cellarDate(raw) : raw;
             return field && value ? [[field, value]] : [];
           }),
         ),
@@ -1014,7 +1127,7 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
         nationalMeasure: Object.keys(nationalMeasure).length ? nationalMeasure : undefined,
         baseActCelex: baseAct?.celex,
         resourceType: CellarSparqlService.bindingValue(first, 'type'),
-        date: CellarSparqlService.bindingValue(first, 'date'),
+        date: cellarDate(CellarSparqlService.bindingValue(first, 'date')),
         title: CellarSparqlService.bindingValue(first, 'title'),
         languageTitle: CellarSparqlService.bindingValue(first, 'languageTitle'),
         ecli:
@@ -1023,13 +1136,15 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
         inForce: CellarSparqlService.parseBoolean(
           CellarSparqlService.bindingValue(first, 'inForce'),
         ),
-        entryIntoForce: CellarSparqlService.bindingValue(first, 'entryIntoForce')?.slice(0, 10),
+        // Every date of effect is a cdm:resource_legal_date_entry-into-force value,
+        // sorted by date, so the first is the earliest entry into force.
+        entryIntoForce: citation.dates_of_effect?.[0]?.date,
         endOfValidity: CellarSparqlService.bindingValue(first, 'endOfValidity')?.slice(0, 10),
         repealedBy: (CellarSparqlService.bindingValue(first, 'repealedBy') ?? '')
           .split(' ')
           .filter(Boolean)
           .sort(),
-        citation: readActCitation(first),
+        citation,
         agents,
         legalBases: collectResolved(legalBasisBindings, 'legalBasis', 'celex').map(
           ({ uri, literal }) => ({ work_uri: uri, ...(literal ? { celex_number: literal } : {}) }),
@@ -1038,6 +1153,8 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
           concept_uri: uri,
           ...(literal ? { label: literal } : {}),
         })),
+        caseLawFacts: caseLawFacts?.get(workUri),
+        procedures,
       };
     };
 
@@ -1121,6 +1238,7 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
       dates_of_effect?: DateOfEffect[];
       end_of_validity?: string;
       transposition_deadlines?: string[];
+      procedures?: LegislativeProcedure[];
       base_act_celex?: string;
       is_superseded?: boolean;
       current_consolidated_celex?: string;
@@ -1144,7 +1262,7 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
       selection?: { requested: string[]; matched: string[]; missed: string[] };
       selected_sections?: SelectedSection[];
       structure_detected?: boolean;
-    } = {
+    } & CaseLawFacts = {
       celex_number: servedCelex,
       content_mode: input.content_mode,
       content_available: false,
@@ -1184,6 +1302,8 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
     } else if (servedTitle) {
       result.title = servedTitle;
     }
+    // #178: each case-law fact is present only when CELLAR records a value for it.
+    Object.assign(result, metaResult.caseLawFacts);
     if (metaResult.ecli) result.ecli = metaResult.ecli;
     if (metaResult.date) result.date = metaResult.date;
     if (metaResult.resourceType) {
@@ -1224,6 +1344,7 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
     if (citation.transposition_deadlines) {
       result.transposition_deadlines = citation.transposition_deadlines;
     }
+    if (metaResult.procedures.length > 0) result.procedures = metaResult.procedures;
 
     // #109: staleness describes the served text. It is current when it is the
     // newest consolidated version in effect, and not superseded either when it is
@@ -1468,6 +1589,14 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
     if (result.referring_court) lines.push(`**Referring court:** ${esc(result.referring_court)}`);
     if (result.subject_matter) lines.push(`**Subject matter:** ${esc(result.subject_matter)}`);
     if (result.case_reference) lines.push(`**Case reference:** ${esc(result.case_reference)}`);
+    if (result.countries) lines.push(`**Countries:** ${escList(result.countries)}`);
+    if (result.procedure_types) {
+      lines.push(`**Procedure types:** ${escList(result.procedure_types, '; ')}`);
+    }
+    if (result.subjects) lines.push(`**Subjects:** ${escList(result.subjects, '; ')}`);
+    if (result.procedure_languages) {
+      lines.push(`**Procedure languages:** ${escList(result.procedure_languages)}`);
+    }
     if (typeof result.in_force === 'boolean') lines.push(`**In Force:** ${result.in_force}`);
     if (result.repealed_by && result.repealed_by.length > 0) {
       lines.push(`**Repealed by:** ${escList(result.repealed_by)}`);
@@ -1479,12 +1608,26 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
     if (result.dates_of_effect && result.dates_of_effect.length > 0) {
       lines.push(
         `**Dates of effect:** ${result.dates_of_effect
-          .map(({ date, type }) => (type ? `${esc(date)} (${type})` : esc(date)))
+          .map(({ date, type, provision }) => {
+            const labels = [type, provision && esc(provision)].filter(Boolean);
+            return labels.length > 0 ? `${esc(date)} (${labels.join(', ')})` : esc(date);
+          })
           .join(', ')}`,
       );
     }
     if (result.transposition_deadlines && result.transposition_deadlines.length > 0) {
       lines.push(`**Transposition deadlines:** ${escList(result.transposition_deadlines)}`);
+    }
+    // #180: one line per procedure, each field it carries labelled.
+    for (const procedure of result.procedures ?? []) {
+      const facts = [
+        procedure.status && `status: ${procedure.status}`,
+        procedure.withdrawal_date && `withdrawal date: ${esc(procedure.withdrawal_date)}`,
+        procedure.adopted_acts && `adopted acts: ${escList(procedure.adopted_acts)}`,
+      ].filter(Boolean);
+      lines.push(
+        `**Procedure:** ${esc(procedure.reference)}${facts.length > 0 ? ` — ${facts.join('; ')}` : ''}`,
+      );
     }
     // #29/#109 staleness — each field renders in its own block so the
     // format-parity sentinel walk sees every one.

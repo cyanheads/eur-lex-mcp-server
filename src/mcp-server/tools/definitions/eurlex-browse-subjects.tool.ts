@@ -35,7 +35,7 @@ const MAX_PAGE_SIZE = 50;
 export const eurlex_browse_subjects = tool('eurlex_browse_subjects', {
   title: 'Browse EuroVoc Subjects',
   description:
-    'Search the EuroVoc thesaurus, resolving a keyword into concept URIs usable in the eurovoc_concept subject filter of eurlex_search_documents. Matches both preferred and alternative (non-preferred) labels, so a common synonym reaches the concept it stands for. Returns each concept URI, its preferred label in the requested language, code, broader (parent) label, and the alternative label that matched when one did. Concepts with an exact label match come first, then those whose label or one of its words starts with the keyword, then other substring matches, each group ordered by preferred label.',
+    'Search the EuroVoc thesaurus, resolving a keyword into concept URIs usable in the eurovoc_concept subject filter of eurlex_search_documents. CELLAR indexes no judgment, order, or Advocate General opinion of the Court of Justice or General Court by EuroVoc concept; only EFTA Court judgments carry one, so search case law by subject with eurlex_get_cases subject. Matches both preferred and alternative (non-preferred) labels, so a common synonym reaches the concept it stands for. Returns each concept URI, its preferred label in the requested language, code, broader (parent) label, and the alternative label that matched when one did. Concepts with an exact label match come first, then those whose label or one of its words starts with the keyword, then other substring matches, each group ordered by preferred label.',
   annotations: { readOnlyHint: true, openWorldHint: true, idempotentHint: true },
   input: z.object({
     keyword: z
@@ -151,7 +151,7 @@ export const eurlex_browse_subjects = tool('eurlex_browse_subjects', {
     {
       reason: 'sparql_timeout',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'The thesaurus search ran past the client timeout, or CELLAR refused it as too costly to run. It is not retried.',
+      when: "The thesaurus search ran past its time budget (retryable: CELLAR's response time varies, so a later search can finish), or CELLAR refused it as too costly to run (not retryable: the same search is refused again). Neither is retried within the call.",
       recovery:
         'Use a longer, more specific keyword so fewer labels match, or a smaller limit, then search again.',
       thrownBy: 'service',

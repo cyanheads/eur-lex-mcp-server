@@ -68,6 +68,11 @@ export function isResolutionQuery(sparql: string): boolean {
   return sparql.includes('VALUES ?celexNumber') && sparql.includes('owl#sameAs');
 }
 
+/** True for the case-law facts query (#178), keyed by the resolved works. */
+export function isCaseLawFactsQuery(sparql: string): boolean {
+  return sparql.includes('VALUES ?work {') && sparql.includes('BIND("countries" AS ?fact)');
+}
+
 /** The CELEX values a resolution query asks for, unescaped, in `VALUES` order. */
 export function requestedCelex(sparql: string): string[] {
   const values = /VALUES \?celexNumber \{([^}]*)\}/.exec(sparql)?.[1] ?? '';

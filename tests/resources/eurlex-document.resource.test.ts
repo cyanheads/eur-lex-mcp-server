@@ -17,6 +17,7 @@ import {
   ACTS,
   fakeConsolidationCellar,
   isConsolidationLookup,
+  isProcedureLookup,
   WORK,
 } from '../fixtures/cellar-consolidations.js';
 import {
@@ -29,6 +30,10 @@ import {
   isResolutionQuery,
   resolutionRows,
 } from '../fixtures/cellar-works.js';
+import { queryRoles, roles } from '../helpers/query-roles.js';
+
+/** The metadata queries every read sends after resolution (#96, #173). */
+const READ_ROLES = ['core', 'citation', 'agents', 'legal_basis', 'eurovoc'] as const;
 
 // Reserved per-request `_meta` keys of MCP protocol revision 2026-07-28.
 const PROTOCOL_VERSION_META_KEY = 'io.modelcontextprotocol/protocolVersion';
@@ -185,6 +190,26 @@ describe('eurlex_document_resource', () => {
       // #35: the raw resource-type URI resolves to a human-readable label.
       resource_type: 'Regulation',
     });
+  });
+
+  it('reads CELLAR’s undated placeholder as no date, in the result and over the wire (#184)', async () => {
+    mockQuery.mockResolvedValue([
+      makeMetaBinding({ celex: '71995L0046BEL_101325', date: '1001-01-01', title: 'Loi' }),
+    ]);
+
+    const params = eurlex_document_resource.params!.parse({ celexNumber: '71995L0046BEL_101325' });
+    const result = await eurlex_document_resource.handler(
+      params,
+      createMockContext({ tenantId: 'test-tenant', errors: eurlex_document_resource.errors }),
+    );
+    expect(result).toMatchObject({ celex_number: '71995L0046BEL_101325', title: 'Loi' });
+    expect(result).not.toHaveProperty('date');
+
+    const { result: read, error } = await readOverWire('eurlex://document/71995L0046BEL_101325');
+    expect(error).toBeUndefined();
+    const text = read?.contents[0]?.text ?? '';
+    expect(JSON.parse(text)).toMatchObject({ celex_number: '71995L0046BEL_101325', title: 'Loi' });
+    expect(text).not.toContain('1001-01-01');
   });
 
   // --- #67: legal basis and EuroVoc subjects resolve inline ---
@@ -547,7 +572,7 @@ describe('eurlex_document_resource', () => {
 
   // --- #92 / #97: the typed CELEX resolves once; metadata keys on the work ---
 
-  it('types the CELEX in the resolution and keys all four metadata queries on the resolved work', async () => {
+  it('types the CELEX in the resolution and keys all five metadata queries on the resolved work', async () => {
     const ctx = createMockContext({
       tenantId: 'test-tenant',
       errors: eurlex_document_resource.errors,
@@ -560,7 +585,7 @@ describe('eurlex_document_resource', () => {
     const result = (await eurlex_document_resource.handler(params, ctx)) as Record<string, unknown>;
 
     const queries = mockQuery.mock.calls.map((c) => c[0] as string);
-    expect(queries).toHaveLength(5);
+    expect(queryRoles(queries)).toEqual(roles('resolution', ...READ_ROLES));
     expect(queries[0]).toContain('VALUES ?celexNumber { "62012CJ0131"^^xsd:string }');
     const work = `<${CELLAR}62012CJ0131>`;
     for (const q of queries.slice(1)) {
@@ -678,7 +703,7 @@ describe('eurlex_document_resource', () => {
           },
         }));
       }
-      if (q.includes('cdm:expression_belongs_to_work')) {
+      if (q.includes('cdm:work_has_resource-type')) {
         const authors = q.includes('cdm:work_created_by_agent') ? agentRows(q) : [{}];
         return works.flatMap(({ celex, work }) =>
           authors.map((author) => ({
@@ -790,8 +815,7 @@ describe('eurlex_document_resource', () => {
       expect(result).not.toHaveProperty('base_act_celex');
       expect(result.work_uri).toBe(WORK.aiAct);
       const queries = mockQuery.mock.calls.map((c) => c[0] as string);
-      expect(queries.some(isConsolidationLookup)).toBe(false);
-      expect(queries).toHaveLength(5);
+      expect(queryRoles(queries)).toEqual(roles('resolution', ...READ_ROLES, 'procedures'));
     });
 
     it('runs the base lookup concurrently with CELEX resolution for a sector-0 CELEX', async () => {
@@ -845,12 +869,13 @@ describe('eurlex_document_resource', () => {
     };
 
     const FIELDS = ['eli', 'oj_reference', 'dates_of_effect', 'transposition_deadlines'];
+    // Three of its application dates are partial, each set by a point of Article 113 (#181).
     const AI_ACT_DATES = [
-      { date: '2024-08-01', type: 'entry_into_force' },
-      { date: '2025-02-02', type: 'application' },
-      { date: '2025-08-02', type: 'application' },
-      { date: '2026-08-02', type: 'application' },
-      { date: '2027-08-02', type: 'application' },
+      { date: '2024-08-01', type: 'entry_into_force', provision: 'Article 113' },
+      { date: '2025-02-02', type: 'partial_application', provision: 'Article 113(a)' },
+      { date: '2025-08-02', type: 'partial_application', provision: 'Article 113(b)' },
+      { date: '2026-08-02', type: 'application', provision: 'Article 113' },
+      { date: '2027-08-02', type: 'partial_application', provision: 'Article 113(c)' },
     ];
 
     it.each<[string, Record<string, unknown>]>([
@@ -871,6 +896,36 @@ describe('eurlex_document_resource', () => {
           dates_of_effect: AI_ACT_DATES,
         },
       ],
+      // The v0.20.0 output of four more acts, as read live on 2026-11-03.
+      [
+        '32016R0679',
+        {
+          eli: 'http://data.europa.eu/eli/reg/2016/679/oj',
+          oj_reference: 'OJ L 119, 4.5.2016, p. 1–88',
+          dates_of_effect: [
+            { date: '2016-05-24', type: 'entry_into_force' },
+            { date: '2018-05-25', type: 'application' },
+          ],
+        },
+      ],
+      [
+        '32022L2555',
+        {
+          eli: 'http://data.europa.eu/eli/dir/2022/2555/oj',
+          oj_reference: 'OJ L 333, 27.12.2022, p. 80–152',
+          dates_of_effect: [{ date: '2023-01-16', type: 'entry_into_force' }],
+          transposition_deadlines: ['2024-10-17', '2024-10-18'],
+        },
+      ],
+      [
+        '31962R0017',
+        {
+          eli: 'http://data.europa.eu/eli/reg/1962/17/oj',
+          oj_reference: 'OJ 13, 21.2.1962, p. 204–211',
+          dates_of_effect: [{ date: '1962-03-13', type: 'entry_into_force' }],
+        },
+      ],
+      ['12001C', { oj_reference: 'OJ C 80, 10.3.2001' }],
       /*
        * Consolidated texts: the ELI is the served text's own, the other three its
        * base act's — the fixture answers each pattern from the work it names.
@@ -907,11 +962,104 @@ describe('eurlex_document_resource', () => {
       expect(facts).toEqual(expected);
     });
 
-    it('folds the facts into the core query: resolution plus the same four metadata queries', async () => {
+    it('reads the facts with their own query, beside an ungrouped core query (#173)', async () => {
       const result = await read('32016R0679');
       expect(result.oj_reference).toBe('OJ L 119, 4.5.2016, p. 1–88');
-      // Resolution, core, agents, legal bases, EuroVoc.
-      expect(mockQuery).toHaveBeenCalledTimes(5);
+      const queries = mockQuery.mock.calls.map((c) => c[0] as string);
+      expect(queryRoles(queries)).toEqual(roles('resolution', ...READ_ROLES, 'procedures'));
+      const core = queries.find((q) => q.includes('cdm:work_has_resource-type')) as string;
+      for (const pattern of [
+        'GROUP BY',
+        'cdm:resource_legal_eli',
+        'type_of_date',
+        'official-journal',
+        'AS ?datesOfEffect)',
+      ]) {
+        expect(core).not.toContain(pattern);
+      }
+      const citation = queries.find((q) => q.includes('AS ?datesOfEffect)')) as string;
+      expect(citation).not.toContain('GROUP BY');
+      expect(citation).not.toContain('cdm:work_has_resource-type');
+    });
+
+    it.each([
+      ['core', 'cdm:work_has_resource-type'],
+      ['citation', 'AS ?datesOfEffect)'],
+      ['procedure', 'cdm:procedure_code_interinstitutional_reference_procedure'],
+    ])('propagates a caller cancellation raised by the %s query', async (_label, marker) => {
+      mockQuery.mockImplementation((q: string) =>
+        q.includes(marker)
+          ? Promise.reject(new DOMException('The operation was aborted.', 'AbortError'))
+          : fakeConsolidationCellar(q),
+      );
+      const params = eurlex_document_resource.params!.parse({ celexNumber: '32016R0679' });
+      await expect(
+        eurlex_document_resource.handler(
+          params,
+          createMockContext({ errors: eurlex_document_resource.errors }),
+        ),
+      ).rejects.toThrow(/aborted/);
+      expect(mockQuery.mock.calls.some(([q]) => (q as string).includes(marker))).toBe(true);
+    });
+  });
+
+  // --- #180: the legislative procedures, read as eurlex_get_document reads them ---
+
+  describe('legislative procedures (#180)', () => {
+    const read = async (celex: string) => {
+      mockQuery.mockImplementation(fakeConsolidationCellar);
+      const ctx = createMockContext({ errors: eurlex_document_resource.errors });
+      const params = eurlex_document_resource.params!.parse({ celexNumber: celex });
+      return (await eurlex_document_resource.handler(params, ctx)) as Record<string, unknown>;
+    };
+    const sent = () => mockQuery.mock.calls.map((c) => c[0] as string);
+
+    it.each([
+      [
+        '52017PC0010',
+        [{ reference: '2017/0003(COD)', status: 'withdrawn', withdrawal_date: '2025-10-06' }],
+      ],
+      [
+        '32024R1689',
+        [{ reference: '2021/0106(COD)', status: 'adopted', adopted_acts: ['32024R1689'] }],
+      ],
+      [
+        '52023PC0331',
+        [
+          { reference: '2018/0135(CNS)', status: 'adopted', adopted_acts: ['32020D2053'] },
+          { reference: '2021/0430(CNS)', status: 'pending' },
+        ],
+      ],
+      /** A consolidated text carries its base act's. */
+      [
+        '02016R0679-20160504',
+        [{ reference: '2012/0011(COD)', status: 'adopted', adopted_acts: ['32016R0679'] }],
+      ],
+    ])('%s returns the procedures eurlex_get_document returns', async (celex, procedures) => {
+      const result = await read(celex);
+      expect(result.procedures).toEqual(procedures);
+    });
+
+    it('a consolidated text sends one added query, keyed on its base act', async () => {
+      await read('02016R0679-20160504');
+      expect(queryRoles(sent())).toEqual(
+        roles('resolution', 'consolidation', ...READ_ROLES, 'procedures'),
+      );
+      expect(sent().find(isProcedureLookup)).toContain(
+        `<${WORK.gdpr}> cdm:work_part_of_dossier ?procedure .`,
+      );
+    });
+
+    it('31962R0017 belongs to no procedure and carries no procedures field', async () => {
+      const result = await read('31962R0017');
+      expect(result).not.toHaveProperty('procedures');
+      expect(sent().filter(isProcedureLookup)).toHaveLength(1);
+    });
+
+    it('case law sends no procedure query and carries no procedures field', async () => {
+      const result = await read('62012CJ0131');
+      expect(result).not.toHaveProperty('procedures');
+      expect(queryRoles(sent())).toEqual(roles('resolution', ...READ_ROLES));
     });
   });
 });

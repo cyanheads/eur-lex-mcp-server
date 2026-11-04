@@ -1,6 +1,6 @@
 /**
- * @fileoverview Whole-row relation paging through the actual CELLAR service and wire contract.
- * @module tests/tools/eurlex-get-relations-budget
+ * @fileoverview Relation paging and provisions through the actual CELLAR service and wire contract.
+ * @module tests/tools/eurlex-get-relations.service.test
  */
 
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
@@ -66,10 +66,6 @@ it('walks actual-service multi-direction pages to exhaustion and preserves omitt
   for (; calls < 40; calls++) {
     const result = await runToolContract(eurlex_get_relations, { ...input, offset });
     expect(result.isError).not.toBe(true);
-    expect(Buffer.byteLength(JSON.stringify(result.structuredContent), 'utf8')).toBeLessThanOrEqual(
-      64000,
-    );
-    expect(Buffer.byteLength(JSON.stringify(result.content), 'utf8')).toBeLessThanOrEqual(64000);
     const page = result.structuredContent as {
       relations: { direction: string; related_work_uri: string; related_title: string }[];
       next_offset?: number;
@@ -91,11 +87,14 @@ it('walks actual-service multi-direction pages to exhaustion and preserves omitt
     if (offset >= 4) expect(page.relations.every((row) => row.direction === 'incoming')).toBe(true);
     if (!page.has_more) break;
     if (page.next_offset === undefined) throw new Error('Missing continuation');
-    expect(page.next_offset).toBe(offset + (page.cap ?? 100));
+    // The default limit of 10 is the page: every arm serves it whole (#183).
+    expect(page.cap).toBe(10);
+    expect(page.next_offset).toBe(offset + 10);
     offset = page.next_offset;
   }
-  expect(calls).toBeGreaterThan(1);
-  expect(calls).toBeLessThan(40);
+  // 31 incoming rows at 10 a page: the walk ends on its fourth call, at offset 30.
+  expect(calls).toBe(3);
+  expect(offset).toBe(30);
   expect(keys.toSorted()).toEqual(
     [
       ...Array.from({ length: 31 }, (_, i) => `incoming:http://example.test/shared-${i}`),
@@ -154,8 +153,6 @@ it('reads all of an edge’s provisions through the actual service, past its row
   // The internal path leaves the LIMIT-less follow-up uncapped.
   expect(followUp).not.toMatch(/LIMIT/);
   expect(followUp.startsWith('PREFIX')).toBe(true);
-  expect(Buffer.byteLength(JSON.stringify(result.structuredContent), 'utf8')).toBeLessThanOrEqual(
-    64000,
-  );
-  expect(Buffer.byteLength(JSON.stringify(result.content), 'utf8')).toBeLessThanOrEqual(64000);
+  // Every provision rides the row, with nothing withheld and no notice (#183).
+  expect(result.structuredContent).not.toHaveProperty('notice');
 });

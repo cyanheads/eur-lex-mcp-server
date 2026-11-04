@@ -414,6 +414,11 @@ describe('CellarSparqlService typed failures (#26)', () => {
     );
   }
 
+  /*
+   * A query that runs out of time is reported retryable (#177): whether it finishes
+   * turns on CELLAR's response time, so a later call can. The service still sends it
+   * once: re-running it inside the call would spend the same budget again (#78).
+   */
   it('fails fast on a client-side timeout: one attempt, typed reason, no hint of its own (#78, #145)', async () => {
     const fetchMock = vi.fn(async () => {
       throw new DOMException('The operation timed out.', 'TimeoutError');
@@ -421,13 +426,15 @@ describe('CellarSparqlService typed failures (#26)', () => {
     vi.stubGlobal('fetch', fetchMock);
     const ctx = createMockContext();
 
+    // A 1,000 ms per-query timeout under the 5,000 ms budget: the timeout, not the budget, ends it.
     const error = (await makeService()
       .query('SELECT ?work WHERE { ?s ?p ?o }', ctx, 1_000)
       .catch((e: unknown) => e)) as { data?: Record<string, unknown> };
 
     expect(error).toMatchObject({
       code: JsonRpcErrorCode.ServiceUnavailable,
-      data: { reason: 'sparql_timeout', retryable: false },
+      message: 'CELLAR SPARQL request exceeded the 1000 ms client timeout',
+      data: { reason: 'sparql_timeout', retryable: true },
     });
     // The calling tool's sparql_timeout recovery fills the hint on the wire.
     expect(error?.data).not.toHaveProperty('recovery');
@@ -451,7 +458,7 @@ describe('CellarSparqlService typed failures (#26)', () => {
       makeService().query('SELECT ?work WHERE { ?s ?p ?o }', createMockContext(), 30),
     ).rejects.toMatchObject({
       code: JsonRpcErrorCode.ServiceUnavailable,
-      data: { reason: 'sparql_timeout', retryable: false },
+      data: { reason: 'sparql_timeout', retryable: true },
     });
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
@@ -594,21 +601,44 @@ describe('CellarSparqlService typed failures (#26)', () => {
       expect(error.data?.recovery?.hint).not.toContain('syntax');
     });
 
-    it('carries the tool’s sparql_timeout recovery for a Virtuoso timeout', async () => {
+    /*
+     * The service's 5,000 ms timeout is below the most timeout_hint accepts, so the tool
+     * adds a higher timeout_hint to its contract recovery (#177).
+     */
+    const TIMEOUT_RECOVERY = `${eurlex_query_sparql.errors?.find((e) => e.reason === 'sparql_timeout')?.recovery} Raising timeout_hint above the 5000 ms in effect, up to 55000, gives a query that ran past its timeout longer.`;
+
+    it('carries the tool’s sparql_timeout recovery for a Virtuoso timeout, not retryable', async () => {
       stubFetchRaw({ ok: true, status: 200, body: TIMEOUT_BODY });
 
       const error = await wireError();
 
       expect(error).toMatchObject({
         code: JsonRpcErrorCode.ServiceUnavailable,
-        data: {
-          reason: 'sparql_timeout',
-          recovery: {
-            hint: eurlex_query_sparql.errors?.find((e) => e.reason === 'sparql_timeout')?.recovery,
-          },
-        },
+        data: { reason: 'sparql_timeout', retryable: false, recovery: { hint: TIMEOUT_RECOVERY } },
       });
-      expect(error.data?.recovery?.hint).toContain('timeout_hint');
+    });
+
+    it('reports a query that ran out of time as retryable, in both channels (#177)', async () => {
+      const fetchMock = vi.fn(async () => {
+        throw new DOMException('The operation timed out.', 'TimeoutError');
+      });
+      vi.stubGlobal('fetch', fetchMock);
+
+      const result = await runToolContract(eurlex_query_sparql, {
+        sparql_query: 'SELECT ?s WHERE { ?s ?p ?o } LIMIT 1',
+      });
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const { data } = (result.structuredContent as { error: { data: Record<string, unknown> } })
+        .error;
+      expect(data).toMatchObject({
+        reason: 'sparql_timeout',
+        retryable: true,
+        recovery: { hint: TIMEOUT_RECOVERY },
+      });
+      const text = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+      expect(text).toContain(`Recovery: ${TIMEOUT_RECOVERY}`);
+      expect(text.trimEnd().endsWith('(reason sparql_timeout · retryable)')).toBe(true);
     });
   });
 });
@@ -823,15 +853,16 @@ describe('CellarSparqlService caller cancellation (#122)', () => {
   });
 
   it('still reports its own client timeout as sparql_timeout, not as a cancellation', async () => {
-    stubSlowFetch(5_000);
+    const fetchMock = stubSlowFetch(5_000);
     const ctx = createMockContext();
 
     await expect(
       makeService().query('SELECT ?work WHERE { ?s ?p ?o } LIMIT 1', ctx, 30),
     ).rejects.toMatchObject({
       code: JsonRpcErrorCode.ServiceUnavailable,
-      data: { reason: 'sparql_timeout', retryable: false },
+      data: { reason: 'sparql_timeout', retryable: true },
     });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -842,7 +873,8 @@ describe('CellarSparqlService per-call deadline', () => {
   const START = new Date('2026-10-24T12:00:00Z').getTime();
   const BUDGET_SPENT = {
     code: JsonRpcErrorCode.ServiceUnavailable,
-    data: { reason: 'sparql_timeout', retryable: false },
+    message: 'CELLAR SPARQL queries for this request ran past the time budget they share',
+    data: { reason: 'sparql_timeout', retryable: true },
   };
 
   // Only the clock is faked, so moving it ages the call's first query; the budget is 5,000 ms.

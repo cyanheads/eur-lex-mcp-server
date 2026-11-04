@@ -38,8 +38,12 @@ export interface FixtureAct {
   /** `cdm:work_created_by_agent` authority codes. */
   creators: string[];
   date: string;
-  /** `fd_335` codes (`EV`, `MA`, `PE/PART`, …) annotating each entry-into-force date. */
-  effectTypes?: Record<string, string[]>;
+  /**
+   * The `owl:Axiom`s annotating each entry-into-force date: its `type_of_date` code
+   * (`EV`, `MA`, `PE/PART`, …), alone or with its `comment_on_date` (#181), written
+   * with each `fd_335` token as `{CODE}`.
+   */
+  effectTypes?: Record<string, (string | [code: string, comment: string])[]>;
   /** `cdm:resource_legal_eli` values. */
   eli?: string[];
   /**
@@ -147,6 +151,15 @@ export const WORK = {
   reg2215: `${CELLAR}59fa99c2-8079-4783-9e1b-36ff3092624f`,
   googleSpain: `${CELLAR}fixture-62012CJ0131`,
   proposal: `${CELLAR}fixture-52012PC0011`,
+  nis2: `${CELLAR}9b84d482-85bd-11ed-9887-01aa75ed71a1`,
+  treatyOfNice: `${CELLAR}0a223e1e-2f65-484e-9bcb-e9a1c25f55eb`,
+  dataAct: `${CELLAR}ef51c6ab-a06c-11ee-b164-01aa75ed71a1`,
+  ePrivacyProposal: `${CELLAR}b54bd5d0-d809-11e6-ad7c-01aa75ed71a1`,
+  aiActProposal: `${CELLAR}e0649735-a372-11eb-9585-01aa75ed71a1`,
+  twoProcedureProposal: `${CELLAR}f846b904-104b-11ee-b12e-01aa75ed71a1`,
+  representativeActions: `${CELLAR}b5ff45c2-35f4-11eb-b27b-01aa75ed71a1`,
+  threeProcedureDecision: `${CELLAR}fffc51cb-88dd-11ee-99ba-01aa75ed71a1`,
+  initiatorOnlyProposal: `${CELLAR}29292a50-c615-4258-941f-e5b2cc95c3c5`,
 } as const;
 
 /** The Official Journal reference facts of an act (#169), as CELLAR held them on 2026-10-24. */
@@ -164,18 +177,29 @@ const withReasons = (
 /** CELLAR's end-of-validity placeholder for an act with no end date. */
 const OPEN_ENDED = '9999-12-31';
 
+/** A Commission proposal: CELLAR records no in-force flag, legal basis, or subjects on one. */
+const proposal = (uri: string, date: string): FixtureAct => ({
+  uri,
+  type: `${RT}PROP_REG`,
+  date,
+  title: `Proposal ${uri.slice(-8)}`,
+  creators: [`${CB}COM`],
+  eurovoc: [],
+  legalBases: [],
+});
+
 /** Every fixture work, keyed by CELEX. */
 export const ACTS: Record<string, FixtureAct> = {
-  /** Published act by act, in force in five stages. */
+  /** Published act by act, in force in five stages; three of its application dates are partial. */
   '32024R1689': withCitation(base(WORK.aiAct, '2024-06-13', '1', ['EP', 'CONSIL'], 7, 2), {
     eli: ['http://data.europa.eu/eli/reg/2024/1689/oj'],
     entryIntoForce: ['2025-02-02', '2024-08-01', '2027-08-02', '2025-08-02', '2026-08-02'],
     effectTypes: {
-      '2024-08-01': ['EV'],
-      '2025-02-02': ['MA'],
-      '2025-08-02': ['MA'],
-      '2026-08-02': ['MA'],
-      '2027-08-02': ['MA'],
+      '2024-08-01': [['EV', '{DATPUB} +20 {V} {ART} 113']],
+      '2025-02-02': [['MA', '{MA/PART} {V} {ART} 113(a)']],
+      '2025-08-02': [['MA', '{MA/PART} {V} {ART} 113(b)']],
+      '2026-08-02': [['MA', '{V} {ART} 113']],
+      '2027-08-02': [['MA', '{MA/PART} {V} {ART} 113(c)']],
     },
     oj: { act: { collection: 'OJ-L', date: '2024-07-12', year: '2024', number: '1689' } },
   }),
@@ -368,7 +392,16 @@ export const ACTS: Record<string, FixtureAct> = {
     {
       eli: ['http://data.europa.eu/eli/dec/2004/752/oj'],
       entryIntoForce: ['2004-11-10', '2005-12-12'],
-      effectTypes: { '2004-11-10': ['EV'], '2005-12-12': ['PE/PART'] },
+      effectTypes: {
+        '2004-11-10': [['EV', '{DATPUB} + 1 {V} {ART} 4']],
+        // Article 4 and another act: no single provision of this one.
+        '2005-12-12': [
+          [
+            'PE/PART',
+            '{V} {ART} 4 {ET} {32005D1212(01)|http://publications.europa.eu/resource/celex/32005D1212%2801%29}',
+          ],
+        ],
+      },
       oj: {
         issues: [
           { collection: 'OJ-L', date: '2006-06-07', number: '153', class: 'M' },
@@ -383,16 +416,132 @@ export const ACTS: Record<string, FixtureAct> = {
   '31983R2215': withCitation(base(WORK.reg2215, '1983-08-02', '0', ['COM'], 2, 1), {
     eli: ['http://data.europa.eu/eli/reg/1983/2215/oj'],
     entryIntoForce: ['1983-08-07'],
-    effectTypes: { '1983-08-07': ['MA', 'EV'] },
+    effectTypes: {
+      '1983-08-07': [
+        ['MA', '{V} {ART} 1'],
+        ['EV', '{DATPUB} + 3 {V} {ART} 2'],
+      ],
+    },
     oj: {
       issues: [{ collection: 'OJ-L', date: '1983-08-04', number: '213', class: 'R' }],
       englishPages: [['0024', '0025']],
     },
   }),
+  /** NIS2, as CELLAR held it on 2026-11-03: two transposition deadlines a day apart. */
+  '32022L2555': withCitation(base(WORK.nis2, '2022-12-14', '1', ['CONSIL', 'EP'], 6, 1, 'DIR'), {
+    eli: ['http://data.europa.eu/eli/dir/2022/2555/oj'],
+    entryIntoForce: ['2023-01-16'],
+    effectTypes: { '2023-01-16': ['EV'] },
+    transposition: ['2024-10-18', '2024-10-17'],
+    oj: {
+      issues: [{ collection: 'OJ-L', date: '2022-12-27', number: '333', class: 'R' }],
+      englishPages: [['0080', '0152']],
+    },
+  }),
+  /** The Treaty of Nice, as CELLAR held it on 2026-11-03: an OJ issue on page `s1`, no ELI, no date of effect. */
+  '12001C': withCitation(base(WORK.treatyOfNice, '2001-03-10', '1', [], 0, 0, 'TREATY'), {
+    oj: {
+      issues: [{ collection: 'OJ-C', date: '2001-03-10', number: '080', class: 'R' }],
+      englishPages: [['s1', 's1']],
+    },
+  }),
+  /** The Data Act's dates of effect as CELLAR held them on 2026-11-03: two partial, all set by Article 50. */
+  '32023R2854': withCitation(base(WORK.dataAct, '2023-12-13', '1', ['EP', 'CONSIL'], 2, 1), {
+    entryIntoForce: ['2027-09-12', '2024-01-11', '2026-09-12', '2025-09-12'],
+    effectTypes: {
+      '2024-01-11': [['EV', '{DATPUB} +20 {V} {ART} 50']],
+      '2025-09-12': [['MA', '{V} {ART} 50']],
+      '2026-09-12': [['MA', '{MA/PART} {V} {ART} 50']],
+      '2027-09-12': [['MA', '{MA/PART} {V} {ART} 50']],
+    },
+  }),
   /** Case law and a proposal record none of the citation facts. */
   '62012CJ0131': base(WORK.googleSpain, '2014-05-13', '1', ['CJ'], 3, 0, 'JUDG'),
   '52012PC0011': base(WORK.proposal, '2012-01-25', '1', ['COM'], 3, 1, 'PROP_REG'),
+  /** The works of the procedure dossiers in {@link DOSSIERS} (#180). */
+  '52017PC0010': proposal(WORK.ePrivacyProposal, '2017-01-10'),
+  '52021PC0206': proposal(WORK.aiActProposal, '2021-04-21'),
+  '52023PC0331': proposal(WORK.twoProcedureProposal, '2023-06-22'),
+  '32020L1828': base(WORK.representativeActions, '2020-11-25', '1', ['EP', 'CONSIL'], 2, 1, 'DIR'),
+  '32023D2641': base(WORK.threeProcedureDecision, '2023-11-20', '1', ['CONSIL'], 2, 1, 'DEC'),
+  '52000PC0609': proposal(WORK.initiatorOnlyProposal, '2000-09-29'),
 };
+
+/** A procedure dossier: one carrying `procedure_code_interinstitutional_reference_procedure` (#180). */
+interface FixtureDossier {
+  /** `dossier_*-proposal` flags as recorded; a flag CELLAR leaves unrecorded is absent. */
+  flags: Partial<Record<'adopted' | 'notAdopted' | 'pending' | 'withdrawn', boolean>>;
+  /** CELEX of each act linked by `cdm:dossier_initiated_by_act_preparatory`, when modelled. */
+  initiators?: string[];
+  /** CELEX of each work linked by `cdm:work_part_of_dossier`. */
+  parts: string[];
+  /** CELEX of each act linked by `cdm:dossier_produces_resource_legal`. */
+  produces: string[];
+  /** The reference as CELLAR stores it, `YYYY/NUMBER/TYPE`. */
+  ref: string;
+  /** `cdm:dossier_date_withdrawn`. */
+  withdrawalDate?: string;
+}
+
+/** Procedure dossiers and their links, as CELLAR held them on 2026-11-03. */
+const DOSSIERS: FixtureDossier[] = [
+  {
+    ref: '2017/0003/COD',
+    flags: { adopted: false, withdrawn: true, pending: false },
+    withdrawalDate: '2025-10-06',
+    parts: ['52017PC0010'],
+    produces: [],
+  },
+  /** The AI Act carries both links; its proposal the first only. */
+  {
+    ref: '2021/0106/COD',
+    flags: { adopted: true, withdrawn: false, pending: false, notAdopted: false },
+    parts: ['52021PC0206', '32024R1689'],
+    produces: ['32024R1689'],
+  },
+  {
+    ref: '2012/0011/COD',
+    flags: { adopted: true, withdrawn: false, pending: false },
+    parts: [],
+    produces: ['32016R0679'],
+  },
+  /** Reached from the directive it produced only through the produces link. */
+  {
+    ref: '2018/0089/COD',
+    flags: { adopted: true, withdrawn: false, pending: false },
+    parts: [],
+    produces: ['32020L1828'],
+  },
+  {
+    ref: '2018/0135/CNS',
+    flags: { adopted: true, withdrawn: false, pending: false },
+    parts: ['52023PC0331'],
+    produces: ['32020D2053'],
+  },
+  {
+    ref: '2021/0430/CNS',
+    flags: { adopted: false, withdrawn: false, pending: true },
+    parts: ['52023PC0331'],
+    produces: [],
+  },
+  ...['2023/0808/NLE', '2023/0806/NLE', '2023/0807/NLE'].map((ref) => ({
+    ref,
+    flags: { adopted: true, withdrawn: false, pending: false },
+    parts: ['32023D2641'],
+    produces: ['32023D2641'],
+  })),
+  /**
+   * One of the four 2000/0247/ACC dossiers: CELLAR links 52000PC0609 to it only as its
+   * initiating act, with no part-of or produces link. Its flags are not modelled.
+   */
+  {
+    ref: '2000/0247/ACC',
+    flags: {},
+    initiators: ['52000PC0609'],
+    parts: [],
+    produces: [],
+  },
+];
 
 /** A base work with no CELEX: reachable only by IRI. */
 const CELEXLESS_BASE = base(WORK.celexlessBase, '2019-01-01', '1', ['COM'], 2, 1);
@@ -490,6 +639,70 @@ export function isConsolidationLookup(sparql: string): boolean {
   );
 }
 
+/** True for the legislative-procedure lookup (#180). */
+export function isProcedureLookup(sparql: string): boolean {
+  return sparql.includes('cdm:procedure_code_interinstitutional_reference_procedure');
+}
+
+/** The work URI of a CELEX: its fixture work, or a stand-in for an act the fixture lacks. */
+const workOf = (celex: string) => ACTS[celex]?.uri ?? `${CELLAR}fixture-${celex}`;
+
+/** Each status flag's aggregate variable and the predicate its OPTIONAL reads. */
+const DOSSIER_FLAGS = [
+  ['adopted', 'dossier_adopted-proposal'],
+  ['withdrawn', 'dossier_withdrawn-proposal'],
+  ['pending', 'dossier_pending-proposal'],
+  ['notAdopted', 'dossier_not-adopted-proposal'],
+] as const;
+
+/**
+ * One grouped row per procedure dossier the lookup reaches, as CELLAR evaluates the
+ * query as written: a dossier is reached only through a link arm the query carries
+ * (`work_part_of_dossier` from the work, `dossier_produces_resource_legal` or
+ * `dossier_initiated_by_act_preparatory` to it), and each aggregate is bound only
+ * when the query projects it and carries the pattern
+ * binding it — a flag CELLAR leaves unrecorded stays unbound, and the produced acts'
+ * `GROUP_CONCAT` reads `""` when the dossier links none with a CELEX, or the query
+ * joins the CELEX to acts reached by another link than `dossier_produces_resource_legal`.
+ */
+function procedureRows(sparql: string): Row[] {
+  const partOf = /\{ <([^>]+)> cdm:work_part_of_dossier \?procedure \. \}/.exec(sparql)?.[1];
+  const producedBy = /\{ \?procedure cdm:dossier_produces_resource_legal <([^>]+)> \. \}/.exec(
+    sparql,
+  )?.[1];
+  const initiatedBy =
+    /\{ \?procedure cdm:dossier_initiated_by_act_preparatory <([^>]+)> \. \}/.exec(sparql)?.[1];
+  const reads = (variable: string, pattern: string) =>
+    sparql.includes(`AS ?${variable})`) && sparql.includes(pattern);
+  return DOSSIERS.filter(
+    (d) =>
+      (partOf !== undefined && d.parts.map(workOf).includes(partOf)) ||
+      (producedBy !== undefined && d.produces.map(workOf).includes(producedBy)) ||
+      (initiatedBy !== undefined && (d.initiators ?? []).map(workOf).includes(initiatedBy)),
+  ).map((d) => {
+    const row: Row = { procedureRef: literal(d.ref) };
+    for (const [variable, predicate] of DOSSIER_FLAGS) {
+      const flag = d.flags[variable];
+      if (flag !== undefined && reads(variable, `?procedure cdm:${predicate} ?${variable}Flag .`)) {
+        row[variable] = literal(String(flag));
+      }
+    }
+    if (
+      d.withdrawalDate &&
+      reads('withdrawalDate', '?procedure cdm:dossier_date_withdrawn ?withdrawalDateValue .')
+    ) {
+      row.withdrawalDate = literal(d.withdrawalDate);
+    }
+    if (sparql.includes('AS ?adoptedActs)')) {
+      const joinsCelex =
+        sparql.includes('?procedure cdm:dossier_produces_resource_legal ?adoptedAct .') &&
+        sparql.includes('?adoptedAct cdm:resource_legal_id_celex ?adoptedCelex .');
+      row.adoptedActs = literal(joinsCelex ? d.produces.join(' ') : '');
+    }
+    return row;
+  });
+}
+
 /** Answer every query the consolidation paths issue, from the fixture works. */
 export async function fakeConsolidationCellar(sparql: string): Promise<Row[]> {
   if (isResolutionQuery(sparql)) {
@@ -534,6 +747,8 @@ export async function fakeConsolidationCellar(sparql: string): Promise<Row[]> {
     return versionRows(sparql, act.uri).map((row) => ({ baseWork: uri(act.uri), ...row }));
   }
 
+  if (isProcedureLookup(sparql)) return procedureRows(sparql);
+
   const act = addressedAct(sparql);
   if (!act) return [];
   if (sparql.includes('cdm:work_created_by_agent')) {
@@ -553,9 +768,10 @@ export async function fakeConsolidationCellar(sparql: string): Promise<Row[]> {
   if (sparql.includes('cdm:work_is_about_concept_eurovoc')) {
     return act.eurovoc.map((e) => ({ eurovoc: uri(e) }));
   }
-  if (sparql.includes('cdm:expression_belongs_to_work')) {
-    return [coreRow(sparql)];
-  }
+  // The core query reads the served work's type. The citation query (#173) projects
+  // aggregates only, so CELLAR returns it one row whatever the act records.
+  if (sparql.includes('cdm:work_has_resource-type')) return [coreRow(sparql)];
+  if (sparql.includes('AS ?datesOfEffect)')) return [citationColumns(sparql)];
   return [];
 }
 
@@ -593,12 +809,31 @@ const pagePairs = (pages: [string, string?][] | undefined) =>
   [...new Set((pages ?? []).map(([first, last]) => `${first}|${last ?? ''}`))].join(' ') || '|';
 
 /**
+ * A `comment_on_date` written with bare `{CODE}` tokens, as the citation query's
+ * aggregate carries it (#181): each token stored as CELLAR stores it,
+ * `{CODE|<fd_335 URI>}`, then encoded by SPARQL `ENCODE_FOR_URI`, which also escapes
+ * the `!'()*` that `encodeURIComponent` leaves.
+ */
+export function encodedComment(comment: string): string {
+  const stored = comment.replace(
+    /\{([^{}|]+)\}/g,
+    (_token, code: string) => `{${code}|${FD_335}${encodeURIComponent(code)}}`,
+  );
+  return encodeURIComponent(stored).replace(
+    /[!'()*]/g,
+    (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`,
+  );
+}
+
+/**
  * The citation aggregates (#169), each answered only when the query projects it and
  * from the work its own pattern reads, as CELLAR returns them for an act with no
  * value: an unbound `MIN(STR())`, `"|"` for a `GROUP_CONCAT` of an empty `CONCAT`,
  * `"|||"` for a `MIN` over an empty composite. A date's types are read only when the
- * entry-into-force pattern joins the `type_of_date` annotation; the original-language
- * pages only when the query carries their pattern.
+ * entry-into-force pattern joins the `type_of_date` annotation, and its comment
+ * (#181) only when that annotation's OPTIONAL joins `comment_on_date` and the
+ * `CONCAT` appends it encoded; the original-language pages only when the query
+ * carries their pattern.
  */
 function citationColumns(sparql: string): Row {
   const columns: Row = {};
@@ -610,11 +845,22 @@ function citationColumns(sparql: string): Row {
   const effects = actReadBy(sparql, 'cdm:resource_legal_date_entry-into-force');
   if (projects('datesOfEffect') && effects) {
     const typed = sparql.includes('annotation#type_of_date> ?effectType');
+    const commented =
+      typed &&
+      sparql.includes('annotation#comment_on_date> ?effectComment') &&
+      sparql.includes('"|", COALESCE(ENCODE_FOR_URI(STR(?effectComment)), "")');
+    const tail = (comment: string | undefined) =>
+      commented ? `|${comment ? encodedComment(comment) : ''}` : '';
     const items = (effects.entryIntoForce ?? []).flatMap((date) => {
-      const codes = typed ? (effects.effectTypes?.[date] ?? []) : [];
-      return codes.length > 0 ? codes.map((c) => `${date}|{${c}|${FD_335}${c}}`) : [`${date}|`];
+      const axioms = typed ? (effects.effectTypes?.[date] ?? []) : [];
+      return axioms.length > 0
+        ? axioms.map((axiom) => {
+            const [code, comment] = typeof axiom === 'string' ? [axiom] : axiom;
+            return `${date}|{${code}|${FD_335}${code}}${tail(comment)}`;
+          })
+        : [`${date}|${tail(undefined)}`];
     });
-    columns.datesOfEffect = literal([...new Set(items)].join(' ') || '|');
+    columns.datesOfEffect = literal([...new Set(items)].join(' ') || `|${tail(undefined)}`);
   }
 
   const transposition = actReadBy(sparql, 'cdm:directive_date_transposition');
@@ -659,7 +905,6 @@ function citationColumns(sparql: string): Row {
  * The in-force reason aggregates (#111), answered only when the query projects them
  * and each from the work its own pattern reads, the way CELLAR evaluates the query
  * as written:
- *  - the earliest entry into force;
  *  - the latest end of validity over every value the pattern binds — CELLAR's
  *    `9999-12-31` placeholder included, unless a filter inside that same OPTIONAL
  *    excludes it;
@@ -670,12 +915,6 @@ function citationColumns(sparql: string): Row {
  */
 function reasonColumns(sparql: string): Row {
   const columns: Row = {};
-
-  const entry = /<([^>]+)> cdm:resource_legal_date_entry-into-force \?(\w+)/.exec(sparql);
-  if (entry && sparql.includes(`(MIN(STR(?${entry[2]})) AS ?entryIntoForce)`)) {
-    const earliest = byUri.get(entry[1] as string)?.act.entryIntoForce?.toSorted()[0];
-    if (earliest) columns.entryIntoForce = literal(earliest);
-  }
 
   const end = /<([^>]+)> cdm:resource_legal_date_end-of-validity \?(\w+)/.exec(sparql);
   if (end && sparql.includes(`(MAX(STR(?${end[2]})) AS ?endOfValidity)`)) {

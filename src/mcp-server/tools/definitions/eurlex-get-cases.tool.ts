@@ -3,7 +3,7 @@
  * @module mcp-server/tools/definitions/eurlex-get-cases
  */
 
-import { tool, z } from '@cyanheads/mcp-ts-core';
+import { type Context, tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { echoValue } from '@/mcp-server/tools/echo-value.js';
@@ -18,11 +18,25 @@ import {
   escapeMarkdownHeading,
   renderNoticeBlockquote,
 } from '@/mcp-server/tools/markdown-render.js';
+import { fetchCaseLawFacts } from '@/services/cellar-sparql/case-law-facts.js';
 import {
+  CASE_LAW_SUBJECT_MATTER_SCHEME,
+  COUNTRY_AUTHORITY_URI,
   DERIVATIVE_RESOURCE_TYPES,
   ENG_LANGUAGE_URI,
+  isProvisionalData,
+  labelHoldsEveryWord,
+  PROCEDURE_AUTHORITY_URI,
+  PROCEDURE_OUTCOME_CODES,
+  PROCEDURE_OUTCOME_SEPARATOR,
+  PROCEDURE_OUTCOMES,
+  PROCEDURE_TYPE_ROOTS,
+  PROCEDURE_TYPES,
+  type ProcedureOutcome,
+  type ProcedureType,
   parseCaseLawTitle,
   resolveResourceTypeLabels,
+  subjectWords,
 } from '@/services/cellar-sparql/cdm-labels.js';
 import {
   CellarSparqlService,
@@ -42,9 +56,15 @@ import {
   keywordTitlePhrase,
 } from '@/services/cellar-sparql/keyword-match.js';
 import {
+  MEMBER_STATE_CODES,
+  toMemberStateCode,
+} from '@/services/cellar-sparql/relation-traversal.js';
+import {
+  cellarDate,
   dateRangeFilters,
   isPastSortWindow,
   readWindowedPage,
+  UNDATED_PLACEHOLDER,
   windowEndRoute,
   windowedLimit,
 } from '@/services/cellar-sparql/sort-window.js';
@@ -183,10 +203,75 @@ function caseNumberMatch(
   return `${celexPrefixTerms('?celexNumber', terms)}\n    ${regex}`;
 }
 
+/**
+ * The procedure match: a procedure code of the work that is one of the type's roots or
+ * a root plus an outcome (`ANNU`, `ANNU%3DOB`), never a longer root sharing its start
+ * (`REFE` must not take `REFER_PREL_URG`). With an outcome, the code is that root plus
+ * that outcome, so both hold on the same procedure: a case recorded as `ANNU%3DRF`
+ * and `PVOI%3DOB` is no successful annulment. An outcome alone matches any root
+ * carrying it. Built from the enum tables alone; undefined when neither is given.
+ */
+function procedurePattern(
+  type: ProcedureType | undefined,
+  outcome: ProcedureOutcome | undefined,
+): string | undefined {
+  const triple = '?work cdm:case-law_has_type_procedure_concept_type_procedure ?procedure .';
+  const suffix = outcome
+    ? `${PROCEDURE_OUTCOME_SEPARATOR}${PROCEDURE_OUTCOME_CODES[outcome]}`
+    : undefined;
+  if (!type) return suffix && `${triple}\n  FILTER(STRENDS(STR(?procedure), "${suffix}"))`;
+  const tests = PROCEDURE_TYPE_ROOTS[type].flatMap((root) => {
+    const code = `${PROCEDURE_AUTHORITY_URI}${root}`;
+    return suffix
+      ? [`?procedure = <${code}${suffix}>`]
+      : [
+          `?procedure = <${code}>`,
+          `STRSTARTS(STR(?procedure), "${code}${PROCEDURE_OUTCOME_SEPARATOR}")`,
+        ];
+  });
+  return `${triple}\n  FILTER(${tests.join(' || ')})`;
+}
+
+/**
+ * The case-law subjects a subject phrase names: every concept of the subject-matter
+ * scheme whose English label holds each of `words`, but the "Provisional data"
+ * placeholder, with the labels matched. One lookup of the scheme's English labels,
+ * matched here, so no caller text reaches the query; it needs no `LIMIT`, since the
+ * scheme bounds it (186 concepts). The page then joins the concepts as `VALUES`,
+ * about 18× faster than testing the labels inside the page query.
+ */
+async function resolveSubjects(
+  svc: Pick<CellarSparqlService, 'query'>,
+  words: readonly string[],
+  ctx: Context,
+): Promise<{ concepts: string[]; labels: string[] }> {
+  const rows = await svc.query(
+    `
+SELECT ?concept ?label WHERE {
+  ?concept skos:inScheme <${CASE_LAW_SUBJECT_MATTER_SCHEME}> .
+  ?concept skos:prefLabel ?label .
+  FILTER(LANG(?label) = "en")
+}`,
+    ctx,
+  );
+  const concepts = new Set<string>();
+  const labels = new Set<string>();
+  for (const b of rows) {
+    const concept = CellarSparqlService.bindingValue(b, 'concept');
+    const label = CellarSparqlService.bindingValue(b, 'label');
+    if (!concept || !label || isProvisionalData(concept) || !labelHoldsEveryWord(label, words)) {
+      continue;
+    }
+    concepts.add(concept);
+    labels.add(label);
+  }
+  return { concepts: [...concepts].sort(), labels: [...labels].sort() };
+}
+
 export const eurlex_get_cases = tool('eurlex_get_cases', {
   title: 'Search CJEU/GC Case Law',
   description:
-    'Search CJEU and General Court case law — judgments, orders, and Advocate General opinions and views — by case number, court, case type, keyword, and date range. A case number reaches every judgment, order, AG opinion, and AG view filed under it. By default only these primary records are returned; derivative judicial information notices, case abstracts, summaries, and corrigenda are excluded so distinct cases fill the page (set include_derivative to include them). Keyword matches English case titles (which carry party names) and CELEX strings; there is no full-text body search. Returns each case with its CELEX number (whose sixth character names the court: C, T, or F), work URI, ECLI, date, and type, plus — parsed from the title where present — the formation, Advocate General, parties, referring court, subject matter, and case reference. The raw CELLAR title is returned only when those fields do not capture all of it.',
+    'Search CJEU and General Court case law — judgments, orders, and Advocate General opinions and views — by case number, court, case type, member state, procedure type and outcome, subject, keyword, and date range. A case number reaches every judgment, order, AG opinion, and AG view filed under it. By default only these primary records are returned; derivative judicial information notices, case abstracts, summaries, and corrigenda are excluded so distinct cases fill the page (set include_derivative to include them). Keyword matches English case titles (which carry party names) and CELEX strings; there is no full-text body search. member_state, procedure_type, outcome, and subject match the facts CELLAR records on each case, so a case it records none of a filtered fact for never matches. Returns each case with its CELEX number (whose sixth character names the court: C, T, or F), work URI, ECLI, date, and type; where CELLAR records them, its countries, procedure types with outcome, subjects, and procedure languages; and — parsed from the title where present — the formation, Advocate General, parties, referring court, subject matter, and case reference. The raw CELLAR title is returned only when those fields do not capture all of it.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
     case_number: z
@@ -229,11 +314,56 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
           'Case type: judgment, order (procedural decision), or ag_opinion (Advocate General opinion or view). Omit to search all.',
         ),
     ),
+    member_state: z
+      .string()
+      .refine((value) => value.trim() === '' || toMemberStateCode(value) !== undefined, {
+        message: `member_state takes a member-state code: ISO 3166-1 alpha-3 (${MEMBER_STATE_CODES.join(', ')}; GBR is the United Kingdom) or the two-letter codes (DE, FR; EL or GR for Greece, UK or GB for the United Kingdom), in any case.`,
+      })
+      .optional()
+      .describe(
+        "Member state the case originates in, as CELLAR records it: the referring court's state on a preliminary reference, the defendant state on an action for failure to fulfil obligations, the applicant's state (or the member state party) on a direct action. A member state as its ISO 3166-1 alpha-3 code (DEU, GRC, GBR for the United Kingdom) or two-letter code (DE; EL or GR for Greece; UK or GB), in any case: the 27 member states plus the United Kingdom. Cases CELLAR records no country for, Civil Service Tribunal staff cases among them, never match. Leave blank or omit to search every state.",
+      ),
+    procedure_type: enumInput(
+      PROCEDURE_TYPES,
+      z
+        .union([
+          z.literal(''),
+          z
+            .enum(PROCEDURE_TYPES)
+            .describe(
+              'preliminary_ruling, annulment, staff_case, appeal, failure_to_fulfil_obligations, damages, interim_measures, appeal_against_penalty, failure_to_act, or arbitration_clause.',
+            ),
+        ])
+        .optional()
+        .describe(
+          'Procedure type, as CELLAR classifies the case: preliminary_ruling (urgent references included), annulment, staff_case, appeal, failure_to_fulfil_obligations, damages, interim_measures, appeal_against_penalty, failure_to_act, or arbitration_clause. A case can carry several: an appeal also carries the action appealed. Each row lists its own in procedure_types. Omit to search all.',
+        ),
+    ),
+    outcome: enumInput(
+      PROCEDURE_OUTCOMES,
+      z
+        .union([
+          z.literal(''),
+          z
+            .enum(PROCEDURE_OUTCOMES)
+            .describe('successful, unfounded, inadmissible, or decision_unnecessary.'),
+        ])
+        .optional()
+        .describe(
+          'Outcome CELLAR records with the procedure: successful, unfounded, inadmissible, or decision_unnecessary. With procedure_type, both hold on the same procedure (annulment with successful finds annulment actions that succeeded); alone, any procedure with that outcome. Preliminary references rarely record one. Omit to search all.',
+        ),
+    ),
+    subject: z
+      .string()
+      .optional()
+      .describe(
+        'Subject phrase matched against the English labels of CELLAR\'s case-law subject classification: the search covers every subject whose label contains each word of the phrase, in any case and also inside a longer word ("trade mark" matches "Trade marks", "personal data" "Protection of personal data", "tax" also "Taxation"). query_echo.subject_labels names the subjects matched; each row lists its own in subjects. This is not the title\'s subject_matter keywords. A phrase matching no label returns an empty page with a notice. Leave blank or omit to search every subject.',
+      ),
     include_derivative: z
       .boolean()
       .default(false)
       .describe(
-        'Include derivative sector-6 records — judicial information notices, case abstracts, case summaries, and corrigenda — alongside primary judgments, orders, AG opinions, and AG views. Default false: these are excluded so distinct primary cases fill the page. Ignored when case_type is set (that path already requires the selected primary type family).',
+        'Include derivative sector-6 records — judicial information notices, case abstracts, case summaries, and corrigenda — alongside primary judgments, orders, AG opinions, and AG views. Default false: these are excluded so distinct primary cases fill the page. Ignored when case_type is set (that path already requires the selected primary type family). Has no effect beside member_state, procedure_type, outcome, or subject, since derivative records carry none of those facts.',
       ),
     date_from: z
       .union([
@@ -302,7 +432,12 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
               .describe(
                 'Human-readable case type label (e.g. "Judgment", "Order", "AG Opinion"). Cases with several resource-types (e.g. corrigenda) list all, comma-separated. Absent for some older cases.',
               ),
-            date: z.string().optional().describe('Judgment/opinion date in ISO 8601 format.'),
+            date: z
+              .string()
+              .optional()
+              .describe(
+                `Judgment/opinion date in ISO 8601 format. Absent when CELLAR records no real document date — none, or the ${UNDATED_PLACEHOLDER} it records for an undated work; such cases sort last.`,
+              ),
             title: z
               .string()
               .optional()
@@ -343,13 +478,43 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
               .string()
               .optional()
               .describe(
-                'Subject-matter keyword summary parsed from the title — the legal topics and provisions at issue. Absent when the title carries no subject-matter segment.',
+                "Subject-matter keyword summary parsed from the title — the legal topics and provisions at issue. Free text, unlike subjects, CELLAR's subject classification. Absent when the title carries no subject-matter segment.",
               ),
             case_reference: z
               .string()
               .optional()
               .describe(
                 'Case reference parsed from the title (e.g. "Case C-97/23 P."). Absent when the title carries no case-reference segment.',
+              ),
+            countries: z
+              .array(z.string().describe('ISO 3166-1 alpha-3 country code, e.g. "BGR".'))
+              .optional()
+              .describe(
+                "Countries CELLAR records the case as originating in, as ISO 3166-1 alpha-3 codes, sorted: the referring court's state on a preliminary reference, the defendant state on an action for failure to fulfil obligations, the applicant's state on a direct action. Member states, the values member_state takes, bar a few older direct actions by non-EU applicants. Absent when CELLAR records none, as on Civil Service Tribunal staff cases.",
+              ),
+            procedure_types: z
+              .array(
+                z
+                  .string()
+                  .describe('English procedure label, e.g. "Action for annulment - successful".'),
+              )
+              .optional()
+              .describe(
+                'Procedure types CELLAR classifies the case under, as English labels with the outcome where recorded ("Reference for a preliminary ruling", "Appeal - unfounded"), sorted; what procedure_type and outcome match. An appeal also lists the action appealed. Absent when CELLAR records none.',
+              ),
+            subjects: z
+              .array(
+                z.string().describe('English subject label, e.g. "Protection of personal data".'),
+              )
+              .optional()
+              .describe(
+                "Subjects of CELLAR's case-law subject classification, as English labels, sorted; what subject matches. A controlled vocabulary, unlike the title's subject_matter keywords. Absent when CELLAR records none.",
+              ),
+            procedure_languages: z
+              .array(z.string().describe('Two-letter EUR-Lex language code, e.g. "BG".'))
+              .optional()
+              .describe(
+                'Languages of the case, as the two-letter codes eurlex_get_document takes as language, sorted. Absent when CELLAR records none, as on about half of the Court of Justice AG opinions and records dated before 1990.',
               ),
           })
           .describe('A single CJEU or General Court case law record.'),
@@ -380,6 +545,19 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
         keyword: z.string().optional().describe('Keyword filter applied.'),
         court: z.string().optional().describe('Court filter applied.'),
         case_type: z.string().optional().describe('Case type filter applied.'),
+        member_state: z
+          .string()
+          .optional()
+          .describe('Member-state filter applied, as its ISO 3166-1 alpha-3 code.'),
+        procedure_type: z.string().optional().describe('Procedure type filter applied.'),
+        outcome: z.string().optional().describe('Outcome filter applied.'),
+        subject: z.string().optional().describe('Subject phrase applied.'),
+        subject_labels: z
+          .array(z.string().describe('English subject label.'))
+          .optional()
+          .describe(
+            'English labels of the subjects the subject phrase matched, sorted: the subjects the search was narrowed to. Empty when the phrase matched none, and then no case was searched. Absent when no subject was given.',
+          ),
         include_derivative: z
           .boolean()
           .describe(
@@ -402,7 +580,7 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
       .string()
       .optional()
       .describe(
-        'Guidance for the next call: on an empty first page, the filters that matched nothing and how to broaden them; on a page with more rows, the offset to continue from; on a page ending at row 10,000, that no later page can be read and the closed date_from/date_to window that continues past it.',
+        'Guidance for the next call: on an empty first page, the filters that matched nothing and how to broaden them; when subject matched no subject label, that no case was searched; on a page with more rows, the offset to continue from; on a page ending at row 10,000, that no later page can be read and the closed date_from/date_to window that continues past it.',
       ),
     limit_clamp: limitClampEnrichment,
   },
@@ -420,7 +598,7 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
       code: JsonRpcErrorCode.ValidationError,
       when: 'offset is 10,000 or more, past the last row CELLAR sorts for one search.',
       recovery:
-        'Narrow the search below 10,000 matches — search a date_from/date_to window ending at the date of the last case reached (results run newest first), or add court, case_type, or keyword — then page from offset 0.',
+        'Narrow the search below 10,000 matches — search a date_from/date_to window ending at the date of the last case reached (results run newest first), or add court, case_type, keyword, member_state, procedure_type, outcome, or subject — then page from offset 0.',
     },
     {
       reason: 'invalid_date_range',
@@ -444,17 +622,24 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
         'Pass a party name or title phrase (e.g. "Google Spain") or a CELEX number (e.g. 62013CJ0131), or omit keyword.',
     },
     {
+      reason: 'invalid_subject',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'subject holds no letters or digits, so no subject label can match it.',
+      recovery:
+        'Pass a subject phrase such as "data protection", "trade mark", or "state aid", or omit subject.',
+    },
+    {
       reason: 'sparql_error',
       code: JsonRpcErrorCode.ValidationError,
       when: 'CELLAR rejected the search it was sent: a filter combination its query planner cannot compile. The same call fails the same way again.',
       recovery:
-        'Drop one of the combined filters (keyword, case_number, case_type, court), then search again.',
+        'Drop one of the combined filters (keyword, case_number, case_type, court, member_state, procedure_type, outcome, subject), then search again.',
       thrownBy: 'service',
     },
     {
       reason: 'sparql_timeout',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'The search ran past the client timeout, or CELLAR refused it as too costly to run. It is not retried.',
+      when: "The search ran past its time budget (retryable: CELLAR's response time varies, so a later search can finish), or CELLAR refused it as too costly to run (not retryable: the same search is refused again). Neither is retried within the call.",
       recovery:
         'Narrow the search with a closer date_from/date_to range, a court, or a more specific keyword or case_number, then search again.',
       thrownBy: 'service',
@@ -550,6 +735,19 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
       );
     }
 
+    // A subject with no letter or digit can match no subject label, so it is rejected
+    // the same way, before any CELLAR call.
+    const subjectInput = input.subject?.trim();
+    const subjectTerms = subjectInput ? subjectWords(subjectInput) : [];
+    if (subjectInput && subjectTerms.length === 0) {
+      throw ctx.fail(
+        'invalid_subject',
+        `subject "${echoValue(subjectInput)}" holds no letters or digits.`,
+      );
+    }
+    // The schema admits only a member-state code or a blank value, which names none.
+    const memberState = input.member_state ? toMemberStateCode(input.member_state) : undefined;
+
     if (input.court) {
       filters.push(
         `FILTER(SUBSTR(STR(?celexNumber), 6, 1) = "${COURT_CELEX_LETTER[input.court]}")`,
@@ -595,6 +793,60 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
 
     filters.push(...dateRangeFilters(dateFrom, dateTo));
 
+    /**
+     * The case-law facts CELLAR records on a work (#178), each a required pattern, so
+     * a case it records none of a filtered fact for never matches, and derivative
+     * records, which carry none, drop out whatever include_derivative says. They are
+     * appended only when set, so a search without them sends the query it always did.
+     */
+    const factPatterns: string[] = [];
+    if (memberState) {
+      factPatterns.push(
+        `?work cdm:case-law_originates_in_country <${COUNTRY_AUTHORITY_URI}${memberState}> .`,
+      );
+    }
+    const procedure = procedurePattern(
+      input.procedure_type || undefined,
+      input.outcome || undefined,
+    );
+    if (procedure) factPatterns.push(procedure);
+
+    // The subject's one lookup runs before the page, which joins what it resolved to.
+    const subjects = subjectInput ? await resolveSubjects(svc, subjectTerms, ctx) : undefined;
+    if (subjects?.concepts.length) {
+      factPatterns.push(
+        `VALUES ?subject { ${subjects.concepts.map((uri) => `<${uri}>`).join(' ')} }
+  ?work cdm:case-law_is-about_case-law-subject-matter ?subject .`,
+      );
+    }
+
+    const queryEcho = {
+      ...(input.case_number ? { case_number: input.case_number } : {}),
+      ...(celexFragment ? { celex_fragment: celexFragment } : {}),
+      ...(keywordInput ? { keyword: keywordInput } : {}),
+      ...(input.court ? { court: input.court } : {}),
+      ...(input.case_type ? { case_type: input.case_type } : {}),
+      ...(memberState ? { member_state: memberState } : {}),
+      ...(input.procedure_type ? { procedure_type: input.procedure_type } : {}),
+      ...(input.outcome ? { outcome: input.outcome } : {}),
+      ...(subjectInput && subjects
+        ? { subject: subjectInput, subject_labels: subjects.labels }
+        : {}),
+      // Echo the effective flag (Zod applies the false default, so it is always a
+      // boolean) — a defaulted false still describes the search semantics (#57).
+      include_derivative: input.include_derivative,
+      ...(input.date_from ? { date_from: input.date_from } : {}),
+      ...(input.date_to ? { date_to: input.date_to } : {}),
+    };
+
+    // A subject naming no label leaves no case to search: an empty page, no page query.
+    if (subjectInput && subjects?.concepts.length === 0) {
+      ctx.enrich.notice(
+        `No case-law subject label contains every word of subject "${echoValue(subjectInput)}", so no case was searched. Try fewer or other words — labels read like "Protection of personal data", "Trade marks", or "State aid" — or omit subject.`,
+      );
+      return { cases: [], total: 0, offset: input.offset, has_more: false, query_echo: queryEcho };
+    }
+
     // Title arm on the full-text index, CELEX arm by the keyword's shape (#17, #105).
     // Its one CELLAR lookup runs only once the input has passed validation.
     const keywordClause = keywordInput ? await keywordMatchPattern(svc, keywordInput, ctx) : '';
@@ -638,22 +890,9 @@ SELECT
   ?work cdm:resource_legal_id_celex ?celexNumber .
   ${typeConstraint}
   OPTIONAL { ?work cdm:work_date_document ?date . }
-  ${keywordClause}
+  ${keywordClause}${factPatterns.map((pattern) => `\n  ${pattern}`).join('')}
   ${filters.join('\n  ')}
 } GROUP BY ?celexNumber ORDER BY DESC(?docDate) ?celexNumber LIMIT ${windowedLimit(input.offset, pageLimit)} OFFSET ${input.offset}`;
-
-    const queryEcho = {
-      ...(input.case_number ? { case_number: input.case_number } : {}),
-      ...(celexFragment ? { celex_fragment: celexFragment } : {}),
-      ...(keywordInput ? { keyword: keywordInput } : {}),
-      ...(input.court ? { court: input.court } : {}),
-      ...(input.case_type ? { case_type: input.case_type } : {}),
-      // Echo the effective flag (Zod applies the false default, so it is always a
-      // boolean) — a defaulted false still describes the search semantics (#57).
-      include_derivative: input.include_derivative,
-      ...(input.date_from ? { date_from: input.date_from } : {}),
-      ...(input.date_to ? { date_to: input.date_to } : {}),
-    };
 
     const bindings = await svc.queryWithContinuation(sparql, ctx);
     ctx.log.info('Case law search', {
@@ -662,6 +901,10 @@ SELECT
       keyword: input.keyword,
       court: input.court,
       caseType: input.case_type,
+      memberState,
+      procedureType: input.procedure_type,
+      outcome: input.outcome,
+      subjectConcepts: subjects?.concepts.length,
       resultCount: bindings.length,
     });
 
@@ -675,8 +918,18 @@ SELECT
       const filterSummary = Object.entries(queryEcho)
         .map(([k, v]) => `${k}=${echoValue(String(v))}`)
         .join(', ');
+      const factFilters = (
+        ['member_state', 'procedure_type', 'outcome', 'subject'] as const
+      ).filter((key) => key in queryEcho);
+      const [onlyFactFilter] = factFilters;
+      const factHint =
+        factFilters.length > 1
+          ? ` Or drop one of ${factFilters.join(', ')}: each matches only the cases CELLAR records its fact for.`
+          : onlyFactFilter
+            ? ` Or drop ${onlyFactFilter}: it matches only the cases CELLAR records that fact for.`
+            : '';
       ctx.enrich.notice(
-        `No case law records matched the search criteria (${filterSummary}). Try a different keyword, broader date range, or remove the court/case_type filter.`,
+        `No case law records matched the search criteria (${filterSummary}). Try a different keyword, broader date range, or remove the court/case_type filter.${factHint}`,
       );
     }
 
@@ -692,9 +945,20 @@ SELECT
       ctx,
       CASE_WORK_COLUMNS,
     );
+    /**
+     * The case-law facts sit on the resolved work, never on its `do_not_index` copy
+     * (#178), so they are read for the resolved works, in one more query: folded into
+     * the resolution query above, each work's rows would multiply across its types,
+     * titles, and every fact's values.
+     */
+    const facts = await fetchCaseLawFacts(
+      svc,
+      [...resolvedWorks.values()].map(({ work }) => work),
+      ctx,
+    );
     const cases = page.map((b) => {
       const celexNumber = CellarSparqlService.bindingValue(b, 'celex') ?? '';
-      const date = CellarSparqlService.bindingValue(b, 'docDate');
+      const date = cellarDate(CellarSparqlService.bindingValue(b, 'docDate'));
       const resolved = resolvedWorks.get(celexNumber);
       /**
        * The page's CELEX came from the same triple the follow-up joins on, so a miss
@@ -759,7 +1023,7 @@ SELECT
         if (parsed.subjectMatter) c.subject_matter = parsed.subjectMatter;
         if (parsed.caseReference) c.case_reference = parsed.caseReference;
       }
-      return c;
+      return { ...c, ...facts.get(resolved.work) };
     });
 
     if (hasMore) {
@@ -816,6 +1080,12 @@ SELECT
       if (c.referring_court) lines.push(field('Referring court', c.referring_court));
       if (c.subject_matter) lines.push(field('Subject matter', c.subject_matter));
       if (c.case_reference) lines.push(field('Case reference', c.case_reference));
+      if (c.countries) lines.push(field('Countries', c.countries.join(', ')));
+      if (c.procedure_types) lines.push(field('Procedure types', c.procedure_types.join('; ')));
+      if (c.subjects) lines.push(field('Subjects', c.subjects.join('; ')));
+      if (c.procedure_languages) {
+        lines.push(field('Procedure languages', c.procedure_languages.join(', ')));
+      }
       // Raw CELLAR title, present only when the parsed fields miss part of it.
       if (c.title) lines.push(field('Full title', c.title));
       lines.push(field('Work URI', c.work_uri));

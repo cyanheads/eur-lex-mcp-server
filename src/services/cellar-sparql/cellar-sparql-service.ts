@@ -9,7 +9,7 @@ import type { Context } from '@cyanheads/mcp-ts-core';
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import { McpError, serviceUnavailable, validationError } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
-import { withRetry } from '@cyanheads/mcp-ts-core/utils';
+import { defaultIsTransient, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import type { ServerConfig } from '@/config/server-config.js';
 import type { SparqlBinding, SparqlResultsJson } from './types.js';
 
@@ -58,8 +58,8 @@ function sparqlError(text: string) {
 
 /**
  * The typed failure a Virtuoso error body stands for, or `undefined` when the
- * body is not one. `deterministic` marks a failure a retry would repeat: a
- * timeout, or a SQLSTATE matching {@link DETERMINISTIC_SQLSTATE_RE}.
+ * body is not one. `deterministic` marks a failure a retry would repeat: an
+ * estimated-cost refusal (SP031), or a SQLSTATE matching {@link DETERMINISTIC_SQLSTATE_RE}.
  *
  * Apart from the sort-window hint, the throws carry no recovery hint: each
  * calling tool declares `sparql_error` and `sparql_timeout` with recovery text
@@ -70,7 +70,8 @@ function virtuosoFailure(text: string) {
   if (sqlState === undefined) return;
   if (VIRTUOSO_TIMEOUT_RE.test(text)) {
     // Virtuoso's estimated-cost limit is deterministic for the query as
-    // written — a retry re-runs the same estimate and fails the same way.
+    // written — a retry re-runs the same estimate and fails the same way. A
+    // query that ran out of time is the other `sparql_timeout`, and retryable.
     return {
       deterministic: true,
       error: serviceUnavailable('CELLAR SPARQL query timed out on Virtuoso', {
@@ -198,7 +199,12 @@ function enforceLimitInQuery(
 
 export class CellarSparqlService {
   private readonly endpoint: string;
-  private readonly timeoutMs: number;
+  /**
+   * Client-side timeout per query and budget per call, in ms (`SPARQL_QUERY_TIMEOUT_MS`).
+   * Public so `eurlex_query_sparql` can tell whether a higher `timeout_hint` would give a
+   * query that ran out of time longer.
+   */
+  readonly timeoutMs: number;
   /**
    * Enforced ceiling on generated LIMIT clauses (`MAX_SPARQL_RESULTS`). Public so
    * callers that split a query into multiple independently-capped sub-selects
@@ -310,10 +316,12 @@ export class CellarSparqlService {
     const budgetMs = Math.max(this.timeoutMs, effectiveTimeoutMs);
     const deadline = this.callDeadlines.get(ctx) ?? Date.now() + budgetMs;
     this.callDeadlines.set(ctx, deadline);
+    // Retryable on the wire: whether a query finishes in time turns on CELLAR's
+    // response time, so a later call can. A Virtuoso cost refusal is not.
     const budgetSpent = (cause?: unknown) =>
       serviceUnavailable(
         'CELLAR SPARQL queries for this request ran past the time budget they share',
-        { reason: 'sparql_timeout', retryable: false },
+        { reason: 'sparql_timeout', retryable: true },
         cause === undefined ? undefined : { cause },
       );
     const callBudgetMs = deadline - Date.now();
@@ -356,13 +364,14 @@ export class CellarSparqlService {
           // `signal` also carries the call's deadline clock.
           if (signal.aborted) throw budgetSpent(error);
           // The client-side bound must bound the whole call, not one attempt of
-          // four (#78): a query that could not finish inside the window will not
-          // finish on a retry either, and re-running it hammers a shared endpoint.
+          // four (#78): `isTransient` below never re-runs a query that ran out of
+          // time, since a re-run spends the same budget again and hammers a shared
+          // endpoint. The caller may still call again later.
           if (error instanceof DOMException && error.name === 'TimeoutError') {
             if (attemptTimeoutMs < effectiveTimeoutMs) throw budgetSpent(error);
             throw serviceUnavailable(
               `CELLAR SPARQL request exceeded the ${effectiveTimeoutMs} ms client timeout`,
-              { reason: 'sparql_timeout', retryable: false },
+              { reason: 'sparql_timeout', retryable: true },
             );
           }
           throw error;
@@ -400,6 +409,11 @@ export class CellarSparqlService {
         baseDelayMs: 1500,
         signal: ctx.signal,
         deadlineMs: callBudgetMs,
+        // One attempt per query for every `sparql_timeout`: a retryable one is the
+        // caller's to retry, never this ladder's (#78). Outages keep the default.
+        isTransient: (error) =>
+          !(error instanceof McpError && error.data?.reason === 'sparql_timeout') &&
+          defaultIsTransient(error),
       },
     ).catch((error: unknown) => {
       /*

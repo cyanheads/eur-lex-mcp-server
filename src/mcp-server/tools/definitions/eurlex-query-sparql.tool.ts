@@ -8,6 +8,7 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { echoValue } from '@/mcp-server/tools/echo-value.js';
 import { renderNoticeBlockquote } from '@/mcp-server/tools/markdown-render.js';
+import { withTimeoutAlternative } from '@/mcp-server/tools/timeout-alternative.js';
 import { getCellarSparqlService } from '@/services/cellar-sparql/cellar-sparql-service.js';
 import type { SparqlBinding, SparqlTerm } from '@/services/cellar-sparql/types.js';
 
@@ -230,6 +231,21 @@ function plainTripleObjectLiterals(query: string): string[] {
   return found;
 }
 
+/** The most timeout_hint accepts, in ms. */
+const TIMEOUT_HINT_MAX_MS = 55_000;
+
+/**
+ * The `sparql_timeout` recovery's next move when a higher timeout_hint would give
+ * the query longer: the timeout in effect (timeout_hint, else the deployment's) is
+ * below the most timeout_hint accepts. None at that ceiling, so a caller who sent
+ * it, or runs under a deployment default at or above it, is never offered it (#177).
+ */
+function raiseTimeoutHint(effectiveTimeoutMs: number): string | undefined {
+  return effectiveTimeoutMs < TIMEOUT_HINT_MAX_MS
+    ? `Raising timeout_hint above the ${effectiveTimeoutMs} ms in effect, up to ${TIMEOUT_HINT_MAX_MS}, gives a query that ran past its timeout longer.`
+    : undefined;
+}
+
 export const eurlex_query_sparql = tool('eurlex_query_sparql', {
   title: 'Raw CELLAR SPARQL Query',
   description:
@@ -246,7 +262,7 @@ export const eurlex_query_sparql = tool('eurlex_query_sparql', {
       .number()
       .int()
       .min(1000)
-      .max(55000)
+      .max(TIMEOUT_HINT_MAX_MS)
       .optional()
       .describe(
         'Optional client-side timeout in milliseconds (1000–55000). The server default (55000 unless the deployment configures another value) applies when omitted.',
@@ -322,9 +338,9 @@ export const eurlex_query_sparql = tool('eurlex_query_sparql', {
     {
       reason: 'sparql_timeout',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'The query ran past the client-side timeout (timeout_hint, default 55 s), or Virtuoso refused it as over its estimated-cost limit. Neither is retried: the call fails inside the configured bound.',
+      when: "The query ran past the client-side timeout (timeout_hint, default 55 s; retryable: CELLAR's response time varies, so a later run can finish, though a query slower than its timeout fails every run), or Virtuoso refused it as over its estimated-cost limit (not retryable: the same query is refused again). Neither is retried within the call, which fails inside the configured bound.",
       recovery:
-        'Narrow the query with more specific FILTER conditions or a smaller LIMIT, or raise timeout_hint.',
+        'Narrow the query with more specific FILTER conditions or a smaller LIMIT: Virtuoso refuses a too-costly query every time, and a query slower than its timeout fails every run. When the error is retryable, a later run can also finish once CELLAR answers faster.',
       thrownBy: 'service',
     },
   ],
@@ -352,10 +368,10 @@ export const eurlex_query_sparql = tool('eurlex_query_sparql', {
     // result columns are reported even when no rows match — Object.keys on an
     // empty bindings array would drop them. It also reports whether the server's
     // LIMIT ceiling rewrote the query (limitEnforced).
-    const { variables, bindings, limitEnforced } = await svc.queryWithVars(
-      input.sparql_query,
+    const { variables, bindings, limitEnforced } = await withTimeoutAlternative(
       ctx,
-      input.timeout_hint,
+      raiseTimeoutHint(input.timeout_hint ?? svc.timeoutMs),
+      svc.queryWithVars(input.sparql_query, ctx, input.timeout_hint),
     );
     ctx.log.info('Raw SPARQL query executed', { resultCount: bindings.length });
 

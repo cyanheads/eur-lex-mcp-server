@@ -11,7 +11,7 @@ import { McpError } from '@cyanheads/mcp-ts-core/errors';
 import { ENG_LANGUAGE_URI } from './cdm-labels.js';
 import { CellarSparqlService } from './cellar-sparql-service.js';
 import { celexLiteral, escapeSparqlLiteral, isSafeSparqlIri } from './eli-resolution.js';
-import { readWindowedPage, windowedLimit } from './sort-window.js';
+import { cellarDate, readWindowedPage, windowedLimit } from './sort-window.js';
 import type { SparqlBinding, WorkRelation } from './types.js';
 
 /** The relation types this server exposes over the CDM graph. */
@@ -325,14 +325,16 @@ function articleFilterClause(
 }
 
 /**
- * Default per-direction result cap. Each relation type is queried independently
- * with its own LIMIT so a high-volume type (e.g. `cites`) can't starve rarer
- * types under a single shared cap; a symmetric type splits its cap per direction
- * too (see `buildRelationQuery`). The service caps further if MAX_SPARQL_RESULTS
- * is lower — callers clamp to it to keep both sides of a symmetric query capped
- * consistently.
+ * Ceiling on the per-direction page size: the largest `limit` the
+ * eurlex_get_relations tool serves, clamping anything above it. It is not the
+ * tool's default, which its input schema sets. Each relation type is queried
+ * independently with its own LIMIT so a high-volume type (e.g. `cites`) can't
+ * starve rarer types under a single shared cap; a symmetric type splits its cap
+ * per direction too (see `buildRelationQuery`). The service caps further if
+ * MAX_SPARQL_RESULTS is lower — callers clamp to it to keep both sides of a
+ * symmetric query capped consistently.
  */
-export const DEFAULT_PER_TYPE_LIMIT = 100;
+export const PER_TYPE_LIMIT_CEILING = 100;
 
 /**
  * CELEX constraint pushed into a relation arm before LIMIT/OFFSET and continuation
@@ -705,17 +707,17 @@ export interface RelationWindowEnd {
    */
   continuationQuery: string;
   direction: 'outgoing' | 'incoming';
-  /** Related date of the direction's last row on the page; absent when it is undated. */
+  /** Related date of the direction's last row on the page; absent when that row reports none. */
   lastDate?: string;
   relationType: RelationType;
 }
 
 /**
  * The SELECT that lists a direction's related works past a page ending at row
- * 10,000, ordered as the page was: the works dated on or before the page's last
- * date, newest first, or — when the page ended among the undated works, which
- * sort last — the undated works. Either way the page's own last rows come first
- * again, and nothing past them is skipped.
+ * 10,000, ordered as the page was: the works dated on or before the date the page's
+ * last row sorted on (CELLAR's undated placeholder included), newest first, or — when
+ * the page ended among the undated works, which sort last — the undated works. Either
+ * way the page's own last rows come first again, and nothing past them is skipped.
  *
  * Ungrouped by design: CELLAR evaluates a grouped `MAX` over the date wrongly (see
  * {@link buildRelationQuery}), so a work with several dates or CELEX numbers repeats
@@ -786,8 +788,9 @@ function continuationQuery(
  * row 10,000, where no offset reaches.
  *
  * Each relation carries the related work's date — the value its page is ordered
- * by — and its English title (#119), each omitted when the work has none; no
- * other language stands in for a missing English title.
+ * by — and its English title (#119), each omitted when the work has none. CELLAR's
+ * undated placeholder reads as no date (#184), and no other language stands in for
+ * a missing English title.
  *
  * `article` narrows `interpreted_by` to the rulings with a recorded provision in
  * that article ({@link articleLocationPattern}), pushed into the paged query and its
@@ -813,23 +816,17 @@ export async function traverseRelations(
     article?: ArticleFilter | undefined;
     memberStates?: readonly MemberStateCode[] | undefined;
     offset?: number;
-    perTypeLimit?: number;
+    perTypeLimit: number;
     provisions?: boolean;
     sourceCelex?: string | undefined;
-  } = {},
+  },
 ): Promise<{
   hasMore: boolean;
   provisionsUnavailable: RelationType[];
   relations: WorkRelation[];
   windowEnds: RelationWindowEnd[];
 }> {
-  const {
-    article,
-    memberStates,
-    offset = 0,
-    perTypeLimit = DEFAULT_PER_TYPE_LIMIT,
-    sourceCelex,
-  } = options;
+  const { article, memberStates, offset = 0, perTypeLimit, sourceCelex } = options;
   const articleFor = (type: RelationType) => (type === 'interpreted_by' ? article : undefined);
   const sourceActCore = sourceCelex ? celexActCore(sourceCelex) : undefined;
   const fetchLimit = windowedLimit(offset, perTypeLimit);
@@ -880,7 +877,13 @@ export async function traverseRelations(
   const pageRowsByType = new Map<RelationType, WorkRelation[]>();
   let hasMore = false;
   for (const { type, bindings, celex } of perType) {
-    const rowsByDirection = new Map<'outgoing' | 'incoming', Omit<WorkRelation, 'direction'>[]>();
+    // Each row beside the date its page sorted it on, CELLAR's undated placeholder
+    // included: the row reports a real date alone, and a window end continues from
+    // the sort date.
+    const rowsByDirection = new Map<
+      'outgoing' | 'incoming',
+      { row: Omit<WorkRelation, 'direction'>; sortDate: string | undefined }[]
+    >();
     // Rows CELLAR returned per direction, before the client-side re-checks: the
     // window is reached by what the query read, not by what survived them.
     const fetchedByDirection = new Map<'outgoing' | 'incoming', number>();
@@ -891,7 +894,8 @@ export async function traverseRelations(
         CellarSparqlService.bindingValue(b, 'direction') === 'incoming' ? 'incoming' : 'outgoing';
       fetchedByDirection.set(direction, (fetchedByDirection.get(direction) ?? 0) + 1);
       const relatedCelex = CellarSparqlService.bindingValue(b, 'relatedCelexSample');
-      const relatedDate = CellarSparqlService.bindingValue(b, 'relatedDateMax')?.slice(0, 10);
+      const sortDate = CellarSparqlService.bindingValue(b, 'relatedDateMax')?.slice(0, 10);
+      const relatedDate = cellarDate(sortDate);
       const relatedTitle = CellarSparqlService.bindingValue(b, 'relatedTitleMax');
 
       // Keep CELEX-constrained relation lists trustworthy at a glance. These
@@ -914,24 +918,31 @@ export async function traverseRelations(
       seenForType.add(typeKey);
       const rows = rowsByDirection.get(direction) ?? [];
       rows.push({
-        relationType: type,
-        relatedWorkUri,
-        ...(relatedCelex ? { relatedCelexNumber: relatedCelex } : {}),
-        ...(relatedMemberState ? { relatedMemberState } : {}),
-        ...(relatedDate ? { relatedDate } : {}),
-        ...(relatedTitle ? { relatedTitle } : {}),
+        row: {
+          relationType: type,
+          relatedWorkUri,
+          ...(relatedCelex ? { relatedCelexNumber: relatedCelex } : {}),
+          ...(relatedMemberState ? { relatedMemberState } : {}),
+          ...(relatedDate ? { relatedDate } : {}),
+          ...(relatedTitle ? { relatedTitle } : {}),
+        },
+        sortDate,
       });
       rowsByDirection.set(direction, rows);
     }
 
     for (const [direction, rows] of rowsByDirection) {
       if (rows.length > perTypeLimit) hasMore = true;
-      const page = rows.slice(0, perTypeLimit).map((row) => ({ ...row, direction }));
+      const kept = rows.slice(0, perTypeLimit);
+      const page = kept.map(({ row }) => ({ ...row, direction }));
       relations.push(...page);
       pageRowsByType.set(type, [...(pageRowsByType.get(type) ?? []), ...page]);
       const fetched = fetchedByDirection.get(direction) ?? 0;
       if (readWindowedPage(fetched, offset, perTypeLimit).atWindowEnd) {
-        const lastDate = page.at(-1)?.relatedDate;
+        // A page ending among placeholder-dated works continues through them, bounded
+        // by the placeholder; reporting no date must not send it to the undated works.
+        const lastSortDate = kept.at(-1)?.sortDate;
+        const lastDate = cellarDate(lastSortDate);
         windowEnds.push({
           relationType: type,
           direction,
@@ -940,7 +951,7 @@ export async function traverseRelations(
             workUri,
             RELATION_SPECS[type].predicate,
             direction,
-            lastDate,
+            lastSortDate,
             celex,
             articleFor(type),
           ),
@@ -977,6 +988,106 @@ export async function traverseRelations(
     );
   }
   return { relations, hasMore, windowEnds, provisionsUnavailable };
+}
+
+/** One member state's national implementing measures of an act. */
+export interface MemberStateTransposition {
+  /** Newest document date among the measures (YYYY-MM-DD); absent when none has a real one. */
+  latestDate?: string;
+  /** Distinct measures whose CELEX carries this code after the act core. */
+  measures: number;
+  /** The three-letter code the measures' CELEX carries after the act core. */
+  memberState: string;
+}
+
+/** An act's national transposition tallied per member state, or CELLAR's failure to give it. */
+export type TranspositionSummary =
+  | {
+      /** Every code with at least one measure, sorted. */
+      byMemberState: MemberStateTransposition[];
+      status: 'summarized';
+      /** The codes in scope with no measure, sorted. */
+      withoutMeasures: string[];
+    }
+  | { status: 'unavailable' };
+
+/** The 27 current member states: every code a sector-7 CELEX carries but the United Kingdom's. */
+const CURRENT_MEMBER_STATES = MEMBER_STATE_CODES.filter((code) => code !== 'GBR');
+
+/** Prefix of the IRI each member state's group is keyed on (see {@link summarizeTransposition}). */
+const MEMBER_STATE_KEY = 'urn:member-state:';
+
+/**
+ * Tally the national implementing measures of the act `sourceCelex` names per member
+ * state, in one grouped query over the same pushed CELEX pattern its
+ * `national_transposition` rows page through, `memberStates` included: each state's
+ * distinct measures and their newest document date, and the states in scope with
+ * none — the `memberStates` filter, or else the 27 current member states.
+ *
+ * The group key is an IRI built from the code after the act core, never that code
+ * as a computed string: CELLAR splits a computed-string GROUP BY key into several
+ * groups by the length of the CELEX it came from (NIS2's CZE measures came back as
+ * groups of 27 and 56, its HUN measures as 4 and 36). The date aggregates as
+ * `MAX(STR(?date))`, as the paged query's does, so each state's `latestDate` is the
+ * `relatedDate` of its first row. CELLAR's undated placeholder is its earliest date, so
+ * the aggregate returns it only when no measure of the state has a real date, and it
+ * is then dropped as on rows; the `measures` count includes every measure either way.
+ *
+ * Returns `undefined` without a query when the CELEX carries no act core, and
+ * `undefined` when no member state in scope has a measure. A CELLAR failure returns
+ * `unavailable`, for the caller to serve its page without the summary; cancellation
+ * and anything that is not a CELLAR failure still end the call.
+ */
+export async function summarizeTransposition(
+  svc: Pick<CellarSparqlService, 'query'>,
+  workUri: string,
+  sourceCelex: string | undefined,
+  memberStates: readonly MemberStateCode[] | undefined,
+  ctx: Context,
+): Promise<TranspositionSummary | undefined> {
+  const sourceActCore = sourceCelex ? celexActCore(sourceCelex) : undefined;
+  if (!sourceActCore) return;
+  const query = `SELECT ?memberState (COUNT(DISTINCT ?measure) AS ?measures) (MAX(STR(?date)) AS ?latestDate) WHERE {
+  ?measure cdm:measure_national_implementing_implements_resource_legal <${workUri}> .
+  ?measure cdm:resource_legal_id_celex ?celex .
+  FILTER(REGEX(STR(?celex), "${nationalMeasureCelexPattern(sourceActCore, memberStates)}"))
+  BIND(IRI(CONCAT("${MEMBER_STATE_KEY}", SUBSTR(STRAFTER(STR(?celex), "7${sourceActCore}"), 1, 3))) AS ?memberState)
+  OPTIONAL { ?measure cdm:work_date_document ?date . }
+} GROUP BY ?memberState`;
+  let bindings: SparqlBinding[];
+  try {
+    bindings = await svc.query(query, ctx);
+  } catch (error) {
+    if (ctx.signal.aborted || !(error instanceof McpError)) throw error;
+    ctx.log.warning('Transposition summary failed; page returned without it', {
+      error: error.message,
+    });
+    return { status: 'unavailable' };
+  }
+  const byMemberState: MemberStateTransposition[] = [];
+  for (const binding of bindings) {
+    const key = CellarSparqlService.bindingValue(binding, 'memberState');
+    const measures = Number(CellarSparqlService.bindingValue(binding, 'measures'));
+    if (!key?.startsWith(MEMBER_STATE_KEY) || !Number.isInteger(measures)) continue;
+    const latestDate = cellarDate(
+      CellarSparqlService.bindingValue(binding, 'latestDate')?.slice(0, 10),
+    );
+    byMemberState.push({
+      memberState: key.slice(MEMBER_STATE_KEY.length),
+      measures,
+      ...(latestDate ? { latestDate } : {}),
+    });
+  }
+  if (byMemberState.length === 0) return;
+  byMemberState.sort((a, b) => a.memberState.localeCompare(b.memberState));
+  const present = new Set(byMemberState.map((entry) => entry.memberState));
+  return {
+    status: 'summarized',
+    byMemberState,
+    withoutMeasures: (memberStates ?? CURRENT_MEMBER_STATES)
+      .filter((code) => !present.has(code))
+      .toSorted(),
+  };
 }
 
 /**

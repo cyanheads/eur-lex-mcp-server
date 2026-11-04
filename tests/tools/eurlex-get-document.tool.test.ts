@@ -17,8 +17,10 @@ import { EURLEX_LANGUAGES } from '@/services/eurlex-content/eurlex-content-servi
 import { htmlToMarkdown } from '@/services/eurlex-content/html-to-markdown.js';
 import {
   ACTS,
+  encodedComment,
   fakeConsolidationCellar,
   isConsolidationLookup,
+  isProcedureLookup,
   WORK,
 } from '../fixtures/cellar-consolidations.js';
 import {
@@ -51,6 +53,7 @@ import { AMENDING_FORMEX, AMENDING_HTML } from '../fixtures/eurlex-amending-act.
 import { CONSOLIDATED_ACT_HTML } from '../fixtures/eurlex-consolidated-act.js';
 import { LEGACY_ACT_HTML, LEGACY_TWO_CHAPTER_ACT_HTML } from '../fixtures/eurlex-legacy-act.js';
 import { readCommonMark, readCommonMarkTarget } from '../helpers/commonmark.js';
+import { queryRoles, roles } from '../helpers/query-roles.js';
 
 // --- Service mocks ---
 const mockSparqlQuery = vi.fn();
@@ -74,6 +77,18 @@ vi.mock('@/services/eurlex-content/eurlex-content-service.js', async (importOrig
   ...(await importOriginal()),
   getEurLexContentService: () => ({ fetchContent: mockFetchContent }),
 }));
+
+/** The queries a metadata read of a legislative CELEX sends (#109, #173, #180). */
+const METADATA_ROLES = roles(
+  'resolution',
+  'consolidation',
+  'core',
+  'citation',
+  'agents',
+  'legal_basis',
+  'eurovoc',
+  'procedures',
+);
 
 /** Build a metadata binding for a document. */
 function makeMetaBinding(opts: {
@@ -197,6 +212,42 @@ describe('eurlex_get_document', () => {
     expect(text).toContain('**Journal pages:** 00052-00074');
     expect(text).toContain('**Journal publication date:** 2006-02-14');
     expect(text).toContain('**Notification date:** 2006-02-21');
+  });
+
+  it('reads CELLAR’s undated placeholder on a national measure as no date, its journal dates included, on both surfaces (#184)', async () => {
+    const citation = {
+      journal: 'Moniteur belge',
+      publication_date: '1001-01-01',
+      notification_date: '1999-03-01',
+    };
+    mockSparqlQuery.mockImplementation(async (query: string) =>
+      query.includes('measure_national_implementing_name_official_journal')
+        ? Object.entries(citation).map(([field, value]) => ({
+            field: { type: 'literal', value: field },
+            value: { type: 'literal', value },
+          }))
+        : [makeMetaBinding({ celex: '71995L0046BEL_101325', title: 'Loi', date: '1001-01-01' })],
+    );
+
+    const response = await runToolContract(eurlex_get_document, {
+      celex_number: '71995L0046BEL_101325',
+      content_mode: 'metadata_only',
+    });
+
+    expect(response.isError).toBeFalsy();
+    const structured = eurlex_get_document.output.parse(response.structuredContent);
+    expect(structured).toMatchObject({ celex_number: '71995L0046BEL_101325', title: 'Loi' });
+    expect(structured).not.toHaveProperty('date');
+    expect(structured.national_measure).toEqual({
+      journal: 'Moniteur belge',
+      notification_date: '1999-03-01',
+    });
+    const text = response.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+    expect(text).toContain('Loi');
+    expect(text).toContain('**Notification date:** 1999-03-01');
+    expect(text).not.toContain('**Date:**');
+    expect(text).not.toContain('**Journal publication date:**');
+    expect(text).not.toContain('1001-01-01');
   });
 
   it('mirrors sparse national citations and unavailable-body gazette guidance on the wire', async () => {
@@ -765,7 +816,7 @@ describe('eurlex_get_document', () => {
     const routeTitles = (titles: { title?: string; languageTitle?: string }) =>
       mockSparqlQuery.mockImplementation(async (sparql: string) => {
         if (isResolutionQuery(sparql)) return resolutionRows(sparql);
-        if (!sparql.includes('cdm:expression_belongs_to_work')) return [];
+        if (!sparql.includes('cdm:work_has_resource-type')) return [];
         return [
           {
             ...(titles.title ? { title: literal(titles.title) } : {}),
@@ -2897,6 +2948,7 @@ describe('eurlex_get_document', () => {
       /** The miss path's expression/manifestation → owning work lookup (#158). */
       owner?: SparqlRows;
       core?: SparqlRows;
+      citation?: SparqlRows;
       author?: SparqlRows;
       legalBasis?: SparqlRows;
       eurovoc?: SparqlRows;
@@ -2904,9 +2956,9 @@ describe('eurlex_get_document', () => {
     }) => {
       mockSparqlQuery.mockImplementation((query: string) => {
         if (isResolutionQuery(query)) return Promise.resolve(resolutionRows(query));
-        // The core query also reads the ELI and the OJ pages' manifestations (#169),
-        // so it is told apart by its earliest-entry aggregate before those routes.
-        if (query.includes('AS ?entryIntoForce)')) return Promise.resolve(routes.core ?? []);
+        // The citation query (#173) reads the ELI and the OJ pages' manifestations,
+        // so it is told apart by its dates-of-effect aggregate before those routes.
+        if (query.includes('AS ?datesOfEffect)')) return Promise.resolve(routes.citation ?? []);
         if (query.includes('cdm:resource_legal_eli')) return Promise.resolve(routes.eli ?? []);
         if (query.includes('cdm:act_consolidated_based_on_resource_legal'))
           return Promise.resolve(routes.consolidation ?? []);
@@ -3166,7 +3218,7 @@ describe('eurlex_get_document', () => {
         false,
       );
       // The owner lookup is the query that tells an expression from a manifestation;
-      // the core query reads manifestations too, for the OJ pages (#169).
+      // the citation query reads manifestations too, for the OJ pages (#169, #173).
       expect(
         mockSparqlQuery.mock.calls.some((c) =>
           (c[0] as string).includes('BIND("manifestation" AS ?kind)'),
@@ -3640,7 +3692,9 @@ describe('eurlex_get_document', () => {
         'cdm:resource_legal_id_celex "32016R0679"^^xsd:string .',
       );
       const byWork = queries.filter((q) => q.includes(`<${CELLAR}32016R0679>`));
-      expect(byWork).toHaveLength(4);
+      expect(queryRoles(byWork)).toEqual(
+        roles('core', 'citation', 'agents', 'legal_basis', 'eurovoc', 'procedures'),
+      );
       expect(queries.join('\n')).not.toMatch(/STR\(\?\w+\)\s*=/);
       expect(result.celex_number).toBe('32016R0679');
       expect(result.work_uri).toBe(`${CELLAR}32016R0679`);
@@ -3673,10 +3727,15 @@ describe('eurlex_get_document', () => {
       expect(queries.find(isResolutionQuery)).toContain(
         'VALUES ?celexNumber { "02016R0679-20160504"^^xsd:string }',
       );
-      // The consolidation's own identity comes from its work; its act metadata from
-      // the base act's work (#110): the core query names both.
-      expect(queries.filter((q) => q.includes(`<${CELLAR}02016R0679-20160504>`))).toHaveLength(1);
-      expect(queries.filter((q) => q.includes(`<${CELLAR}32016R0679>`))).toHaveLength(4);
+      // The consolidation's own identity and ELI come from its work; its act metadata
+      // from the base act's work (#110): the core and citation queries name both, and
+      // the procedure lookup (#180) the base act's alone.
+      expect(
+        queryRoles(queries.filter((q) => q.includes(`<${CELLAR}02016R0679-20160504>`))),
+      ).toEqual(roles('core', 'citation'));
+      expect(queryRoles(queries.filter((q) => q.includes(`<${CELLAR}32016R0679>`)))).toEqual(
+        roles('core', 'citation', 'agents', 'legal_basis', 'eurovoc', 'procedures'),
+      );
       expect(queries.join('\n')).not.toMatch(/STR\(\?\w+\)\s*=/);
     });
   });
@@ -3814,7 +3873,7 @@ describe('eurlex_get_document', () => {
           SUBJECTS[work.uri] ? [{ eurovoc: uri(SUBJECTS[work.uri] as string) }] : [],
         );
       }
-      if (q.includes('cdm:expression_belongs_to_work')) {
+      if (q.includes('cdm:work_has_resource-type')) {
         return works.map(({ celex, work }) => ({
           work: uri(work.uri),
           celexNumber: literal(celex),
@@ -4171,9 +4230,7 @@ describe('eurlex_get_document', () => {
       await getDocument({ celex_number: '32024R1689' });
 
       const queries = mockSparqlQuery.mock.calls.map((c) => c[0] as string);
-      // Resolution, the consolidation lookup, core, agents, legal basis, EuroVoc.
-      expect(queries).toHaveLength(6);
-      expect(queries.filter(isConsolidationLookup)).toHaveLength(1);
+      expect(queryRoles(queries)).toEqual(METADATA_ROLES);
     });
 
     it('#109: a consolidated-CELEX request runs its lookup concurrently with CELEX resolution', async () => {
@@ -4203,8 +4260,9 @@ describe('eurlex_get_document', () => {
         content_mode: 'metadata_only',
       });
       expect(result.isError).toBeFalsy();
-      // Resolution, lookup, core, agents, legal basis, EuroVoc: one query added.
-      expect(mockSparqlQuery).toHaveBeenCalledTimes(6);
+      expect(queryRoles(mockSparqlQuery.mock.calls.map((c) => c[0] as string))).toEqual(
+        METADATA_ROLES,
+      );
     });
 
     it('#109: propagates a caller cancellation raised by the lookup on a consolidated CELEX', async () => {
@@ -4336,6 +4394,7 @@ describe('eurlex_get_document', () => {
       result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
     const REASON_FIELDS = ['repealed_by', 'entry_into_force', 'end_of_validity'] as const;
     const REASON_LINES = ['**Repealed by:**', '**Entry into force:**', '**End of validity:**'];
+    const FD_335 = 'http://publications.europa.eu/resource/authority/fd_335/';
 
     const expectNoReasons = (result: Awaited<ReturnType<typeof getDocument>>) => {
       const structured = structuredOf(result);
@@ -4353,16 +4412,26 @@ describe('eurlex_get_document', () => {
       expectNoReasons(result);
     });
 
-    it('a base-act request still issues six queries — the reasons ride the core query', async () => {
+    it('a base-act request issues eight queries — the reasons ride the core and citation queries', async () => {
       await getDocument('31995L0046');
-      // Resolution, consolidation lookup, core, agents, legal bases, EuroVoc.
-      expect(mockSparqlQuery).toHaveBeenCalledTimes(6);
+      expect(queryRoles(mockSparqlQuery.mock.calls.map((c) => c[0] as string))).toEqual(
+        METADATA_ROLES,
+      );
     });
 
-    it('propagates a caller cancellation raised by the core metadata query', async () => {
+    /**
+     * The core, citation, and procedure queries run side by side (#173, #180), and a
+     * failure of any ends the read the same way: a caller cancellation propagates, and
+     * so does a CELLAR error, with the error the query raised.
+     */
+    it.each([
+      ['core', 'cdm:work_has_resource-type'],
+      ['citation', 'AS ?datesOfEffect)'],
+      ['procedure', 'cdm:procedure_code_interinstitutional_reference_procedure'],
+    ])('propagates a caller cancellation from the %s query', async (_label, marker) => {
       const ctx = createMockContext({ errors: eurlex_get_document.errors });
       mockSparqlQuery.mockImplementation((q: string) =>
-        q.includes('cdm:expression_belongs_to_work')
+        q.includes(marker)
           ? Promise.reject(new DOMException('The operation was aborted.', 'AbortError'))
           : fakeConsolidationCellar(q),
       );
@@ -4371,6 +4440,29 @@ describe('eurlex_get_document', () => {
         content_mode: 'metadata_only',
       });
       await expect(eurlex_get_document.handler(input, ctx)).rejects.toThrow(/aborted/);
+      expect(mockSparqlQuery.mock.calls.some(([q]) => (q as string).includes(marker))).toBe(true);
+    });
+
+    it.each([
+      ['core', 'cdm:work_has_resource-type'],
+      ['citation', 'AS ?datesOfEffect)'],
+      ['procedure', 'cdm:procedure_code_interinstitutional_reference_procedure'],
+    ])('fails the read with the CELLAR error the %s query raises', async (_label, marker) => {
+      const timeout = serviceUnavailable('CELLAR SPARQL query timed out after 55000ms', {
+        reason: 'sparql_timeout',
+      });
+      mockSparqlQuery.mockImplementation((q: string) =>
+        q.includes(marker) ? Promise.reject(timeout) : fakeConsolidationCellar(q),
+      );
+      const result = await runToolContract(eurlex_get_document, {
+        celex_number: '31995L0046',
+        content_mode: 'metadata_only',
+      });
+      expect(result.isError).toBe(true);
+      const error = (result.structuredContent as { error: { code: number; data: object } }).error;
+      expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+      expect(error.data).toMatchObject({ reason: 'sparql_timeout' });
+      expect(result.structuredContent).not.toHaveProperty('dates_of_effect');
     });
 
     it('31995L0046: names its repealing act and end of validity, in both channels', async () => {
@@ -4451,7 +4543,7 @@ describe('eurlex_get_document', () => {
 
       const core = mockSparqlQuery.mock.calls
         .map((c) => c[0] as string)
-        .find((q) => q.includes('cdm:expression_belongs_to_work')) as string;
+        .find((q) => q.includes('cdm:work_has_resource-type')) as string;
       expect(core).toMatch(
         /OPTIONAL \{[^{}]*cdm:resource_legal_date_end-of-validity \?(\w+) \.[^{}]*FILTER\(STR\(\?\1\) != "9999-12-31"\)[^{}]*\}/,
       );
@@ -4477,7 +4569,7 @@ describe('eurlex_get_document', () => {
     it('sorts several repealing acts and reads the dates as string aggregates', async () => {
       mockSparqlQuery.mockImplementation(async (q: string) => {
         const rows = await fakeConsolidationCellar(q);
-        if (!q.includes('cdm:expression_belongs_to_work')) return rows;
+        if (!q.includes('cdm:work_has_resource-type')) return rows;
         return rows.map((r) => ({
           ...r,
           inForce: { type: 'literal', value: '0' },
@@ -4494,9 +4586,39 @@ describe('eurlex_get_document', () => {
       // CELLAR computes a grouped MAX over an OPTIONAL xsd:date wrongly; STR() avoids it.
       const core = mockSparqlQuery.mock.calls
         .map((c) => c[0] as string)
-        .find((q) => q.includes('cdm:expression_belongs_to_work'));
-      expect(core).toMatch(/MIN\(STR\(\?\w+\)\) AS \?entryIntoForce/);
+        .find((q) => q.includes('cdm:work_has_resource-type'));
       expect(core).toMatch(/MAX\(STR\(\?\w+\)\) AS \?endOfValidity/);
+    });
+
+    it('takes the earliest entry into force from the dates of effect, however many entries a date splits into (#173, #181)', async () => {
+      vi.setSystemTime(new Date('2026-01-01T12:00:00Z'));
+      mockSparqlQuery.mockImplementation(async (q: string) => {
+        const rows = await fakeConsolidationCellar(q);
+        if (!q.includes('AS ?datesOfEffect)')) return rows;
+        // Several types and provisions on the earliest date, listed in no particular order.
+        const items = [
+          `2027-03-26|{MA|${FD_335}MA}|${encodedComment('{V} {ART} 12')}`,
+          `2026-10-12|{MA|${FD_335}MA}|${encodedComment('{MA/PART} {V} {ART} 12(b)')}`,
+          `2026-10-12|{MA|${FD_335}MA}|${encodedComment('{V} {ART} 12')}`,
+          `2026-10-12|{EV|${FD_335}EV}|${encodedComment('{DATPUB} +20 {V} {ART} 12')}`,
+          `2026-10-12|{EV|${FD_335}EV}|${encodedComment('{V} {ANN} II')}`,
+          '2029-03-26||',
+        ];
+        return [{ datesOfEffect: { type: 'literal', value: items.join(' ') } }];
+      });
+      const result = await runToolContract(eurlex_get_document, {
+        celex_number: '32026R2099',
+        content_mode: 'metadata_only',
+      });
+      const structured = structuredOf(result);
+      expect(structured.entry_into_force).toBe('2026-10-12');
+      expect(structured.dates_of_effect?.slice(0, 4)).toEqual([
+        { date: '2026-10-12', type: 'entry_into_force', provision: 'Annex II' },
+        { date: '2026-10-12', type: 'entry_into_force', provision: 'Article 12' },
+        { date: '2026-10-12', type: 'application', provision: 'Article 12' },
+        { date: '2026-10-12', type: 'partial_application', provision: 'Article 12(b)' },
+      ]);
+      expect(textOf(result)).toContain('**Entry into force:** 2026-10-12');
     });
   });
 
@@ -4514,10 +4636,12 @@ describe('eurlex_get_document', () => {
       eurlex_get_document.output.parse(result.structuredContent);
     const textOf = (result: Awaited<ReturnType<typeof getDocument>>) =>
       result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
-    const coreQuery = () =>
+    const sentQuery = (marker: string) =>
       mockSparqlQuery.mock.calls
         .map((c) => c[0] as string)
-        .find((q) => q.includes('AS ?entryIntoForce)')) as string;
+        .find((q) => q.includes(marker)) as string;
+    const coreQuery = () => sentQuery('cdm:work_has_resource-type');
+    const citationQuery = () => sentQuery('AS ?datesOfEffect)');
     const CITATION_LINES = [
       '**ELI:**',
       '**OJ reference:**',
@@ -4542,14 +4666,14 @@ describe('eurlex_get_document', () => {
         eli: 'http://data.europa.eu/eli/reg/2024/1689/oj',
         oj: 'OJ L, 2024/1689, 12.7.2024',
         dates: [
-          { date: '2024-08-01', type: 'entry_into_force' },
-          { date: '2025-02-02', type: 'application' },
-          { date: '2025-08-02', type: 'application' },
-          { date: '2026-08-02', type: 'application' },
-          { date: '2027-08-02', type: 'application' },
+          { date: '2024-08-01', type: 'entry_into_force', provision: 'Article 113' },
+          { date: '2025-02-02', type: 'partial_application', provision: 'Article 113(a)' },
+          { date: '2025-08-02', type: 'partial_application', provision: 'Article 113(b)' },
+          { date: '2026-08-02', type: 'application', provision: 'Article 113' },
+          { date: '2027-08-02', type: 'partial_application', provision: 'Article 113(c)' },
         ],
         datesLine:
-          '2024-08-01 (entry_into_force), 2025-02-02 (application), 2025-08-02 (application), 2026-08-02 (application), 2027-08-02 (application)',
+          '2024-08-01 (entry_into_force, Article 113), 2025-02-02 (partial_application, Article 113(a)), 2025-08-02 (partial_application, Article 113(b)), 2026-08-02 (application, Article 113), 2027-08-02 (partial_application, Article 113(c))',
         transposition: undefined,
       },
       {
@@ -4561,7 +4685,7 @@ describe('eurlex_get_document', () => {
         transposition: ['2021-12-17', '2023-12-17'],
       },
     ])(
-      '$celex returns its four citation facts on both surfaces, and no entry_into_force, in the same query count',
+      '$celex returns its four citation facts on both surfaces, and no entry_into_force, from their own query',
       async (row) => {
         const result = await getDocument(row.celex);
         const structured = structuredOf(result);
@@ -4581,9 +4705,43 @@ describe('eurlex_get_document', () => {
           expect(text).not.toContain('**Transposition deadlines:**');
         }
         expect(text).not.toContain('**Entry into force:**');
-        // The facts ride the core query: resolution, consolidation lookup, core,
-        // agents, legal bases, EuroVoc — the same six queries as without them.
-        expect(mockSparqlQuery).toHaveBeenCalledTimes(6);
+        expect(queryRoles(mockSparqlQuery.mock.calls.map((c) => c[0] as string))).toEqual(
+          METADATA_ROLES,
+        );
+      },
+    );
+
+    it('#173: the core query reads none of the citation facts; the citation query only aggregates', async () => {
+      await getDocument('32016R0679');
+      const core = coreQuery();
+      for (const pattern of [
+        'cdm:resource_legal_eli',
+        'type_of_date',
+        'official-journal',
+        'cdm:resource_legal_date_entry-into-force',
+        'AS ?entryIntoForce)',
+        'AS ?datesOfEffect)',
+      ]) {
+        expect(core).not.toContain(pattern);
+      }
+      const citation = citationQuery();
+      expect(citation).not.toContain('GROUP BY');
+      expect(citation).not.toContain('cdm:work_has_resource-type');
+      expect(citation).not.toContain('?inForce');
+      // Every projected column is an aggregate, so CELLAR returns exactly one row.
+      const projection = citation.slice(citation.indexOf('SELECT') + 6, citation.indexOf('WHERE'));
+      expect(projection.replace(/\((?:MIN|GROUP_CONCAT)\(.*\) AS \?\w+\)/g, '').trim()).toBe('');
+    });
+
+    it.each([
+      ['31962R0017', true],
+      ['32016R0679', false],
+    ])(
+      '#173: %s carries the original-language page join in the citation query: %s',
+      async (celex, joined) => {
+        await getDocument(celex);
+        expect(citationQuery().includes('?ojOriginalFirst')).toBe(joined);
+        expect(coreQuery()).not.toContain('ojOriginal');
       },
     );
 
@@ -4614,7 +4772,7 @@ describe('eurlex_get_document', () => {
       );
       expect(structured).not.toHaveProperty('dates_of_effect');
       // A post-1973 act skips the costly original-language page join.
-      expect(coreQuery()).not.toContain('ojOriginal');
+      expect(citationQuery()).not.toContain('ojOriginal');
     });
 
     it('32004D0752: cites the earliest of its three issues and ends with a partial effect', async () => {
@@ -4630,11 +4788,71 @@ describe('eurlex_get_document', () => {
     it('31983R2215: one date carrying two types is listed once per type, entry into force first', async () => {
       const result = await getDocument('31983R2215');
       expect(structuredOf(result).dates_of_effect).toEqual([
-        { date: '1983-08-07', type: 'entry_into_force' },
-        { date: '1983-08-07', type: 'application' },
+        { date: '1983-08-07', type: 'entry_into_force', provision: 'Article 2' },
+        { date: '1983-08-07', type: 'application', provision: 'Article 1' },
       ]);
       expect(textOf(result)).toContain(
-        '**Dates of effect:** 1983-08-07 (entry_into_force), 1983-08-07 (application)',
+        '**Dates of effect:** 1983-08-07 (entry_into_force, Article 2), 1983-08-07 (application, Article 1)',
+      );
+    });
+
+    // --- #181: the provision and partial scope behind each date ---
+
+    it('32023R2854: the Data Act’s staged dates, each set by Article 50, two of them partial', async () => {
+      const result = await getDocument('32023R2854');
+      expect(structuredOf(result).dates_of_effect).toEqual([
+        { date: '2024-01-11', type: 'entry_into_force', provision: 'Article 50' },
+        { date: '2025-09-12', type: 'application', provision: 'Article 50' },
+        { date: '2026-09-12', type: 'partial_application', provision: 'Article 50' },
+        { date: '2027-09-12', type: 'partial_application', provision: 'Article 50' },
+      ]);
+      expect(textOf(result)).toContain(
+        '**Dates of effect:** 2024-01-11 (entry_into_force, Article 50), 2025-09-12 (application, Article 50), 2026-09-12 (partial_application, Article 50), 2027-09-12 (partial_application, Article 50)',
+      );
+    });
+
+    it('32004D0752: a comment naming its article and another act yields no provision, on either surface', async () => {
+      const result = await getDocument('32004D0752');
+      expect(structuredOf(result).dates_of_effect).toEqual([
+        { date: '2004-11-10', type: 'entry_into_force', provision: 'Article 4' },
+        { date: '2005-12-12', type: 'takes_partial_effect' },
+      ]);
+      expect(textOf(result)).toContain(
+        '**Dates of effect:** 2004-11-10 (entry_into_force, Article 4), 2005-12-12 (takes_partial_effect)',
+      );
+    });
+
+    it('02024R1689-20260727: a consolidated text carries its base act’s provisions', async () => {
+      const result = await getDocument('02024R1689-20260727');
+      const structured = structuredOf(result);
+      expect(structured.base_act_celex).toBe('32024R1689');
+      expect(structured.dates_of_effect?.[1]).toEqual({
+        date: '2025-02-02',
+        type: 'partial_application',
+        provision: 'Article 113(a)',
+      });
+      expect(textOf(result)).toContain('2025-02-02 (partial_application, Article 113(a))');
+    });
+
+    it('renders a provision as CommonMark reads it back, and an untyped entry by its date alone', () => {
+      const text = (
+        eurlex_get_document.format!({
+          celex_number: '32024R1689',
+          content_format: 'html',
+          content_mode: 'metadata_only',
+          content_status: 'not_requested',
+          dates_of_effect: [
+            { date: '2025-02-02', type: 'partial_application', provision: 'Article 113(a)' },
+            { date: '2026-01-01' },
+          ],
+        } as never)[0] as { text: string }
+      ).text;
+      const line = text.split('\n').find((l) => l.startsWith('**Dates of effect:**')) as string;
+      expect(line).toBe(
+        '**Dates of effect:** 2025-02-02 (partial_application, Article 113(a)), 2026-01-01',
+      );
+      expect(readCommonMark(line)).toBe(
+        '⟨strong⟩Dates of effect:⟨/strong⟩ 2025-02-02 (partial_application, Article 113(a)), 2026-01-01',
       );
     });
 
@@ -4662,6 +4880,321 @@ describe('eurlex_get_document', () => {
         for (const line of CITATION_LINES) expect(textOf(result)).not.toContain(line);
       },
     );
+
+    /**
+     * The four fields and entry_into_force of five acts as read live on 2026-11-03,
+     * the same whichever query reads them (#173). The AI Act's dates also carry the
+     * provisions and partial scope its fixture's comments name (#181); the other
+     * fixtures record no comment. entry_into_force shows only on an act not yet in
+     * force, so the second table flips in_force to false and sets the clock before
+     * every date: what it then reports is the earliest entry-into-force date the act
+     * records, however many entries #181 splits a date into.
+     */
+    const CITATION_FIELDS = [
+      'eli',
+      'oj_reference',
+      'dates_of_effect',
+      'transposition_deadlines',
+    ] as const;
+    const PINNED: {
+      celex: string;
+      fields: Partial<Record<(typeof CITATION_FIELDS)[number], unknown>>;
+      lines: string[];
+      earliest: string | undefined;
+    }[] = [
+      {
+        celex: '32016R0679',
+        fields: {
+          eli: 'http://data.europa.eu/eli/reg/2016/679/oj',
+          oj_reference: 'OJ L 119, 4.5.2016, p. 1–88',
+          dates_of_effect: [
+            { date: '2016-05-24', type: 'entry_into_force' },
+            { date: '2018-05-25', type: 'application' },
+          ],
+        },
+        lines: [
+          '**ELI:** http://data.europa.eu/eli/reg/2016/679/oj',
+          '**OJ reference:** OJ L 119, 4.5.2016, p. 1–88',
+          '**Dates of effect:** 2016-05-24 (entry_into_force), 2018-05-25 (application)',
+        ],
+        earliest: '2016-05-24',
+      },
+      {
+        celex: '32024R1689',
+        fields: {
+          eli: 'http://data.europa.eu/eli/reg/2024/1689/oj',
+          oj_reference: 'OJ L, 2024/1689, 12.7.2024',
+          dates_of_effect: [
+            { date: '2024-08-01', type: 'entry_into_force', provision: 'Article 113' },
+            { date: '2025-02-02', type: 'partial_application', provision: 'Article 113(a)' },
+            { date: '2025-08-02', type: 'partial_application', provision: 'Article 113(b)' },
+            { date: '2026-08-02', type: 'application', provision: 'Article 113' },
+            { date: '2027-08-02', type: 'partial_application', provision: 'Article 113(c)' },
+          ],
+        },
+        lines: [
+          '**ELI:** http://data.europa.eu/eli/reg/2024/1689/oj',
+          '**OJ reference:** OJ L, 2024/1689, 12.7.2024',
+          '**Dates of effect:** 2024-08-01 (entry_into_force, Article 113), 2025-02-02 (partial_application, Article 113(a)), 2025-08-02 (partial_application, Article 113(b)), 2026-08-02 (application, Article 113), 2027-08-02 (partial_application, Article 113(c))',
+        ],
+        earliest: '2024-08-01',
+      },
+      {
+        celex: '32022L2555',
+        fields: {
+          eli: 'http://data.europa.eu/eli/dir/2022/2555/oj',
+          oj_reference: 'OJ L 333, 27.12.2022, p. 80–152',
+          dates_of_effect: [{ date: '2023-01-16', type: 'entry_into_force' }],
+          transposition_deadlines: ['2024-10-17', '2024-10-18'],
+        },
+        lines: [
+          '**ELI:** http://data.europa.eu/eli/dir/2022/2555/oj',
+          '**OJ reference:** OJ L 333, 27.12.2022, p. 80–152',
+          '**Dates of effect:** 2023-01-16 (entry_into_force)',
+          '**Transposition deadlines:** 2024-10-17, 2024-10-18',
+        ],
+        earliest: '2023-01-16',
+      },
+      {
+        celex: '31962R0017',
+        fields: {
+          eli: 'http://data.europa.eu/eli/reg/1962/17/oj',
+          oj_reference: 'OJ 13, 21.2.1962, p. 204–211',
+          dates_of_effect: [{ date: '1962-03-13', type: 'entry_into_force' }],
+        },
+        lines: [
+          '**ELI:** http://data.europa.eu/eli/reg/1962/17/oj',
+          '**OJ reference:** OJ 13, 21.2.1962, p. 204–211',
+          '**Dates of effect:** 1962-03-13 (entry_into_force)',
+        ],
+        earliest: '1962-03-13',
+      },
+      {
+        celex: '12001C',
+        fields: { oj_reference: 'OJ C 80, 10.3.2001' },
+        lines: ['**OJ reference:** OJ C 80, 10.3.2001'],
+        earliest: undefined,
+      },
+    ];
+
+    it.each(PINNED)('$celex returns its pinned citation facts on both surfaces', async (row) => {
+      const result = await getDocument(row.celex);
+      const structured = structuredOf(result);
+      for (const field of CITATION_FIELDS) expect(structured[field]).toEqual(row.fields[field]);
+      expect(structured.in_force).toBe(true);
+      expect(structured).not.toHaveProperty('entry_into_force');
+      const citationLines = textOf(result)
+        .split('\n')
+        .filter((line) => CITATION_LINES.some((label) => line.startsWith(label)));
+      expect(citationLines).toEqual(row.lines);
+      expect(textOf(result)).not.toContain('**Entry into force:**');
+    });
+
+    it.each(PINNED)(
+      '$celex not yet in force reports its earliest entry-into-force date as entry_into_force',
+      async (row) => {
+        vi.useFakeTimers({ toFake: ['Date'] });
+        vi.setSystemTime(new Date('1950-01-01T12:00:00Z'));
+        try {
+          mockSparqlQuery.mockImplementation(async (q: string) =>
+            (await fakeConsolidationCellar(q)).map((r) =>
+              r.inForce ? { ...r, inForce: { type: 'literal', value: '0' } } : r,
+            ),
+          );
+          const result = await runToolContract(eurlex_get_document, {
+            celex_number: row.celex,
+            content_mode: 'metadata_only',
+          });
+          const structured = structuredOf(result);
+          expect(structured.in_force).toBe(false);
+          expect(structured.entry_into_force).toBe(row.earliest);
+          if (row.earliest) {
+            expect(textOf(result)).toContain(`**Entry into force:** ${row.earliest}`);
+          } else {
+            expect(textOf(result)).not.toContain('**Entry into force:**');
+          }
+        } finally {
+          vi.useRealTimers();
+        }
+      },
+    );
+  });
+
+  // --- #180: the legislative procedures an act belongs to ---
+
+  describe('legislative procedures (#180)', () => {
+    const getDocument = (celex: string) => {
+      mockSparqlQuery.mockImplementation(fakeConsolidationCellar);
+      return runToolContract(eurlex_get_document, {
+        celex_number: celex,
+        content_mode: 'metadata_only',
+      });
+    };
+    const structuredOf = (result: Awaited<ReturnType<typeof getDocument>>) =>
+      eurlex_get_document.output.parse(result.structuredContent);
+    const textOf = (result: Awaited<ReturnType<typeof getDocument>>) =>
+      result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+    const procedureLines = (text: string) =>
+      text.split('\n').filter((line) => line.startsWith('**Procedure:**'));
+    const sent = () => mockSparqlQuery.mock.calls.map((c) => c[0] as string);
+
+    const AI_ACT_PROCEDURE = {
+      reference: '2021/0106(COD)',
+      status: 'adopted',
+      adopted_acts: ['32024R1689'],
+    };
+    const AI_ACT_LINE = '**Procedure:** 2021/0106(COD) — status: adopted; adopted acts: 32024R1689';
+
+    it.each([
+      {
+        celex: '52017PC0010',
+        why: 'a withdrawn proposal, with its withdrawal date',
+        procedures: [
+          { reference: '2017/0003(COD)', status: 'withdrawn', withdrawal_date: '2025-10-06' },
+        ],
+        lines: ['**Procedure:** 2017/0003(COD) — status: withdrawn; withdrawal date: 2025-10-06'],
+      },
+      {
+        celex: '52021PC0206',
+        why: 'a proposal, through the part-of link',
+        procedures: [AI_ACT_PROCEDURE],
+        lines: [AI_ACT_LINE],
+      },
+      {
+        celex: '52000PC0609',
+        why: 'a proposal reached through the initiated-by link alone',
+        procedures: [{ reference: '2000/0247(ACC)' }],
+        lines: ['**Procedure:** 2000/0247(ACC)'],
+      },
+      {
+        celex: '32024R1689',
+        why: 'the act it adopted, through both links, listed once',
+        procedures: [AI_ACT_PROCEDURE],
+        lines: [AI_ACT_LINE],
+      },
+      {
+        celex: '32020L1828',
+        why: 'a directive reached through the produces link alone',
+        procedures: [
+          { reference: '2018/0089(COD)', status: 'adopted', adopted_acts: ['32020L1828'] },
+        ],
+        lines: ['**Procedure:** 2018/0089(COD) — status: adopted; adopted acts: 32020L1828'],
+      },
+      {
+        celex: '52023PC0331',
+        why: 'a proposal in two procedures, one adopted and one pending',
+        procedures: [
+          { reference: '2018/0135(CNS)', status: 'adopted', adopted_acts: ['32020D2053'] },
+          { reference: '2021/0430(CNS)', status: 'pending' },
+        ],
+        lines: [
+          '**Procedure:** 2018/0135(CNS) — status: adopted; adopted acts: 32020D2053',
+          '**Procedure:** 2021/0430(CNS) — status: pending',
+        ],
+      },
+      {
+        celex: '32023D2641',
+        why: 'a decision three NLE procedures produced, sorted by reference',
+        procedures: ['0806', '0807', '0808'].map((n) => ({
+          reference: `2023/${n}(NLE)`,
+          status: 'adopted',
+          adopted_acts: ['32023D2641'],
+        })),
+        lines: ['0806', '0807', '0808'].map(
+          (n) => `**Procedure:** 2023/${n}(NLE) — status: adopted; adopted acts: 32023D2641`,
+        ),
+      },
+      {
+        celex: '02016R0679-20160504',
+        why: "a consolidated text, its base act's",
+        procedures: [
+          { reference: '2012/0011(COD)', status: 'adopted', adopted_acts: ['32016R0679'] },
+        ],
+        lines: ['**Procedure:** 2012/0011(COD) — status: adopted; adopted acts: 32016R0679'],
+      },
+    ])('$celex: $why, on both surfaces', async ({ celex, procedures, lines }) => {
+      const result = await getDocument(celex);
+      expect(result.isError).toBeFalsy();
+      expect(structuredOf(result).procedures).toEqual(procedures);
+      expect(procedureLines(textOf(result))).toEqual(lines);
+    });
+
+    it('31962R0017, from before the procedure records, carries no procedures and no line', async () => {
+      const result = await getDocument('31962R0017');
+      expect(result.isError).toBeFalsy();
+      expect(structuredOf(result)).not.toHaveProperty('procedures');
+      expect(procedureLines(textOf(result))).toEqual([]);
+      expect(sent().filter(isProcedureLookup)).toHaveLength(1);
+    });
+
+    it("a consolidated text reads the procedures of its base act's work, through both links", async () => {
+      await getDocument('02016R0679-20160504');
+      const lookup = sent().find(isProcedureLookup) as string;
+      expect(lookup).toContain(`<${WORK.gdpr}> cdm:work_part_of_dossier ?procedure .`);
+      expect(lookup).toContain(`?procedure cdm:dossier_produces_resource_legal <${WORK.gdpr}> .`);
+      expect(lookup).not.toContain('fixture-02016R0679');
+    });
+
+    it('legislation sends the procedure query and no case-law query; case law the reverse', async () => {
+      await getDocument('32024R1689');
+      expect(queryRoles(sent())).toEqual(METADATA_ROLES);
+
+      mockSparqlQuery.mockClear();
+      const caseLaw = await getDocument('62012CJ0131');
+      expect(queryRoles(sent())).toEqual(
+        roles(
+          'resolution',
+          'consolidation',
+          'core',
+          'citation',
+          'agents',
+          'legal_basis',
+          'eurovoc',
+          'case_law_facts',
+        ),
+      );
+      expect(structuredOf(caseLaw)).not.toHaveProperty('procedures');
+    });
+
+    it('renders a procedure with no status as its reference and the facts it carries', () => {
+      const result = eurlex_get_document.output.parse({
+        celex_number: '31995R2870',
+        content_mode: 'metadata_only',
+        content_available: false,
+        content_status: 'not_requested',
+        has_more: false,
+        language: 'EN',
+        content_format: 'html',
+        procedures: [
+          {
+            reference: '1995/0146(CNS)',
+            withdrawal_date: '1998-12-17',
+            adopted_acts: ['31995R2870', '31996R0001'],
+          },
+          { reference: '2008/0073/' },
+          { reference: '2002/0047(COD)', status: 'not_adopted' },
+        ],
+      });
+      const text = (eurlex_get_document.format!(result)[0] as { text: string }).text;
+      expect(procedureLines(text)).toEqual([
+        '**Procedure:** 1995/0146(CNS) — withdrawal date: 1998-12-17; adopted acts: 31995R2870, 31996R0001',
+        '**Procedure:** 2008/0073/',
+        '**Procedure:** 2002/0047(COD) — status: not_adopted',
+      ]);
+      for (const line of procedureLines(text)) {
+        expect(readCommonMark(line)).toBe(
+          line.replace(/^\*\*Procedure:\*\*/, '⟨strong⟩Procedure:⟨/strong⟩'),
+        );
+      }
+    });
+
+    it('describes procedures apart from the court procedure types', () => {
+      const { shape } = eurlex_get_document.output;
+      expect(shape.procedures.description).toContain('Distinct from procedure_types');
+      expect(shape.procedure_types.description).toContain(
+        'Not a legislative procedure: those are in procedures',
+      );
+    });
   });
 
   // --- add-tool 2.35: upstream text in content[] reads back as written ---
@@ -4702,6 +5235,11 @@ describe('eurlex_get_document', () => {
         national_measure: { journal: value, number: value, pages: value },
         eurovoc_subjects: [{ concept_uri: 'http://eurovoc.europa.eu/1234', label: value }],
         oj_reference: value,
+        countries: [value],
+        procedure_types: [value, 'Appeal - unfounded'],
+        subjects: [value],
+        procedure_languages: [value],
+        procedures: [{ reference: value, status: 'adopted', adopted_acts: [value] }],
       });
       const text = (eurlex_get_document.format!(result)[0] as { text: string }).text;
 
@@ -4719,11 +5257,20 @@ describe('eurlex_get_document', () => {
         'Journal number',
         'Journal pages',
         'OJ reference',
+        'Countries',
+        'Subjects',
+        'Procedure languages',
       ]) {
         expect(readCommonMark(lineOf(text, `**${label}:** `))).toBe(
           `⟨strong⟩${label}:⟨/strong⟩ ${value}`,
         );
       }
+      expect(readCommonMark(lineOf(text, '**Procedure types:** '))).toBe(
+        `⟨strong⟩Procedure types:⟨/strong⟩ ${value}; Appeal - unfounded`,
+      );
+      expect(readCommonMark(lineOf(text, '**Procedure:** '))).toBe(
+        `⟨strong⟩Procedure:⟨/strong⟩ ${value} — status: adopted; adopted acts: ${value}`,
+      );
       expect(readCommonMark(lineOf(text, '**Authors:** '))).toBe(
         `⟨strong⟩Authors:⟨/strong⟩ ${value}, Council of the European Union`,
       );
@@ -4924,7 +5471,7 @@ describe('eurlex_get_document', () => {
         }
         if (query.includes(`<${work}> ?p ?o`)) return [{ p: literal('cdm:work_date_document') }];
       }
-      if (query.includes('cdm:expression_belongs_to_work')) {
+      if (query.includes('cdm:work_has_resource-type')) {
         return [makeMetaBinding({ celex: 'n/a', title: 'National measure' })];
       }
       return [];
@@ -5253,15 +5800,6 @@ describe('eurlex_get_document CELLAR failures', () => {
           retryable: false,
         }),
     ],
-    [
-      'sparql_timeout',
-      JsonRpcErrorCode.ServiceUnavailable,
-      () =>
-        serviceUnavailable('CELLAR SPARQL query timed out on Virtuoso', {
-          reason: 'sparql_timeout',
-          retryable: false,
-        }),
-    ],
   ])('fails %s with recovery naming its identifier inputs', async (reason, code, failure) => {
     mockSparqlQuery.mockRejectedValue(failure());
 
@@ -5282,5 +5820,82 @@ describe('eurlex_get_document CELLAR failures', () => {
     expect(hint).toBe(eurlex_get_document.errors?.find((e) => e.reason === reason)?.recovery);
     const text = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
     expect(text).toContain(hint);
+  });
+});
+
+// --- #177: a timeout is retryable, and celex_number is offered only where it skips a lookup ---
+
+describe('eurlex_get_document sparql_timeout recovery (#177)', () => {
+  const CONTRACT = eurlex_get_document.errors?.find((e) => e.reason === 'sparql_timeout')?.recovery;
+  const WORK_URI =
+    'http://publications.europa.eu/resource/cellar/3e485e15-11bd-11e6-ba9a-01aa75ed71a1';
+  const BUDGET_SPENT = 'CELLAR SPARQL queries for this request ran past the time budget they share';
+  const budgetSpent = () =>
+    serviceUnavailable(BUDGET_SPENT, { reason: 'sparql_timeout', retryable: true });
+
+  beforeEach(() => {
+    mockSparqlQuery.mockReset();
+    mockFetchContent.mockReset();
+    mockFetchContent.mockResolvedValue({
+      content: '',
+      contentAvailable: false,
+      format: 'html',
+      language: 'EN',
+      unavailabilityReason: 'upstream_failure',
+    });
+  });
+
+  /** The wire error and content[] text of one call. */
+  async function timedOut(input: z.input<typeof eurlex_get_document.input>) {
+    const result = await runToolContract(eurlex_get_document, input);
+    expect(result.isError).toBe(true);
+    const error = (
+      result.structuredContent as {
+        error: { data: { reason: string; retryable?: boolean; recovery?: { hint?: string } } };
+      }
+    ).error;
+    const text = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+    return { data: error.data, text };
+  }
+
+  it.each([
+    ['celex_number, which needs no lookup', { celex_number: '32016R0679' }, ''],
+    [
+      'eli_uri, at its lookup',
+      { eli_uri: 'http://data.europa.eu/eli/reg/2016/679' },
+      ' Passing celex_number in place of eli_uri skips the ELI lookup.',
+    ],
+    [
+      'work_uri, at its dereference',
+      { work_uri: WORK_URI },
+      ' Passing celex_number in place of work_uri skips the work URI lookup.',
+    ],
+  ])('answers a caller of %s', async (_label, input, alternative) => {
+    mockSparqlQuery.mockRejectedValue(budgetSpent());
+
+    const { data, text } = await timedOut(input);
+
+    expect(data).toMatchObject({ reason: 'sparql_timeout', retryable: true });
+    expect(data.recovery?.hint).toBe(`${CONTRACT}${alternative}`);
+    expect(text).toContain(`Recovery: ${CONTRACT}${alternative}`);
+    expect(text.trimEnd().endsWith('(reason sparql_timeout · retryable)')).toBe(true);
+  });
+
+  it('never offers celex_number in the hint every caller receives', () => {
+    expect(CONTRACT).not.toContain('celex_number');
+  });
+
+  it('keeps the contract recovery for a timeout after the eli_uri lookup answered', async () => {
+    mockSparqlQuery.mockImplementation((query: string) =>
+      query.includes('cdm:resource_legal_eli')
+        ? Promise.resolve([makeMetaBinding({ celex: '32016R0679' })])
+        : Promise.reject(budgetSpent()),
+    );
+
+    const { data } = await timedOut({ eli_uri: 'http://data.europa.eu/eli/reg/2016/679/oj' });
+
+    expect(mockSparqlQuery.mock.calls.length).toBeGreaterThan(1);
+    expect(data).toMatchObject({ reason: 'sparql_timeout', retryable: true });
+    expect(data.recovery?.hint).toBe(CONTRACT);
   });
 });

@@ -1,9 +1,10 @@
 /**
- * @fileoverview CDM resource-type URI → human-readable label map and resolvers, plus a
- * parser for CELLAR's `#`-delimited case-law expression titles. Used by tool handlers
- * that normalise raw CDM URIs and titles before returning results. Authors are not
- * labelled here: work-agents.ts reads each authority code's English `skos:prefLabel`
- * in its agent query.
+ * @fileoverview CDM resource-type URI → human-readable label map and resolvers, the
+ * case-law authority tables (country, procedure type and outcome, subject matter) and
+ * the subject-label matcher, plus a parser for CELLAR's `#`-delimited case-law
+ * expression titles. Used by tool handlers that normalise raw CDM URIs and titles
+ * before returning results. Authors are not labelled here: work-agents.ts reads each
+ * authority code's English `skos:prefLabel` in its agent query.
  * @module services/cellar-sparql/cdm-labels
  */
 
@@ -219,6 +220,118 @@ export function resolveResourceTypeLabels(concatenated: string | undefined): str
     ...new Set(concatenated.split(/\s+/).filter(Boolean).map(resolveResourceTypeLabel)),
   ].sort();
   return labels.length > 0 ? labels.join(', ') : undefined;
+}
+
+/**
+ * CELLAR's country authority table, the values of `cdm:case-law_originates_in_country`;
+ * a country's URI appends its upper-case ISO 3166-1 alpha-3 code (`…/country/BGR`).
+ */
+export const COUNTRY_AUTHORITY_URI = 'http://publications.europa.eu/resource/authority/country/';
+
+/**
+ * CELLAR's procedure authority table (`fd_100`), the values of
+ * `cdm:case-law_has_type_procedure_concept_type_procedure`. A code is a procedure
+ * root, optionally followed by the outcome after an `=` the IRI stores encoded:
+ * `…/fd_100/ANNU%3DOB` is "Action for annulment - successful".
+ */
+export const PROCEDURE_AUTHORITY_URI = 'http://publications.europa.eu/resource/authority/fd_100/';
+
+/** The `=` between a procedure root and its outcome, as a procedure IRI stores it. */
+export const PROCEDURE_OUTCOME_SEPARATOR = '%3D';
+
+/**
+ * CELLAR's case-law subject-matter scheme, the `skos:inScheme` of every value of
+ * `cdm:case-law_is-about_case-law-subject-matter` (186 concepts, each with an English
+ * label, 2026-11-03).
+ */
+export const CASE_LAW_SUBJECT_MATTER_SCHEME =
+  'http://publications.europa.eu/resource/authority/case-law-subject-matter';
+
+/**
+ * True for the "Provisional data" placeholder (`OP_DATPRO`) CELLAR keeps in its
+ * country, procedure, and subject-matter tables. It records no fact about a case, so
+ * no case-law field reports it and no subject resolves to it.
+ */
+export function isProvisionalData(authorityUri: string): boolean {
+  return authorityUri.endsWith('/OP_DATPRO');
+}
+
+/**
+ * The `procedure_type` members of eurlex_get_cases: every procedure root heading at
+ * least 300 primary case-law records (2026-11-03), the rest staying visible in each
+ * row's procedure types.
+ */
+export const PROCEDURE_TYPES = [
+  'preliminary_ruling',
+  'annulment',
+  'staff_case',
+  'appeal',
+  'failure_to_fulfil_obligations',
+  'damages',
+  'interim_measures',
+  'appeal_against_penalty',
+  'failure_to_act',
+  'arbitration_clause',
+] as const;
+
+export type ProcedureType = (typeof PROCEDURE_TYPES)[number];
+
+/**
+ * The `fd_100` roots each procedure type covers. A case matches a root when one of
+ * its codes is the root or the root plus an outcome, never a longer root sharing its
+ * start: `REFE` (interim measures) must not take `REFER_PREL_URG`, the urgent
+ * preliminary references, which belong to `preliminary_ruling`.
+ */
+export const PROCEDURE_TYPE_ROOTS = {
+  preliminary_ruling: ['PREJ', 'REFER_PREL_URG'],
+  annulment: ['ANNU'],
+  staff_case: ['FONC'],
+  appeal: ['PVOI'],
+  failure_to_fulfil_obligations: ['CONS'],
+  damages: ['RESP'],
+  interim_measures: ['REFE'],
+  appeal_against_penalty: ['SANC'],
+  failure_to_act: ['CARE'],
+  arbitration_clause: ['COMP'],
+} as const satisfies Record<ProcedureType, readonly string[]>;
+
+/** The `outcome` members of eurlex_get_cases: every outcome on at least 1,000 records. */
+export const PROCEDURE_OUTCOMES = [
+  'successful',
+  'unfounded',
+  'inadmissible',
+  'decision_unnecessary',
+] as const;
+
+export type ProcedureOutcome = (typeof PROCEDURE_OUTCOMES)[number];
+
+/** The code each outcome carries after {@link PROCEDURE_OUTCOME_SEPARATOR}. */
+export const PROCEDURE_OUTCOME_CODES = {
+  successful: 'OB',
+  unfounded: 'RF',
+  inadmissible: 'RI',
+  decision_unnecessary: 'NL',
+} as const satisfies Record<ProcedureOutcome, string>;
+
+/** A run of letters and digits: one word of a subject phrase. */
+const SUBJECT_WORD = /[\p{L}\p{N}]+/gu;
+
+/**
+ * The distinct words of a subject phrase, lowercased: its runs of letters and digits,
+ * every other character a separator. Empty when the phrase holds no letter or digit.
+ */
+export function subjectWords(subject: string): string[] {
+  return [...new Set(Array.from(subject.matchAll(SUBJECT_WORD), ([word]) => word.toLowerCase()))];
+}
+
+/**
+ * True when `label` contains every one of `words` ({@link subjectWords}), in any case
+ * and also inside a longer word: "trade mark" matches "Trade marks", "tax" matches
+ * "Taxation".
+ */
+export function labelHoldsEveryWord(label: string, words: readonly string[]): boolean {
+  const lower = label.toLowerCase();
+  return words.every((word) => lower.includes(word));
 }
 
 /**

@@ -4,13 +4,32 @@
  * however few rows the pattern matches. Every paged tool asks for one sentinel
  * row past its page to prove more exist; this module sizes that request so it
  * never crosses the window, and reads back whether a page proved more rows or
- * stopped at the window's end.
+ * stopped at the window's end. It also owns the dates those pages sort on: the
+ * floor of a search bounded above alone, and CELLAR's placeholder for no date.
  * @module services/cellar-sparql/sort-window
  */
 
 /**
- * Lower date bound for a search bounded by date_to alone. It sits below the
- * earliest `cdm:work_date_document` CELLAR holds (1001-01-01), so it excludes no work.
+ * The date CELLAR records where it holds none: the `cdm:work_date_document` of 14,978
+ * works, almost all of them national implementing measures, and the official-journal
+ * and notification dates of 20,139 and 7,125 national measures (2026-11-03). No work
+ * carries it beside a real value of the same property. It is also the earliest date
+ * CELLAR holds, so newest first it sorts after every real date and before undated works.
+ */
+export const UNDATED_PLACEHOLDER = '1001-01-01';
+
+/**
+ * A CELLAR date as output reports it: `undefined` for {@link UNDATED_PLACEHOLDER},
+ * read as no date, and any other value as given.
+ */
+export function cellarDate(value: string | undefined): string | undefined {
+  return value?.slice(0, 10) === UNDATED_PLACEHOLDER ? undefined : value;
+}
+
+/**
+ * Lower date bound for a search bounded by date_to alone. It sits below
+ * {@link UNDATED_PLACEHOLDER}, the earliest `cdm:work_date_document` CELLAR holds, so it
+ * excludes no work.
  */
 const DATE_FLOOR = '1000-01-01';
 

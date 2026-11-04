@@ -1,14 +1,23 @@
 /**
- * @fileoverview Tests for CDM label resolvers and the case-law title parser.
+ * @fileoverview Tests for CDM label resolvers, the case-law authority tables and subject
+ * matcher, and the case-law title parser.
  * @module tests/services/cdm-labels.test
  */
 
 import { describe, expect, it } from 'vitest';
 import {
+  isProvisionalData,
+  labelHoldsEveryWord,
+  PROCEDURE_OUTCOME_CODES,
+  PROCEDURE_OUTCOMES,
+  PROCEDURE_TYPE_ROOTS,
+  PROCEDURE_TYPES,
   parseCaseLawTitle,
   resolveResourceTypeLabel,
   resolveResourceTypeLabels,
+  subjectWords,
 } from '@/services/cellar-sparql/cdm-labels.js';
+import { bestCpuMs, CPU_TIMED_TEST_TIMEOUT_MS } from '../helpers/cpu-time.js';
 
 /**
  * Fixtures are verbatim CELLAR `expression_title` strings captured from the live
@@ -580,4 +589,152 @@ describe('resolveResourceTypeLabels', () => {
     expect(resolveResourceTypeLabels(CONS_TEXT_URI)).toBe('Consolidated Text');
     expect(resolveResourceTypeLabels(MEAS_NATION_IMPL_URI)).toBe('National Implementing Measure');
   });
+});
+
+// --- #178: the case-law procedure and outcome tables, and the subject matcher ---
+
+describe('case-law procedure tables (#178)', () => {
+  it('maps each procedure type to its fd_100 roots', () => {
+    expect(PROCEDURE_TYPES).toHaveLength(10);
+    expect(PROCEDURE_TYPE_ROOTS).toEqual({
+      preliminary_ruling: ['PREJ', 'REFER_PREL_URG'],
+      annulment: ['ANNU'],
+      staff_case: ['FONC'],
+      appeal: ['PVOI'],
+      failure_to_fulfil_obligations: ['CONS'],
+      damages: ['RESP'],
+      interim_measures: ['REFE'],
+      appeal_against_penalty: ['SANC'],
+      failure_to_act: ['CARE'],
+      arbitration_clause: ['COMP'],
+    });
+    expect(Object.keys(PROCEDURE_TYPE_ROOTS)).toEqual([...PROCEDURE_TYPES]);
+  });
+
+  it('maps each outcome to the code CELLAR stores after %3D', () => {
+    expect(PROCEDURE_OUTCOME_CODES).toEqual({
+      successful: 'OB',
+      unfounded: 'RF',
+      inadmissible: 'RI',
+      decision_unnecessary: 'NL',
+    });
+    expect(Object.keys(PROCEDURE_OUTCOME_CODES)).toEqual([...PROCEDURE_OUTCOMES]);
+  });
+
+  it('recognizes the Provisional data placeholder in every authority table, and nothing else', () => {
+    const authority = 'http://publications.europa.eu/resource/authority/';
+    for (const table of ['country', 'fd_100', 'case-law-subject-matter', 'language']) {
+      expect(isProvisionalData(`${authority}${table}/OP_DATPRO`)).toBe(true);
+    }
+    expect(isProvisionalData(`${authority}country/BGR`)).toBe(false);
+    expect(isProvisionalData(`${authority}case-law-subject-matter/PDON`)).toBe(false);
+    expect(isProvisionalData(`${authority}fd_100/OP_DATPRO_X`)).toBe(false);
+  });
+});
+
+/** English labels of the case-law subject-matter scheme, live on 2026-11-03. */
+const SUBJECT_LABELS = [
+  'Protection of personal data',
+  'Provisional data',
+  'Trade marks',
+  'State aid',
+  'Public procurement',
+  'Taxation',
+  'Value added tax',
+  'Internal taxation',
+  'Principles of Union law',
+  'Charter of Fundamental Rights',
+  'Citizenship of the Union',
+  'Internal market - Principles',
+  'Immigration policy',
+  'Approximation of laws',
+  'Designs',
+];
+
+/** The labels among {@link SUBJECT_LABELS} a subject phrase matches. */
+function labelsMatching(subject: string): string[] {
+  const words = subjectWords(subject);
+  return SUBJECT_LABELS.filter((label) => labelHoldsEveryWord(label, words));
+}
+
+describe('subject matching (#178)', () => {
+  it('splits a phrase into its distinct lowercased letter-and-digit words', () => {
+    expect(subjectWords('trade mark')).toEqual(['trade', 'mark']);
+    expect(subjectWords('  Trade-MARK, trade  ')).toEqual(['trade', 'mark']);
+    expect(subjectWords('Article 82 GDPR')).toEqual(['article', '82', 'gdpr']);
+    expect(subjectWords('Données personnelles')).toEqual(['données', 'personnelles']);
+    expect(subjectWords('!! -- ()')).toEqual([]);
+    expect(subjectWords('')).toEqual([]);
+  });
+
+  it.each([
+    ['trade mark', ['Trade marks']],
+    ['data protection', ['Protection of personal data']],
+    ['personal data', ['Protection of personal data']],
+    ['state aid', ['State aid']],
+    ['PUBLIC procurement', ['Public procurement']],
+    ['tax', ['Taxation', 'Value added tax', 'Internal taxation']],
+    // The matcher sees the placeholder; the lookup excludes it by its code.
+    ['data', ['Protection of personal data', 'Provisional data']],
+    ['trade aid', []],
+    ['marks trade', ['Trade marks']],
+  ])('matches %j to the labels holding every word', (subject, labels) => {
+    expect(labelsMatching(subject)).toEqual(labels);
+  });
+
+  it('matches a label only when it holds every word, inside a longer word included', () => {
+    expect(labelHoldsEveryWord('Trade marks', ['trade', 'mark'])).toBe(true);
+    expect(labelHoldsEveryWord('Taxation', ['tax'])).toBe(true);
+    expect(labelHoldsEveryWord('Trade marks', ['trade', 'design'])).toBe(false);
+    expect(labelHoldsEveryWord('Trade marks', [])).toBe(true);
+  });
+});
+
+/**
+ * The subject matcher runs on caller-sized text. Each shape is timed in thread CPU
+ * at every doubling from 5k to 320k characters, per call over a batch at the small
+ * sizes, bounded at each size before the next runs, with the full 64× span held
+ * under 256×.
+ */
+describe('subject matching runs in linear time (#178)', () => {
+  const SIZES = [5_000, 10_000, 20_000, 40_000, 80_000, 160_000, 320_000];
+  const distinctWords = (n: number) => {
+    let text = '';
+    for (let i = 0; text.length < n; i++) text += `w${i} `;
+    return text;
+  };
+  const overlappingPrefixes = (n: number) => {
+    let text = '';
+    for (let k = 1; text.length < n; k++) text += `${'ab'.repeat(k).slice(0, k)} `;
+    return text;
+  };
+  const shapes: [string, (n: number) => string][] = [
+    ['one long line ending in a break', (n) => `${'§1 x'.repeat(n / 4)}\ny`],
+    ['breaks throughout', (n) => '  \r\n'.repeat(n / 4)],
+    ['a long digit run', (n) => '7'.repeat(n)],
+    ['a repeated word', (n) => 'trade '.repeat(n / 6)],
+    ['words split by single marks', (n) => 'a-'.repeat(n / 2)],
+    ['distinct words', distinctWords],
+    ['overlapping prefixes', overlappingPrefixes],
+  ];
+  it.each(shapes)(
+    '%s',
+    async (_label, shape) => {
+      const timings: number[] = [];
+      for (const size of SIZES) {
+        const text = shape(size);
+        const batch = SIZES.at(-1)! / size;
+        const cpu =
+          (await bestCpuMs(() => {
+            for (let i = 0; i < batch; i++) labelsMatching(text);
+          })) / batch;
+        expect(cpu, `${size} characters: ${cpu.toFixed(4)} ms CPU per call`).toBeLessThan(100);
+        timings.push(cpu);
+      }
+      const [first = 0] = timings;
+      const last = timings.at(-1) ?? 0;
+      expect(last / Math.max(first, 0.001), JSON.stringify(timings)).toBeLessThan(256);
+    },
+    CPU_TIMED_TEST_TIMEOUT_MS,
+  );
 });
