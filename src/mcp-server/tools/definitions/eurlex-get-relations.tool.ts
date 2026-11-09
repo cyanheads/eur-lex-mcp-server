@@ -27,6 +27,12 @@ import {
   normalizeWorkUri,
 } from '@/services/cellar-sparql/eli-resolution.js';
 import {
+  celexMissError,
+  findHeldCelex,
+  type HeldCelex,
+} from '@/services/cellar-sparql/held-celex.js';
+import { CELEX_SECTORS } from '@/services/cellar-sparql/keyword-match.js';
+import {
   ARTICLE_INPUT_PATTERN,
   articleLabel,
   MEMBER_STATE_CODES,
@@ -133,6 +139,12 @@ const RelationsOutputSchema = z.object({
     .describe(
       'The article interpreted_by rows were narrowed to, normalized from the article input: the number without a prefix or leading zeros, any letter in lower case (17, 28c). Absent when no article filter was given.',
     ),
+  related_sectors: z
+    .array(z.string())
+    .optional()
+    .describe(
+      'The CELEX sectors related works were narrowed to, from related_sectors: upper case (C, E), de-duplicated, in the order given. Absent when no related_sectors filter was given.',
+    ),
   transposition_summary: z
     .object({
       by_member_state: z
@@ -165,17 +177,17 @@ const RelationsOutputSchema = z.object({
       member_states_without_measures: z
         .array(z.string())
         .describe(
-          'Member states in scope with no measure CELLAR records for this act, sorted: the member_states filter when given, else the 27 current member states. Empty when none is missing. A missing record is not proof that a state has not transposed the act — CELLAR lacks some notified measures — and the 27 are listed whatever date each joined the EU.',
+          'Member states in scope with no measure CELLAR records for this act, sorted: the member_states filter when given, else the 27 current member states. Empty when none is missing. A missing record is not proof that a state has not transposed the act — CELLAR lacks some notified measures — and the states in scope are listed whatever date each joined the EU.',
         ),
     })
     .optional()
     .describe(
-      "Every national_transposition measure in scope tallied per member state, from one count over all of them rather than this page's rows, so limit does not bound it and total does not count it. Present on a first page (offset 0) that traverses national_transposition when at least one member state in scope has a measure; the scope is the member_states filter when given, else every member state. Absent on later pages, for a work_uri whose work carries several CELEX numbers (address it by celex_number), and when CELLAR did not return it, which the notice then says.",
+      "Every national_transposition measure in scope tallied per member state, from one count over all of them rather than this page's rows, so limit does not bound it and total does not count it. Present on a first page (offset 0) that traverses national_transposition, with 7 among related_sectors when that filter is given, when at least one member state in scope has a measure; the scope is the member_states filter when given, else every member state. Absent on later pages, for a work_uri whose work carries several CELEX numbers (address it by celex_number), and when CELLAR did not return it, which the notice then says.",
     ),
   empty_relation_types: z
     .array(z.string())
     .describe(
-      'Requested relation types that returned zero relations in THIS page. Page-scoped: a type can appear here because all its edges sit beyond the current offset/limit window, not only because the act genuinely has none of that relation — so absent-from-here does not prove absent-in-CELLAR. An empty page — a first page with no edges, or an exhausted later page — returns all requested types here.',
+      'Requested relation types that returned zero relations in THIS page. Page-scoped: a type can appear here because all its edges sit beyond the current offset/limit window, or because a filter matched none of them (member_states on national_transposition, article on interpreted_by, related_sectors on any type), not only because the act genuinely has none of that relation — so absent-from-here does not prove absent-in-CELLAR. An empty page — a first page with no edges, or an exhausted later page — returns all requested types here.',
     ),
 });
 
@@ -217,7 +229,7 @@ const relationEnrichment = {
     .string()
     .optional()
     .describe(
-      'Guidance for the next call: on an empty first page, how to widen the traversal; on a first page where member_states matched no national_transposition measures, the codes it named; with article, that interpreted_by leaves out rulings CELLAR records no provision for, or on a first page with none, the article it named; on a page with more rows, the offset to continue from; on a page ending at row 10,000, the relation types and directions that reached it, each with a ready-to-run eurlex_query_sparql query listing its older works; the relation types whose provisions CELLAR did not return; and on a first page with national_transposition, that CELLAR did not return transposition_summary.',
+      'Guidance for the next call: on an empty first page, how to widen the traversal; on a first page where member_states matched no national_transposition measures, the codes it named; on a first page with related_sectors, the sectors and the requested types that returned no related work in them; with article, that interpreted_by leaves out rulings CELLAR records no provision for, or on a first page with none, the article it named; on a page with more rows, the offset to continue from; on a page ending at row 10,000, the relation types and directions that reached it, each with a ready-to-run eurlex_query_sparql query listing its older works; the relation types whose provisions CELLAR did not return; and on a first page with national_transposition, that CELLAR did not return transposition_summary.',
     ),
   limit_clamp: limitClampEnrichment,
 };
@@ -225,7 +237,7 @@ const relationEnrichment = {
 export const eurlex_get_relations = tool('eurlex_get_relations', {
   title: 'Get CELLAR Relationship Graph',
   description:
-    'Traverse the one-hop CDM relationship graph of an EU act: what it amends or is amended by, what it repeals or is repealed by (explicit and implicit), its consolidated versions, national transposition measures (on a first page also counted per member state, naming the member states with none), its legal basis and the works adopted under it, the proposal it adopts (or, for a proposal, the act that adopted it), the CJEU rulings interpreting it (or, for a ruling, the acts it interprets), and works that cite it. Amendment, repeal, interpretation, and adoption rows carry the provisions CELLAR records each edge as targeting, and article narrows interpreted_by to the rulings on one article. Returns direct relations only, paginated per relation type and direction. Requires a CELEX number or CELLAR work URI.',
+    'Traverse the one-hop CDM relationship graph of an EU act: what it amends or is amended by, what it repeals or is repealed by (explicit and implicit), its consolidated versions, national transposition measures (on a first page also counted per member state, naming the member states with none), its legal basis and the works adopted under it, the proposal it adopts (or, for a proposal, the act that adopted it), the CJEU rulings interpreting it (or, for a ruling, the acts it interprets), and works that cite it. Amendment, repeal, interpretation, and adoption rows carry the provisions CELLAR records each edge as targeting, article narrows interpreted_by to the rulings on one article, and related_sectors keeps only the related works of the named CELEX sectors (3 legal acts, 5 preparatory acts, 6 case law, …). Returns direct relations only, paginated per relation type and direction. Requires a CELEX number or CELLAR work URI.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     celex_number: z
@@ -288,6 +300,19 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
       .describe(
         'Narrow interpreted_by to the rulings with a recorded provision in this article of the act: an article number with at most one letter (17, 6a), optionally prefixed "Article", "Art." or "Art", in any case. The article matches at any depth (17 matches provisions recorded in Article 17(1)(c)), leading zeros are ignored, and a letter also matches its Latin ordinal (28c matches Article 28 quater). Rulings CELLAR records no provision for are left out. Paging, has_more, and next_offset then count matching rulings only; other relation types are unaffected. With an explicit relation_types, include interpreted_by. A blank value is the same as omitting it.',
       ),
+    related_sectors: z
+      .array(
+        enumInput(
+          CELEX_SECTORS,
+          z
+            .enum(CELEX_SECTORS)
+            .describe('A CELEX sector character: a digit 0–9, C, or E (c and e read as C and E).'),
+        ),
+      )
+      .optional()
+      .describe(
+        'Keep only the related works whose CELEX opens with one of these sectors: 0 consolidated texts, 1 treaties, 2 international agreements, 3 legal acts, 4 complementary legislation, 5 preparatory acts, 6 case law, 7 national transposition, 8 national case law, 9 parliamentary questions, C OJ C documents, E EFTA documents. Applies to every requested relation type; related works with no CELEX are left out. Paging, has_more, and next_offset then count matching works only. national_transposition and transposition_summary need 7, member_states needs 7, and article needs 6 (every interpreting ruling is case law). An empty list is the same as omitting it.',
+      ),
     offset: z
       .number()
       .int()
@@ -306,6 +331,12 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
         'Maximum related works per relation type and direction, served up to 100 per call (default 10); a larger value (up to 10,000) is served at 100 and reported in limit_clamp. It bounds each type and direction independently, so one call over every type can return up to sixteen times this many rows. Incoming edges are newest-first. Continue at next_offset for older works; narrow relation_types or lower limit for a smaller response.',
       ),
   }),
+  /*
+   * The name callers guess for celex_number (#194); tools/list still advertises
+   * celex_number alone. identifier and id stay rejected: either could name
+   * celex_number or work_uri.
+   */
+  inputAliases: { celex: 'celex_number' },
   output: RelationsOutputSchema,
 
   enrichment: relationEnrichment,
@@ -328,21 +359,21 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
     {
       reason: 'member_states_not_applicable',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'member_states was given with a relation_types list that does not include national_transposition, the only type it filters.',
+      when: 'member_states was given with a relation_types list that does not include national_transposition, the only type it filters, or with a related_sectors list that does not include 7, the sector of every national transposition measure.',
       recovery:
-        'Add national_transposition to relation_types, omit relation_types to traverse every type, or drop member_states.',
+        'Add national_transposition to relation_types or omit relation_types to traverse every type, include 7 in related_sectors when you give it, or drop member_states.',
     },
     {
       reason: 'article_not_applicable',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'article was given with a relation_types list that does not include interpreted_by, the only type it filters.',
+      when: 'article was given with a relation_types list that does not include interpreted_by, the only type it filters, or with a related_sectors list that does not include 6, the sector of every interpreting ruling.',
       recovery:
-        'Add interpreted_by to relation_types, omit relation_types to traverse every type, or drop article.',
+        'Add interpreted_by to relation_types or omit relation_types to traverse every type, include 6 in related_sectors when you give it, or drop article.',
     },
     {
       reason: 'not_found',
       code: JsonRpcErrorCode.NotFound,
-      when: 'The CELEX number, given directly or as a resource/celex/ work URI, is not found in CELLAR — resolve the identifier with eurlex_lookup_celex first.',
+      when: 'The CELEX number, given directly or as a resource/celex/ work URI, is not found in CELLAR — resolve the identifier with eurlex_lookup_celex first. A celex_number one numbering convention away from a CELEX CELLAR holds — a consolidated CELEX with no date or a date no version carries, a (nn) suffix missing or extra, a number not zero-padded to four digits — fails with each held CELEX named in the message and in data.held_celex.',
       recovery: 'Use eurlex_lookup_celex to confirm the CELEX number exists, then retry.',
     },
     {
@@ -356,7 +387,7 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
     {
       reason: 'sparql_timeout',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: "A query this traversal sent ran past the time budget its queries share (retryable: CELLAR's response time varies, so a later call can finish), or CELLAR refused it as too costly to run (not retryable: the same query is refused again). Neither is retried within the call.",
+      when: "A query this traversal sent ran past the time budget its queries share (retryable: CELLAR's response time varies, so a later call can finish), or CELLAR refused it as too costly to run (not retryable: the same query is refused again). Neither is retried within the call, apart from one re-send, inside the same budget, of a lookup CELLAR leaves unanswered for 20 s.",
       recovery:
         'Name only the relation types you need in relation_types, or lower limit, then call again; every type on a heavily linked act is the heaviest call.',
       thrownBy: 'service',
@@ -378,11 +409,22 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
     const memberStates = input.member_states?.length
       ? [...new Set(input.member_states.flatMap((value) => toMemberStateCode(value) ?? []))]
       : undefined;
-    // A filter on a type the call does not traverse would read as applied.
+    // The schema has read c and e as C and E; an empty list is absent.
+    const relatedSectors = input.related_sectors?.length
+      ? [...new Set(input.related_sectors)]
+      : undefined;
+    // A filter on a type the call does not traverse would read as applied. Every
+    // national transposition measure is sector 7, and every interpreting ruling sector 6.
     if (memberStates && !requestedTypes.includes('national_transposition')) {
       throw ctx.fail(
         'member_states_not_applicable',
         `member_states narrows national_transposition, which relation_types (${requestedTypes.join(', ')}) does not include.`,
+      );
+    }
+    if (memberStates && relatedSectors && !relatedSectors.includes('7')) {
+      throw ctx.fail(
+        'member_states_not_applicable',
+        `member_states narrows national_transposition, whose measures are sector 7, which related_sectors (${relatedSectors.join(', ')}) does not include.`,
       );
     }
     // The schema admitted only an article number and letter; a blank value is absent.
@@ -393,6 +435,17 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
         `article narrows interpreted_by, which relation_types (${requestedTypes.join(', ')}) does not include.`,
       );
     }
+    if (article && relatedSectors && !relatedSectors.includes('6')) {
+      throw ctx.fail(
+        'article_not_applicable',
+        `article narrows interpreted_by, whose rulings are sector 6, which related_sectors (${relatedSectors.join(', ')}) does not include.`,
+      );
+    }
+    // national_transposition can return rows only with sector 7 in scope; its source
+    // identity and per-member-state count serve nothing otherwise.
+    const traversesTransposition =
+      requestedTypes.includes('national_transposition') &&
+      (!relatedSectors || relatedSectors.includes('7'));
 
     // Accept exactly one identifier. Treat empty/whitespace as absent so
     // form-based clients sending "" for an omitted field hit the friendly guard.
@@ -424,10 +477,10 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
        * measures selected against an act the caller never named.
        *
        * Only `national_transposition` consumes that identity, so the lookup runs
-       * only when it was requested — a traversal of any other type spends no
-       * CELLAR round-trip on it.
+       * only when it is traversed — requested, and not excluded by related_sectors —
+       * and a traversal of any other type spends no CELLAR round-trip on it.
        */
-      if (requestedTypes.includes('national_transposition')) {
+      if (traversesTransposition) {
         const sourceIdentitySparql = `
 SELECT ?sourceCelex WHERE {
   <${workUri}> cdm:resource_legal_id_celex ?sourceCelex .
@@ -454,7 +507,15 @@ SELECT ?sourceCelex WHERE {
       // traversal never runs on a copy that lacks edges.
       const resolved = (await resolveCelexWorks(svc, [celexNumber], ctx)).get(celexNumber);
       if (!resolved) {
-        throw ctx.fail('not_found', `No CELLAR work found for CELEX: ${echoValue(celexNumber)}`);
+        // A celex_number one numbering convention away from a held CELEX names it (#196).
+        const held: HeldCelex = celexInput
+          ? await findHeldCelex(svc, celexNumber, ctx)
+          : { kind: 'none' };
+        const miss = celexMissError(
+          `No CELLAR work found for CELEX: ${echoValue(celexNumber)}`,
+          held,
+        );
+        throw ctx.fail('not_found', miss.message, miss.data, miss.options);
       }
       workUri = resolved;
     } else {
@@ -494,9 +555,10 @@ SELECT ?sourceCelex WHERE {
         offset: input.offset,
         memberStates,
         article,
+        relatedSectors,
         provisions: true,
       }),
-      input.offset === 0 && requestedTypes.includes('national_transposition')
+      input.offset === 0 && traversesTransposition
         ? summarizeTransposition(svc, workUri, sourceCelexNumber, memberStates, ctx)
         : undefined,
     ]);
@@ -505,6 +567,7 @@ SELECT ?sourceCelex WHERE {
       workUri,
       memberStates,
       article,
+      relatedSectors,
       resultCount: workRelations.length,
       offset: input.offset,
       hasMore,
@@ -522,14 +585,18 @@ SELECT ?sourceCelex WHERE {
      * one would point at relation_types when the filter is what emptied the type.
      * The framework keeps one notice, so it joins the continuation guidance below.
      * An article filter does the same (#168), and on any page with interpreted_by
-     * rows says that rulings CELLAR records no provision for are left out.
+     * rows says that rulings CELLAR records no provision for are left out. A
+     * related_sectors filter names the requested types that returned nothing under
+     * it (#191), leaving out a type the member_states or article notice already names.
+     * With every type traversed, the generic notice has no other type to point at.
      *
      * The limit is the only page boundary (#183): every row the traversal returns is
      * served whole, provisions included, so `has_more` is the traversal's sentinel
      * proof alone and `next_offset` the offset plus the served limit.
      */
     const notices: string[] = [];
-    const interpretingRulings = workRelations.some((r) => r.relationType === 'interpreted_by');
+    const presentTypes = new Set(workRelations.map((r) => r.relationType));
+    const interpretingRulings = presentTypes.has('interpreted_by');
     if (article && interpretingRulings) {
       notices.push(
         `interpreted_by lists only the rulings with a recorded provision in Article ${articleLabel(article)}; rulings CELLAR records no provision for are left out.`,
@@ -538,21 +605,38 @@ SELECT ?sourceCelex WHERE {
     if (input.offset === 0) {
       const source = echoValue(celexNumber ?? workUri);
       const filterNotices: string[] = [];
-      if (memberStates && !workRelations.some((r) => r.relationType === 'national_transposition')) {
+      const transpositionNotice = memberStates && !presentTypes.has('national_transposition');
+      if (transpositionNotice) {
         filterNotices.push(
           `No national_transposition measures of ${memberStates.join(', ')} were found for ${source}. Name other member states in member_states, or drop it to list every member state's measures.`,
         );
       }
-      if (article && !interpretingRulings) {
+      const articleNotice = article && !interpretingRulings;
+      if (articleNotice) {
         filterNotices.push(
           `No interpreted_by rulings with a recorded provision in Article ${articleLabel(article)} were found for ${source}; rulings CELLAR records no provision for are left out. Name another article, or drop article to list every interpreting ruling.`,
+        );
+      }
+      const unmatchedTypes = relatedSectors
+        ? [...new Set(requestedTypes)].filter(
+            (type) =>
+              !presentTypes.has(type) &&
+              !(type === 'national_transposition' && transpositionNotice) &&
+              !(type === 'interpreted_by' && articleNotice),
+          )
+        : [];
+      if (relatedSectors && unmatchedTypes.length > 0) {
+        filterNotices.push(
+          `No related works in sector${relatedSectors.length > 1 ? 's' : ''} ${relatedSectors.join(', ')} were found for ${source} in ${unmatchedTypes.join(', ')}; related works with no CELEX are left out. Name other sectors in related_sectors, or drop it to list every related work.`,
         );
       }
       if (filterNotices.length > 0) {
         notices.push(...filterNotices);
       } else if (workRelations.length === 0) {
         notices.push(
-          `Work ${source} has no CDM relations of the requested types. Try other relation_types or omit the filter to fetch all available relation types.`,
+          RELATION_TYPES.every((type) => requestedTypes.includes(type))
+            ? `Work ${source} has no CDM relations of any type.`
+            : `Work ${source} has no CDM relations of the requested types. Try other relation_types or omit the filter to fetch all available relation types.`,
         );
       }
       if (workRelations.length === 0 && !celexNumber) {
@@ -620,7 +704,6 @@ SELECT ?sourceCelex WHERE {
     // tell "no such edges" from "dropped/paged out". Echo the full requested list
     // and the subset that returned nothing in this page (computed from the
     // post-filter relations — no extra queries).
-    const presentTypes = new Set(relations.map((r) => r.relation_type));
     const emptyRelationTypes = requestedTypes.filter((t) => !presentTypes.has(t));
 
     // Echo the CELEX the traversal actually ran against. On the work_uri path that
@@ -640,6 +723,7 @@ SELECT ?sourceCelex WHERE {
       requested_relation_types: [...requestedTypes],
       ...(memberStates ? { member_states: memberStates } : {}),
       ...(article ? { article: articleLabel(article) } : {}),
+      ...(relatedSectors ? { related_sectors: relatedSectors } : {}),
       ...(transposition?.status === 'summarized'
         ? {
             transposition_summary: {
@@ -679,6 +763,9 @@ function formatRelationsPage(result: RelationsPage): { type: 'text'; text: strin
   lines.push(`**Requested types:** ${result.requested_relation_types.join(', ')}`);
   if (result.member_states) lines.push(`**Member states:** ${result.member_states.join(', ')}`);
   if (result.article) lines.push(`**Article:** ${result.article}`);
+  if (result.related_sectors) {
+    lines.push(`**Related sectors:** ${result.related_sectors.join(', ')}`);
+  }
   lines.push(
     `**Empty types (this page):** ${
       result.empty_relation_types.length > 0 ? result.empty_relation_types.join(', ') : 'none'
@@ -696,10 +783,11 @@ function formatRelationsPage(result: RelationsPage): { type: 'text'; text: strin
       );
     }
     const without = summary.member_states_without_measures;
-    lines.push(
-      '',
-      `**Member states without measures** (none recorded in CELLAR, which is not proof of non-transposition; the default 27 are listed whatever date each joined): ${without.length > 0 ? without.join(', ') : 'none'}\n`,
-    );
+    // #189: under member_states the scope is the filtered states, not the 27.
+    const label = result.member_states
+      ? `**Member states without measures** among ${result.member_states.join(', ')} (none recorded in CELLAR, which is not proof of non-transposition)`
+      : '**Member states without measures** (none recorded in CELLAR, which is not proof of non-transposition; the default 27 are listed whatever date each joined)';
+    lines.push('', `${label}: ${without.length > 0 ? without.join(', ') : 'none'}\n`);
   }
 
   const grouped = new Map<string, typeof result.relations>();

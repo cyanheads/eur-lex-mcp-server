@@ -5,25 +5,40 @@
  * row past its page to prove more exist; this module sizes that request so it
  * never crosses the window, and reads back whether a page proved more rows or
  * stopped at the window's end. It also owns the dates those pages sort on: the
- * floor of a search bounded above alone, and CELLAR's placeholder for no date.
+ * floor of a search bounded above alone, and CELLAR's placeholders for no date.
  * @module services/cellar-sparql/sort-window
  */
 
 /**
  * The date CELLAR records where it holds none: the `cdm:work_date_document` of 14,978
  * works, almost all of them national implementing measures, and the official-journal
- * and notification dates of 20,139 and 7,125 national measures (2026-11-03). No work
- * carries it beside a real value of the same property. It is also the earliest date
- * CELLAR holds, so newest first it sorts after every real date and before undated works.
+ * and notification dates of 20,139 and 7,125 national measures (2026-11-03), none of
+ * them beside a real value of the same property. An act's own dates carry it too
+ * (2026-11-09): a `cdm:resource_legal_date_entry-into-force` value of 2,678 works (the
+ * only one of 1,925, beside a real one on the rest), a `cdm:directive_date_transposition`
+ * of 17 directives (6 of them beside real deadlines), and a
+ * `cdm:resource_legal_date_end-of-validity` of 70 works (none beside a real end date). It
+ * is also the earliest date CELLAR holds, so newest first it sorts after every real date
+ * and before undated works.
  */
 export const UNDATED_PLACEHOLDER = '1001-01-01';
 
 /**
- * A CELLAR date as output reports it: `undefined` for {@link UNDATED_PLACEHOLDER},
+ * Every value CELLAR records for no date: {@link UNDATED_PLACEHOLDER}, and `1002-02-02`,
+ * found only on three of an act's dates (2026-11-09) and never displayed by EUR-Lex — an
+ * entry-into-force value of 76 works (10 beside a real one), a transposition deadline of
+ * 8 directives (1 beside a real one), and an end of validity of 58 works (none beside a
+ * real end date). No document or national-measure date carries it.
+ */
+export const UNDATED_PLACEHOLDERS = [UNDATED_PLACEHOLDER, '1002-02-02'] as const;
+
+/**
+ * A CELLAR date as output reports it: `undefined` for any of {@link UNDATED_PLACEHOLDERS},
  * read as no date, and any other value as given.
  */
 export function cellarDate(value: string | undefined): string | undefined {
-  return value?.slice(0, 10) === UNDATED_PLACEHOLDER ? undefined : value;
+  const day = value?.slice(0, 10);
+  return UNDATED_PLACEHOLDERS.some((placeholder) => placeholder === day) ? undefined : value;
 }
 
 /**

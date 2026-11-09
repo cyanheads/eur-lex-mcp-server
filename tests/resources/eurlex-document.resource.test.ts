@@ -467,6 +467,71 @@ describe('eurlex_document_resource', () => {
     expect(error?.data?.recovery?.hint).toContain('eurlex_lookup_celex');
   });
 
+  describe('#196 a CELEX one numbering convention away from a held CELEX', () => {
+    const literal = (value: string) => ({ type: 'literal', value });
+
+    /**
+     * CELLAR holding no work for the CELEX read, answering the base-act query with
+     * `bases`; every other query, the consolidation lookup beside the resolution
+     * included, finds nothing.
+     */
+    const routeMiss = (bases: Record<string, { type: string; value: string }>[]) =>
+      mockQuery.mockImplementation(async (q: string) =>
+        q.includes('VALUES ?baseCelex') ? bases : [],
+      );
+
+    const queries = () => mockQuery.mock.calls.map((c) => c[0] as string);
+    const isHeldQuery = (q: string) =>
+      q.includes('VALUES ?baseCelex') || q.includes('VALUES ?heldCelex');
+
+    type MissRead = {
+      error?: {
+        code: number;
+        data?: { celexNumber?: string; held_celex?: string[]; reason?: string };
+        message: string;
+      };
+    };
+
+    it('names each held CELEX in the message and data.held_celex beside celexNumber', async () => {
+      routeMiss([
+        {
+          baseCelex: literal('32006R1907'),
+          baseWorkUri: literal(`${CELLAR}32006R1907`),
+          carriesCore: literal('1'),
+          current: literal('2026-06-22|02006R1907-20260622'),
+          inEffect: literal('2025-10-23|02006R1907-20251023'),
+        },
+      ]);
+
+      const { error } = (await readOverWire('eurlex://document/02006R1907-20260101')) as MissRead;
+
+      expect(error?.code).toBe(JsonRpcErrorCode.NotFound);
+      expect(error?.data).toMatchObject({
+        reason: 'not_found',
+        celexNumber: '02006R1907-20260101',
+        held_celex: ['02006R1907-20251023', '02006R1907-20260622'],
+      });
+      expect(error?.message).toBe(
+        'No CELLAR work found for CELEX: 02006R1907-20260101. CELLAR holds 02006R1907-20251023, the consolidated version of 32006R1907 in effect on 2026-01-01, and 02006R1907-20260622, its current one.',
+      );
+      // One held query beside the resolution and the consolidation lookup it runs with.
+      expect(queries().filter(isHeldQuery)).toHaveLength(1);
+      expect(queryRoles(queries().filter((q) => !isHeldQuery(q)))).toEqual(
+        roles('resolution', 'consolidation'),
+      );
+    });
+
+    it('keeps the not_found of a CELEX whose forms CELLAR does not hold', async () => {
+      routeMiss([]);
+
+      const { error } = (await readOverWire('eurlex://document/52026AG9999')) as MissRead;
+
+      expect(error?.message).toBe('No CELLAR work found for CELEX: 52026AG9999');
+      expect(error?.data).toMatchObject({ reason: 'not_found', celexNumber: '52026AG9999' });
+      expect(error?.data).not.toHaveProperty('held_celex');
+    });
+  });
+
   it.each([
     [
       'sparql_error',
@@ -1000,6 +1065,71 @@ describe('eurlex_document_resource', () => {
         ),
       ).rejects.toThrow(/aborted/);
       expect(mockQuery.mock.calls.some(([q]) => (q as string).includes(marker))).toBe(true);
+    });
+  });
+
+  // --- #187: CELLAR's no-date values, dropped as eurlex_get_document drops them ---
+
+  describe('no-date values (#187)', () => {
+    const read = async (celex: string) => {
+      mockQuery.mockImplementation(fakeConsolidationCellar);
+      const ctx = createMockContext({ errors: eurlex_document_resource.errors });
+      const params = eurlex_document_resource.params!.parse({ celexNumber: celex });
+      return (await eurlex_document_resource.handler(params, ctx)) as Record<string, unknown>;
+    };
+
+    it.each<[string, Record<string, unknown>]>([
+      [
+        '32017R0745',
+        {
+          dates_of_effect: [
+            { date: '2017-05-25', type: 'entry_into_force', provision: 'Article 123.1' },
+            { date: '2017-11-26', type: 'partial_application' },
+            { date: '2018-05-26', type: 'partial_application', provision: 'Article 123.3(c)' },
+            { date: '2019-05-26', type: 'partial_application', provision: 'Article 123.3(i)' },
+            { date: '2020-04-24', type: 'partial_application', provision: 'Article 123.3(j)' },
+            { date: '2021-05-26', type: 'application', provision: 'Article 123.2' },
+            { date: '2021-05-26', type: 'partial_application' },
+            { date: '2023-05-26', type: 'partial_application' },
+            { date: '2025-05-26', type: 'partial_application' },
+            { date: '2027-05-26', type: 'partial_application', provision: 'Article 123.3(g)' },
+          ],
+        },
+      ],
+      [
+        '32016L0802',
+        {
+          dates_of_effect: [
+            { date: '2016-06-10', type: 'entry_into_force', provision: 'Article 20' },
+          ],
+        },
+      ],
+      [
+        '32025L0872',
+        {
+          dates_of_effect: [
+            { date: '2025-05-07', type: 'entry_into_force', provision: 'Article 3' },
+          ],
+          transposition_deadlines: ['2025-12-31', '2026-01-01', '2027-12-31', '2028-01-01'],
+        },
+      ],
+      ['31980D0032', {}],
+    ])('%s lists real dates only', async (celex, expected) => {
+      const result = await read(celex);
+      const facts = Object.fromEntries(
+        ['dates_of_effect', 'transposition_deadlines']
+          .filter((f) => f in result)
+          .map((f) => [f, result[f]]),
+      );
+      expect(facts).toEqual(expected);
+      expect(JSON.stringify(result)).not.toMatch(/1001-01-01|1002-02-02/);
+    });
+
+    it('sends no query for the amending acts of a date-setting article (#188)', async () => {
+      await read('32024R1689');
+      expect(queryRoles(mockQuery.mock.calls.map((c) => c[0] as string))).toEqual(
+        roles('resolution', ...READ_ROLES, 'procedures'),
+      );
     });
   });
 

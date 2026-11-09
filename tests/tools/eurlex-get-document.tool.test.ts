@@ -20,6 +20,7 @@ import {
   encodedComment,
   fakeConsolidationCellar,
   isConsolidationLookup,
+  isDateAmendmentsQuery,
   isProcedureLookup,
   WORK,
 } from '../fixtures/cellar-consolidations.js';
@@ -53,6 +54,7 @@ import { AMENDING_FORMEX, AMENDING_HTML } from '../fixtures/eurlex-amending-act.
 import { CONSOLIDATED_ACT_HTML } from '../fixtures/eurlex-consolidated-act.js';
 import { LEGACY_ACT_HTML, LEGACY_TWO_CHAPTER_ACT_HTML } from '../fixtures/eurlex-legacy-act.js';
 import { readCommonMark, readCommonMarkTarget } from '../helpers/commonmark.js';
+import { bestCpuMs, CPU_TIMED_TEST_TIMEOUT_MS } from '../helpers/cpu-time.js';
 import { queryRoles, roles } from '../helpers/query-roles.js';
 
 // --- Service mocks ---
@@ -78,7 +80,7 @@ vi.mock('@/services/eurlex-content/eurlex-content-service.js', async (importOrig
   getEurLexContentService: () => ({ fetchContent: mockFetchContent }),
 }));
 
-/** The queries a metadata read of a legislative CELEX sends (#109, #173, #180). */
+/** The queries a metadata read of a legislative CELEX sends (#109, #173, #180, #188). */
 const METADATA_ROLES = roles(
   'resolution',
   'consolidation',
@@ -88,6 +90,7 @@ const METADATA_ROLES = roles(
   'legal_basis',
   'eurovoc',
   'procedures',
+  'date_amendments',
 );
 
 /** Build a metadata binding for a document. */
@@ -654,7 +657,7 @@ describe('eurlex_get_document', () => {
     }
   });
 
-  it.each(['ZZ', 'ENG', 'e'])(
+  it.each(['ZZ', 'XYZ', 'e'])(
     'rejects unsupported language %s before the handler runs',
     (language) => {
       expect(() =>
@@ -1003,6 +1006,221 @@ describe('eurlex_get_document', () => {
     await expect(eurlex_get_document.handler(input, ctx)).rejects.toMatchObject({
       code: JsonRpcErrorCode.NotFound,
       data: { reason: 'not_found' },
+    });
+  });
+
+  describe('#196 a celex_number one numbering convention away from a held CELEX', () => {
+    type Row = Record<string, { type: string; value: string }>;
+    const literal = (value: string) => ({ type: 'literal', value });
+
+    /** A base act's row in the held-versions query: each version as `date|CELEX`. */
+    const baseRow = (celex: string, versions: { current?: string; inEffect?: string }): Row => ({
+      baseCelex: literal(celex),
+      baseWorkUri: literal(`${CELLAR}${celex}`),
+      carriesCore: literal('1'),
+      ...(versions.current ? { current: literal(versions.current) } : {}),
+      ...(versions.inEffect ? { inEffect: literal(versions.inEffect) } : {}),
+    });
+
+    /**
+     * CELLAR holding `held` (resolved, and answered to the held-forms query) and the
+     * base-act rows `bases`; every other metadata query gets one row of `held[0]`.
+     */
+    const routeMiss = ({ held = [], bases = [] }: { held?: string[]; bases?: Row[] }) =>
+      mockSparqlQuery.mockImplementation(async (q: string) => {
+        if (isResolutionQuery(q)) {
+          return resolutionRows(q).filter((r) => held.includes(r.celexNumber?.value ?? ''));
+        }
+        if (q.includes('VALUES ?heldCelex')) {
+          return held
+            .filter((c) => q.includes(`"${c}"^^xsd:string`))
+            .map((c) => ({ heldCelex: literal(c) }));
+        }
+        if (q.includes('VALUES ?baseCelex')) return bases;
+        if (isConsolidationLookup(q)) return [];
+        return [makeMetaBinding({ celex: held[0] ?? '' })];
+      });
+
+    const queries = () => mockSparqlQuery.mock.calls.map((c) => c[0] as string);
+    const heldQueries = () =>
+      queries().filter((q) => q.includes('VALUES ?heldCelex') || q.includes('VALUES ?baseCelex'));
+
+    type ErrorEnvelope = {
+      error: {
+        data: { held_celex?: string[]; reason: string; recovery?: { hint?: string } };
+        message: string;
+      };
+    };
+    const call = async (input: Record<string, unknown>) => {
+      const response = await runToolContract(eurlex_get_document, {
+        content_mode: 'metadata_only',
+        ...input,
+      });
+      const text = response.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+      return { response, text, error: (response.structuredContent as ErrorEnvelope).error };
+    };
+
+    it('fails a CELEX with no held form one convention away as before: same message, no held_celex', async () => {
+      routeMiss({});
+      const { response, error } = await call({ celex_number: '52026AG9999' });
+      expect(response.isError).toBe(true);
+      expect(error.message).toBe('No CELLAR work found for CELEX: 52026AG9999');
+      expect(error.data).not.toHaveProperty('held_celex');
+    });
+
+    it('names each held sibling in the message, data.held_celex, and content[] as code', async () => {
+      routeMiss({ held: ['52026AG0012(01)', '52026AG0012(02)'] });
+      const { error, text } = await call({ celex_number: '52026AG0012' });
+      expect(error.message).toBe(
+        'No CELLAR work found for CELEX: 52026AG0012. CELLAR holds 52026AG0012(01) and 52026AG0012(02).',
+      );
+      expect(error.data.held_celex).toEqual(['52026AG0012(01)', '52026AG0012(02)']);
+      expect(error.data.recovery?.hint).toContain('eurlex_lookup_celex');
+      const read = readCommonMark(text);
+      for (const celex of ['52026AG0012', '52026AG0012(01)', '52026AG0012(02)']) {
+        expect(read).toContain(`⟨code_inline:${celex}⟩`);
+      }
+      expect(heldQueries()).toHaveLength(1);
+      expect(queryRoles(queries().filter((q) => !heldQueries().includes(q)))).toEqual(
+        roles('resolution', 'consolidation'),
+      );
+    });
+
+    it.each([
+      [
+        'a consolidated CELEX with no date: its current version',
+        '02014R0833',
+        [baseRow('32014R0833', { current: '2026-07-24|02014R0833-20260724' })],
+        'CELLAR holds 02014R0833-20260724, the current consolidated version of 32014R0833.',
+        ['02014R0833-20260724'],
+      ],
+      [
+        'a dated consolidated CELEX: the version in effect on its date and the current one',
+        '02006R1907-20260101',
+        [
+          baseRow('32006R1907', {
+            current: '2026-06-22|02006R1907-20260622',
+            inEffect: '2025-10-23|02006R1907-20251023',
+          }),
+        ],
+        'CELLAR holds 02006R1907-20251023, the consolidated version of 32006R1907 in effect on 2026-01-01, and 02006R1907-20260622, its current one.',
+        ['02006R1907-20251023', '02006R1907-20260622'],
+      ],
+    ])('names, without resolve, %s', async (_label, celex, bases, sentence, held) => {
+      routeMiss({ bases });
+      const { error } = await call({ celex_number: celex });
+      expect(error.message).toBe(`No CELLAR work found for CELEX: ${celex}. ${sentence}`);
+      expect(error.data.held_celex).toEqual(held);
+    });
+
+    it('serves the current version under resolve "current_consolidated", echoing the request, with a notice on both surfaces', async () => {
+      routeMiss({
+        held: ['02006R1907-20260622'],
+        bases: [
+          baseRow('32006R1907', {
+            current: '2026-06-22|02006R1907-20260622',
+            inEffect: '2025-10-23|02006R1907-20251023',
+          }),
+        ],
+      });
+      mockFetchContent.mockResolvedValue({
+        content: 'consolidated text',
+        contentAvailable: true,
+        language: 'EN',
+        format: 'html',
+      });
+      const response = await runToolContract(eurlex_get_document, {
+        celex_number: '02006R1907-20260101',
+        resolve: 'current_consolidated',
+      });
+      expect(response.isError).toBeFalsy();
+      const structured = response.structuredContent as Record<string, unknown>;
+      expect(structured).toMatchObject({
+        celex_number: '02006R1907-20260622',
+        requested_celex: '02006R1907-20260101',
+        base_act_celex: '32006R1907',
+        current_consolidated_celex: '02006R1907-20260622',
+        consolidated_as_of: '2026-06-22',
+        is_superseded: false,
+        content: 'consolidated text',
+      });
+      const notice =
+        'No CELLAR work holds 02006R1907-20260101, so resolve "current_consolidated" served 02006R1907-20260622, the current consolidated version of 32006R1907.';
+      expect(structured.notice).toBe(notice);
+      const text = response.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+      expect(readCommonMark(text)).toContain(notice);
+      expect(mockFetchContent).toHaveBeenLastCalledWith(
+        '02006R1907-20260622',
+        'EN',
+        'html',
+        expect.anything(),
+      );
+      // The served version's in-force flag is its base act's, keyed on the base work.
+      expect(queries().join('\n')).toContain(`<${CELLAR}32006R1907> cdm:resource_legal_in-force`);
+      expect(heldQueries()).toHaveLength(1);
+    });
+
+    it('fails under resolve "current_consolidated" when several base acts carry the CELEX, naming each version', async () => {
+      routeMiss({
+        bases: [
+          baseRow('41999D0010', { current: '2000-09-22|01999D0010-20000922' }),
+          baseRow('31999D0010', { current: '2002-09-01|01999D0010-20020901' }),
+        ],
+      });
+      const { error } = await call({ celex_number: '01999D0010', resolve: 'current_consolidated' });
+      expect(error.data.reason).toBe('not_found');
+      expect(error.data.held_celex).toEqual(['01999D0010-20020901', '01999D0010-20000922']);
+      expect(error.message).toContain(
+        '01999D0010-20020901, the current consolidated version of 31999D0010',
+      );
+    });
+
+    it('says the forms went unchecked when CELLAR does not answer the held-CELEX query', async () => {
+      routeMiss({});
+      const route = mockSparqlQuery.getMockImplementation();
+      mockSparqlQuery.mockImplementation(async (q: string) => {
+        if (q.includes('VALUES ?heldCelex')) {
+          throw serviceUnavailable('CELLAR SPARQL queries ran past the time budget', {
+            reason: 'sparql_timeout',
+            retryable: true,
+          });
+        }
+        return route?.(q);
+      });
+      const { error } = await call({ celex_number: '52026AG0012' });
+      expect(error.data.reason).toBe('not_found');
+      expect(error.message).toBe(
+        'No CELLAR work found for CELEX: 52026AG0012. CELLAR did not answer whether it holds a CELEX one numbering convention away; call again to check.',
+      );
+    });
+
+    it('sends no held-CELEX query for a CELEX that names a work', async () => {
+      routeMiss({ held: ['32016R0679'] });
+      const { response } = await call({ celex_number: '32016R0679' });
+      expect(response.isError).toBeFalsy();
+      expect(heldQueries()).toEqual([]);
+    });
+
+    it.each([
+      ['an eli_uri', { eli_uri: 'http://data.europa.eu/eli/reg/2026/12/oj' }],
+      [
+        'a work_uri naming a CELEX alias',
+        { work_uri: 'http://publications.europa.eu/resource/celex/52026AG0012' },
+      ],
+    ])('leaves the miss of %s unchanged, sending no held-CELEX query', async (_label, input) => {
+      routeMiss({});
+      const { error } = await call(input);
+      expect(error.data.reason).toBe('not_found');
+      expect(error.data).not.toHaveProperty('held_celex');
+      expect(error.message).not.toContain('CELLAR holds');
+      expect(heldQueries()).toEqual([]);
+    });
+
+    it('compares no STR() of a variable with = in any query a miss sends (#92)', async () => {
+      routeMiss({ bases: [baseRow('32006R1907', { current: '2026-06-22|02006R1907-20260622' })] });
+      await call({ celex_number: '02006R1907-20260101', resolve: 'current_consolidated' });
+      expect(heldQueries()).toHaveLength(1);
+      expect(queries().join('\n')).not.toMatch(/STR\(\?\w+\)\s*=/);
     });
   });
 
@@ -3693,7 +3911,15 @@ describe('eurlex_get_document', () => {
       );
       const byWork = queries.filter((q) => q.includes(`<${CELLAR}32016R0679>`));
       expect(queryRoles(byWork)).toEqual(
-        roles('core', 'citation', 'agents', 'legal_basis', 'eurovoc', 'procedures'),
+        roles(
+          'core',
+          'citation',
+          'agents',
+          'legal_basis',
+          'eurovoc',
+          'procedures',
+          'date_amendments',
+        ),
       );
       expect(queries.join('\n')).not.toMatch(/STR\(\?\w+\)\s*=/);
       expect(result.celex_number).toBe('32016R0679');
@@ -3734,7 +3960,15 @@ describe('eurlex_get_document', () => {
         queryRoles(queries.filter((q) => q.includes(`<${CELLAR}02016R0679-20160504>`))),
       ).toEqual(roles('core', 'citation'));
       expect(queryRoles(queries.filter((q) => q.includes(`<${CELLAR}32016R0679>`)))).toEqual(
-        roles('core', 'citation', 'agents', 'legal_basis', 'eurovoc', 'procedures'),
+        roles(
+          'core',
+          'citation',
+          'agents',
+          'legal_basis',
+          'eurovoc',
+          'procedures',
+          'date_amendments',
+        ),
       );
       expect(queries.join('\n')).not.toMatch(/STR\(\?\w+\)\s*=/);
     });
@@ -4412,7 +4646,7 @@ describe('eurlex_get_document', () => {
       expectNoReasons(result);
     });
 
-    it('a base-act request issues eight queries — the reasons ride the core and citation queries', async () => {
+    it('a base-act request issues nine queries — the reasons ride the core and citation queries', async () => {
       await getDocument('31995L0046');
       expect(queryRoles(mockSparqlQuery.mock.calls.map((c) => c[0] as string))).toEqual(
         METADATA_ROLES,
@@ -4619,6 +4853,302 @@ describe('eurlex_get_document', () => {
         { date: '2026-10-12', type: 'partial_application', provision: 'Article 12(b)' },
       ]);
       expect(textOf(result)).toContain('**Entry into force:** 2026-10-12');
+    });
+  });
+
+  // --- #187/#188: dates CELLAR records with no date, and dates an amendment may have moved ---
+
+  describe('#187/#188 no-date values and amended date-setting articles', () => {
+    beforeEach(() => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(new Date('2026-11-09T12:00:00Z'));
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    const call = (args: Record<string, unknown>) => {
+      mockSparqlQuery.mockImplementation(fakeConsolidationCellar);
+      return runToolContract(eurlex_get_document, { content_mode: 'metadata_only', ...args });
+    };
+    const getDocument = (celex: string) => call({ celex_number: celex });
+    const structuredOf = (result: Awaited<ReturnType<typeof call>>) =>
+      eurlex_get_document.output.parse(result.structuredContent);
+    const textOf = (result: Awaited<ReturnType<typeof call>>) =>
+      result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+    const noticeOf = (result: Awaited<ReturnType<typeof call>>) =>
+      (result.structuredContent as { notice?: string }).notice;
+    const sent = () => mockSparqlQuery.mock.calls.map((c) => c[0] as string);
+    const lineOf = (result: Awaited<ReturnType<typeof call>>, label: string) =>
+      textOf(result)
+        .split('\n')
+        .find((line) => line.startsWith(label));
+    const expectNoPlaceholder = (result: Awaited<ReturnType<typeof call>>) => {
+      for (const placeholder of ['1001-01-01', '1002-02-02']) {
+        expect(JSON.stringify(result.structuredContent)).not.toContain(placeholder);
+        expect(textOf(result)).not.toContain(placeholder);
+      }
+    };
+
+    // --- #187 ---
+
+    const MDR_DATES = [
+      { date: '2017-05-25', type: 'entry_into_force', provision: 'Article 123.1' },
+      { date: '2017-11-26', type: 'partial_application' },
+      { date: '2018-05-26', type: 'partial_application', provision: 'Article 123.3(c)' },
+      { date: '2019-05-26', type: 'partial_application', provision: 'Article 123.3(i)' },
+      { date: '2020-04-24', type: 'partial_application', provision: 'Article 123.3(j)' },
+      { date: '2021-05-26', type: 'application', provision: 'Article 123.2' },
+      { date: '2021-05-26', type: 'partial_application' },
+      { date: '2023-05-26', type: 'partial_application' },
+      { date: '2025-05-26', type: 'partial_application' },
+      { date: '2027-05-26', type: 'partial_application', provision: 'Article 123.3(g)' },
+    ];
+
+    it('#187 32017R0745: the dates open with its entry into force and hold no placeholder stage, on both surfaces', async () => {
+      const result = await getDocument('32017R0745');
+      const structured = structuredOf(result);
+      expect(structured.in_force).toBe(true);
+      expect(structured.dates_of_effect).toEqual(MDR_DATES);
+      expect(structured).not.toHaveProperty('entry_into_force');
+      expect(lineOf(result, '**Dates of effect:**')).toBe(
+        '**Dates of effect:** 2017-05-25 (entry_into_force, Article 123.1), 2017-11-26 (partial_application), 2018-05-26 (partial_application, Article 123.3(c)), 2019-05-26 (partial_application, Article 123.3(i)), 2020-04-24 (partial_application, Article 123.3(j)), 2021-05-26 (application, Article 123.2), 2021-05-26 (partial_application), 2023-05-26 (partial_application), 2025-05-26 (partial_application), 2027-05-26 (partial_application, Article 123.3(g))',
+      );
+      expectNoPlaceholder(result);
+    });
+
+    it.each([
+      ['32016L0802', undefined],
+      ['32025L0872', ['2025-12-31', '2026-01-01', '2027-12-31', '2028-01-01']],
+      ['31996L0062', ['1998-05-21']],
+    ])('#187 %s: transposition deadlines keep only real dates', async (celex, deadlines) => {
+      const result = await getDocument(celex);
+      expect(structuredOf(result).transposition_deadlines).toEqual(deadlines);
+      expect(lineOf(result, '**Transposition deadlines:**')).toBe(
+        deadlines ? `**Transposition deadlines:** ${deadlines.join(', ')}` : undefined,
+      );
+      expectNoPlaceholder(result);
+    });
+
+    it('#187 31977R0256: an act not in force whose only end of validity is 1002-02-02 carries none', async () => {
+      const result = await getDocument('31977R0256');
+      const structured = structuredOf(result);
+      expect(structured.in_force).toBe(false);
+      expect(structured).not.toHaveProperty('end_of_validity');
+      expect(lineOf(result, '**End of validity:**')).toBeUndefined();
+      expect(structured.dates_of_effect).toEqual([
+        { date: '1977-02-01', type: 'application', provision: 'Article 1' },
+        { date: '1977-02-11', type: 'entry_into_force', provision: 'Article 2' },
+      ]);
+      expectNoPlaceholder(result);
+    });
+
+    it('#187 31980D0032: an act whose only date of effect is 1002-02-02 carries no dates_of_effect', async () => {
+      const result = await getDocument('31980D0032');
+      expect(structuredOf(result)).not.toHaveProperty('dates_of_effect');
+      expect(lineOf(result, '**Dates of effect:**')).toBeUndefined();
+      expectNoPlaceholder(result);
+    });
+
+    it('#187 32026D2306 on 2026-11-09: a placeholder application date no longer hides the entry into force ahead', async () => {
+      const result = await getDocument('32026D2306');
+      const structured = structuredOf(result);
+      expect(structured.in_force).toBe(false);
+      expect(structured.entry_into_force).toBe('2026-11-10');
+      expect(structured.dates_of_effect).toEqual([
+        { date: '2026-11-10', type: 'entry_into_force', provision: 'Article 2' },
+      ]);
+      expect(lineOf(result, '**Entry into force:**')).toBe('**Entry into force:** 2026-11-10');
+      expectNoPlaceholder(result);
+    });
+
+    // --- #188 ---
+
+    const AI_ACT_NOTICE =
+      'An amending act changed an article setting dates listed in dates_of_effect: 32026R1744 (Article 113). CELLAR may not have updated those dates; confirm them in the current consolidated version, 02024R1689-20260727 (current_consolidated_celex), or, for an amendment it does not merge yet, in the amending act.';
+    const AI_ACT_DATES = [
+      { date: '2024-08-01', type: 'entry_into_force', provision: 'Article 113' },
+      { date: '2025-02-02', type: 'partial_application', provision: 'Article 113(a)' },
+      { date: '2025-08-02', type: 'partial_application', provision: 'Article 113(b)' },
+      { date: '2026-08-02', type: 'application', provision: 'Article 113' },
+      { date: '2027-08-02', type: 'partial_application', provision: 'Article 113(c)' },
+    ];
+
+    it('#188 32024R1689: names the amending act, the article, and the current consolidated version, on both surfaces', async () => {
+      const result = await getDocument('32024R1689');
+      expect(noticeOf(result)).toBe(AI_ACT_NOTICE);
+      expect(textOf(result)).toContain(AI_ACT_NOTICE);
+      // The notice adds, removes, and reorders no date.
+      expect(structuredOf(result).dates_of_effect).toEqual(AI_ACT_DATES);
+    });
+
+    it.each([
+      { resolve: 'as_requested', content_mode: 'metadata_only' },
+      { resolve: 'as_requested', content_mode: 'paged' },
+      { resolve: 'as_requested', content_mode: 'full' },
+      { resolve: 'current_consolidated', content_mode: 'metadata_only' },
+      { resolve: 'current_consolidated', content_mode: 'paged' },
+      { resolve: 'current_consolidated', content_mode: 'full' },
+    ])('#188 32024R1689 carries the notice under %j', async (args) => {
+      mockFetchContent.mockResolvedValue({
+        content: 'Article 113 Entry into force and application',
+        contentAvailable: true,
+        language: 'EN',
+        format: 'html',
+      });
+      const result = await call({ celex_number: '32024R1689', ...args });
+      expect(result.isError).toBeFalsy();
+      expect(noticeOf(result)).toBe(AI_ACT_NOTICE);
+      expect(textOf(result)).toContain(AI_ACT_NOTICE);
+      expect(structuredOf(result).dates_of_effect).toEqual(AI_ACT_DATES);
+    });
+
+    it('#188 rides the truncation guidance when the body window is cut, and an offset past the end keeps it in notice', async () => {
+      mockFetchContent.mockResolvedValue({
+        content: 'Article 113 Entry into force and application',
+        contentAvailable: true,
+        language: 'EN',
+        format: 'html',
+      });
+      const cut = await call({ celex_number: '32024R1689', content_mode: 'paged', limit: 10 });
+      const structured = cut.structuredContent as { notice?: string; truncated?: boolean };
+      expect(structured.truncated).toBe(true);
+      expect(structured.notice).toBe(
+        `More document content is available. Continue with content_mode="paged" and offset=10. ${AI_ACT_NOTICE}`,
+      );
+      expect(textOf(cut)).toContain(AI_ACT_NOTICE);
+
+      const past = await call({ celex_number: '32024R1689', content_mode: 'paged', offset: 9999 });
+      expect(structuredOf(past).has_more).toBe(false);
+      expect(noticeOf(past)).toBe(AI_ACT_NOTICE);
+    });
+
+    it('#188 02024R1689-20260727: the consolidated text carries its base act’s notice', async () => {
+      const result = await getDocument('02024R1689-20260727');
+      expect(noticeOf(result)).toBe(AI_ACT_NOTICE);
+      expect(textOf(result)).toContain(AI_ACT_NOTICE);
+      // The query keys on the base act, never the consolidated text.
+      const query = sent().find(isDateAmendmentsQuery) as string;
+      expect(query).toContain(`<${WORK.aiAct}>`);
+      expect(query).not.toContain(`<${ACTS['02024R1689-20260727']?.uri}>`);
+    });
+
+    it('#188 32023R1115: names both amending acts and Article 38, pointing to them when no consolidated version is in effect', async () => {
+      const result = await getDocument('32023R1115');
+      const notice =
+        'Amending acts changed an article setting dates listed in dates_of_effect: 32024R3234 (Article 38) and 32025R2650 (Article 38). CELLAR may not have updated those dates; confirm them in the amending acts.';
+      expect(noticeOf(result)).toBe(notice);
+      expect(textOf(result)).toContain(notice);
+    });
+
+    it('#188 32017R0745: the notice beside a dropped placeholder stage leaves the list as the reader produced it', async () => {
+      const result = await getDocument('32017R0745');
+      expect(noticeOf(result)).toBe(
+        'Amending acts changed an article setting dates listed in dates_of_effect: 32020R0561 (Article 123), 32023R0607 (Article 123), and 32024R1860 (Article 123). CELLAR may not have updated those dates; confirm them in the amending acts.',
+      );
+      expect(structuredOf(result).dates_of_effect).toEqual(MDR_DATES);
+    });
+
+    it('#188 32099R0050: a location in the article followed by a dot counts; a longer number, a lettered article, and the compact form do not', async () => {
+      const result = await getDocument('32099R0050');
+      expect(noticeOf(result)).toBe(
+        'An amending act changed an article setting dates listed in dates_of_effect: 32099R0060 (Article 5). CELLAR may not have updated those dates; confirm them in the amending act.',
+      );
+    });
+
+    it.each([
+      ['32016R0679', 'a consolidated version in effect, no amendment of a date-setting article'],
+      ['32024L1760', 'amended, but not Article 38'],
+      ['32011R1227', 'its amended Article 8 cited only by placeholder-dated stages'],
+    ])('#188 %s (%s) carries no notice', async (celex) => {
+      const result = await getDocument(celex);
+      expect(result.isError).toBeFalsy();
+      expect(noticeOf(result)).toBeUndefined();
+      expect(textOf(result)).not.toContain('Amending act');
+      expect(textOf(result)).not.toContain('An amending act');
+    });
+
+    it('#188 a legislative metadata read sends one query more, keyed on the act; case law sends none', async () => {
+      await getDocument('32024R1689');
+      expect(queryRoles(sent())).toEqual(
+        roles(
+          'resolution',
+          'consolidation',
+          'core',
+          'citation',
+          'agents',
+          'legal_basis',
+          'eurovoc',
+          'procedures',
+          'date_amendments',
+        ),
+      );
+      expect(sent().find(isDateAmendmentsQuery)).toContain(
+        `<http://www.w3.org/2002/07/owl#annotatedTarget> <${WORK.aiAct}> ;\n    <http://www.w3.org/2002/07/owl#annotatedProperty> cdm:resource_legal_amends_resource_legal`,
+      );
+
+      mockSparqlQuery.mockClear();
+      await getDocument('62012CJ0131');
+      expect(sent().filter(isDateAmendmentsQuery)).toEqual([]);
+    });
+
+    it('#188 the query is in flight before the core and citation queries settle', async () => {
+      let markIssued!: () => void;
+      const issued = new Promise<void>((resolve) => {
+        markIssued = resolve;
+      });
+      mockSparqlQuery.mockImplementation(async (q: string) => {
+        if (isDateAmendmentsQuery(q)) markIssued();
+        if (q.includes('cdm:work_has_resource-type') || q.includes('AS ?datesOfEffect)')) {
+          await Promise.race([
+            issued,
+            new Promise((_, reject) =>
+              setTimeout(
+                () => reject(new Error('the date-amendments query waited on the metadata')),
+                200,
+              ),
+            ),
+          ]);
+        }
+        return fakeConsolidationCellar(q);
+      });
+      const result = await runToolContract(eurlex_get_document, {
+        celex_number: '32024R1689',
+        content_mode: 'metadata_only',
+      });
+      expect(result.isError).toBeFalsy();
+      expect(noticeOf(result)).toBe(AI_ACT_NOTICE);
+    });
+
+    it('#188 propagates a caller cancellation raised by the query', async () => {
+      const ctx = createMockContext({ errors: eurlex_get_document.errors });
+      mockSparqlQuery.mockImplementation((q: string) =>
+        isDateAmendmentsQuery(q)
+          ? Promise.reject(new DOMException('The operation was aborted.', 'AbortError'))
+          : fakeConsolidationCellar(q),
+      );
+      const input = eurlex_get_document.input.parse({
+        celex_number: '32024R1689',
+        content_mode: 'metadata_only',
+      });
+      await expect(eurlex_get_document.handler(input, ctx)).rejects.toThrow(/aborted/);
+    });
+
+    it('#188 fails the read with the CELLAR error the query raises', async () => {
+      const timeout = serviceUnavailable('CELLAR SPARQL query timed out after 55000ms', {
+        reason: 'sparql_timeout',
+      });
+      mockSparqlQuery.mockImplementation((q: string) =>
+        isDateAmendmentsQuery(q) ? Promise.reject(timeout) : fakeConsolidationCellar(q),
+      );
+      const result = await runToolContract(eurlex_get_document, {
+        celex_number: '32024R1689',
+        content_mode: 'metadata_only',
+      });
+      expect(result.isError).toBe(true);
+      const error = (result.structuredContent as { error: { code: number; data: object } }).error;
+      expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+      expect(error.data).toMatchObject({ reason: 'sparql_timeout' });
     });
   });
 
@@ -5671,6 +6201,436 @@ describe('eurlex_get_document', () => {
           'How much of the body to return. "paged" (default) returns an offset/limit window; "full" requests from the start and returns at most 100000 characters with continuation metadata when more exists; "metadata_only" skips the content fetch. offset and limit apply only to "paged".',
       });
     });
+  });
+
+  // --- #195: three-letter language codes; select as a string, a list, or a variant key ---
+
+  describe('three-letter language codes and select shapes (#195)', () => {
+    const contentText = (result: { content: unknown[] }) =>
+      result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+
+    /** Each EUR-Lex language's ISO 639-2/T code, as CELLAR's language authority table records it. */
+    const ISO_639_2T: [string, string][] = [
+      ['bul', 'BG'],
+      ['ces', 'CS'],
+      ['dan', 'DA'],
+      ['deu', 'DE'],
+      ['ell', 'EL'],
+      ['eng', 'EN'],
+      ['est', 'ET'],
+      ['fin', 'FI'],
+      ['fra', 'FR'],
+      ['gle', 'GA'],
+      ['hrv', 'HR'],
+      ['hun', 'HU'],
+      ['ita', 'IT'],
+      ['lav', 'LV'],
+      ['lit', 'LT'],
+      ['mlt', 'MT'],
+      ['nld', 'NL'],
+      ['pol', 'PL'],
+      ['por', 'PT'],
+      ['ron', 'RO'],
+      ['slk', 'SK'],
+      ['slv', 'SL'],
+      ['spa', 'ES'],
+      ['swe', 'SV'],
+    ];
+    /** The ISO 639-2/B codes that differ from those, Slovak's `slo` aside. */
+    const ISO_639_2B: [string, string][] = [
+      ['fre', 'FR'],
+      ['ger', 'DE'],
+      ['gre', 'EL'],
+      ['dut', 'NL'],
+      ['cze', 'CS'],
+      ['rum', 'RO'],
+    ];
+    const LANGUAGE_MESSAGE =
+      'language must be one of the 24 supported EUR-Lex codes: EN, FR, DE, ES, IT, PL, PT, NL, CS, DA, EL, ET, FI, HU, LT, LV, MT, RO, SK, SL, SV, BG, HR, GA';
+
+    it('tables a terminological code for every EUR-Lex language', () => {
+      expect(ISO_639_2T.map(([, language]) => language).sort()).toEqual(
+        [...EURLEX_LANGUAGES].sort(),
+      );
+    });
+
+    it.each([...ISO_639_2T, ...ISO_639_2B])(
+      'reads language %s as %s in lower, upper, and mixed case',
+      (code, language) => {
+        const mixed = `${code.charAt(0).toUpperCase()}${code.slice(1)}`;
+        for (const value of [code, code.toUpperCase(), mixed]) {
+          expect(
+            eurlex_get_document.input.parse({ celex_number: '32008L0120', language: value })
+              .language,
+          ).toBe(language);
+        }
+      },
+    );
+
+    it('serves language "fra" as FR on both channels', async () => {
+      mockSparqlQuery.mockResolvedValue([makeMetaBinding({ celex: '32008L0120' })]);
+      const result = await runToolContract(eurlex_get_document, {
+        celex_number: '32008L0120',
+        language: 'fra',
+        content_mode: 'metadata_only',
+      });
+
+      expect(result.isError).toBeFalsy();
+      expect(result.structuredContent).toMatchObject({ language: 'FR' });
+      expect(contentText(result)).toContain('**Language:** FR');
+      const queries = mockSparqlQuery.mock.calls.map((c) => c[0] as string);
+      expect(
+        queries.some((q) =>
+          q.includes('<http://publications.europa.eu/resource/authority/language/FRA>'),
+        ),
+      ).toBe(true);
+    });
+
+    it.each(['xx', 'slo', 'SLO', '', 'en-GB'])(
+      'still rejects language %j, naming the 24 codes',
+      async (language) => {
+        const result = await runToolContract(eurlex_get_document, {
+          celex_number: '32008L0120',
+          language,
+          content_mode: 'metadata_only',
+        });
+
+        expect(result.isError).toBe(true);
+        expect(result.structuredContent).toMatchObject({
+          error: {
+            code: JsonRpcErrorCode.InvalidParams,
+            message: `Input validation error: Invalid arguments for tool eurlex_get_document: language: ${LANGUAGE_MESSAGE}`,
+            data: { recovery: { hint: `language: ${LANGUAGE_MESSAGE}` } },
+          },
+        });
+        expect(contentText(result)).toContain(`language: ${LANGUAGE_MESSAGE}`);
+        expect(mockSparqlQuery).not.toHaveBeenCalled();
+      },
+    );
+
+    /** An act with recitals 11–12, articles 1, 4, 5, and 7, and annexes I and II. */
+    const ACT = [
+      '<p class="oj-normal">(11)</p>',
+      '<p class="oj-normal">Recital eleven.</p>',
+      '<p class="oj-normal">(12)</p>',
+      '<p class="oj-normal">Recital twelve.</p>',
+      '<p class="oj-ti-art">Article 1</p>',
+      '<p class="oj-normal">Body one.</p>',
+      '<p class="oj-ti-art">Article 4</p>',
+      '<p class="oj-normal">Body four.</p>',
+      '<p class="oj-ti-art">Article 5</p>',
+      '<p class="oj-normal">Body five.</p>',
+      '<p class="oj-ti-art">Article 7</p>',
+      '<p class="oj-normal">Body seven.</p>',
+      '<p class="oj-doc-ti">ANNEX I</p>',
+      '<p class="oj-normal">Annex one.</p>',
+      '<p class="oj-doc-ti">ANNEX II</p>',
+      '<p class="oj-normal">Annex two.</p>',
+    ].join('\n');
+    /** The same act as its German version heads it. */
+    const ACT_DE = ACT.replaceAll('Article ', 'Artikel ').replaceAll('ANNEX ', 'ANHANG ');
+
+    const fetchSelect = async (select: unknown, language: 'EN' | 'DE' = 'EN') => {
+      mockSparqlQuery.mockResolvedValue([makeMetaBinding({ celex: '32023R1114' })]);
+      mockFetchContent.mockResolvedValue({
+        content: language === 'EN' ? ACT : ACT_DE,
+        contentAvailable: true,
+        format: 'html',
+        language,
+      });
+      return runToolContract(eurlex_get_document, {
+        celex_number: '32023R1114',
+        language,
+        select,
+      });
+    };
+
+    it.each<[string, string[], Record<string, string>]>([
+      ['Article 4', ['Article 4'], { articles: '4' }],
+      ['Annex II', ['ANNEX II'], { annexes: 'II' }],
+      ['Recital 12', ['Recital 12'], { recitals: '12' }],
+      ['Article 1, Article 5', ['Article 1', 'Article 5'], { articles: '1,5' }],
+    ])('reads select %j as the field it names', async (text, matched, object) => {
+      const asText = await fetchSelect(text);
+      const asObject = await fetchSelect(object);
+
+      expect(asText.isError).toBeFalsy();
+      expect(asText.structuredContent).toMatchObject({
+        selection: { requested: matched, matched, missed: [] },
+      });
+      expect(asText.structuredContent).toEqual(asObject.structuredContent);
+      expect(asText.content).toEqual(asObject.content);
+    });
+
+    it.each(['EN', 'DE'] as const)(
+      'reads select "Artikel 4" as Article 4 under language %s',
+      async (language) => {
+        const result = await fetchSelect('Artikel 4', language);
+
+        expect(result.structuredContent).toMatchObject({
+          language,
+          selection: { requested: ['Article 4'], matched: ['Article 4'], missed: [] },
+        });
+        const content = (result.structuredContent as { content: string }).content;
+        expect(content).toContain('Body four.');
+        expect(content).not.toContain('Body five.');
+        expect(contentText(result)).toContain('Body four.');
+      },
+    );
+
+    it.each(['4', 'Section 2', 'Article 4, Annex II', 'Art. 4'])(
+      'keeps rejecting select %j as a string',
+      async (select) => {
+        const result = await fetchSelect(select);
+
+        expect(result.isError).toBe(true);
+        expect(result.structuredContent).toMatchObject({
+          error: {
+            code: JsonRpcErrorCode.InvalidParams,
+            message:
+              'Input validation error: Invalid arguments for tool eurlex_get_document: select: Invalid input: expected object, received string',
+            data: {
+              issues: [
+                {
+                  expected: 'object',
+                  code: 'invalid_type',
+                  path: ['select'],
+                  message: 'Invalid input: expected object, received string',
+                },
+              ],
+              recovery: { hint: 'Send select as an object, not a string.' },
+            },
+          },
+        });
+        expect(contentText(result)).toContain('Recovery: Send select as an object, not a string.');
+        expect(mockFetchContent).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each<[unknown, string[]]>([
+      [{ articles: ['7'] }, ['Article 7']],
+      [{ articles: ['1', 5] }, ['Article 1', 'Article 5']],
+      [{ annexes: ['I', 'II'] }, ['ANNEX I', 'ANNEX II']],
+    ])('reads a list in a select field as its comma-joined string: %j', async (select, matched) => {
+      const result = await fetchSelect(select);
+
+      expect(result.isError).toBeFalsy();
+      expect(result.structuredContent).toMatchObject({
+        selection: { requested: matched, matched, missed: [] },
+      });
+    });
+
+    it('reads an empty list as the empty string', async () => {
+      const asList = await fetchSelect({ articles: [] });
+      const asString = await fetchSelect({ articles: '' });
+
+      expect(asList.isError).toBeFalsy();
+      expect(asList.structuredContent).toEqual(asString.structuredContent);
+      expect(asList.content).toEqual(asString.content);
+    });
+
+    it('still rejects a list holding anything but strings and integers', async () => {
+      const result = await fetchSelect({ articles: [{}] });
+
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.InvalidParams,
+          data: { recovery: { hint: 'Send select.articles as a string, not an array.' } },
+        },
+      });
+    });
+
+    it.each<[string, unknown]>([
+      ['an integer field', { articles: 7 }],
+      ['a JSON-stringified select', '{"articles":"7"}'],
+      ['a variant key holding an integer', { article: 7 }],
+    ])('still repairs %s to Article 7', async (_label, select) => {
+      const result = await fetchSelect(select);
+
+      expect(result.isError).toBeFalsy();
+      expect(result.structuredContent).toMatchObject({
+        selection: { requested: ['Article 7'], matched: ['Article 7'], missed: [] },
+      });
+    });
+
+    it.each<[unknown]>([[{ article: '7' }], [{ Articles: '7' }], [{ ARTICLE: ['7'] }]])(
+      'reads the variant key of %j as articles',
+      async (select) => {
+        const result = await fetchSelect(select);
+
+        expect(result.structuredContent).toMatchObject({
+          selection: { requested: ['Article 7'], matched: ['Article 7'], missed: [] },
+        });
+      },
+    );
+
+    it('reads operative-part and operativePart as operative_part', () => {
+      for (const key of ['operative-part', 'operativePart', 'Operative_Part']) {
+        expect(
+          eurlex_get_document.input.parse({ celex_number: '62012CJ0131', select: { [key]: true } })
+            .select,
+        ).toEqual({ operative_part: true });
+      }
+    });
+
+    it.each<[string, unknown, string[]]>([
+      ['the field beside its variant', { articles: '1', article: '7' }, ['Article 1']],
+      ['two variants of one field', { article: '1', Articles: '7' }, []],
+      ['a key naming no field', { artcles: '7' }, []],
+    ])('keeps dropping %s', async (_label, select, requested) => {
+      const result = await fetchSelect(select);
+
+      expect(result.isError).toBeFalsy();
+      expect(result.structuredContent).toMatchObject({ selection: { requested } });
+    });
+
+    it('advertises language and select in tools/list exactly as before', () => {
+      const schema = z.toJSONSchema(eurlex_get_document.input, { io: 'input' }) as {
+        properties: Record<string, Record<string, unknown>>;
+      };
+      expect(schema.properties.language).toStrictEqual({
+        default: 'EN',
+        description:
+          'One of the 24 supported two-letter EUR-Lex language codes (e.g. EN, FR, DE), accepted case-insensitively and normalized to uppercase. Defaults to EN, and falls back to EN if the requested language is unavailable.',
+        type: 'string',
+        pattern:
+          '^(?:[Ee][Nn]|[Ff][Rr]|[Dd][Ee]|[Ee][Ss]|[Ii][Tt]|[Pp][Ll]|[Pp][Tt]|[Nn][Ll]|[Cc][Ss]|[Dd][Aa]|[Ee][Ll]|[Ee][Tt]|[Ff][Ii]|[Hh][Uu]|[Ll][Tt]|[Ll][Vv]|[Mm][Tt]|[Rr][Oo]|[Ss][Kk]|[Ss][Ll]|[Ss][Vv]|[Bb][Gg]|[Hh][Rr]|[Gg][Aa])$',
+      });
+      const select = schema.properties.select;
+      expect(Object.keys(select ?? {})).toEqual(['description', 'type', 'properties']);
+      expect(select).toMatchObject({
+        type: 'object',
+        description: expect.stringMatching(/^Return only the text of specific sections/),
+      });
+      expect(
+        Object.entries(select?.properties as Record<string, Record<string, unknown>>).map(
+          ([key, field]) => [key, Object.keys(field), field.type],
+        ),
+      ).toEqual([
+        ['articles', ['description', 'type'], 'string'],
+        ['chapters', ['description', 'type'], 'string'],
+        ['recitals', ['description', 'type'], 'string'],
+        ['annexes', ['description', 'type'], 'string'],
+        ['headings', ['description', 'type'], 'string'],
+        ['operative_part', ['description', 'type'], 'boolean'],
+      ]);
+    });
+
+    it(
+      'reads a caller-sized select string in linear time',
+      async () => {
+        const span = async (label: string, build: (n: number) => string) => {
+          const timed = (n: number) => {
+            const select = build(n);
+            return () => {
+              for (let round = 0; round < 10; round++) {
+                eurlex_get_document.input.safeParse({ celex_number: '32023R1114', select });
+              }
+            };
+          };
+          const base = await bestCpuMs(timed(5_000));
+          for (let n = 10_000; n <= 320_000; n *= 2) {
+            const t = await bestCpuMs(timed(n));
+            const timings = `${label}: ${t.toFixed(3)} ms at ${n}, ${base.toFixed(3)} ms at 5000`;
+            expect(t, timings).toBeLessThan(1_000);
+            if (n === 320_000) expect(t / base, timings).toBeLessThan(256);
+          }
+        };
+        await span('a line-broken run of words', (n) => `${'§1 x'.repeat(n / 4)}\ny`);
+        await span('a run of blank lines', (n) => '  \r\n'.repeat(n / 4));
+      },
+      CPU_TIMED_TEST_TIMEOUT_MS,
+    );
+  });
+
+  // --- #194: celex and max_chars, the keys callers guess for celex_number and limit ---
+
+  describe('input aliases (#194)', () => {
+    const contentText = (result: { content: unknown[] }) =>
+      result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+    const sentQueries = () => mockSparqlQuery.mock.calls.map((c) => c[0] as string);
+
+    /** Call the tool with arguments as a client sends them, keys the schema omits included. */
+    const callTool = (args: Record<string, unknown>) =>
+      runToolContract(eurlex_get_document, args as z.input<typeof eurlex_get_document.input>);
+
+    it('serves celex as celex_number, normalized: the same queries, metadata, and content[]', async () => {
+      mockSparqlQuery.mockResolvedValue([makeMetaBinding({ celex: '32016R0679' })]);
+      const viaTarget = await callTool({
+        celex_number: 'CELEX:32016r0679',
+        content_mode: 'metadata_only',
+      });
+      const targetQueries = sentQueries();
+      mockSparqlQuery.mockClear();
+
+      const viaAlias = await callTool({ celex: 'CELEX:32016r0679', content_mode: 'metadata_only' });
+
+      expect(viaAlias.isError).toBeFalsy();
+      expect(viaAlias.structuredContent).toMatchObject({ celex_number: '32016R0679' });
+      expect(viaAlias.structuredContent).toStrictEqual(viaTarget.structuredContent);
+      expect(viaAlias.content).toStrictEqual(viaTarget.content);
+      expect(sentQueries()).toStrictEqual(targetQueries);
+      expect(targetQueries.some((q) => q.includes('"32016R0679"^^xsd:string'))).toBe(true);
+    });
+
+    it('serves max_chars as limit: the same window, offsets, and content[]', async () => {
+      mockSparqlQuery.mockResolvedValue([makeMetaBinding({ celex: '32016R0679' })]);
+      mockFetchContent.mockResolvedValue({
+        content: 'abcdefghij'.repeat(30),
+        contentAvailable: true,
+        format: 'html',
+        language: 'EN',
+      });
+      const viaTarget = await callTool({ celex_number: '32016R0679', offset: 20, limit: 50 });
+      const viaAlias = await callTool({ celex_number: '32016R0679', offset: 20, max_chars: 50 });
+
+      expect(viaAlias.isError).toBeFalsy();
+      expect(viaAlias.structuredContent).toMatchObject({
+        content_offset: 20,
+        content_chars_returned: 50,
+        content_chars_total: 300,
+        has_more: true,
+      });
+      expect(viaAlias.structuredContent).toStrictEqual(viaTarget.structuredContent);
+      expect(viaAlias.content).toStrictEqual(viaTarget.content);
+    });
+
+    it.each([
+      ['celex', { celex: '32016R0679', celex_number: '32016R0679' }, 'celex_number'],
+      ['max_chars', { celex_number: '32016R0679', limit: 50, max_chars: 50 }, 'limit'],
+    ])(
+      'rejects %s sent beside its target with the alias hint, before any request',
+      async (alias, args, target) => {
+        const hint = `${alias} is an alias of ${target}; send one of them, not both.`;
+
+        const result = await callTool(args);
+
+        expect(result.isError).toBe(true);
+        expect(result.structuredContent).toMatchObject({
+          error: { code: JsonRpcErrorCode.InvalidParams, data: { recovery: { hint } } },
+        });
+        expect(contentText(result)).toContain(hint);
+        expect(mockSparqlQuery).not.toHaveBeenCalled();
+        expect(mockFetchContent).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each(['identifier', 'id'])(
+      'still rejects %s, which could name any of the three identifier inputs',
+      async (key) => {
+        const hint = `Unknown key ${key}. This tool accepts: celex_number, eli_uri, work_uri, resolve, language, format, content_mode, offset, limit, outline, include_recitals, select.`;
+
+        const result = await callTool({ [key]: '32016R0679' });
+
+        expect(result.isError).toBe(true);
+        expect(result.structuredContent).toMatchObject({
+          error: { code: JsonRpcErrorCode.InvalidParams, data: { recovery: { hint } } },
+        });
+        expect(contentText(result)).toContain(hint);
+        expect(mockSparqlQuery).not.toHaveBeenCalled();
+      },
+    );
   });
 });
 

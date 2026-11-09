@@ -19,6 +19,11 @@ import {
   renderNoticeBlockquote,
 } from '@/mcp-server/tools/markdown-render.js';
 import {
+  OR_LIST,
+  unsetFiltersHint,
+  withTimeoutAlternative,
+} from '@/mcp-server/tools/timeout-alternative.js';
+import {
   canonicalEurovocConceptUri,
   ENG_LANGUAGE_URI,
   resolveResourceTypeLabels,
@@ -121,6 +126,16 @@ const CORRIGENDUM_URI = `${RESOURCE_TYPE_BASE}CORRIGENDUM`;
  */
 const CASE_LAW_EUROVOC_GUIDANCE =
   'CELLAR indexes no judgment, order, or Advocate General opinion of the Court of Justice or General Court by EuroVoc concept; only EFTA Court judgments carry one. Search case law by subject with eurlex_get_cases subject (e.g. "personal data"), or omit document_type and pass keyword "Case" to list the Judicial Information Notices that announce cases under this concept, each naming the case number eurlex_get_cases takes.';
+
+/**
+ * The filters the `sparql_timeout` and `offset_past_window` recoveries offer to
+ * narrow a search with (#186). A contract recovery reaches every caller, so it names
+ * none of them; each call is offered the ones it left unset, before any query for an
+ * offset past the window and at the page query for a timeout. The exact-CELEX
+ * keyword lookup and the page's work resolution keep the contract recovery: none of
+ * these filters shrinks them.
+ */
+const NARROWING_FILTERS = ['document_type', 'eurovoc_concept', 'author_institution'] as const;
 
 export const eurlex_search_documents = tool('eurlex_search_documents', {
   title: 'Search EU Documents',
@@ -243,6 +258,8 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
         'Maximum number of results to return, served up to 100 per call; a larger value (up to 10,000) is served at 100 and reported in limit_clamp. Defaults to 20.',
       ),
   }),
+  // The name callers guess for keyword (#194); tools/list still advertises keyword alone.
+  inputAliases: { query: 'keyword' },
   output: z.object({
     documents: z
       .array(
@@ -354,7 +371,7 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
       code: JsonRpcErrorCode.ValidationError,
       when: 'offset is 10,000 or more, past the last row CELLAR sorts for one search.',
       recovery:
-        'Narrow the search below 10,000 matches — search a date_from/date_to window ending at the date of the last document reached (results run newest first), or add document_type, eurovoc_concept, author_institution, or keyword — then page from offset 0.',
+        'Narrow the search below 10,000 matches — search a date_from/date_to window ending at the date of the last document reached (results run newest first), or use a more specific keyword — then page from offset 0.',
     },
     {
       reason: 'no_filters',
@@ -395,18 +412,26 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
     {
       reason: 'sparql_timeout',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: "The search ran past its time budget (retryable: CELLAR's response time varies, so a later search can finish), or CELLAR refused it as too costly to run (not retryable: the same search is refused again). Neither is retried within the call.",
+      when: "The search ran past its time budget (retryable: CELLAR's response time varies, so a later search can finish), or CELLAR refused it as too costly to run (not retryable: the same search is refused again). Neither is retried within the call, apart from one re-send, inside the same budget, of a lookup CELLAR leaves unanswered for 20 s.",
       recovery:
-        'Narrow the search with a closer date_from/date_to range, a document_type, or a more specific keyword, then search again.',
+        'Narrow the search with a closer date_from/date_to range or a more specific keyword, then search again.',
       thrownBy: 'service',
     },
   ],
 
   async handler(input, ctx) {
+    const narrowingHint = unsetFiltersHint(NARROWING_FILTERS, input);
     if (isPastSortWindow(input.offset)) {
       throw ctx.fail(
         'offset_past_window',
         `offset ${input.offset} is past row 10,000, the last row CELLAR sorts for one search, so no page starts there.`,
+        narrowingHint
+          ? {
+              recovery: {
+                hint: `${ctx.recoveryFor('offset_past_window').recovery.hint} ${narrowingHint}`,
+              },
+            }
+          : undefined,
       );
     }
     const svc = getCellarSparqlService();
@@ -564,15 +589,16 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
      * `!== undefined`, never truthiness: `false` is a supplied filter, while an
      * omitted optional boolean is undefined and must leave the gate closed.
      */
-    const hasEffectiveFilter =
-      !!keywordInput ||
-      !!input.document_type ||
-      !!dateFrom ||
-      !!dateTo ||
-      !!eurovocConcept ||
-      !!authorInput ||
-      input.in_force !== undefined;
-    if (!hasEffectiveFilter) {
+    const effectiveFilterCount = [
+      keywordInput,
+      input.document_type,
+      dateFrom,
+      dateTo,
+      eurovocConcept,
+      authorInput,
+      input.in_force !== undefined,
+    ].filter(Boolean).length;
+    if (effectiveFilterCount === 0) {
       throw ctx.fail(
         'no_filters',
         'A document search needs at least one narrowing filter; an unfiltered query would scan the entire 2.7M-work corpus.',
@@ -712,7 +738,11 @@ ${projection('?date')} WHERE {
       ...(input.in_force !== undefined ? { in_force: input.in_force } : {}),
     };
 
-    const bindings = await svc.queryWithContinuation(sparql, ctx);
+    const bindings = await withTimeoutAlternative(
+      ctx,
+      narrowingHint,
+      svc.queryWithContinuation(sparql, ctx),
+    );
     ctx.log.info('Document search', {
       keyword: input.keyword,
       documentType: input.document_type,
@@ -723,18 +753,44 @@ ${projection('?date')} WHERE {
     /**
      * Zero hits is an answer, not a failure (#112): an empty first page returns the
      * same shape as a page past the end, plus a notice naming the filters and how to
-     * broaden them — or, for a EuroVoc search of case law, where case law is searched
-     * by subject (#176). A page past the end stays silent — the caller already has
-     * rows. Each echoed value is bounded; query_echo keeps it whole.
+     * broaden them, each step on a filter the call set and leaving the call one to
+     * search on (#186) — or, for a EuroVoc search of case law, where case law is
+     * searched by subject (#176). A page past
+     * the end stays silent — the caller already has rows. Each echoed value is
+     * bounded; query_echo keeps it whole.
      */
     if (bindings.length === 0 && input.offset === 0) {
       const filterSummary = Object.entries(queryEcho)
         .map(([k, v]) => `${k}=${echoValue(String(v))}`)
         .join(', ');
+      const removable = [
+        ...(input.document_type ? ['document_type'] : []),
+        ...(eurovocConcept ? ['eurovoc_concept'] : []),
+        ...(authorInput ? ['author_institution'] : []),
+        ...(input.in_force !== undefined ? ['in_force'] : []),
+      ];
+      // Removing a call's only filter leaves a call the no_filters gate rejects, so that
+      // filter is offered another value instead; a removal is named while another remains.
+      const filterSteps =
+        removable.length === 0
+          ? []
+          : effectiveFilterCount > 1
+            ? [`removing ${OR_LIST.format(removable)}`]
+            : [
+                removable[0] === 'in_force'
+                  ? `setting in_force to ${!input.in_force}`
+                  : `trying a different ${removable[0]}`,
+              ];
+      // The no_filters gate leaves at least one of these steps.
+      const steps = [
+        ...(keywordInput ? ['trying a shorter keyword'] : []),
+        ...(dateFrom || dateTo ? ['expanding the date range'] : []),
+        ...filterSteps,
+      ];
       const guidance =
         eurovocConcept && (input.document_type === 'JUDG' || input.document_type === 'OPIN_AG')
           ? CASE_LAW_EUROVOC_GUIDANCE
-          : 'Broaden the search by removing filters, trying a shorter keyword, or expanding the date range.';
+          : `Broaden the search by ${OR_LIST.format(steps)}.`;
       ctx.enrich.notice(`No documents matched the search criteria (${filterSummary}). ${guidance}`);
     }
 

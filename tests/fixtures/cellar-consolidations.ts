@@ -31,6 +31,13 @@ const AGENT_LABELS: ReadonlyMap<string, string> = new Map(
 
 /** One CELLAR work in the fixture set. */
 export interface FixtureAct {
+  /**
+   * Each work whose `cdm:resource_legal_amends_resource_legal` names this one (#188):
+   * its CELEX and the `reference_to_modified_location` designators its axioms record,
+   * written compact (`AR 113 PA 3 PTA (a)`); each upper-case code is stored as CELLAR
+   * stores it, a `{CODE|<fd_370 URI>}` token.
+   */
+  amendedBy?: { celex: string; locations: string[] }[];
   /** Base act work, via `cdm:act_consolidated_based_on_resource_legal`. */
   basedOn?: string;
   /** `cdm:act_consolidated_date`, on a consolidated text. */
@@ -160,6 +167,17 @@ export const WORK = {
   representativeActions: `${CELLAR}b5ff45c2-35f4-11eb-b27b-01aa75ed71a1`,
   threeProcedureDecision: `${CELLAR}fffc51cb-88dd-11ee-99ba-01aa75ed71a1`,
   initiatorOnlyProposal: `${CELLAR}29292a50-c615-4258-941f-e5b2cc95c3c5`,
+  mdr: `${CELLAR}83bdc18f-315d-11e7-9412-01aa75ed71a1`,
+  eudr: `${CELLAR}d80446fe-0660-11ee-b12e-01aa75ed71a1`,
+  csddd: `${CELLAR}a416fd73-3a66-11ef-a1cb-01aa75ed71a1`,
+  remit: `${CELLAR}43657d28-ddcc-4428-8a57-532c2cddb901`,
+  pendingDecision2306: `${CELLAR}aed35b77-cd2f-11f1-8b4c-01aa75ed71a1`,
+  placeholderDeadline: `${CELLAR}fixture-32016L0802`,
+  mixedDeadlines: `${CELLAR}fixture-32025L0872`,
+  deadlineBesidePlaceholder: `${CELLAR}fixture-31996L0062`,
+  placeholderEnd: `${CELLAR}fixture-31977R0256`,
+  placeholderOnly: `${CELLAR}fixture-31980D0032`,
+  dotAmended: `${CELLAR}fixture-32099R0050`,
 } as const;
 
 /** The Official Journal reference facts of an act (#169), as CELLAR held them on 2026-10-24. */
@@ -173,6 +191,15 @@ const withReasons = (
   act: FixtureAct,
   reasons: Pick<FixtureAct, 'endOfValidity' | 'entryIntoForce' | 'repealedBy'>,
 ): FixtureAct => ({ ...act, ...reasons });
+
+/** The acts amending an act (#188), as CELLAR held them on 2026-11-09. */
+const withAmendments = (
+  act: FixtureAct,
+  amendedBy: NonNullable<FixtureAct['amendedBy']>,
+): FixtureAct => ({
+  ...act,
+  amendedBy,
+});
 
 /** CELLAR's end-of-validity placeholder for an act with no end date. */
 const OPEN_ENDED = '9999-12-31';
@@ -190,19 +217,31 @@ const proposal = (uri: string, date: string): FixtureAct => ({
 
 /** Every fixture work, keyed by CELEX. */
 export const ACTS: Record<string, FixtureAct> = {
-  /** Published act by act, in force in five stages; three of its application dates are partial. */
-  '32024R1689': withCitation(base(WORK.aiAct, '2024-06-13', '1', ['EP', 'CONSIL'], 7, 2), {
-    eli: ['http://data.europa.eu/eli/reg/2024/1689/oj'],
-    entryIntoForce: ['2025-02-02', '2024-08-01', '2027-08-02', '2025-08-02', '2026-08-02'],
-    effectTypes: {
-      '2024-08-01': [['EV', '{DATPUB} +20 {V} {ART} 113']],
-      '2025-02-02': [['MA', '{MA/PART} {V} {ART} 113(a)']],
-      '2025-08-02': [['MA', '{MA/PART} {V} {ART} 113(b)']],
-      '2026-08-02': [['MA', '{V} {ART} 113']],
-      '2027-08-02': [['MA', '{MA/PART} {V} {ART} 113(c)']],
-    },
-    oj: { act: { collection: 'OJ-L', date: '2024-07-12', year: '2024', number: '1689' } },
-  }),
+  /**
+   * Published act by act, in force in five stages; three of its application dates are
+   * partial. Regulation (EU) 2026/1744 replaced points (a) and (c) of Article 113, the
+   * article setting all five, and inserted (d) (#188).
+   */
+  '32024R1689': withAmendments(
+    withCitation(base(WORK.aiAct, '2024-06-13', '1', ['EP', 'CONSIL'], 7, 2), {
+      eli: ['http://data.europa.eu/eli/reg/2024/1689/oj'],
+      entryIntoForce: ['2025-02-02', '2024-08-01', '2027-08-02', '2025-08-02', '2026-08-02'],
+      effectTypes: {
+        '2024-08-01': [['EV', '{DATPUB} +20 {V} {ART} 113']],
+        '2025-02-02': [['MA', '{MA/PART} {V} {ART} 113(a)']],
+        '2025-08-02': [['MA', '{MA/PART} {V} {ART} 113(b)']],
+        '2026-08-02': [['MA', '{V} {ART} 113']],
+        '2027-08-02': [['MA', '{MA/PART} {V} {ART} 113(c)']],
+      },
+      oj: { act: { collection: 'OJ-L', date: '2024-07-12', year: '2024', number: '1689' } },
+    }),
+    [
+      {
+        celex: '32026R1744',
+        locations: ['AR 113 PA 3 PTA (a)', 'AR 113 PA 3 PTA (c)', 'AR 113 PA 3 PTA (d)'],
+      },
+    ],
+  ),
   '02024R1689-20260727': consolidation(
     `${CELLAR}b1730fb2-8f1c-11f1-9262-01aa75ed71a1`,
     WORK.aiAct,
@@ -465,6 +504,172 @@ export const ACTS: Record<string, FixtureAct> = {
   '32020L1828': base(WORK.representativeActions, '2020-11-25', '1', ['EP', 'CONSIL'], 2, 1, 'DIR'),
   '32023D2641': base(WORK.threeProcedureDecision, '2023-11-20', '1', ['CONSIL'], 2, 1, 'DEC'),
   '52000PC0609': proposal(WORK.initiatorOnlyProposal, '2000-09-29'),
+  /*
+   * #187 and #188: acts recording CELLAR's no-date values (1001-01-01, 1002-02-02)
+   * among their dates, and acts whose date-setting article an amending act changed,
+   * as CELLAR held them on 2026-11-09. Comments of the acts marked so are reduced to
+   * the clause they name.
+   */
+  /**
+   * The MDR: an EUDAMED-dependent stage CELLAR dates 1001-01-01 beside ten real ones,
+   * all set by Article 123, which three acts amended.
+   */
+  '32017R0745': withAmendments(
+    withCitation(base(WORK.mdr, '2017-04-05', '1', ['EP', 'CONSIL'], 3, 1), {
+      entryIntoForce: [
+        '2027-05-26',
+        '1001-01-01',
+        '2017-05-25',
+        '2017-11-26',
+        '2018-05-26',
+        '2019-05-26',
+        '2020-04-24',
+        '2021-05-26',
+        '2023-05-26',
+        '2025-05-26',
+      ],
+      effectTypes: {
+        '1001-01-01': [['MA', '{MA/PART} {V} {ART} 123.3(d) {ET} 123.3(e) {ET} 123.3(ea)']],
+        '2017-05-25': [['EV', '{DATPUB} +20 {V} {ART} 123.1']],
+        '2017-11-26': [['MA', '{MA/PART} {V} {ART} 123.3(a) {ET} 123.3(b)']],
+        '2018-05-26': [['MA', '{MA/PART} {V} {ART} 123.3(c)']],
+        '2019-05-26': [['MA', '{MA/PART} {V} {ART} 123.3(i)']],
+        '2020-04-24': [['MA', '{MA/PART} {V} {ART} 123.3(j)']],
+        '2021-05-26': [
+          ['MA', '{MA/PART} {V} {ART} 123.3(a) {ET} 123.3(f)'],
+          ['MA', '{V} {ART} 123.2'],
+        ],
+        '2023-05-26': [['MA', '{MA/PART} {V} {ART} 123.3(f) {ET} 123.3(g)']],
+        '2025-05-26': [['MA', '{MA/PART} {V} {ART} 123.3(f) {ET} 123.3(g)']],
+        '2027-05-26': [['MA', '{MA/PART} {V} {ART} 123.3(g)']],
+      },
+    }),
+    [
+      { celex: '32020R0561', locations: ['AR 123 PA 2 TXT', 'AR 123 PA 3 PTA (a) TEXT'] },
+      { celex: '32023R0607', locations: ['AR 123 PA 3 PTA (d) TIRE 24'] },
+      { celex: '32024R1860', locations: ['AR 123 PA 3 PTA (e)', 'AR 123 PA 3 PTA (ea)'] },
+    ],
+  ),
+  /** A transposition deadline CELLAR records only as 1001-01-01. */
+  '32016L0802': withCitation(
+    base(WORK.placeholderDeadline, '2016-05-11', '1', ['EP', 'CONSIL'], 2, 1, 'DIR'),
+    {
+      entryIntoForce: ['2016-06-10'],
+      effectTypes: { '2016-06-10': [['EV', '{DATPUB} +20 {V} {ART} 20']] },
+      transposition: ['1001-01-01'],
+    },
+  ),
+  /** Four real transposition deadlines beside 1001-01-01. Comments reduced. */
+  '32025L0872': withCitation(
+    base(WORK.mixedDeadlines, '2025-04-14', '1', ['EP', 'CONSIL'], 2, 1, 'DIR'),
+    {
+      entryIntoForce: ['2025-05-07'],
+      effectTypes: { '2025-05-07': [['EV', '{V} {ART} 3']] },
+      transposition: ['2027-12-31', '1001-01-01', '2025-12-31', '2028-01-01', '2026-01-01'],
+    },
+  ),
+  '31996L0062': withCitation(
+    base(WORK.deadlineBesidePlaceholder, '1996-09-27', '1', ['CONSIL'], 2, 1, 'DIR'),
+    { transposition: ['1001-01-01', '1998-05-21'] },
+  ),
+  /** Not in force, its only end of validity 1002-02-02. Comments reduced. */
+  '31977R0256': withCitation(
+    withReasons(base(WORK.placeholderEnd, '1977-02-07', '0', ['COM'], 2, 1), {
+      endOfValidity: ['1002-02-02'],
+    }),
+    {
+      entryIntoForce: ['1977-02-11', '1977-02-01'],
+      effectTypes: {
+        '1977-02-01': [['MA', '{V} {ART} 1']],
+        '1977-02-11': [['EV', '{V} {ART} 2']],
+      },
+    },
+  ),
+  /** Its only date of effect is 1002-02-02. */
+  '31980D0032': withCitation(base(WORK.placeholderOnly, '1980-01-01', '1', ['COM'], 1, 1, 'DEC'), {
+    entryIntoForce: ['1002-02-02'],
+    effectTypes: { '1002-02-02': ['EV'] },
+  }),
+  /** Not yet in force: an application date CELLAR records as 1001-01-01, in force from 2026-11-10. */
+  '32026D2306': withCitation(
+    base(WORK.pendingDecision2306, '2026-10-20', '0', ['COM'], 1, 1, 'DEC'),
+    {
+      entryIntoForce: ['1001-01-01', '2026-11-10'],
+      effectTypes: {
+        '1001-01-01': [['MA', '{V} {ART} 2']],
+        '2026-11-10': [['EV', '{DATPUB} +20 {V} {ART} 2']],
+      },
+    },
+  ),
+  /** The EUDR: two staged dates set by Article 38, which two acts amended. */
+  '32023R1115': withAmendments(
+    withCitation(base(WORK.eudr, '2023-05-31', '1', ['EP', 'CONSIL'], 3, 1), {
+      entryIntoForce: ['2027-06-30', '2023-06-29', '2026-12-30'],
+      effectTypes: {
+        '2023-06-29': [['EV', '{DATPUB} +20 {V} {ART} 38.1']],
+        '2026-12-30': [['MA', '{MA/PART} {V} {ART} 38.2 {ET}']],
+        '2027-06-30': [['MA', '{MA/PART} {V} {ART} 38.3 {ET}']],
+      },
+    }),
+    [
+      { celex: '32024R3234', locations: ['AR 38 PA 2', 'AR 38 PA 3'] },
+      { celex: '32025R2650', locations: ['AR 38'] },
+    ],
+  ),
+  /** The CSDDD: in force by Article 38; its amendments change other articles. */
+  '32024L1760': withAmendments(
+    withCitation(base(WORK.csddd, '2024-06-13', '1', ['EP', 'CONSIL'], 3, 1, 'DIR'), {
+      entryIntoForce: ['2024-07-25'],
+      effectTypes: { '2024-07-25': [['EV', '{DATPUB} +20 {V} {ART} 38']] },
+    }),
+    [
+      { celex: '32025L0794', locations: ['AR 37 PA 1 ALN 1', 'AR 37 PA 1 ALN 2'] },
+      {
+        celex: '32026L0470',
+        locations: ['AR 1 PA 1', 'AR 2 PA 1 PTA (a)', 'AR 19 PA 3', 'AR 37 PA 1 ALN 1'],
+      },
+    ],
+  ),
+  /**
+   * REMIT: its amended Article 8 is cited only by four stages CELLAR dates 1001-01-01,
+   * whose comments carry no {V} code.
+   */
+  '32011R1227': withAmendments(
+    withCitation(base(WORK.remit, '2011-10-25', '1', ['EP', 'CONSIL'], 3, 1), {
+      entryIntoForce: ['1001-01-01', '2011-12-28'],
+      effectTypes: {
+        '1001-01-01': [
+          ['MA', '{MA/PART} {ART} 8P1'],
+          ['MA', '{MA/PART} {ART} 8P3L1'],
+          ['MA', '{MA/PART} {ART} 8P4'],
+          ['MA', '{MA/PART} {ART} 8P5'],
+        ],
+        '2011-12-28': [['EV', '{DATPUB} + 20 {V} {ART} 22']],
+      },
+    }),
+    [
+      { celex: '32024R1106', locations: ['AR 1 PA 2', 'AR 13a', 'AR 15'] },
+      { celex: '32024R1789', locations: ['AR 2 PO 1 PTA (b) TXT', 'AR 8 PO 5 TXT'] },
+    ],
+  ),
+  /**
+   * A synthetic act whose dates Article 5 sets, for the bounds of an article's
+   * location: Article 5 followed by a dot, and neither Article 50, Article 5a, nor the
+   * compact form.
+   */
+  '32099R0050': withAmendments(
+    withCitation(base(WORK.dotAmended, '2099-01-01', '1', ['COM'], 1, 1), {
+      entryIntoForce: ['2099-02-01', '2099-06-01'],
+      effectTypes: {
+        '2099-02-01': [['EV', '{DATPUB} +20 {V} {ART} 5']],
+        '2099-06-01': [['MA', '{MA/PART} {V} {ART} 5.2(a)']],
+      },
+    }),
+    [
+      { celex: '32099R0060', locations: ['AR 5.2 PTA (a)'] },
+      { celex: '32099R0061', locations: ['AR 50', 'AR 5a', 'AR 15 PA 5', 'A5P2'] },
+    ],
+  ),
 };
 
 /** A procedure dossier: one carrying `procedure_code_interinstitutional_reference_procedure` (#180). */
@@ -751,6 +956,7 @@ export async function fakeConsolidationCellar(sparql: string): Promise<Row[]> {
 
   const act = addressedAct(sparql);
   if (!act) return [];
+  if (isDateAmendmentsQuery(sparql)) return dateAmendmentRows(sparql, act);
   if (sparql.includes('cdm:work_created_by_agent')) {
     const readsLabel = sparql.includes('?agentLabel');
     return act.creators.map((c) => {
@@ -808,20 +1014,66 @@ function actReadBy(sparql: string, predicate: string): FixtureAct | undefined {
 const pagePairs = (pages: [string, string?][] | undefined) =>
   [...new Set((pages ?? []).map(([first, last]) => `${first}|${last ?? ''}`))].join(' ') || '|';
 
-/**
- * A `comment_on_date` written with bare `{CODE}` tokens, as the citation query's
- * aggregate carries it (#181): each token stored as CELLAR stores it,
- * `{CODE|<fd_335 URI>}`, then encoded by SPARQL `ENCODE_FOR_URI`, which also escapes
- * the `!'()*` that `encodeURIComponent` leaves.
- */
-export function encodedComment(comment: string): string {
-  const stored = comment.replace(
+/** A `comment_on_date` written with bare `{CODE}` tokens, each stored as CELLAR stores it, `{CODE|<fd_335 URI>}`. */
+const storedComment = (comment: string) =>
+  comment.replace(
     /\{([^{}|]+)\}/g,
     (_token, code: string) => `{${code}|${FD_335}${encodeURIComponent(code)}}`,
   );
-  return encodeURIComponent(stored).replace(
+
+/**
+ * A `comment_on_date` written with bare `{CODE}` tokens, as the citation query's
+ * aggregate carries it (#181): stored as CELLAR stores it, then encoded by SPARQL
+ * `ENCODE_FOR_URI`, which also escapes the `!'()*` that `encodeURIComponent` leaves.
+ */
+export function encodedComment(comment: string): string {
+  return encodeURIComponent(storedComment(comment)).replace(
     /[!'()*]/g,
     (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`,
+  );
+}
+
+const FD_370 = 'http://publications.europa.eu/resource/authority/fd_370/';
+
+/** A compact designator (`AR 113 PA 3 PTA (a)`) as CELLAR stores it, each upper-case code a `{CODE|<fd_370 URI>}` token. */
+const storedLocation = (location: string) =>
+  location
+    .split(' ')
+    .map((word) => (/^[A-Z]+$/.test(word) ? `{${word}|${FD_370}${word}}` : word))
+    .join(' ');
+
+/** True for the query reading the locations an act's amending acts changed (#188). */
+export function isDateAmendmentsQuery(sparql: string): boolean {
+  return sparql.includes('?amenderCelex');
+}
+
+/**
+ * The rows of the date-amendments query (#188), as CELLAR evaluates it as written: one
+ * per `reference_to_modified_location` an amending act of `act` records, read only when
+ * the query reads it from the `resource_legal_amends_resource_legal` axiom and kept
+ * only when it opens with the prefix a `STRSTARTS` filter names. Each row binds only
+ * the plain variables the query projects, the amending act's CELEX only when the query
+ * joins it, so an aggregate the query projects is never answered.
+ */
+function dateAmendmentRows(sparql: string, act: FixtureAct): Row[] {
+  const readsLocations =
+    /annotatedProperty> cdm:resource_legal_amends_resource_legal ;[\s\S]*#reference_to_modified_location> \?location \./.test(
+      sparql,
+    );
+  if (!readsLocations) return [];
+  const projected = /SELECT\s+(?:DISTINCT\s+)?(.*?)\s+WHERE/s.exec(sparql)?.[1]?.split(/\s+/) ?? [];
+  const bindsCelex =
+    projected.includes('?amenderCelex') &&
+    sparql.includes('?amender cdm:resource_legal_id_celex ?amenderCelex .');
+  const prefix = /FILTER\(STRSTARTS\(STR\(\?location\), "([^"]*)"\)\)/.exec(sparql)?.[1] ?? '';
+  return (act.amendedBy ?? []).flatMap(({ celex, locations }) =>
+    locations
+      .map(storedLocation)
+      .filter((location) => location.startsWith(prefix))
+      .map((location) => ({
+        ...(bindsCelex ? { amenderCelex: literal(celex) } : {}),
+        ...(projected.includes('?location') ? { location: literal(location) } : {}),
+      })),
   );
 }
 

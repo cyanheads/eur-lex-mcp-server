@@ -16,9 +16,12 @@ import { renderNoticeBlockquote } from '@/mcp-server/tools/markdown-render.js';
 import { withTimeoutAlternative } from '@/mcp-server/tools/timeout-alternative.js';
 import {
   actCitationQuery,
+  type DateAmendment,
   type DateOfEffect,
+  dateAmendmentsQuery,
   EFFECT_TYPE_VALUES,
   readActCitation,
+  readDateAmendments,
 } from '@/services/cellar-sparql/act-citation.js';
 import { type CaseLawFacts, fetchCaseLawFacts } from '@/services/cellar-sparql/case-law-facts.js';
 import {
@@ -42,6 +45,11 @@ import {
   resolveEliToWork,
 } from '@/services/cellar-sparql/eli-resolution.js';
 import {
+  celexMissError,
+  findHeldCelex,
+  type HeldCelex,
+} from '@/services/cellar-sparql/held-celex.js';
+import {
   fetchLegislativeProcedures,
   type LegislativeProcedure,
   PROCEDURE_STATUS_VALUES,
@@ -51,7 +59,11 @@ import {
   findConsolidation,
   isConsolidatedCelex,
 } from '@/services/cellar-sparql/relation-traversal.js';
-import { cellarDate, UNDATED_PLACEHOLDER } from '@/services/cellar-sparql/sort-window.js';
+import {
+  cellarDate,
+  UNDATED_PLACEHOLDER,
+  UNDATED_PLACEHOLDERS,
+} from '@/services/cellar-sparql/sort-window.js';
 import type { SparqlBinding } from '@/services/cellar-sparql/types.js';
 import { fetchWorkAgents } from '@/services/cellar-sparql/work-agents.js';
 import { resolveCelexWorks } from '@/services/cellar-sparql/work-resolution.js';
@@ -62,6 +74,7 @@ import {
   isCaseLawCelex,
   outermostSections,
   readDocumentStructure,
+  readSelectorString,
   type SectionSelectors,
   type SelectedSection,
 } from '@/services/eurlex-content/act-structure.js';
@@ -72,6 +85,7 @@ import {
   type EurLexLanguage,
   getEurLexContentService,
   LANGUAGE_TO_ISO_639_2,
+  normalizeLanguageCode,
 } from '@/services/eurlex-content/eurlex-content-service.js';
 
 /**
@@ -95,6 +109,90 @@ const EURLEX_LANGUAGE_PATTERN = new RegExp(
     [...code].map((letter) => `[${letter}${letter.toLowerCase()}]`).join(''),
   ).join('|')})$`,
 );
+
+/**
+ * The select field a key names once case-folded — `-` and `_` dropped, lower-cased —
+ * as itself or in the singular (#195): `article`, `Articles`, and `operative-part`
+ * name `articles`, `articles`, and `operative_part`.
+ */
+const SELECT_KEYS = new Map<string, keyof SectionSelectors>([
+  ['articles', 'articles'],
+  ['article', 'articles'],
+  ['chapters', 'chapters'],
+  ['chapter', 'chapters'],
+  ['recitals', 'recitals'],
+  ['recital', 'recitals'],
+  ['annexes', 'annexes'],
+  ['annex', 'annexes'],
+  ['headings', 'headings'],
+  ['heading', 'headings'],
+  ['operativepart', 'operative_part'],
+]);
+
+/**
+ * A select object as the schema reads it (#195): a key naming a field it does not
+ * spell (`article`, `Articles`) renamed to that field when the field is absent and
+ * no other key claims it, and a list of strings or safe integers in a comma-separated
+ * field joined with commas (`["1", 5]` as `"1,5"`, `[]` as `""`). Any other key or
+ * value is kept as sent, for the schema to decide.
+ */
+function normalizeSelectObject(select: object): Record<string, unknown> {
+  const entries = Object.entries(select);
+  const keys = new Set(entries.map(([key]) => key));
+  const claims = new Map<string, string[]>();
+  for (const [key] of entries) {
+    const field = SELECT_KEYS.get(key.replaceAll(/[-_]/g, '').toLowerCase());
+    if (field && !keys.has(field)) claims.set(field, [...(claims.get(field) ?? []), key]);
+  }
+  const renamed = new Map<string, string>();
+  for (const [field, [key, ...rest]] of claims) {
+    if (key && rest.length === 0) renamed.set(key, field);
+  }
+  return Object.fromEntries(
+    entries.map(([key, value]) => {
+      const name = renamed.get(key) ?? key;
+      // A field spelled as itself is one of the five comma-separated ones.
+      const joins =
+        SELECT_KEYS.get(name) === name &&
+        Array.isArray(value) &&
+        value.every((item) => typeof item === 'string' || Number.isSafeInteger(item));
+      return [name, joins ? value.join(',') : value];
+    }),
+  );
+}
+
+/**
+ * The select value the schema reads (#195): an object normalized by
+ * {@link normalizeSelectObject}, and a string read by its kind words
+ * ({@link readSelectorString}) unless it opens `{` or `[`, which the framework's
+ * JSON repair reads. Any other value raises the issue the object schema raises for
+ * it, from here: an issue raised inside the transform leaves the framework reading
+ * the value as sent ("Send select as an object, not a string."), where the object's
+ * own issue, below a transform, would only be restated.
+ */
+function readSelect(value: unknown, ctx: z.core.$RefinementCtx): unknown {
+  if (value === undefined) return value;
+  if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+    return normalizeSelectObject(value);
+  }
+  if (typeof value === 'string' && !/^[{[]/.test(value.trimStart())) {
+    const selectors = readSelectorString(value);
+    if (selectors) return selectors;
+  }
+  ctx.addIssue({ expected: 'object', code: 'invalid_type', input: value });
+  return value;
+}
+
+/**
+ * `schema` read through {@link readSelect}, advertised in `tools/list` as `schema`
+ * byte for byte: a `z.preprocess`, with `schema`'s description reported as the
+ * wrapper's own for the definition linter, as {@link enumInput} does.
+ */
+function selectInput<S extends z.ZodType>(schema: S) {
+  return Object.defineProperty(z.preprocess(readSelect, schema), 'description', {
+    value: schema.description,
+  });
+}
 
 /**
  * Present HTML/XML source as literal text without allowing source-owned tildes
@@ -121,6 +219,32 @@ const META_DIMENSION_LIMIT = 100;
 
 /** CELLAR's end-of-validity value for an act with no end date. */
 const OPEN_ENDED_VALIDITY = '9999-12-31';
+
+/** CELLAR's values for no date, as describes name them: `1001-01-01, 1002-02-02`. */
+const NO_DATE_VALUES = UNDATED_PLACEHOLDERS.join(', ');
+
+const LIST = new Intl.ListFormat('en', { style: 'long', type: 'conjunction' });
+
+/**
+ * The notice for the amending acts that changed an article setting a listed date of
+ * effect (#188), each named by CELEX with its articles. CELLAR may not have moved the
+ * dates since, so it points to the current consolidated version (`currentCelex`) and,
+ * for an amendment that version does not merge yet or when there is none, the
+ * amending act.
+ */
+function dateAmendmentNotice(amendments: DateAmendment[], currentCelex?: string): string {
+  const named = amendments.map(
+    ({ celex, articles }) =>
+      `${celex} (${articles.length === 1 ? 'Article' : 'Articles'} ${LIST.format(articles)})`,
+  );
+  const several = amendments.length > 1;
+  const articleCount = new Set(amendments.flatMap((a) => a.articles)).size;
+  const amendingActs = several ? 'the amending acts' : 'the amending act';
+  const confirm = currentCelex
+    ? `confirm them in the current consolidated version, ${currentCelex} (current_consolidated_celex), or, for an amendment it does not merge yet, in ${amendingActs}.`
+    : `confirm them in ${amendingActs}.`;
+  return `${several ? 'Amending acts' : 'An amending act'} changed ${articleCount === 1 ? 'an article' : 'articles'} setting dates listed in dates_of_effect: ${LIST.format(named)}. CELLAR may not have updated those dates; ${confirm}`;
+}
 
 /** Sparse national-measure citation facts retain CELLAR's lexical strings. */
 const NationalMeasureSchema = z.object({
@@ -220,12 +344,16 @@ export const eurlex_get_document = tool('eurlex_get_document', {
         .enum(RESOLVE_MODES)
         .default('as_requested')
         .describe(
-          'Which version to serve. "as_requested" (default) returns the exact CELEX requested; "current_consolidated" serves the newest consolidated version in effect of the requested act — or, for a consolidated CELEX, of its base act — echoing the request in requested_celex, and is a no-op when none exists (with a notice when the act\'s only consolidated versions are dated in the future). Either way, is_superseded / current_consolidated_celex / consolidated_as_of describe the text served.',
+          'Which version to serve. "as_requested" (default) returns the exact CELEX requested; "current_consolidated" serves the newest consolidated version in effect of the requested act — or, for a consolidated CELEX, of its base act, and for a consolidated CELEX that names no work (no date, or a date no version carries, e.g. 02014R0833), of the one act whose consolidated versions start with that CELEX before its date, with a notice — echoing the request in requested_celex, and is a no-op when none exists (with a notice when the act\'s only consolidated versions are dated in the future). Either way, is_superseded / current_consolidated_celex / consolidated_as_of describe the text served.',
         ),
     ),
     language: z
       .string()
-      .regex(EURLEX_LANGUAGE_PATTERN, 'language must be one of the 24 supported EUR-Lex codes')
+      .overwrite(normalizeLanguageCode)
+      .regex(
+        EURLEX_LANGUAGE_PATTERN,
+        `language must be one of the 24 supported EUR-Lex codes: ${EURLEX_LANGUAGES.join(', ')}`,
+      )
       .overwrite((value) => value.toUpperCase())
       .pipe(z.enum(EURLEX_LANGUAGES))
       .default('EN')
@@ -282,38 +410,49 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .describe(
         'List every recital as its own outline entry, with its own offset, instead of one entry for the run. Applies only when outline is true; select reaches a single recital either way.',
       ),
-    select: z
-      .object({
-        articles: z.string().optional().describe('Comma-separated article numbers, e.g. "1,5,17".'),
-        chapters: z
-          .string()
-          .optional()
-          .describe('Comma-separated chapter numbers, Roman or Arabic, e.g. "I,IV" or "1,4".'),
-        recitals: z.string().optional().describe('Comma-separated recital numbers, e.g. "1,10".'),
-        annexes: z
-          .string()
-          .optional()
-          .describe(
-            'Comma-separated annex numbers or letters, e.g. "I,II". "ANNEX" alone (any case, or the served language\'s annex word, e.g. "Anhang") selects an act\'s lone unnumbered annex; on an act whose annexes are numbered it misses, and the notice names their numbers.',
-          ),
-        headings: z
-          .string()
-          .optional()
-          .describe(
-            'Case law: comma-separated positions of section headings, as numbered in the outline, e.g. "2" or "1,4". A section runs to the next heading or the operative part.',
-          ),
-        operative_part: z
-          .boolean()
-          .optional()
-          .describe(
-            'Case law: true to return a judgment\'s or order\'s operative part (the ruling) to the end of the body: from its opening words ("On those grounds, …") in a modern body, from the "Operative part" section in a legacy one.',
-          ),
-      })
-      .optional()
-      .describe(
-        `Return only the text of specific sections by type and number, instead of a raw character window (Roman and Arabic numbers are equivalent; a number may carry an English kind word or one in the language served, e.g. "Article 5", "Artikel 5", "5. cikk"). For case law, select headed sections by position or the operative part. An act's section runs to its next heading, and its last article, section, and chapter stop where the enacting terms end: the closing formula, signatures, and footnotes after them (and in xml the annexes) belong to no section, nor do the notes closing a consolidated text — read those by paging on from the section's end. Sections are located in the body of the requested format, so pair select with the same format used for any outline. A section inside another selected section (an article in a selected chapter) is returned once, within the enclosing one. A section that cannot be located — including a number that appears only in text an amending act inserts into another act — is reported in selection.missed with no wrong text returned. offset and limit do not apply: the joined sections are capped at ${MAX_CONTENT_LIMIT} characters with no continuation, and each section stays readable on its own from its offset and chars in selected_sections. Ignored when outline is true or in content_mode "metadata_only".`,
-      ),
+    select: selectInput(
+      z
+        .object({
+          articles: z
+            .string()
+            .optional()
+            .describe('Comma-separated article numbers, e.g. "1,5,17".'),
+          chapters: z
+            .string()
+            .optional()
+            .describe('Comma-separated chapter numbers, Roman or Arabic, e.g. "I,IV" or "1,4".'),
+          recitals: z.string().optional().describe('Comma-separated recital numbers, e.g. "1,10".'),
+          annexes: z
+            .string()
+            .optional()
+            .describe(
+              'Comma-separated annex numbers or letters, e.g. "I,II". "ANNEX" alone (any case, or the served language\'s annex word, e.g. "Anhang") selects an act\'s lone unnumbered annex; on an act whose annexes are numbered it misses, and the notice names their numbers.',
+            ),
+          headings: z
+            .string()
+            .optional()
+            .describe(
+              'Case law: comma-separated positions of section headings, as numbered in the outline, e.g. "2" or "1,4". A section runs to the next heading or the operative part.',
+            ),
+          operative_part: z
+            .boolean()
+            .optional()
+            .describe(
+              'Case law: true to return a judgment\'s or order\'s operative part (the ruling) to the end of the body: from its opening words ("On those grounds, …") in a modern body, from the "Operative part" section in a legacy one.',
+            ),
+        })
+        .optional()
+        .describe(
+          `Return only the text of specific sections by type and number, instead of a raw character window (Roman and Arabic numbers are equivalent; a number may carry an English kind word or one in the language served, e.g. "Article 5", "Artikel 5", "5. cikk"). For case law, select headed sections by position or the operative part. An act's section runs to its next heading, and its last article, section, and chapter stop where the enacting terms end: the closing formula, signatures, and footnotes after them (and in xml the annexes) belong to no section, nor do the notes closing a consolidated text — read those by paging on from the section's end. Sections are located in the body of the requested format, so pair select with the same format used for any outline. A section inside another selected section (an article in a selected chapter) is returned once, within the enclosing one. A section that cannot be located — including a number that appears only in text an amending act inserts into another act — is reported in selection.missed with no wrong text returned. offset and limit do not apply: the joined sections are capped at ${MAX_CONTENT_LIMIT} characters with no continuation, and each section stays readable on its own from its offset and chars in selected_sections. Ignored when outline is true or in content_mode "metadata_only".`,
+        ),
+    ),
   }),
+  /*
+   * The names callers guess for celex_number and limit (#194); tools/list still
+   * advertises the canonical keys alone. identifier and id stay rejected: either
+   * could name celex_number, eli_uri, or work_uri.
+   */
+  inputAliases: { celex: 'celex_number', max_chars: 'limit' },
   output: z.object({
     celex_number: z.string().describe('Confirmed CELEX number for the retrieved work.'),
     work_uri: z.string().optional().describe('CELLAR work URI.'),
@@ -482,7 +621,7 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .string()
       .optional()
       .describe(
-        "Earliest entry-into-force date (YYYY-MM-DD) of an act not yet in force. Present only when in_force is false and that date is after today (UTC); for a consolidated text, its base act's. Every recorded date, typed, is in dates_of_effect.",
+        "Earliest entry-into-force date (YYYY-MM-DD) of an act not yet in force, the first date in dates_of_effect. Present only when in_force is false and that date is after today (UTC); for a consolidated text, its base act's. Every recorded date, typed, is in dates_of_effect.",
       ),
     dates_of_effect: z
       .array(
@@ -506,19 +645,19 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       )
       .optional()
       .describe(
-        "Every date of effect CELLAR records for the act, sorted by date, one entry per date, type, and provision (a date can carry several, e.g. entry into force and application), whether past or ahead and whatever in_force says. An act that applies in stages records its general date of application as application and each date from which only some provisions apply as partial_application. For a consolidated text, its base act's. Absent when none is recorded.",
+        `Every date of effect CELLAR records for the act, sorted by date, one entry per date, type, and provision (a date can carry several, e.g. entry into force and application), whether past or ahead and whatever in_force says. An act that applies in stages records its general date of application as application and each date from which only some provisions apply as partial_application. A stage CELLAR records with no date (${NO_DATE_VALUES}) is left out. CELLAR's dates can lag an amending act that moves one: the current consolidated version (current_consolidated_celex) states the dates that apply, and notice names an amending act that changed an article setting a listed date. For a consolidated text, its base act's. Absent when none is recorded.`,
       ),
     end_of_validity: z
       .string()
       .optional()
       .describe(
-        "Date (YYYY-MM-DD) the act's validity ends or ended: past for an expired act, and possibly in the future for one not yet in force (read it with entry_into_force), so on its own it does not mean the act expired. Present only when in_force is false and CELLAR records an actual date rather than its open-ended 9999-12-31; for a consolidated text, its base act's.",
+        `Date (YYYY-MM-DD) the act's validity ends or ended: past for an expired act, and possibly in the future for one not yet in force (read it with entry_into_force), so on its own it does not mean the act expired. Present only when in_force is false and CELLAR records an actual date rather than its open-ended 9999-12-31 or a value for no date (${NO_DATE_VALUES}); for a consolidated text, its base act's.`,
       ),
     transposition_deadlines: z
       .array(z.string().describe('Deadline (YYYY-MM-DD).'))
       .optional()
       .describe(
-        "A directive's deadlines for transposition into national law, sorted. For a consolidated text, its base act's. Absent when none is recorded.",
+        `A directive's deadlines for transposition into national law, sorted; a deadline CELLAR records with no date (${NO_DATE_VALUES}) is left out. For a consolidated text, its base act's. Absent when none is recorded.`,
       ),
     procedures: z
       .array(
@@ -582,7 +721,7 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .string()
       .optional()
       .describe(
-        'The originally requested CELEX, echoed when resolve "current_consolidated" served a different consolidated version. celex_number holds the CELEX actually served. Absent when the served work is the one requested.',
+        'The originally requested CELEX, echoed when resolve "current_consolidated" served a different consolidated version, including one served in place of a consolidated CELEX that names no work. celex_number holds the CELEX actually served. Absent when the served work is the one requested.',
       ),
     content: z
       .string()
@@ -773,7 +912,7 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .string()
       .optional()
       .describe(
-        'How to retrieve the remaining document content; when select.annexes asked for "ANNEX" on an act whose annexes are numbered, which numbers select one; when work_uri names an expression or manifestation, the work served in its place; when a work_uri carries several CELEX numbers, how many it carries and which one was served; and, when no consolidated version is in effect yet, that the consolidated text served does not apply yet, or that resolve "current_consolidated" served the base act.',
+        'How to retrieve the remaining document content; when select.annexes asked for "ANNEX" on an act whose annexes are numbered, which numbers select one; when work_uri names an expression or manifestation, the work served in its place; when a work_uri carries several CELEX numbers, how many it carries and which one was served; when no consolidated version is in effect yet, that the consolidated text served does not apply yet, or that resolve "current_consolidated" served the base act; when resolve "current_consolidated" served a consolidated version in place of a consolidated CELEX that names no work, which version, of which act; and, when an amending act changed an article setting a date listed in dates_of_effect, that act\'s CELEX and the article, since CELLAR may not have updated the date, with where to confirm it.',
       ),
     limit_clamp: limitClampEnrichment,
   },
@@ -796,7 +935,7 @@ export const eurlex_get_document = tool('eurlex_get_document', {
     {
       reason: 'not_found',
       code: JsonRpcErrorCode.NotFound,
-      when: 'The CELEX, ELI, or work URI resolves to no fetchable work — the work is absent from the corpus, or the CELLAR work (for an expression or manifestation URI, the work it belongs to) carries no CELEX number.',
+      when: 'The CELEX, ELI, or work URI resolves to no fetchable work — the work is absent from the corpus, or the CELLAR work (for an expression or manifestation URI, the work it belongs to) carries no CELEX number. A celex_number one numbering convention away from a CELEX CELLAR holds — a consolidated CELEX with no date or a date no version carries, a (nn) suffix missing or extra, a number not zero-padded to four digits — fails with each held CELEX named in the message and in data.held_celex, unless resolve "current_consolidated" serves one.',
       recovery:
         'Verify the identifier with eurlex_lookup_celex; a CELLAR work with no CELEX cannot be fetched as a document.',
     },
@@ -819,7 +958,7 @@ export const eurlex_get_document = tool('eurlex_get_document', {
     {
       reason: 'sparql_timeout',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: "A query this call sent to CELLAR ran past the time budget the call's queries share (retryable: CELLAR's response time varies, so a later call can finish), or CELLAR refused it as too costly to run (not retryable: the same query is refused again). Neither is retried within the call.",
+      when: "A query this call sent to CELLAR ran past the time budget the call's queries share (retryable: CELLAR's response time varies, so a later call can finish), or CELLAR refused it as too costly to run (not retryable: the same query is refused again). Neither is retried within the call, apart from one re-send, inside the same budget, of a lookup CELLAR leaves unanswered for 20 s.",
       recovery:
         "When the error is retryable, call again shortly: whether the call's queries finish inside their time budget turns on CELLAR's response time, not on the request.",
       thrownBy: 'service',
@@ -1073,6 +1212,9 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
       // its resolved work; any other act the legislative procedures it belongs to
       // (#180), from its base act for a consolidated text. No case-law work links
       // to a procedure dossier, so each kind sends only the query that can match.
+      // The article locations the act's amending acts changed (#188) are read
+      // alongside, for legislation only, and matched to the articles setting its dates
+      // of effect once the citation row is in.
       const [
         coreBindings,
         citationBindings,
@@ -1082,6 +1224,7 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
         nationalBindings,
         caseLawFacts,
         procedures,
+        dateAmendmentBindings,
       ] = await Promise.all([
         sparqlSvc.query(coreQuery, ctx),
         sparqlSvc.query(citationQuery, ctx),
@@ -1091,6 +1234,7 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
         celex.startsWith('7') ? sparqlSvc.query(nationalQuery, ctx) : Promise.resolve([]),
         caseLaw ? fetchCaseLawFacts(sparqlSvc, [workUri], ctx) : Promise.resolve(undefined),
         caseLaw ? Promise.resolve([]) : fetchLegislativeProcedures(sparqlSvc, actWork, ctx),
+        caseLaw ? Promise.resolve([]) : sparqlSvc.query(dateAmendmentsQuery(actWork), ctx),
       ]);
 
       /** One entry per distinct URI, carrying the companion literal when bound. */
@@ -1136,10 +1280,14 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
         inForce: CellarSparqlService.parseBoolean(
           CellarSparqlService.bindingValue(first, 'inForce'),
         ),
-        // Every date of effect is a cdm:resource_legal_date_entry-into-force value,
-        // sorted by date, so the first is the earliest entry into force.
+        // Every date of effect is a real cdm:resource_legal_date_entry-into-force value
+        // (#187), sorted by date, so the first is the earliest entry into force.
         entryIntoForce: citation.dates_of_effect?.[0]?.date,
-        endOfValidity: CellarSparqlService.bindingValue(first, 'endOfValidity')?.slice(0, 10),
+        // The MAX sees a no-date value only when the act records no real end date (#187).
+        endOfValidity: cellarDate(CellarSparqlService.bindingValue(first, 'endOfValidity'))?.slice(
+          0,
+          10,
+        ),
         repealedBy: (CellarSparqlService.bindingValue(first, 'repealedBy') ?? '')
           .split(' ')
           .filter(Boolean)
@@ -1155,6 +1303,7 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
         })),
         caseLawFacts: caseLawFacts?.get(workUri),
         procedures,
+        dateAmendments: readDateAmendments(dateAmendmentBindings, citationBindings[0]),
       };
     };
 
@@ -1201,8 +1350,34 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
       currentConsolidated: context.current?.celex,
     });
 
+    /**
+     * A celex_number no work holds can sit one numbering convention away from one
+     * CELLAR holds (#196): on the miss path only, one query names them. Under resolve
+     * "current_consolidated", a consolidated CELEX that names no work is served as
+     * the current version of the one act whose consolidated versions carry its
+     * number, with a notice; anything else held is named in the not_found.
+     */
+    let resolvedNotice: string | undefined;
     if (!metaResult) {
-      throw ctx.fail('not_found', `No CELLAR work found for CELEX: ${servedCelex}`);
+      const missedCelex = servedCelex;
+      const held: HeldCelex =
+        celexInput && missedCelex === requestedCelex
+          ? await findHeldCelex(sparqlSvc, requestedCelex, ctx)
+          : { kind: 'none' };
+      if (held.kind === 'held' && held.current && input.resolve === 'current_consolidated') {
+        const { base, celex, asOf } = held.current;
+        servedCelex = celex;
+        context = { base, current: { celex, asOf } };
+        [metaResult, body] = await Promise.all([
+          fetchMetadata(celex, Promise.resolve(base)),
+          fetchBody(celex),
+        ]);
+        resolvedNotice = `No CELLAR work holds ${requestedCelex}, so resolve "current_consolidated" served ${celex}, the current consolidated version of ${base.celex}.`;
+      }
+      if (!metaResult) {
+        const miss = celexMissError(`No CELLAR work found for CELEX: ${missedCelex}`, held);
+        throw ctx.fail('not_found', miss.message, miss.data, miss.options);
+      }
     }
 
     // Step 2: assemble metadata, then shape the body per content_mode. The body
@@ -1374,6 +1549,11 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
     } else if (!current && context.pending && input.resolve === 'current_consolidated') {
       consolidationNotice = `No consolidated version of ${requestedCelex} is in effect yet (${context.pending.celex} applies from ${context.pending.asOf}), so resolve "current_consolidated" served the base act.`;
     }
+    // #188: a date of effect an amending act may have moved since CELLAR recorded it.
+    const amendmentNotice =
+      metaResult.dateAmendments.length > 0
+        ? dateAmendmentNotice(metaResult.dateAmendments, current?.celex)
+        : undefined;
 
     /** Uncapped size of a structural selection, set only when the cap cut it. */
     let selectedCharsBeforeCap: number | undefined;
@@ -1491,8 +1671,9 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
     // continuation offset; a capped selection has no resumable offset, so it
     // discloses through this enrichment alone and points at the per-section
     // addresses instead (#80).
-    // Both write the one notice field, so the numbered-annex (#156), consolidation
-    // (#109), and served-CELEX (#104) notices ride behind it.
+    // Both write the one notice field, so the numbered-annex (#156), served-in-place
+    // (#196), consolidation (#109), served-CELEX (#104), and amended-date (#188)
+    // notices ride behind it.
     const omissionNotice = result.content_omissions
       ? `The source body omits ${result.content_omissions.tables} table(s), represented by table placeholders. This count covers the full source, including sections outside this view; pagination does not recover those tables. Consult an alternative representation where available.`
       : undefined;
@@ -1504,8 +1685,10 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
       omissionNotice,
       gazetteNotice,
       annexNotice,
+      resolvedNotice,
       consolidationNotice,
       celexNotice,
+      amendmentNotice,
     ]
       .filter(Boolean)
       .join(' ');

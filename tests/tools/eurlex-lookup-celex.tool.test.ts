@@ -3,6 +3,7 @@
  * @module tests/tools/eurlex-lookup-celex.tool.test
  */
 
+import type { z } from '@cyanheads/mcp-ts-core';
 import {
   JsonRpcErrorCode,
   serviceUnavailable,
@@ -136,18 +137,18 @@ describe('eurlex_lookup_celex', () => {
 
     it('falls back to the authority code for an unmapped resource-type URI', async () => {
       const ctx = createMockContext({ errors: eurlex_lookup_celex.errors });
-      // BUDGET is a live CELLAR resource-type with no curated label — the fallback
-      // is deliberately kept, so an uncurated code still resolves to something.
+      // A type CELLAR adds after the label map was written (fabricated here) keeps
+      // its code, so an unlabelled type still resolves to something.
       mockQuery.mockResolvedValue([
         makeBinding('32015B0367', {
-          type: 'http://publications.europa.eu/resource/authority/resource-type/BUDGET',
+          type: 'http://publications.europa.eu/resource/authority/resource-type/NEW_TYPE_2099',
         }),
       ]);
 
       const input = eurlex_lookup_celex.input.parse({ identifier: '32015B0367' });
       const result = await eurlex_lookup_celex.handler(input, ctx);
 
-      expect(result.resource_type).toBe('BUDGET');
+      expect(result.resource_type).toBe('NEW_TYPE_2099');
     });
 
     it('omits resource_type when the work carries none', async () => {
@@ -389,6 +390,136 @@ describe('eurlex_lookup_celex', () => {
     expect(result.found).toBe(false);
     // The /oj retry fired (bare work-level) but also missed — never fabricates a match.
     expect(mockQuery).toHaveBeenCalledTimes(2);
+  });
+
+  describe('#196 a CELEX one numbering convention away from a held CELEX', () => {
+    type Row = Record<string, { type: string; value: string }>;
+    const literal = (value: string) => ({ type: 'literal', value });
+
+    /** A base act's row in the held-versions query: each version as `date|CELEX`. */
+    const baseRow = (celex: string, versions: { current?: string; inEffect?: string }): Row => ({
+      baseCelex: literal(celex),
+      baseWorkUri: literal(`${CELLAR}${celex}`),
+      carriesCore: literal('1'),
+      ...(versions.current ? { current: literal(versions.current) } : {}),
+      ...(versions.inEffect ? { inEffect: literal(versions.inEffect) } : {}),
+    });
+
+    /**
+     * CELLAR answering the held-forms query with the CELEX of `held` it lists and the
+     * base-act query with `bases`; every lookup query misses.
+     */
+    const routeMiss = ({ held = [], bases = [] }: { held?: string[]; bases?: Row[] }) =>
+      mockQuery.mockImplementation(async (q: string) => {
+        if (q.includes('VALUES ?heldCelex')) {
+          return held
+            .filter((c) => q.includes(`"${c}"^^xsd:string`))
+            .map((c) => ({ heldCelex: literal(c) }));
+        }
+        if (q.includes('VALUES ?baseCelex')) return bases;
+        return [];
+      });
+
+    const heldQueries = () =>
+      mockQuery.mock.calls
+        .map((c) => c[0] as string)
+        .filter((q) => q.includes('VALUES ?heldCelex') || q.includes('VALUES ?baseCelex'));
+
+    const lookup = async (identifier: string) => {
+      const response = await runToolContract(eurlex_lookup_celex, { identifier });
+      const text = response.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+      return { response, text, structured: response.structuredContent as Record<string, unknown> };
+    };
+
+    const MISS_ADVICE =
+      'A CELEX reads {sector}{year}{type}{number} (e.g. 32016R0679); an OJ citation resolves when it names its act type and year (e.g. "Regulation (EU) 2016/679"). To find the act by title words or a partial CELEX, use eurlex_search_documents with keyword.';
+    const ONE = 'Pass that CELEX here or to eurlex_get_document.';
+    const SEVERAL = 'Pass the CELEX of the one you want here or to eurlex_get_document.';
+
+    it.each([
+      [
+        '02014R0833',
+        { bases: [baseRow('32014R0833', { current: '2026-07-24|02014R0833-20260724' })] },
+        `CELLAR holds 02014R0833-20260724, the current consolidated version of 32014R0833. ${ONE}`,
+      ],
+      [
+        '02006R1907-20260101',
+        {
+          bases: [
+            baseRow('32006R1907', {
+              current: '2026-06-22|02006R1907-20260622',
+              inEffect: '2025-10-23|02006R1907-20251023',
+            }),
+          ],
+        },
+        `CELLAR holds 02006R1907-20251023, the consolidated version of 32006R1907 in effect on 2026-01-01, and 02006R1907-20260622, its current one. ${SEVERAL}`,
+      ],
+      [
+        '52026AG0012',
+        { held: ['52026AG0012(01)', '52026AG0012(02)'] },
+        `CELLAR holds 52026AG0012(01) and 52026AG0012(02). ${SEVERAL}`,
+      ],
+      ['62009CJ0197(01)', { held: ['62009CJ0197'] }, `CELLAR holds 62009CJ0197. ${ONE}`],
+      ['32023R138', { held: ['32023R0138'] }, `CELLAR holds 32023R0138. ${ONE}`],
+    ])(
+      'keeps found: false for %s and names what CELLAR holds in the notice on both surfaces',
+      async (identifier, cellar, named) => {
+        routeMiss(cellar);
+        const { response, text, structured } = await lookup(identifier);
+        expect(response.isError).toBeFalsy();
+        const notice = `No CELLAR work matches CELEX ${identifier}. ${named}`;
+        expect(structured).toEqual({ found: false, notice });
+        expect(readCommonMark(text)).toContain(notice);
+        expect(heldQueries()).toHaveLength(1);
+      },
+    );
+
+    it('keeps the notice of a CELEX whose forms CELLAR does not hold', async () => {
+      routeMiss({});
+      const { structured } = await lookup('52026AG9999');
+      expect(structured).toEqual({
+        found: false,
+        notice: `No CELLAR work matches CELEX 52026AG9999. ${MISS_ADVICE}`,
+      });
+    });
+
+    it('says the forms went unchecked when CELLAR does not answer the held-CELEX query', async () => {
+      routeMiss({});
+      mockQuery.mockImplementation(async (q: string) => {
+        if (q.includes('VALUES ?heldCelex')) {
+          throw serviceUnavailable('CELLAR SPARQL queries ran past the time budget', {
+            reason: 'sparql_timeout',
+            retryable: true,
+          });
+        }
+        return [];
+      });
+      const { response, structured } = await lookup('52026AG0012');
+      expect(response.isError).toBeFalsy();
+      expect(structured).toEqual({
+        found: false,
+        notice: `No CELLAR work matches CELEX 52026AG0012. ${MISS_ADVICE} CELLAR did not answer whether it holds a CELEX one numbering convention away; call again to check.`,
+      });
+    });
+
+    it.each([
+      ['a CELEX year past next year', '043443136', 'CELEX 043443136'],
+      ['a consolidated CELEX dated past next year', '02099R9999', 'CELEX 02099R9999'],
+      ['an ECLI', 'ECLI:EU:C:2099:1', 'ECLI ECLI:EU:C:2099:1'],
+      [
+        'an ELI',
+        'http://data.europa.eu/eli/reg/2026/12/oj',
+        'ELI http://data.europa.eu/eli/reg/2026/12/oj',
+      ],
+    ])('sends no held-CELEX query for the miss of %s', async (_label, identifier, tried) => {
+      routeMiss({ held: ['52026AG0012(01)'] });
+      const { structured } = await lookup(identifier);
+      expect(structured).toEqual({
+        found: false,
+        notice: `No CELLAR work matches ${tried}. ${MISS_ADVICE}`,
+      });
+      expect(heldQueries()).toEqual([]);
+    });
   });
 
   // --- Format ---
@@ -1597,6 +1728,24 @@ describe('eurlex_lookup_celex', () => {
       '2023/0077B/COD': ['52023PC0177'],
       '2022/132A/COD': [undefined],
       '2021/0053/COD': [undefined],
+      '2016/0282/COD': ['52016PC0605', undefined],
+      '2014/0204/NLE': [undefined],
+      '1981/1012/CNS': [undefined],
+      '1979/1030/CNS': [undefined, undefined],
+      '2002/0296/CNS': [undefined],
+    };
+    /**
+     * The CELEX of each act a dossier produced (#190), per dossier in `PROCEDURES`
+     * order and in the order CELLAR returns them, as CELLAR held them on 2026-11-09.
+     */
+    const PRODUCED: Record<string, string[][]> = {
+      '2021/0106/COD': [['32024R1689']],
+      '2000/0247/ACC': [['32000R2228'], ['32000R2313'], ['32000R2227'], []],
+      '2016/0282/COD': [['32018R1046', '32017R2393'], ['32017R2393']],
+      '2014/0204/NLE': [['32014R0747']],
+      '1981/1012/CNS': [['31982R3082', '31985R3307', '31981R3577']],
+      '1979/1030/CNS': [['31980R3308'], []],
+      '2002/0296/CNS': [['32004R0139', '32004R0139R(03)']],
     };
     const HELD_CELEX = new Set([
       ...Object.values(DOCUMENT_IDS),
@@ -1606,7 +1755,8 @@ describe('eurlex_lookup_celex', () => {
     /**
      * CELLAR matching typed literals exactly, as it does for each of these lookups. Neither
      * query sorts, so the rows arrive in no CELEX order: a document number's opposite the
-     * VALUES list, a procedure's as `PROCEDURES` lists them.
+     * VALUES list, a procedure's as `PROCEDURES` lists them. A procedure query that reads
+     * the produced acts answers one row per dossier and produced act, as CELLAR does.
      */
     function holdsPreparatory(): void {
       mockQuery.mockImplementation(async (q: string) => {
@@ -1619,14 +1769,24 @@ describe('eurlex_lookup_celex', () => {
             .reverse();
         }
         if (q.includes('cdm:procedure_code_interinstitutional_reference_procedure')) {
+          const readsProduced = q.includes('cdm:dossier_produces_resource_legal');
           return literals.flatMap((reference) =>
-            (PROCEDURES[reference] ?? []).map((celex, i) => ({
-              dossier: {
-                type: 'uri',
-                value: `http://publications.europa.eu/resource/cellar/${reference}-${i}`,
-              },
-              ...(celex ? { celex: { type: 'literal', value: celex } } : {}),
-            })),
+            (PROCEDURES[reference] ?? []).flatMap((celex, i) => {
+              const row = {
+                dossier: {
+                  type: 'uri',
+                  value: `http://publications.europa.eu/resource/cellar/${reference}-${i}`,
+                },
+                ...(celex ? { celex: { type: 'literal', value: celex } } : {}),
+              };
+              const produced = readsProduced ? (PRODUCED[reference]?.[i] ?? []) : [];
+              return produced.length === 0
+                ? [row]
+                : produced.map((act) => ({
+                    ...row,
+                    producedCelex: { type: 'literal', value: act },
+                  }));
+            }),
           );
         }
         const [celex] = literals;
@@ -1673,6 +1833,8 @@ describe('eurlex_lookup_celex', () => {
       ['2008/0264(COD)', '52006PC0812'],
       ['2013/2145(BUD)', '52013DC0450'],
       ['2023/0077B(COD)', '52023PC0177'],
+      // A second dossier with no initiating act, whose produced act is the first's too (#190).
+      ['2016/0282(COD)', '52016PC0605'],
     ])(
       'resolves %j to %s with the output of that CELEX lookup and no notice',
       async (identifier, celex) => {
@@ -1750,6 +1912,54 @@ describe('eurlex_lookup_celex', () => {
       expect(readCommonMark(text)).toContain(notice);
       expect(queries).toHaveLength(1);
     });
+
+    it('keeps the full v0.20.1 notice for a procedure with no initiating act that produced nothing', async () => {
+      const { structured, text, queries } = await lookup('2021/0053(COD)');
+
+      expect(structured.notice).toBe(
+        'No CELLAR work matches procedure "2021/0053(COD)": CELLAR records no initiating act with a CELEX for that procedure. A Commission document resolves when it names its series (COM, SEC, SWD, or JOIN), year, and number (e.g. "COM(2021) 206 final"), and a procedure reference when it names its year, number, and type (e.g. "2021/0106(COD)"). To find the act by title words, use eurlex_search_documents with keyword.',
+      );
+      expect(readCommonMark(text)).toContain(String(structured.notice));
+      expect(queries).toHaveLength(1);
+    });
+
+    // --- #190: the acts a procedure with no initiating act produced ---
+
+    it.each([
+      [
+        '2014/0204(NLE)',
+        'No initiating act with a CELEX is recorded for procedure "2014/0204(NLE)"; it produced 32014R0747. Pass that CELEX here or to eurlex_get_document.',
+      ],
+      [
+        '1981/1012(CNS)',
+        'No initiating act with a CELEX is recorded for procedure "1981/1012(CNS)"; it produced 3 acts: 31981R3577, 31982R3082, 31985R3307. Pass the CELEX of the one you want here or to eurlex_get_document.',
+      ],
+      [
+        '1981/1012/CNS',
+        'No initiating act with a CELEX is recorded for procedure "1981/1012/CNS" (read as 1981/1012(CNS)); it produced 3 acts: 31981R3577, 31982R3082, 31985R3307. Pass the CELEX of the one you want here or to eurlex_get_document.',
+      ],
+      [
+        '1979/1030(CNS)',
+        'No initiating act with a CELEX is recorded for procedure "1979/1030(CNS)"; it produced 31980R3308. Pass that CELEX here or to eurlex_get_document.',
+      ],
+      [
+        '2002/0296(CNS)',
+        'No initiating act with a CELEX is recorded for procedure "2002/0296(CNS)"; it produced 2 acts: 32004R0139, 32004R0139R(03). Pass the CELEX of the one you want here or to eurlex_get_document.',
+      ],
+    ])(
+      'names the acts %j produced, found false, on both surfaces, in one query (#190)',
+      async (identifier, notice) => {
+        const { result, structured, text, queries } = await lookup(identifier);
+
+        expect(result.isError).toBeFalsy();
+        expect(Object.keys(structured).sort()).toEqual(['found', 'notice']);
+        expect(structured.found).toBe(false);
+        expect(structured.notice).toBe(notice);
+        expect(readCommonMark(text)).toContain(notice);
+        expect(text).toContain('**Found:** false');
+        expect(queries).toHaveLength(1);
+      },
+    );
 
     it('sends the typed reference literals, never the procedure alias', async () => {
       const { queries } = await lookup('2021/106 (COD)');
@@ -2016,6 +2226,103 @@ describe('eurlex_lookup_celex', () => {
 
       expect(structured.found).toBe(false);
       expect(structured.notice).toContain(`No CELLAR work matches ELI ${eli}.`);
+    });
+  });
+
+  // --- #194: the keys callers guess for identifier ---
+
+  describe('input aliases (#194)', () => {
+    const contentText = (result: { content: unknown[] }) =>
+      result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+    const sentQueries = () => mockQuery.mock.calls.map((c) => c[0] as string);
+
+    /** Call the tool with arguments as a client sends them, keys the schema omits included. */
+    const callTool = (args: Record<string, unknown>) =>
+      runToolContract(eurlex_lookup_celex, args as z.input<typeof eurlex_lookup_celex.input>);
+
+    /** CELLAR holds the GDPR and Directive 95/46/EC alone. */
+    beforeEach(() => {
+      mockQuery.mockImplementation(async (q: string) => {
+        for (const [celex, type] of [
+          ['32016R0679', 'REG'],
+          ['31995L0046', 'DIR'],
+        ] as const) {
+          if (q.includes(`"${celex}"^^xsd:string`)) {
+            return [makeBinding(celex, { type: `${RESOURCE_TYPE}${type}`, canonical: true })];
+          }
+        }
+        return [];
+      });
+    });
+
+    it.each([
+      ['celex', '32016R0679', '32016R0679'],
+      ['celex_number', 'celex:32016r0679', '32016R0679'],
+      ['celexNumber', '32016R0679', '32016R0679'],
+      ['citation', 'Regulation (EU) 2016/679', '32016R0679'],
+      ['reference', 'Directive 95/46/EC', '31995L0046'],
+      ['query', 'Regulation (EU) 2016/679', '32016R0679'],
+    ])(
+      'serves %s as identifier: the same lookup, result, and content[]',
+      async (alias, value, celex) => {
+        const viaTarget = await callTool({ identifier: value });
+        const targetQueries = sentQueries();
+        mockQuery.mockClear();
+
+        const viaAlias = await callTool({ [alias]: value });
+
+        expect(viaAlias.isError).toBeFalsy();
+        expect(viaAlias.structuredContent).toMatchObject({ found: true, celex_number: celex });
+        expect(viaAlias.structuredContent).toStrictEqual(viaTarget.structuredContent);
+        expect(viaAlias.content).toStrictEqual(viaTarget.content);
+        expect(sentQueries()).toStrictEqual(targetQueries);
+        expect(targetQueries.length).toBeGreaterThan(0);
+      },
+    );
+
+    it('serves an alias under a forced identifier_type', async () => {
+      const result = await callTool({ celex: '32016R0679', identifier_type: 'celex' });
+
+      expect(result.structuredContent).toMatchObject({ found: true, celex_number: '32016R0679' });
+      expect(contentText(result)).toContain('**CELEX:** 32016R0679');
+    });
+
+    it.each(['celex', 'celex_number', 'celexNumber', 'citation', 'reference', 'query'])(
+      'rejects %s sent beside identifier with the alias hint, before any CELLAR request',
+      async (alias) => {
+        const hint = `${alias} is an alias of identifier; send one of them, not both.`;
+
+        const result = await callTool({ identifier: '32016R0679', [alias]: '32016R0679' });
+
+        expect(result.isError).toBe(true);
+        expect(result.structuredContent).toMatchObject({
+          error: { code: JsonRpcErrorCode.InvalidParams, data: { recovery: { hint } } },
+        });
+        expect(contentText(result)).toContain(hint);
+        expect(mockQuery).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each([
+      [
+        // The first declared alias is moved onto identifier, so the hint reports that too.
+        'two aliases',
+        { celex: '32016R0679', query: '32016R0679' },
+        'celex and query are aliases of identifier; send one of them, not both. Validated celex as identifier.',
+      ],
+      [
+        'two aliases beside identifier',
+        { identifier: '32016R0679', celex: '32016R0679', query: '32016R0679' },
+        'celex and query are aliases of identifier; send only one of them.',
+      ],
+    ])('rejects %s with the alias hint naming each', async (_label, args, hint) => {
+      const result = await callTool(args);
+
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: { code: JsonRpcErrorCode.InvalidParams, data: { recovery: { hint } } },
+      });
+      expect(mockQuery).not.toHaveBeenCalled();
     });
   });
 });

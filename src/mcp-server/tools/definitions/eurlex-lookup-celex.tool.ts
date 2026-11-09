@@ -29,6 +29,7 @@ import {
   normalizeEli,
   resolveEliToWork,
 } from '@/services/cellar-sparql/eli-resolution.js';
+import { findHeldCelex, type HeldCelex } from '@/services/cellar-sparql/held-celex.js';
 import {
   type OjReference,
   type OjResolution,
@@ -216,8 +217,9 @@ function ojReferenceNotice(
 
 /**
  * The notice of a Commission document number or procedure reference that names no
- * single act (#179): the CELEX of each work or initiating act, or why nothing
- * matched. The canonical reading is named when it differs from the citation.
+ * single act (#179): the CELEX of each work or initiating act, the acts a procedure
+ * with no initiating act produced (#190), or why nothing matched. The canonical
+ * reading is named when it differs from the citation.
  */
 function preparatoryNotice(
   citation: string,
@@ -229,6 +231,12 @@ function preparatoryNotice(
   const document = reference.kind === 'document';
   if (resolution.kind === 'several') {
     return `${document ? 'Commission document' : 'Procedure'} ${quoted} names ${resolution.celex.length} ${document ? 'works' : 'initiating acts'}: ${resolution.celex.join(', ')}. Pass the CELEX of the one you want here or to eurlex_get_document.`;
+  }
+  if (resolution.kind === 'no_initiating_act' && resolution.produced.length > 0) {
+    const { produced } = resolution;
+    return produced.length === 1
+      ? `No initiating act with a CELEX is recorded for procedure ${quoted}; it produced ${produced[0]}. Pass that CELEX here or to eurlex_get_document.`
+      : `No initiating act with a CELEX is recorded for procedure ${quoted}; it produced ${produced.length} acts: ${produced.join(', ')}. Pass the CELEX of the one you want here or to eurlex_get_document.`;
   }
   const reason =
     resolution.kind === 'no_initiating_act'
@@ -318,7 +326,7 @@ const CELEX_LOOKUP_ALTERNATIVE =
 export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
   title: 'Resolve EU Legal Citation',
   description:
-    'Resolve an EU legal citation — a CELEX number, ELI URI, ECLI, an OJ citation naming its act type and year (e.g. "Regulation (EU) 2016/679", "Directive 95/46/EC"), an Official Journal reference naming its issue, date, and first page (e.g. "OJ L 119, 4.5.2016, p. 1"), a Commission document number (e.g. "COM(2021) 206 final", also SEC, SWD, JOIN), or an interinstitutional procedure reference (e.g. "2021/0106(COD)", resolved to the act that initiated it) — to its canonical CELLAR work, confirming it exists before you fetch or traverse it. Returns the work URI, confirmed CELEX number, document type, date, and the ECLI of a case that carries one. A CELEX that CELLAR holds under several works resolves to the one the EUR-Lex content resolver serves. An ECLI shared by several records (a judgment and its abstract or extract, or a joined AG opinion) resolves to the primary record with the lowest CELEX. An OJ reference whose first page starts several acts, a document number CELLAR holds in several parts, and a procedure with several initiating acts return found false, the notice naming each CELEX.',
+    'Resolve an EU legal citation — a CELEX number, ELI URI, ECLI, an OJ citation naming its act type and year (e.g. "Regulation (EU) 2016/679", "Directive 95/46/EC"), an Official Journal reference naming its issue, date, and first page (e.g. "OJ L 119, 4.5.2016, p. 1"), a Commission document number (e.g. "COM(2021) 206 final", also SEC, SWD, JOIN), or an interinstitutional procedure reference (e.g. "2021/0106(COD)", resolved to the act that initiated it) — to its canonical CELLAR work, confirming it exists before you fetch or traverse it. Returns the work URI, confirmed CELEX number, document type, date, and the ECLI of a case that carries one. A CELEX that CELLAR holds under several works resolves to the one the EUR-Lex content resolver serves. An ECLI shared by several records (a judgment and its abstract or extract, or a joined AG opinion) resolves to the primary record with the lowest CELEX. An OJ reference whose first page starts several acts, a document number CELLAR holds in several parts, and a procedure with several initiating acts return found false, the notice naming each CELEX; a procedure with no initiating act returns found false, the notice naming the CELEX of each act it produced.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     identifier: z
@@ -337,11 +345,24 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
         ),
     ),
   }),
+  /*
+   * The names callers guess for identifier, including the sibling tools' celex_number
+   * (#194); tools/list still advertises identifier alone. The framework case-folds a
+   * key onto a declared input, never onto an alias, so celexNumber is declared too.
+   */
+  inputAliases: {
+    celex: 'identifier',
+    celex_number: 'identifier',
+    celexNumber: 'identifier',
+    citation: 'identifier',
+    reference: 'identifier',
+    query: 'identifier',
+  },
   output: z.object({
     found: z
       .boolean()
       .describe(
-        'True when the identifier resolves to a CELLAR work; false when a well-formed CELEX, ELI, ECLI, OJ citation, Official Journal reference, Commission document number, or procedure reference matches no work in the corpus, when an OJ reference\'s first page starts several acts, when a document number or procedure names several works, when a procedure has no initiating act with a CELEX, or when the identifier is a case number, with a notice naming what was tried. Only an identifier_type "auto" value that, after trimming, is neither an ECLI, an ELI, a CELEX in any accepted form, an OJ citation naming its act type and year, an OJ reference naming its issue, year, and first page, a Commission document number, nor a procedure reference with its type raises ambiguous_identifier instead.',
+        'True when the identifier resolves to a CELLAR work; false when a well-formed CELEX, ELI, ECLI, OJ citation, Official Journal reference, Commission document number, or procedure reference matches no work in the corpus, when an OJ reference\'s first page starts several acts, when a document number or procedure names several works, when a procedure has no initiating act with a CELEX (the notice then naming each act it produced), or when the identifier is a case number, with a notice naming what was tried. Only an identifier_type "auto" value that, after trimming, is neither an ECLI, an ELI, a CELEX in any accepted form, an OJ citation naming its act type and year, an OJ reference naming its issue, year, and first page, a Commission document number, nor a procedure reference with its type raises ambiguous_identifier instead.',
       ),
     work_uri: z.string().optional().describe('CELLAR work URI (stable resource identifier).'),
     celex_number: z.string().optional().describe('Confirmed CELEX number for the resolved work.'),
@@ -355,7 +376,7 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
       .string()
       .optional()
       .describe(
-        'Human-readable document category resolved from the CDM resource type (e.g. "Regulation", "Directive", "Judgment"). An authority value with no known label falls back to its code (e.g. "BUDGET"). Absent for some works.',
+        'Human-readable document category resolved from the CDM resource type (e.g. "Regulation", "Directive", "Judgment"). An authority value with no known label falls back to its code. Absent for some works.',
       ),
     date: z
       .string()
@@ -371,7 +392,7 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
       .string()
       .optional()
       .describe(
-        'Present only when found is false: the CELEX, ELI, ECLI, OJ reference, Commission document number, or procedure looked up, the accepted forms, and the search to use instead; for an OJ reference whose first page starts several acts, or a document number or procedure naming several works, the CELEX of each.',
+        'Present only when found is false: the CELEX, ELI, ECLI, OJ reference, Commission document number, or procedure looked up, the accepted forms, and the search to use instead; for a CELEX one numbering convention away from one CELLAR holds (a consolidated CELEX with no date or a date no version carries, a (nn) suffix missing or extra, a number not zero-padded to four digits), each held CELEX in place of the accepted forms; for an OJ reference whose first page starts several acts, or a document number or procedure naming several works, the CELEX of each; for a procedure with no initiating act, the CELEX of each act it produced.',
       ),
   },
   enrichmentTrailer: { notice: { render: (notice) => renderNoticeBlockquote(String(notice)) } },
@@ -395,7 +416,7 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
     {
       reason: 'sparql_timeout',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: "The lookup ran past its time budget (retryable: CELLAR's response time varies, so a later lookup can finish), or CELLAR refused a lookup query as too costly to run (not retryable: the same query is refused again). Neither is retried within the call.",
+      when: "The lookup ran past its time budget (retryable: CELLAR's response time varies, so a later lookup can finish), or CELLAR refused a lookup query as too costly to run (not retryable: the same query is refused again). Neither is retried within the call, apart from one re-send, inside the same budget, of a lookup CELLAR leaves unanswered for 20 s.",
       recovery:
         "When the error is retryable, look the identifier up again shortly: whether the lookup finishes inside its time budget turns on CELLAR's response time, not on the identifier.",
       thrownBy: 'service',
@@ -551,12 +572,18 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
        * A well-formed identifier that resolves to no work is a clean negative, not an
        * error — the documented "validate before fetch" role depends on a boolean here.
        * Malformed/undetectable input already errored above with ambiguous_identifier.
-       * The notice names what was tried and where to go next (#114).
+       * The notice names what was tried and where to go next (#114), or, for a CELEX
+       * one numbering convention away from one CELLAR holds, each held CELEX (#196).
        */
       const tried = `${IDENTIFIER_LABEL[effectiveType]} ${echoValue(identifier)}`;
       const parsedFrom = identifier === citation ? '' : ` (parsed from "${echoValue(citation)}")`;
+      const missed = `No CELLAR work matches ${tried}${parsedFrom}.`;
+      const held: HeldCelex =
+        effectiveType === 'celex' ? await findHeldCelex(svc, identifier, ctx) : { kind: 'none' };
       ctx.enrich.notice(
-        `No CELLAR work matches ${tried}${parsedFrom}. A CELEX reads {sector}{year}{type}{number} (e.g. 32016R0679); an OJ citation resolves when it names its act type and year (e.g. "Regulation (EU) 2016/679"). To find the act by title words or a partial CELEX, use eurlex_search_documents with keyword.`,
+        held.kind === 'held'
+          ? `${missed} ${held.sentence} ${held.celex.length === 1 ? 'Pass that CELEX here or to eurlex_get_document.' : 'Pass the CELEX of the one you want here or to eurlex_get_document.'}`
+          : `${missed} A CELEX reads {sector}{year}{type}{number} (e.g. 32016R0679); an OJ citation resolves when it names its act type and year (e.g. "Regulation (EU) 2016/679"). To find the act by title words or a partial CELEX, use eurlex_search_documents with keyword.${held.kind === 'unchecked' ? ` ${held.sentence}` : ''}`,
       );
       return { found: false };
     }

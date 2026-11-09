@@ -105,6 +105,83 @@ it('walks actual-service multi-direction pages to exhaustion and preserves omitt
   expect(queries.every((query) => query.startsWith('PREFIX'))).toBe(true);
 });
 
+it('sends related_sectors through the actual service inside each arm and pages matching works only (#191)', async () => {
+  initService();
+  /** One direction's related works, newest first; `-` marks a work with no CELEX. */
+  const works = (direction: string, sectors: string[]) =>
+    sectors.map((sector, i) => ({
+      work: `http://example.test/${direction}-${i}`,
+      ...(sector === '-' ? {} : { celex: `${sector}2020R${String(i).padStart(4, '0')}` }),
+    }));
+  const arms: Record<string, { work: string; celex?: string }[]> = {
+    outgoing: works('outgoing', ['3', '5', '-', '3']),
+    incoming: works('incoming', ['6', '3', '-', '3', '5', '3']),
+  };
+  const queries: string[] = [];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (_url: string, init: RequestInit) => {
+      const query = new URLSearchParams(String(init.body)).get('query') ?? '';
+      queries.push(query);
+      // CELLAR: each arm keeps the CELEX-bearing works its SUBSTR test lists, then pages.
+      const bindings = query.includes('cdm:work_cites_work')
+        ? query.split(' UNION ').flatMap((arm) => {
+            const direction = arm.includes('BIND("incoming" AS ?direction)')
+              ? 'incoming'
+              : 'outgoing';
+            const [, limit = '0', offset = '0'] = /LIMIT (\d+) OFFSET (\d+)/.exec(arm) ?? [];
+            const listed =
+              /SUBSTR\(STR\(\?relatedCelex\), 1, 1\) IN \(([^)]*)\)/.exec(arm)?.[1] ?? '';
+            return (arms[direction] ?? [])
+              .filter((w) => w.celex && listed.includes(`"${w.celex[0]}"`))
+              .slice(Number(offset), Number(offset) + Number(limit))
+              .map((w) => ({
+                relatedWork: { type: 'uri', value: w.work },
+                direction: { type: 'literal', value: direction },
+                relatedCelexSample: { type: 'literal', value: w.celex },
+              }));
+          })
+        : [];
+      return new Response(JSON.stringify({ head: { vars: [] }, results: { bindings } }));
+    }),
+  );
+
+  const keys: string[] = [];
+  const hasMore: boolean[] = [];
+  let offset: number | undefined = 0;
+  while (offset !== undefined) {
+    const result = await runToolContract(eurlex_get_relations, {
+      work_uri: 'http://example.test/source',
+      relation_types: ['cites'],
+      related_sectors: ['3'],
+      limit: 2,
+      offset,
+    });
+    expect(result.isError).not.toBe(true);
+    const page = eurlex_get_relations.output.parse(result.structuredContent);
+    for (const row of page.relations) keys.push(`${row.direction}:${row.related_celex_number}`);
+    hasMore.push(page.has_more);
+    offset = page.next_offset;
+  }
+
+  // Two outgoing and three incoming sector-3 works at 2 a page: two pages.
+  expect(hasMore).toEqual([true, false]);
+  expect(keys.toSorted()).toEqual(
+    [
+      'outgoing:32020R0000',
+      'outgoing:32020R0003',
+      'incoming:32020R0001',
+      'incoming:32020R0003',
+      'incoming:32020R0005',
+    ].toSorted(),
+  );
+  expect(queries).toHaveLength(2);
+  for (const query of queries) {
+    expect(query.startsWith('PREFIX')).toBe(true);
+    expect(query.split('FILTER(SUBSTR(STR(?relatedCelex), 1, 1) IN ("3"))')).toHaveLength(3);
+  }
+});
+
 it('reads all of an edge’s provisions through the actual service, past its row ceiling (#168)', async () => {
   initService();
   const fd = 'http://publications.europa.eu/resource/authority/fd_370';

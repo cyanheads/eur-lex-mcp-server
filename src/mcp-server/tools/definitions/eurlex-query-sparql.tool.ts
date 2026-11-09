@@ -268,6 +268,8 @@ export const eurlex_query_sparql = tool('eurlex_query_sparql', {
         'Optional client-side timeout in milliseconds (1000–55000). The server default (55000 unless the deployment configures another value) applies when omitted.',
       ),
   }),
+  // The SPARQL protocol's name for the query (#194); tools/list advertises sparql_query alone.
+  inputAliases: { query: 'sparql_query' },
   output: z.object({
     bindings: z
       .array(

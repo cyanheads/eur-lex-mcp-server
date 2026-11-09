@@ -18,6 +18,11 @@ import {
   escapeMarkdownHeading,
   renderNoticeBlockquote,
 } from '@/mcp-server/tools/markdown-render.js';
+import {
+  OR_LIST,
+  unsetFiltersHint,
+  withTimeoutAlternative,
+} from '@/mcp-server/tools/timeout-alternative.js';
 import { fetchCaseLawFacts } from '@/services/cellar-sparql/case-law-facts.js';
 import {
   CASE_LAW_SUBJECT_MATTER_SCHEME,
@@ -268,6 +273,24 @@ SELECT ?concept ?label WHERE {
   return { concepts: [...concepts].sort(), labels: [...labels].sort() };
 }
 
+/**
+ * The filters the `sparql_timeout` and `offset_past_window` recoveries offer to
+ * narrow a search with (#186). A contract recovery reaches every caller, so it names
+ * none of them; each call is offered the ones it left unset, before any query for an
+ * offset past the window and at the page query for a timeout. The subject and
+ * keyword lookups and the page's follow-ups keep the contract recovery: none of
+ * these filters shrinks them.
+ */
+const NARROWING_FILTERS = [
+  'court',
+  'case_type',
+  'case_number',
+  'member_state',
+  'procedure_type',
+  'outcome',
+  'subject',
+] as const;
+
 export const eurlex_get_cases = tool('eurlex_get_cases', {
   title: 'Search CJEU/GC Case Law',
   description:
@@ -413,6 +436,8 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
         'Maximum number of results to return, served up to 100 per call; a larger value (up to 10,000) is served at 100 and reported in limit_clamp. Defaults to 20.',
       ),
   }),
+  // The name callers guess for keyword (#194); tools/list still advertises keyword alone.
+  inputAliases: { query: 'keyword' },
   output: z.object({
     cases: z
       .array(
@@ -598,7 +623,7 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
       code: JsonRpcErrorCode.ValidationError,
       when: 'offset is 10,000 or more, past the last row CELLAR sorts for one search.',
       recovery:
-        'Narrow the search below 10,000 matches — search a date_from/date_to window ending at the date of the last case reached (results run newest first), or add court, case_type, keyword, member_state, procedure_type, outcome, or subject — then page from offset 0.',
+        'Narrow the search below 10,000 matches — search a date_from/date_to window ending at the date of the last case reached (results run newest first), or use a more specific keyword — then page from offset 0.',
     },
     {
       reason: 'invalid_date_range',
@@ -639,18 +664,26 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
     {
       reason: 'sparql_timeout',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: "The search ran past its time budget (retryable: CELLAR's response time varies, so a later search can finish), or CELLAR refused it as too costly to run (not retryable: the same search is refused again). Neither is retried within the call.",
+      when: "The search ran past its time budget (retryable: CELLAR's response time varies, so a later search can finish), or CELLAR refused it as too costly to run (not retryable: the same search is refused again). Neither is retried within the call, apart from one re-send, inside the same budget, of a lookup CELLAR leaves unanswered for 20 s.",
       recovery:
-        'Narrow the search with a closer date_from/date_to range, a court, or a more specific keyword or case_number, then search again.',
+        'Narrow the search with a closer date_from/date_to range or a more specific keyword, then search again.',
       thrownBy: 'service',
     },
   ],
 
   async handler(input, ctx) {
+    const narrowingHint = unsetFiltersHint(NARROWING_FILTERS, input);
     if (isPastSortWindow(input.offset)) {
       throw ctx.fail(
         'offset_past_window',
         `offset ${input.offset} is past row 10,000, the last row CELLAR sorts for one search, so no page starts there.`,
+        narrowingHint
+          ? {
+              recovery: {
+                hint: `${ctx.recoveryFor('offset_past_window').recovery.hint} ${narrowingHint}`,
+              },
+            }
+          : undefined,
       );
     }
     const svc = getCellarSparqlService();
@@ -894,7 +927,11 @@ SELECT
   ${filters.join('\n  ')}
 } GROUP BY ?celexNumber ORDER BY DESC(?docDate) ?celexNumber LIMIT ${windowedLimit(input.offset, pageLimit)} OFFSET ${input.offset}`;
 
-    const bindings = await svc.queryWithContinuation(sparql, ctx);
+    const bindings = await withTimeoutAlternative(
+      ctx,
+      narrowingHint,
+      svc.queryWithContinuation(sparql, ctx),
+    );
     ctx.log.info('Case law search', {
       caseNumber: input.case_number,
       celexFragment,
@@ -911,25 +948,36 @@ SELECT
     /**
      * Zero hits is an answer, not a failure (#112): an empty first page returns the
      * same shape as a page past the end, plus a notice naming the filters and how to
-     * broaden them. A page past the end stays silent — the caller already has rows.
-     * Each echoed value is bounded; query_echo keeps it whole.
+     * broaden them, each step on a filter the call set (#186). A page past the end
+     * stays silent — the caller already has rows. Each echoed value is bounded;
+     * query_echo keeps it whole.
      */
     if (bindings.length === 0 && input.offset === 0) {
       const filterSummary = Object.entries(queryEcho)
         .map(([k, v]) => `${k}=${echoValue(String(v))}`)
         .join(', ');
+      const retried = (['keyword', 'case_number'] as const).filter((key) => input[key]?.trim());
+      const removable = (['court', 'case_type'] as const).filter((key) => input[key]);
+      const steps = [
+        ...(retried.length > 0 ? [`trying a different ${OR_LIST.format(retried)}`] : []),
+        ...(dateFrom || dateTo ? ['expanding the date range'] : []),
+        ...(removable.length > 0 ? [`removing ${OR_LIST.format(removable)}`] : []),
+      ];
+      const broaden = steps.length > 0 ? ` Broaden the search by ${OR_LIST.format(steps)}.` : '';
       const factFilters = (
         ['member_state', 'procedure_type', 'outcome', 'subject'] as const
       ).filter((key) => key in queryEcho);
       const [onlyFactFilter] = factFilters;
+      // With no broadening step before it, the fact sentence opens the guidance.
+      const drop = broaden ? ' Or drop' : ' Drop';
       const factHint =
         factFilters.length > 1
-          ? ` Or drop one of ${factFilters.join(', ')}: each matches only the cases CELLAR records its fact for.`
+          ? `${drop} one of ${factFilters.join(', ')}: each matches only the cases CELLAR records its fact for.`
           : onlyFactFilter
-            ? ` Or drop ${onlyFactFilter}: it matches only the cases CELLAR records that fact for.`
+            ? `${drop} ${onlyFactFilter}: it matches only the cases CELLAR records that fact for.`
             : '';
       ctx.enrich.notice(
-        `No case law records matched the search criteria (${filterSummary}). Try a different keyword, broader date range, or remove the court/case_type filter.${factHint}`,
+        `No case law records matched the search criteria (${filterSummary}).${broaden}${factHint}`,
       );
     }
 

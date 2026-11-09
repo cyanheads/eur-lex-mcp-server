@@ -7,6 +7,7 @@ import { resource, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getCellarSparqlService } from '@/services/cellar-sparql/cellar-sparql-service.js';
 import { CELEX_PATTERN, normalizeCelex } from '@/services/cellar-sparql/eli-resolution.js';
+import { celexMissError, findHeldCelex } from '@/services/cellar-sparql/held-celex.js';
 import { RELATION_TYPES, traverseRelations } from '@/services/cellar-sparql/relation-traversal.js';
 import { resolveCelexWorks } from '@/services/cellar-sparql/work-resolution.js';
 
@@ -41,7 +42,7 @@ export const eurlex_document_relations_resource = resource(
       {
         reason: 'not_found',
         code: JsonRpcErrorCode.NotFound,
-        when: 'No CELLAR work holds the CELEX number.',
+        when: 'No CELLAR work holds the CELEX number. One numbering convention away from a CELEX CELLAR holds — a consolidated CELEX with no date or a date no version carries, a (nn) suffix missing or extra, a number not zero-padded to four digits — each held CELEX is named in the message and in data.held_celex.',
         recovery:
           'Confirm the CELEX number with eurlex_lookup_celex, then read the resource again with the CELEX it returns.',
       },
@@ -56,7 +57,7 @@ export const eurlex_document_relations_resource = resource(
       {
         reason: 'sparql_timeout',
         code: JsonRpcErrorCode.ServiceUnavailable,
-        when: "A query this summary sent to CELLAR ran past the time budget its queries share (retryable: CELLAR's response time varies, so a later read can finish), or CELLAR refused it as too costly to run (not retryable: the same query is refused again). Neither is retried within the read.",
+        when: "A query this summary sent to CELLAR ran past the time budget its queries share (retryable: CELLAR's response time varies, so a later read can finish), or CELLAR refused it as too costly to run (not retryable: the same query is refused again). Neither is retried within the read, apart from one re-send, inside the same budget, of a lookup CELLAR leaves unanswered for 20 s.",
         recovery:
           'When the error is retryable, read the resource again shortly; or call the eurlex_get_relations tool with relation_types narrowed to the types you need.',
         thrownBy: 'service',
@@ -71,9 +72,12 @@ export const eurlex_document_relations_resource = resource(
       // several works never summarizes a copy that lacks edges.
       const workUri = (await resolveCelexWorks(svc, [celexNumber], ctx)).get(celexNumber);
       if (!workUri) {
-        throw ctx.fail('not_found', `No CELLAR work found for CELEX: ${celexNumber}`, {
-          celexNumber,
-        });
+        // A CELEX one numbering convention away from a held CELEX names it (#196).
+        const miss = celexMissError(
+          `No CELLAR work found for CELEX: ${celexNumber}`,
+          await findHeldCelex(svc, celexNumber, ctx),
+        );
+        throw ctx.fail('not_found', miss.message, { celexNumber, ...miss.data }, miss.options);
       }
 
       // Summarize all relation types via the shared traversal — one query per

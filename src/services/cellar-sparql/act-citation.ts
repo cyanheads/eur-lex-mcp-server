@@ -2,12 +2,14 @@
  * @fileoverview An act's citation facts — its ELI, Official Journal reference,
  * typed dates of effect, and transposition deadlines — read by one aggregate-only
  * query that eurlex_get_document and the eurlex://document/{celexNumber} resource
- * run beside their other metadata queries.
+ * run beside their other metadata queries; and the amending acts that changed an
+ * article setting one of those dates, which eurlex_get_document reads beside them.
  * @module services/cellar-sparql/act-citation
  */
 
 import { LANGUAGE_AUTHORITY_URI } from './cdm-labels.js';
 import { CellarSparqlService } from './cellar-sparql-service.js';
+import { cellarDate } from './sort-window.js';
 import type { SparqlBinding } from './types.js';
 
 /** `annotation:type_of_date` (`fd_335`) codes mapped to their `dates_of_effect` types. */
@@ -300,25 +302,53 @@ function provisionOf(comment: string): string | undefined {
   return;
 }
 
+/** One real-dated item of the `?datesOfEffect` aggregate. */
+interface DatedItem {
+  /** The axiom's `comment_on_date`, decoded, its tokens as CELLAR stores them. */
+  comment: string;
+  date: string;
+  /** The axiom's `type_of_date` literal, `{CODE|uri}`. */
+  type?: string;
+}
+
 /**
- * The dated entries of the `?datesOfEffect` aggregate, each `date|type|comment`
- * with the comment URI-encoded: one per date, type, and provision, sorted by date
- * and, on one date, in {@link EFFECT_TYPE_VALUES} order with an untyped entry last,
- * then by provision with an entry naming none last. A date whose code maps to no
- * type is listed without one. An `MA` (application) date whose comment carries
- * `{MA/PART}` is a partial application; no other comment changes a type, since
- * other codes in a comment label the clause it cites rather than the date.
+ * The items of the `?datesOfEffect` aggregate, each `date|type|comment` with the
+ * comment URI-encoded after the item's last `|`, split into their parts. An item
+ * dated with one of CELLAR's values for no date ({@link cellarDate}) is none (#187).
+ */
+function datedItems(value: string | undefined): DatedItem[] {
+  return (value ?? '').split(' ').flatMap((item) => {
+    const first = item.indexOf('|');
+    const date = cellarDate((first === -1 ? item : item.slice(0, first)).slice(0, 10));
+    if (!date) return [];
+    if (first === -1) return [{ date, comment: '' }];
+    const last = item.lastIndexOf('|');
+    return [
+      {
+        date,
+        type: item.slice(first + 1, last),
+        comment: decodeURIComponent(item.slice(last + 1)),
+      },
+    ];
+  });
+}
+
+/**
+ * The dated entries of the `?datesOfEffect` aggregate ({@link datedItems}): one per
+ * date, type, and provision, sorted by date and, on one date, in
+ * {@link EFFECT_TYPE_VALUES} order with an untyped entry last, then by provision with
+ * an entry naming none last. A date whose code maps to no type is listed without one,
+ * and a placeholder-dated item is no entry at all (#187), so the first entry is the
+ * earliest real date. An `MA` (application) date whose comment carries `{MA/PART}` is
+ * a partial application; no other comment changes a type, since other codes in a
+ * comment label the clause it cites rather than the date.
  */
 function readDatesOfEffect(value: string | undefined): DateOfEffect[] {
   const byKey = new Map<string, DateOfEffect>();
-  for (const item of (value ?? '').split(' ')) {
-    const first = item.indexOf('|');
-    const date = (first === -1 ? item : item.slice(0, first)).slice(0, 10);
-    if (!date) continue;
-    const last = item.lastIndexOf('|');
-    const comment =
-      first === -1 ? '' : decodeURIComponent(item.slice(last + 1)).replace(COMMENT_TOKEN, '{$1}');
-    const recorded = first === -1 ? undefined : effectTypeOf(item.slice(first + 1, last));
+  for (const item of datedItems(value)) {
+    const { date } = item;
+    const comment = item.comment.replace(COMMENT_TOKEN, '{$1}');
+    const recorded = item.type === undefined ? undefined : effectTypeOf(item.type);
     const type =
       recorded === 'application' && comment.includes('{MA/PART}')
         ? 'partial_application'
@@ -372,12 +402,12 @@ export function readActCitation(binding: SparqlBinding | undefined): ActCitation
     originalPages: pairs('ojOriginalPages'),
   });
   const datesOfEffect = readDatesOfEffect(value('datesOfEffect'));
+  // A deadline CELLAR records with no date (#187) is dropped, real ones beside it kept.
   const transposition = [
     ...new Set(
       (value('transposition') ?? '')
         .split(' ')
-        .filter(Boolean)
-        .map((date) => date.slice(0, 10)),
+        .flatMap((date) => cellarDate(date.slice(0, 10)) || []),
     ),
   ].sort();
   const eli = value('eli');
@@ -387,4 +417,102 @@ export function readActCitation(binding: SparqlBinding | undefined): ActCitation
     ...(datesOfEffect.length > 0 ? { dates_of_effect: datesOfEffect } : {}),
     ...(transposition.length > 0 ? { transposition_deadlines: transposition } : {}),
   };
+}
+
+/** An amending act that changed an article setting one of an act's dates of effect (#188). */
+export interface DateAmendment {
+  /** The date-setting articles it changed, numbered as CELLAR records them, sorted. */
+  articles: string[];
+  /** CELEX of the amending act. */
+  celex: string;
+}
+
+const MODIFIED_LOCATION =
+  '<http://publications.europa.eu/ontology/annotation#reference_to_modified_location>';
+/** The `fd_370` article token a modified location opens with, before the article's number. */
+const ARTICLE_LOCATION = '{AR|http://publications.europa.eu/resource/authority/fd_370/AR} ';
+/** The `fd_335` article code, as a stored `comment_on_date` writes it before the article. */
+const ARTICLE_CODE = 'fd_335/ART} ';
+/** The leading digits and optional letter of a date-setting article: `113` of `113(c)`. */
+const ARTICLE_NUMBER = /^[0-9]+[a-z]?/;
+
+/**
+ * The query for the article locations an act's amending acts changed (#188): one row
+ * per amending act with a CELEX and `reference_to_modified_location` on its
+ * `cdm:resource_legal_amends_resource_legal` axiom that opens with the article token.
+ * {@link readDateAmendments} keeps those in an article setting one of the act's dates
+ * of effect, read from the citation query's row.
+ *
+ * It joins no date. Matching the act's dated `comment_on_date` axioms to its amendment
+ * axioms in SPARQL left Virtuoso a `FILTER` with no join key, and that query ran past
+ * 60 s on 32006R1907 and 32024R1689; this one answers in 0.14–0.8 s, so it runs beside
+ * the citation query and the match is made in process. It carries no `LIMIT`, which
+ * `CellarSparqlService.query` would cap at `MAX_SPARQL_RESULTS`: the most article
+ * locations any act has is 1,404 (31993R2454: 1,382 rows in 797 ms), and CELLAR
+ * returns 20,000 rows uncut (2026-11-09).
+ */
+export function dateAmendmentsQuery(actWork: string): string {
+  return `
+SELECT DISTINCT ?amenderCelex ?location
+WHERE {
+  ?amendmentAxiom <${OWL}annotatedTarget> <${actWork}> ;
+    <${OWL}annotatedProperty> cdm:resource_legal_amends_resource_legal ;
+    <${OWL}annotatedSource> ?amender ;
+    ${MODIFIED_LOCATION} ?location .
+  FILTER(STRSTARTS(STR(?location), "${ARTICLE_LOCATION}"))
+  ?amender cdm:resource_legal_id_celex ?amenderCelex .
+}`;
+}
+
+/**
+ * The articles setting an act's real dates of effect (#188), from the `?datesOfEffect`
+ * aggregate of the citation query: each comment's text after its first `{ART}` code,
+ * cut to its leading digits and optional letter, so `113(c)`, `123.3(d) {ET} …`, and
+ * `8P1` read `113`, `123`, and `8`. Text opening with no digit is kept whole: a
+ * roman-numbered article (`II`, `XV.1`). A placeholder-dated stage sets none, so an
+ * article cited by such stages alone raises no notice.
+ */
+function dateSettingArticles(value: string | undefined): Set<string> {
+  const articles = new Set<string>();
+  for (const { comment } of datedItems(value)) {
+    const at = comment.indexOf(ARTICLE_CODE);
+    if (at === -1) continue;
+    const rest = comment.slice(at + ARTICLE_CODE.length);
+    articles.add(ARTICLE_NUMBER.exec(rest)?.[0] ?? rest);
+  }
+  return articles;
+}
+
+/**
+ * The amending acts in {@link dateAmendmentsQuery}'s rows that changed an article
+ * setting one of the dates the citation row lists (`citation`, {@link actCitationQuery}),
+ * sorted by CELEX, each with its articles distinct and in numeric order; a row naming no
+ * CELEX or location is none. A location lies in an article when it is the article token
+ * and number alone (`AR 38`), or the two followed by a space (`AR 113 PA 3 PTA (a)`) or
+ * a dot (`AR 123.3`): of the 102,678 amendment locations that open with the article
+ * token, 26,481, 37,318, and 34,032 take those three forms, and 95 zero-pad the number
+ * and so lie in no article; only 26 use the compact `A17P1` form (2026-11-09).
+ */
+export function readDateAmendments(
+  bindings: SparqlBinding[],
+  citation: SparqlBinding | undefined,
+): DateAmendment[] {
+  const articles = [
+    ...dateSettingArticles(CellarSparqlService.bindingValue(citation, 'datesOfEffect')),
+  ];
+  const byCelex = new Map<string, Set<string>>();
+  for (const binding of bindings) {
+    const celex = CellarSparqlService.bindingValue(binding, 'amenderCelex');
+    const location = CellarSparqlService.bindingValue(binding, 'location');
+    if (!celex || !location) continue;
+    for (const article of articles) {
+      const at = `${ARTICLE_LOCATION}${article}`;
+      if (location === at || location.startsWith(`${at} `) || location.startsWith(`${at}.`)) {
+        byCelex.set(celex, (byCelex.get(celex) ?? new Set()).add(article));
+      }
+    }
+  }
+  return [...byCelex]
+    .map(([celex, matched]) => ({ celex, articles: [...matched].sort(PROVISION_ORDER.compare) }))
+    .sort((a, b) => a.celex.localeCompare(b.celex));
 }

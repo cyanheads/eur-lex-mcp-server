@@ -846,6 +846,69 @@ describe('eurlex_document_relations_resource', () => {
     expect(error?.data?.recovery?.hint).toContain('eurlex_lookup_celex');
   });
 
+  describe('#196 a CELEX one numbering convention away from a held CELEX', () => {
+    const literal = (value: string) => ({ type: 'literal', value });
+
+    /**
+     * CELLAR holding no work for the CELEX read, answering the base-act query with
+     * `bases` ahead of routeQuery, which reads its consolidation predicate as a
+     * consolidated-relation page.
+     */
+    const routeMiss = (bases: Row[]) => {
+      const route = routeQuery({ resolve: [] });
+      mockQuery.mockImplementation(async (q: string) =>
+        q.includes('VALUES ?baseCelex') ? bases : route(q),
+      );
+    };
+
+    const queries = () => mockQuery.mock.calls.map((c) => c[0] as string);
+
+    type MissRead = {
+      error?: {
+        code: number;
+        data?: { celexNumber?: string; held_celex?: string[]; reason?: string };
+        message: string;
+      };
+    };
+
+    it('names the held CELEX in the message and data.held_celex beside celexNumber', async () => {
+      routeMiss([
+        {
+          baseCelex: literal('32014R0833'),
+          baseWorkUri: literal(`${CELLAR}32014R0833`),
+          carriesCore: literal('1'),
+          current: literal('2026-07-24|02014R0833-20260724'),
+        },
+      ]);
+
+      const { error } = (await readOverWire('eurlex://document/02014R0833/relations')) as MissRead;
+
+      expect(error?.code).toBe(JsonRpcErrorCode.NotFound);
+      expect(error?.data).toMatchObject({
+        reason: 'not_found',
+        celexNumber: '02014R0833',
+        held_celex: ['02014R0833-20260724'],
+      });
+      expect(error?.message).toBe(
+        'No CELLAR work found for CELEX: 02014R0833. CELLAR holds 02014R0833-20260724, the current consolidated version of 32014R0833.',
+      );
+      // The resolution, then the one held query; no relation is traversed.
+      expect(queries()).toHaveLength(2);
+      expect(isResolutionQuery(queries()[0] ?? '')).toBe(true);
+      expect(queries()[1]).toContain('VALUES ?baseCelex');
+    });
+
+    it('keeps the not_found of a CELEX whose forms CELLAR does not hold', async () => {
+      routeMiss([]);
+
+      const { error } = (await readOverWire('eurlex://document/52026AG9999/relations')) as MissRead;
+
+      expect(error?.message).toBe('No CELLAR work found for CELEX: 52026AG9999');
+      expect(error?.data).toMatchObject({ reason: 'not_found', celexNumber: '52026AG9999' });
+      expect(error?.data).not.toHaveProperty('held_celex');
+    });
+  });
+
   it.each([
     [
       'sparql_error',

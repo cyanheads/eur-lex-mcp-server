@@ -5,7 +5,11 @@
  * @module tests/helpers/query-roles
  */
 
-import { isConsolidationLookup, isProcedureLookup } from '../fixtures/cellar-consolidations.js';
+import {
+  isConsolidationLookup,
+  isDateAmendmentsQuery,
+  isProcedureLookup,
+} from '../fixtures/cellar-consolidations.js';
 import { isCaseLawFactsQuery, isResolutionQuery } from '../fixtures/cellar-works.js';
 
 /** Each role and the test for it, the more specific first. */
@@ -14,6 +18,7 @@ const MATCHERS: [role: string, matches: (sparql: string) => boolean][] = [
   ['consolidation', isConsolidationLookup],
   ['procedures', isProcedureLookup],
   ['case_law_facts', isCaseLawFactsQuery],
+  ['date_amendments', isDateAmendmentsQuery],
   ['citation', (q) => q.includes('AS ?datesOfEffect)')],
   ['core', (q) => q.includes('cdm:work_has_resource-type')],
   ['agents', (q) => q.includes('cdm:work_created_by_agent')],

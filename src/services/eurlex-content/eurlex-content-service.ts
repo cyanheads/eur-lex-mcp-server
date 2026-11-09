@@ -130,6 +130,36 @@ export const LANGUAGE_TO_ISO_639_2: Record<EurLexLanguage, string> = {
 };
 
 /**
+ * The ISO 639-2/B codes that differ from a language's terminological code and name
+ * that language alone (#195). Slovak's `slo` is left out: it reads as Slovenian
+ * (`slv`) as readily, so it has no single reading.
+ */
+const ISO_639_2B_LANGUAGES: Readonly<Record<string, EurLexLanguage>> = {
+  fre: 'FR',
+  ger: 'DE',
+  gre: 'EL',
+  dut: 'NL',
+  cze: 'CS',
+  rum: 'RO',
+};
+
+/** Each three-letter code a language input reads, lowercased, to its EUR-Lex code. */
+const LANGUAGE_OF_ISO_639_2: ReadonlyMap<string, EurLexLanguage> = new Map([
+  ...EURLEX_LANGUAGES.map((code) => [LANGUAGE_TO_ISO_639_2[code], code] as const),
+  ...Object.entries(ISO_639_2B_LANGUAGES),
+]);
+
+/**
+ * A language input with a three-letter ISO 639-2 code — one of the 24 terminological
+ * codes CELLAR itself uses (`fra`, `deu`) or a bibliographic one (`fre`, `ger`), in
+ * any case — read as its two-letter EUR-Lex code, upper-cased (#195). Every other
+ * value is returned unchanged, so the field's own check still decides it.
+ */
+export function normalizeLanguageCode(value: string): string {
+  return (value.length === 3 && LANGUAGE_OF_ISO_639_2.get(value.toLowerCase())) || value;
+}
+
+/**
  * `Accept` values tried per format, in order. HTML resolves to `application/xhtml+xml`
  * for OJ legislation and `text/html` for CJEU judgments; the first to return a body
  * wins. XML requests Formex 4 only.

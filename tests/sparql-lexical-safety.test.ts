@@ -214,7 +214,8 @@ function zodDef(schema: unknown): Record<string, unknown> | undefined {
 
 /**
  * The path of every string a schema accepts, through its optional/default/union
- * wrappers and into nested objects (`.field`) and arrays (`[]`).
+ * wrappers and into nested objects (`.field`) and arrays (`[]`). A `z.preprocess`
+ * hands its value on to the schema it feeds, so its strings are that schema's.
  */
 function stringLeaves(schema: unknown, path: string): string[] {
   const def = zodDef(schema);
@@ -228,7 +229,7 @@ function stringLeaves(schema: unknown, path: string): string[] {
     case 'readonly':
       return stringLeaves(def.innerType, path);
     case 'pipe':
-      return stringLeaves(def.in, path);
+      return stringLeaves(zodDef(def.in)?.type === 'transform' ? def.out : def.in, path);
     case 'union':
       return [...new Set((def.options as unknown[]).flatMap((o) => stringLeaves(o, path)))];
     case 'object':
@@ -430,6 +431,55 @@ describe('SPARQL lexical safety of caller input', () => {
   });
 });
 
+/**
+ * A CELEX miss sends one more query, naming the CELEX one numbering convention away
+ * (#196). The gate's own variants never reach it — no marker-carrying value reads as
+ * a CELEX — so each miss shape is sent to every read that looks one up, with the
+ * CELEX each lists as a typed literal.
+ */
+describe('#196 the held-CELEX query of a CELEX miss', () => {
+  const MISSES: [celex: string, listed: string][] = [
+    ['02014R0833', '32014R0833'],
+    ['02006R1907-20260101', '32006R1907'],
+    ['52026AG0012', '52026AG0012(01)'],
+    ['62009CJ0197(01)', '62009CJ0197'],
+    ['32023R138', '32023R0138'],
+  ];
+  const READS: [name: string, build: (celex: string) => Record<string, unknown>][] = [
+    ['eurlex_get_document', (celex) => ({ celex_number: celex, content_mode: 'metadata_only' })],
+    ['eurlex_get_relations', (celex) => ({ celex_number: celex })],
+    ['eurlex_lookup_celex', (celex) => ({ identifier: celex })],
+    ['EUR-Lex document metadata', (celex) => ({ celexNumber: celex })],
+    ['EUR-Lex document relations', (celex) => ({ celexNumber: celex })],
+  ];
+  const isHeldQuery = (query: string) =>
+    query.includes('VALUES ?heldCelex') || query.includes('VALUES ?baseCelex');
+
+  it.each(
+    READS.flatMap(([name, build]) =>
+      MISSES.map(([celex, listed]) => ({ name, build, celex, listed })),
+    ),
+  )(
+    '$name sends $celex to one well-formed held-CELEX query',
+    async ({ name, build, celex, listed }) => {
+      const target = targets.find((t) => t.name === name);
+      const parsed = target?.schema.safeParse(build(celex));
+      if (!target || !parsed?.success) throw new Error(`${name} takes ${celex}`);
+      captured.length = 0;
+      await Promise.resolve(
+        target.handler(
+          parsed.data as never,
+          createMockContext({ errors: target.errors } as never) as never,
+        ),
+      ).catch(() => {});
+      const held = captured.filter(isHeldQuery);
+      expect(held).toHaveLength(1);
+      expect(held[0]).toContain(`"${listed}"^^xsd:string`);
+      expect(sparqlLexicalIssues(held[0] ?? '')).toEqual([]);
+    },
+  );
+});
+
 describe('gate harness', () => {
   /** A tool with a required enum beside its free-text input, which a bare `{ term }` fails. */
   const probe = (interpolate: (term: string) => string): GateTarget => ({
@@ -481,6 +531,29 @@ describe('gate harness', () => {
       g: z.enum(['x']),
     });
     expect(stringLeaves(schema, 't')).toEqual(['t.a', 't.b.c', 't.e[]', 't.f']);
+  });
+
+  it('finds the strings a z.preprocess feeds, as the exempt select strings sit (#195)', () => {
+    const schema = z.object({
+      s: z.preprocess((v) => v, z.object({ a: z.string().optional(), b: z.boolean() }).optional()),
+    });
+    expect(stringLeaves(schema, 't')).toEqual(['t.s.a']);
+  });
+
+  it('hands a benign select string to the eurlex_get_document handler (#195)', async () => {
+    const target = targets.find((t) => t.name === 'eurlex_get_document');
+    const parsed = target?.schema.safeParse({ celex_number: '32016R0679', select: 'Article 17' });
+    if (!target || !parsed?.success)
+      throw new Error('eurlex_get_document reads select "Article 17"');
+    expect((parsed.data as { select?: unknown }).select).toEqual({ articles: '17' });
+    captured.length = 0;
+    await Promise.resolve(
+      target.handler(
+        parsed.data as never,
+        createMockContext({ errors: target.errors } as never) as never,
+      ),
+    ).catch(() => {});
+    expect(captured.length).toBeGreaterThan(0);
   });
 });
 

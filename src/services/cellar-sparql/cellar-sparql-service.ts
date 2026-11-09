@@ -38,6 +38,38 @@ const DETERMINISTIC_SQLSTATE_RE = /^(?:37000|22\d{3})$/;
 const SORT_WINDOW_ERROR_RE = /\bSR353\b/;
 
 /**
+ * How long a lookup's first request may go without a complete response before it
+ * counts as stalled and is aborted and sent again (#193). Keyed lookups answer in a
+ * few seconds at most (the slowest of 154 measured took 2.65 s), so 20 s of silence
+ * is a request CELLAR accepted and is not answering, not a slow query. Fixed rather
+ * than scaled to the budget, so a budget of 20 s or less keeps one attempt.
+ */
+const STALL_RESEND_MS = 20_000;
+
+/**
+ * A lookup's first request, aborted after {@link STALL_RESEND_MS} with no complete
+ * response. The retry ladder sends it again; it never reaches a caller, since a
+ * budget that ends the ladder first is reported as the budget's `sparql_timeout`.
+ */
+class StalledRequest extends Error {
+  override name = 'StalledRequest';
+}
+
+/** How an entry point runs its query through `CellarSparqlService.execute`. */
+interface ExecuteOptions {
+  /**
+   * Append an outer `LIMIT` when the query has none of its own (the raw escape
+   * hatch), so an untrusted query is bounded even when only a subselect carries a
+   * `LIMIT`. Internal, trusted, self-bounded queries leave a LIMIT-less query untouched.
+   */
+  boundOuterResult: boolean;
+  /** Maximum top-level LIMIT accepted; trusted pagination raises it by one for a private sentinel row. */
+  limitCeiling: number;
+  /** Abort a first request still silent after {@link STALL_RESEND_MS} and send it again. */
+  resendStalled: boolean;
+}
+
+/**
  * A query CELLAR rejected: it fails the same way on every attempt. A sort-window
  * error carries its own recovery hint, since the fix is the query's paging, not
  * its syntax; every other one leaves the hint to the calling tool's contract.
@@ -237,13 +269,21 @@ export class CellarSparqlService {
    * their own bound. The untrusted raw escape hatch uses `queryWithVars`, which
    * additionally imposes an outer LIMIT.
    *
+   * These are keyed lookups, which answer in seconds, so a first request with no
+   * complete response after 20 s is aborted and sent once more inside the call's
+   * budget (#193); the other entry points send once.
+   *
    * @param timeoutMs - Optional per-query client-side timeout in milliseconds.
    *   Falls back to the server-configured `sparqlQueryTimeoutMs` when omitted;
    *   either way no query runs past the budget its call's queries share.
    */
   async query(rawQuery: string, ctx: Context, timeoutMs?: number): Promise<SparqlBinding[]> {
-    return (await this.execute(rawQuery, ctx, timeoutMs, false, this.maxResults)).parsed.results
-      .bindings;
+    const { parsed } = await this.execute(rawQuery, ctx, timeoutMs, {
+      boundOuterResult: false,
+      limitCeiling: this.maxResults,
+      resendStalled: true,
+    });
+    return parsed.results.bindings;
   }
 
   /**
@@ -251,14 +291,21 @@ export class CellarSparqlService {
    * private row beyond `maxResults`. Paged tools use that row only to prove a
    * continuation exists, then remove it before returning public output. The raw
    * SPARQL path remains capped at `maxResults` through `queryWithVars`.
+   *
+   * A page's cost scales with its match set, and search pages legitimately run
+   * tens of seconds, so a page is sent once and never cut at the stall delay.
    */
   async queryWithContinuation(
     rawQuery: string,
     ctx: Context,
     timeoutMs?: number,
   ): Promise<SparqlBinding[]> {
-    return (await this.execute(rawQuery, ctx, timeoutMs, false, this.maxResults + 1)).parsed.results
-      .bindings;
+    const { parsed } = await this.execute(rawQuery, ctx, timeoutMs, {
+      boundOuterResult: false,
+      limitCeiling: this.maxResults + 1,
+      resendStalled: false,
+    });
+    return parsed.results.bindings;
   }
 
   /**
@@ -270,20 +317,19 @@ export class CellarSparqlService {
    * This is the untrusted raw-escape-hatch path: it imposes an outer LIMIT so the
    * caller's result is bounded to `maxResults` regardless of subselect structure.
    * `limitEnforced` reports whether that ceiling rewrote the query, so a caller can
-   * tell a genuinely complete result from one the server truncated.
+   * tell a genuinely complete result from one the server truncated. The query is
+   * sent once, whatever its timeout: the caller's own query sets its cost.
    */
   async queryWithVars(
     rawQuery: string,
     ctx: Context,
     timeoutMs?: number,
   ): Promise<{ variables: string[]; bindings: SparqlBinding[]; limitEnforced: boolean }> {
-    const { parsed, limitEnforced } = await this.execute(
-      rawQuery,
-      ctx,
-      timeoutMs,
-      true,
-      this.maxResults,
-    );
+    const { parsed, limitEnforced } = await this.execute(rawQuery, ctx, timeoutMs, {
+      boundOuterResult: true,
+      limitCeiling: this.maxResults,
+      resendStalled: false,
+    });
     return {
       variables: parsed.head?.vars ?? [],
       bindings: parsed.results.bindings,
@@ -294,21 +340,13 @@ export class CellarSparqlService {
   /**
    * POST a SPARQL query to CELLAR and return the parsed SPARQL-results JSON
    * envelope (`head` + `results`) alongside whether the `maxResults` ceiling
-   * rewrote the query. Shared by `query` and `queryWithVars`.
-   *
-   * @param boundOuterResult - When true (the raw escape hatch), append an outer
-   *   `LIMIT` if the query has none of its own, so an untrusted query is bounded
-   *   even when only a subselect carries a `LIMIT`. When false (internal, trusted,
-   *   self-bounded queries), leave a LIMIT-less query untouched.
-   * @param limitCeiling - Maximum top-level LIMIT accepted on this execution
-   *   path. Trusted pagination may raise it by one for a private sentinel row.
+   * rewrote the query. Shared by `query`, `queryWithContinuation`, and `queryWithVars`.
    */
   private async execute(
     rawQuery: string,
     ctx: Context,
     timeoutMs: number | undefined,
-    boundOuterResult: boolean,
-    limitCeiling: number,
+    { boundOuterResult, limitCeiling, resendStalled }: ExecuteOptions,
   ): Promise<{ parsed: SparqlResultsJson; limitEnforced: boolean }> {
     const effectiveTimeoutMs = timeoutMs ?? this.timeoutMs;
     // A per-query timeout above the configured one (eurlex_query_sparql's
@@ -334,9 +372,24 @@ export class CellarSparqlService {
       boundOuterResult,
     );
 
+    let firstAttempt = true;
     const parsed = await withRetry(
       async ({ signal, remainingMs }) => {
         const attemptTimeoutMs = Math.min(effectiveTimeoutMs, remainingMs);
+        /*
+         * Only a lookup's first request is cut at the stall delay, and only when it
+         * would otherwise wait longer, so a budget (or what is left of it) of 20 s or
+         * less keeps one attempt. The re-send, and every attempt after it, has the
+         * rest of the budget. Armed with setTimeout and cleared in `finally`, so no
+         * timer outlives the request.
+         */
+        const stall =
+          resendStalled && firstAttempt && attemptTimeoutMs > STALL_RESEND_MS
+            ? new AbortController()
+            : undefined;
+        firstAttempt = false;
+        const stallTimer = stall && setTimeout(() => stall.abort(), STALL_RESEND_MS);
+        const sentAt = Date.now();
         const body = new URLSearchParams({
           query: cappedQuery,
           format: 'application/sparql-results+json',
@@ -344,7 +397,7 @@ export class CellarSparqlService {
         let response: Response;
         let text: string;
         // The body read sits inside the try too: the fetch signal still bounds it, so
-        // a timeout or cancellation mid-body is classified here like one before headers.
+        // a timeout, stall, or cancellation mid-body is classified here like one before headers.
         try {
           response = await fetch(this.endpoint, {
             method: 'POST',
@@ -355,7 +408,11 @@ export class CellarSparqlService {
             body: body.toString(),
             // The caller's cancellation (ctx.signal, carried by withRetry) aborts the
             // request in flight; without it a cancelled call ran to completion (#122).
-            signal: AbortSignal.any([signal, AbortSignal.timeout(attemptTimeoutMs)]),
+            signal: AbortSignal.any([
+              signal,
+              AbortSignal.timeout(attemptTimeoutMs),
+              ...(stall ? [stall.signal] : []),
+            ]),
           });
           text = await response.text();
         } catch (error) {
@@ -363,6 +420,16 @@ export class CellarSparqlService {
           if (ctx.signal.aborted) throw error;
           // `signal` also carries the call's deadline clock.
           if (signal.aborted) throw budgetSpent(error);
+          if (stall?.signal.aborted) {
+            const stalledMs = Date.now() - sentAt;
+            ctx.log.warning(
+              'CELLAR SPARQL request stalled with no complete response; aborted to send it again',
+              { stalledMs },
+            );
+            throw new StalledRequest(`No complete CELLAR SPARQL response in ${stalledMs} ms`, {
+              cause: error,
+            });
+          }
           // The client-side bound must bound the whole call, not one attempt of
           // four (#78): `isTransient` below never re-runs a query that ran out of
           // time, since a re-run spends the same budget again and hammers a shared
@@ -375,6 +442,8 @@ export class CellarSparqlService {
             );
           }
           throw error;
+        } finally {
+          clearTimeout(stallTimer);
         }
 
         if (!response.ok) {
@@ -410,17 +479,21 @@ export class CellarSparqlService {
         signal: ctx.signal,
         deadlineMs: callBudgetMs,
         // One attempt per query for every `sparql_timeout`: a retryable one is the
-        // caller's to retry, never this ladder's (#78). Outages keep the default.
+        // caller's to retry, never this ladder's (#78). A stalled first request is
+        // sent again (#193); outages keep the default.
         isTransient: (error) =>
-          !(error instanceof McpError && error.data?.reason === 'sparql_timeout') &&
-          defaultIsTransient(error),
+          error instanceof StalledRequest ||
+          (!(error instanceof McpError && error.data?.reason === 'sparql_timeout') &&
+            defaultIsTransient(error)),
       },
     ).catch((error: unknown) => {
       /*
        * The budget ended the retry ladder: a backoff would have outlasted it, or
-       * its clock fired mid-attempt. The last attempt's typed failure (an outage
-       * status, or the budget timeout thrown above) says more than the ladder's
-       * own `retry_deadline_exceeded`, which no tool contract declares.
+       * its clock fired mid-attempt or mid-backoff. The last attempt's typed failure
+       * (an outage status, or the budget timeout thrown above) says more than the
+       * ladder's own `retry_deadline_exceeded`, which no tool contract declares. A
+       * stalled request is no typed failure, so a backoff after one that the budget
+       * cuts short is the budget's `sparql_timeout`.
        */
       if (error instanceof McpError && error.data?.reason === 'retry_deadline_exceeded') {
         throw error.cause instanceof McpError ? error.cause : budgetSpent(error);

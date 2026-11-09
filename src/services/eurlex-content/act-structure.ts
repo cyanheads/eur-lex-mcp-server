@@ -1612,6 +1612,89 @@ function parseTokens(raw: string | undefined, kind: SectionKind, vocabulary: Voc
   return tokens;
 }
 
+/** The select field each kind word names (#195); a section word names none, as no field takes one. */
+const FIELD_OF_KIND = {
+  article: 'articles',
+  chapter: 'chapters',
+  section: undefined,
+  annex: 'annexes',
+  recital: 'recitals',
+  heading: 'headings',
+} as const satisfies Record<
+  Exclude<SectionKind, 'operative_part'>,
+  keyof SectionSelectors | undefined
+>;
+
+type WordKind = keyof typeof FIELD_OF_KIND;
+
+/**
+ * A whole word naming a heading kind, in any case: English `article`, `chapter`,
+ * `section`, `annex`, `recital`, or `heading`, or any language's article, chapter,
+ * section, or annex keyword ({@link HEADING_FORMS}). The named group that matched is
+ * the kind. No keyword names two kinds across the 24 languages — `Artikel`,
+ * `KAPITEL`, `AFDELING`, and `ANEXO` each name the same kind in every language that
+ * writes them — so a word's kind never depends on the language served.
+ */
+const KIND_WORD = new RegExp(
+  `^(?:${(['article', 'chapter', 'section', 'annex'] as const)
+    .map((kind) => {
+      const keywords = Object.values(HEADING_FORMS).map((forms) =>
+        keywordSource(splitForm(forms[kind]).keyword),
+      );
+      return `(?<${kind}>${[...new Set([kind, ...keywords])].join('|')})`;
+    })
+    .join('|')}|(?<recital>recital)|(?<heading>heading))$`,
+  'iu',
+);
+
+/** The kind a word names, or undefined for any other word. */
+function kindOfWord(word: string): WordKind | undefined {
+  const groups = KIND_WORD.exec(word)?.groups;
+  if (!groups) return undefined;
+  return (Object.keys(FIELD_OF_KIND) as WordKind[]).find((kind) => groups[kind] !== undefined);
+}
+
+/**
+ * A select sent as one string — "Article 4", "Artikel 1, 5", "5. cikk", "Annex II",
+ * "Anhang" — read as the selectors naming the same sections, or undefined when it
+ * has no single reading (#195). Each comma-separated token is a number with a kind
+ * word before or after it, a number alone, or an annex word alone, which names the
+ * act's lone unnumbered annex as `ANNEX`; the kind words must all name the same
+ * field. That field gets the numbers joined with commas, the kind words removed: a
+ * word is read in every language at once, since the language served is not known
+ * until the body is. A string naming no kind, a section, or two kinds, or holding a
+ * token of any other shape ("Art. 5", "Articles 4", "article:50", "Article 4 of the
+ * Regulation", a kind word with no number), has no reading. Blank tokens are
+ * dropped, as each field drops them.
+ */
+export function readSelectorString(text: string): SectionSelectors | undefined {
+  let kind: WordKind | undefined;
+  const numbers: string[] = [];
+  for (const token of text.split(',')) {
+    const trimmed = token.trim();
+    if (!trimmed) continue;
+    const words = trimmed.split(/\s+/);
+    if (words.length > 2) return undefined;
+    const [first = '', second] = words;
+    const firstKind = kindOfWord(first);
+    const secondKind = second === undefined ? undefined : kindOfWord(second);
+    let tokenKind: WordKind | undefined;
+    if (second === undefined) {
+      if (firstKind && firstKind !== 'annex') return undefined;
+      tokenKind = firstKind;
+      numbers.push(firstKind ? 'ANNEX' : first);
+    } else {
+      if (!firstKind === !secondKind) return undefined;
+      tokenKind = firstKind ?? secondKind;
+      numbers.push(firstKind ? second : first);
+    }
+    if (tokenKind && kind && tokenKind !== kind) return undefined;
+    kind ??= tokenKind;
+  }
+  const field = kind && FIELD_OF_KIND[kind];
+  return field ? { [field]: numbers.join(',') } : undefined;
+}
+
 /**
  * The sections not contained in another section of the list — the slices a
  * selection's text is built from. `sections` must be in document order.

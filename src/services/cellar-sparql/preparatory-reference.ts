@@ -3,7 +3,8 @@
  * final`) and interinstitutional procedure references (`2021/0106(COD)`) parsed and
  * resolved to the CELEX they name: a document number by the typed `comnat:` document
  * id CELLAR records on the work, a procedure reference by the typed reference literal
- * on its dossier, then the act that initiated the dossier.
+ * on its dossier, then the act that initiated the dossier — or, when no act with a
+ * CELEX initiated it, the acts it produced.
  * @module services/cellar-sparql/preparatory-reference
  */
 
@@ -45,8 +46,11 @@ export type PreparatoryResolution =
   | { kind: 'several'; celex: readonly string[] }
   /** No work carries the document number, or no dossier the procedure reference. */
   | { kind: 'not_held' }
-  /** The procedure's dossier exists, but no act with a CELEX initiated it. */
-  | { kind: 'no_initiating_act' };
+  /**
+   * The procedure's dossier exists, but no act with a CELEX initiated it. `produced`
+   * is the CELEX of each act its dossiers produced, sorted, empty when none has one.
+   */
+  | { kind: 'no_initiating_act'; produced: readonly string[] };
 
 /*
  * Both patterns run on the value after `normalize`, so every separator is one space;
@@ -179,16 +183,21 @@ SELECT DISTINCT ?celex WHERE {
 
 /**
  * Each dossier carrying the procedure reference, with the CELEX of the act that
- * initiated it. CELLAR records some initiating acts as the act's
- * `…/resource/celex/` alias IRI rather than its work, so the CELEX is also read
- * through the work `owl:sameAs` that alias. A dossier with no such act still answers
- * one row, without a CELEX.
+ * initiated it (`?celex`) and of each act it produced (`?producedCelex`, #190).
+ * CELLAR records some initiating acts as the act's `…/resource/celex/` alias IRI
+ * rather than its work, so the initiating CELEX is also read through the work
+ * `owl:sameAs` that alias. A produced act is read directly, as
+ * `procedures[].adopted_acts` reads it: no produced resource without a CELEX reaches
+ * one through `owl:sameAs` (2026-11-09). The two reads are separate `OPTIONAL`s, so a
+ * dossier with neither still answers one row, and one with no initiating act still
+ * answers its produced acts. A stored reference answers at most 7 rows (2026-11-09),
+ * far inside the `LIMIT`.
  */
 export function buildProcedureQuery(
   reference: PreparatoryReference & { kind: 'procedure' },
 ): string {
   return `
-SELECT DISTINCT ?dossier ?celex WHERE {
+SELECT DISTINCT ?dossier ?celex ?producedCelex WHERE {
   VALUES ?reference { ${typedLiterals(procedureReferenceLiterals(reference))} }
   ?dossier cdm:procedure_code_interinstitutional_reference_procedure ?reference .
   OPTIONAL {
@@ -200,12 +209,21 @@ SELECT DISTINCT ?dossier ?celex WHERE {
         cdm:resource_legal_id_celex ?celex .
     }
   }
+  OPTIONAL {
+    ?dossier cdm:dossier_produces_resource_legal ?produced .
+    ?produced cdm:resource_legal_id_celex ?producedCelex .
+  }
 } LIMIT 100`;
+}
+
+/** The distinct values `variable` binds across `rows`, sorted. */
+function sortedValues(rows: readonly SparqlBinding[], variable: string): string[] {
+  return [...new Set(rows.flatMap((row) => row[variable]?.value ?? []))].sort();
 }
 
 /** One CELEX resolves, several are named, none is undefined. */
 function byCelex(rows: readonly SparqlBinding[]): PreparatoryResolution | undefined {
-  const celex = [...new Set(rows.flatMap((row) => row.celex?.value ?? []))].sort();
+  const celex = sortedValues(rows, 'celex');
   const [only] = celex;
   if (only === undefined) return;
   return celex.length === 1 ? { kind: 'one', celex: only } : { kind: 'several', celex };
@@ -214,7 +232,9 @@ function byCelex(rows: readonly SparqlBinding[]): PreparatoryResolution | undefi
 /**
  * Resolve a parsed reference against CELLAR in one query. A procedure held by several
  * dossiers (`2000/0247(ACC)`) or opened by several acts names each CELEX, as does a
- * document number held in parts.
+ * document number held in parts. A procedure that no act with a CELEX initiated
+ * carries the acts every dossier holding it produced (#190); one with an initiating
+ * act resolves to that act alone.
  */
 export async function resolvePreparatoryReference(
   svc: Pick<CellarSparqlService, 'query'>,
@@ -227,5 +247,7 @@ export async function resolvePreparatoryReference(
   }
   const rows = await svc.query(buildProcedureQuery(reference), ctx);
   if (rows.length === 0) return { kind: 'not_held' };
-  return byCelex(rows) ?? { kind: 'no_initiating_act' };
+  return (
+    byCelex(rows) ?? { kind: 'no_initiating_act', produced: sortedValues(rows, 'producedCelex') }
+  );
 }

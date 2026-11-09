@@ -17,6 +17,7 @@ import {
   parseActStructure,
   readActStructure,
   readDocumentStructure,
+  readSelectorString,
   type SectionSelectors,
 } from '@/services/eurlex-content/act-structure.js';
 import {
@@ -2403,6 +2404,103 @@ describe('a lone unnumbered annex is selected as "ANNEX" (#156)', () => {
       await span((n) => `${' '.repeat(n - 6)}anhang`);
       await span((n) => 'annex'.repeat(n / 5));
       await span((n) => 'annex,'.repeat(n / 6));
+    },
+    CPU_TIMED_TEST_TIMEOUT_MS,
+  );
+});
+
+describe('a select sent as one string (#195)', () => {
+  it.each<[string, SectionSelectors]>([
+    ['Article 4', { articles: '4' }],
+    ['4 article', { articles: '4' }],
+    ['ARTICLE 4', { articles: '4' }],
+    ['Artikel 4', { articles: '4' }],
+    ['5. cikk', { articles: '5.' }],
+    ['Άρθρο 5', { articles: '5' }],
+    ['член 5', { articles: '5' }],
+    ['Chapter IV', { chapters: 'IV' }],
+    ['IV LUKU', { chapters: 'IV' }],
+    ['Recital 12', { recitals: '12' }],
+    ['Heading 2', { headings: '2' }],
+    ['Annex II', { annexes: 'II' }],
+    ['Annex', { annexes: 'ANNEX' }],
+    ['Anhang', { annexes: 'ANNEX' }],
+    ['annex, Annex II', { annexes: 'ANNEX,II' }],
+    ['Article 1, Article 5', { articles: '1,5' }],
+    ['Article 1, 5', { articles: '1,5' }],
+    ['1, Article 5', { articles: '1,5' }],
+    ['  Article\t4 , , Artikel 17,', { articles: '4,17' }],
+  ])('reads %j as %j', (text, selectors) => {
+    expect(readSelectorString(text)).toEqual(selectors);
+  });
+
+  it.each([
+    ['no kind word', '4'],
+    ['numbers alone', '1, 5'],
+    ['a section', 'Section 2'],
+    ['a section in another language', 'ABSCHNITT 2'],
+    ['two kinds', 'Article 4, Annex II'],
+    ['two kind words in one token', 'Article Annex'],
+    ['an abbreviation', 'Art. 4'],
+    ['a plural', 'Articles 4'],
+    ['a colon', 'article:50'],
+    ['words after the number', 'Article 4 of the Regulation'],
+    ['an article word with no number', 'Article'],
+    ['a recital word with no number', 'Recital'],
+    ['an empty string', ''],
+    ['blank tokens', ' , '],
+    ['the operative part', 'Operative part'],
+  ])('has no reading for %s (%j)', (_label, text) => {
+    expect(readSelectorString(text)).toBeUndefined();
+  });
+
+  /** Visible text of a fixture heading. */
+  const visible = (markup: string) => markup.replace(/<[^<>]*>/g, '');
+
+  it.each(EURLEX_LANGUAGES)('%s: each heading word names its own field', (lang) => {
+    const { article2, chapter4, annex1, section1 } = AI_ACT_HEADINGS[lang];
+    expect(Object.keys(readSelectorString(visible(article2)) ?? {})).toEqual(['articles']);
+    expect(Object.keys(readSelectorString(visible(chapter4)) ?? {})).toEqual(['chapters']);
+    expect(Object.keys(readSelectorString(visible(annex1)) ?? {})).toEqual(['annexes']);
+    expect(readSelectorString(visible(section1))).toBeUndefined();
+  });
+
+  it.each(EURLEX_LANGUAGES)(
+    '%s: its chapter and annex headings select those sections of the English body',
+    (lang) => {
+      const { chapter4, annex1 } = AI_ACT_HEADINGS[lang];
+      const english = actHtml(AI_ACT_HEADINGS.EN);
+      const headings = parseActStructure(english, 'html', 'EN');
+      const select = (text: string) =>
+        extractSections(english, headings, readSelectorString(visible(text)) ?? {}, 'EN');
+      expect(select(chapter4)).toMatchObject({ matched: ['CHAPTER IV'], missed: [] });
+      expect(select(annex1)).toMatchObject({ matched: ['ANNEX I'], missed: [] });
+    },
+  );
+
+  it(
+    'reads a caller-sized string in linear time',
+    async () => {
+      const span = async (label: string, build: (n: number) => string) => {
+        const timed = (n: number) => {
+          const text = build(n);
+          return () => {
+            for (let round = 0; round < 10; round++) readSelectorString(text);
+          };
+        };
+        const base = await bestCpuMs(timed(5_000));
+        for (let n = 10_000; n <= 320_000; n *= 2) {
+          const t = await bestCpuMs(timed(n));
+          const timings = `${label}: ${t.toFixed(3)} ms at ${n}, ${base.toFixed(3)} ms at 5000`;
+          expect(t, timings).toBeLessThan(1_000);
+          if (n === 320_000) expect(t / base, timings).toBeLessThan(256);
+        }
+      };
+      await span('a line-broken run of words', (n) => `${'§1 x'.repeat(n / 4)}\ny`);
+      await span('a run of blank lines', (n) => '  \r\n'.repeat(n / 4));
+      await span('one kind word behind a whitespace run', (n) => `${' '.repeat(n - 9)}Article 4`);
+      await span('one long word', (n) => 'article'.repeat(n / 7));
+      await span('repeated tokens', (n) => 'Article 1,'.repeat(n / 10));
     },
     CPU_TIMED_TEST_TIMEOUT_MS,
   );

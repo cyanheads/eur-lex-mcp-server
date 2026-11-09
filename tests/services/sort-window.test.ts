@@ -11,6 +11,7 @@ import {
   readWindowedPage,
   SORT_WINDOW,
   UNDATED_PLACEHOLDER,
+  UNDATED_PLACEHOLDERS,
   windowEndRoute,
   windowedLimit,
 } from '@/services/cellar-sparql/sort-window.js';
@@ -32,6 +33,24 @@ describe('CELLAR undated placeholder (#184)', () => {
     ['2016-04-27', '2016-04-27'],
     ['2016-04-27+02:00', '2016-04-27+02:00'],
     [undefined, undefined],
+  ])('reports CELLAR date %j as %j', (value, reported) => {
+    expect(cellarDate(value)).toBe(reported);
+  });
+});
+
+describe('CELLAR second no-date value (#187)', () => {
+  it('is 1002-02-02, listed after the undated placeholder', () => {
+    expect(UNDATED_PLACEHOLDERS).toEqual(['1001-01-01', '1002-02-02']);
+  });
+
+  it.each([
+    ['1002-02-02', undefined],
+    ['1002-02-02+01:00', undefined],
+    ['1002-02-02T00:00:00', undefined],
+    ['1002-02-01', '1002-02-01'],
+    ['1002-02-03', '1002-02-03'],
+    ['1002-12-02', '1002-12-02'],
+    ['2002-02-02', '2002-02-02'],
   ])('reports CELLAR date %j as %j', (value, reported) => {
     expect(cellarDate(value)).toBe(reported);
   });

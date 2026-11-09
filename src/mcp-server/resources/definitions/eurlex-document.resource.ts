@@ -12,12 +12,13 @@ import {
   getCellarSparqlService,
 } from '@/services/cellar-sparql/cellar-sparql-service.js';
 import { CELEX_PATTERN, normalizeCelex } from '@/services/cellar-sparql/eli-resolution.js';
+import { celexMissError, findHeldCelex } from '@/services/cellar-sparql/held-celex.js';
 import { fetchLegislativeProcedures } from '@/services/cellar-sparql/legislative-procedures.js';
 import {
   findConsolidation,
   isConsolidatedCelex,
 } from '@/services/cellar-sparql/relation-traversal.js';
-import { cellarDate } from '@/services/cellar-sparql/sort-window.js';
+import { cellarDate, UNDATED_PLACEHOLDERS } from '@/services/cellar-sparql/sort-window.js';
 import type { SparqlBinding } from '@/services/cellar-sparql/types.js';
 import { fetchWorkAgents } from '@/services/cellar-sparql/work-agents.js';
 import { resolveCelexWorks } from '@/services/cellar-sparql/work-resolution.js';
@@ -44,8 +45,7 @@ function collectResolved(
 
 export const eurlex_document_resource = resource('eurlex://document/{celexNumber}', {
   name: 'EUR-Lex document metadata',
-  description:
-    "Metadata snapshot for a CELLAR work by CELEX number — human-readable document type, authors by English authority label (an EU institution or body, a member state, an MEP, or a national court; each usable as the author_institution filter of eurlex_search_documents), Advocates General of a case-law record, date, English title, in-force flag, ELI (eli), Official Journal reference (oj_reference, e.g. OJ L 119, 4.5.2016, p. 1–88), every date of effect with its type and the clause that sets it (dates_of_effect: [{ date, type?, provision? }], type one of entry_into_force, application, partial_application, provisional_application, takes_effect, takes_partial_effect; provision e.g. Article 113(a), numbered as CELLAR records it), a directive's transposition deadlines (transposition_deadlines), legal basis acts (work URI plus CELEX), EuroVoc subjects (concept URI plus English label), and the legislative procedures the act belongs to, sorted (procedures: [{ reference, status?, withdrawal_date?, adopted_acts? }], reference e.g. 2021/0106(COD), status one of adopted, withdrawn, pending, not_adopted and absent when CELLAR flags none or several, withdrawal_date when CELLAR flags the procedure withdrawn, adopted_acts the CELEX numbers the procedure produced). A consolidated text keeps its own type, date, title, and ELI, and reports its base act (base_act_celex) with that act's authors, in-force flag, OJ reference, dates of effect, transposition deadlines, legal bases, subjects, and procedures.",
+  description: `Metadata snapshot for a CELLAR work by CELEX number — human-readable document type, authors by English authority label (an EU institution or body, a member state, an MEP, or a national court; each usable as the author_institution filter of eurlex_search_documents), Advocates General of a case-law record, date, English title, in-force flag, ELI (eli), Official Journal reference (oj_reference, e.g. OJ L 119, 4.5.2016, p. 1–88), every date of effect with its type and the clause that sets it (dates_of_effect: [{ date, type?, provision? }], type one of entry_into_force, application, partial_application, provisional_application, takes_effect, takes_partial_effect; provision e.g. Article 113(a), numbered as CELLAR records it), a directive's transposition deadlines (transposition_deadlines), each list leaving out the values CELLAR records for no date (${UNDATED_PLACEHOLDERS.join(', ')}) and reading CELLAR's dates, which can lag an amending act that moves one (eurlex_get_document names such an act and the current consolidated version, whose text states the dates that apply), legal basis acts (work URI plus CELEX), EuroVoc subjects (concept URI plus English label), and the legislative procedures the act belongs to, sorted (procedures: [{ reference, status?, withdrawal_date?, adopted_acts? }], reference e.g. 2021/0106(COD), status one of adopted, withdrawn, pending, not_adopted and absent when CELLAR flags none or several, withdrawal_date when CELLAR flags the procedure withdrawn, adopted_acts the CELEX numbers the procedure produced). A consolidated text keeps its own type, date, title, and ELI, and reports its base act (base_act_celex) with that act's authors, in-force flag, OJ reference, dates of effect, transposition deadlines, legal bases, subjects, and procedures.`,
   mimeType: 'application/json',
   params: z.object({
     celexNumber: z
@@ -64,7 +64,7 @@ export const eurlex_document_resource = resource('eurlex://document/{celexNumber
     {
       reason: 'not_found',
       code: JsonRpcErrorCode.NotFound,
-      when: 'No CELLAR work holds the CELEX number.',
+      when: 'No CELLAR work holds the CELEX number. One numbering convention away from a CELEX CELLAR holds — a consolidated CELEX with no date or a date no version carries, a (nn) suffix missing or extra, a number not zero-padded to four digits — each held CELEX is named in the message and in data.held_celex.',
       recovery:
         'Confirm the CELEX number with eurlex_lookup_celex, then read the resource again with the CELEX it returns.',
     },
@@ -79,7 +79,7 @@ export const eurlex_document_resource = resource('eurlex://document/{celexNumber
     {
       reason: 'sparql_timeout',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: "A query this read sent to CELLAR ran past the time budget the read's queries share (retryable: CELLAR's response time varies, so a later read can finish), or CELLAR refused it as too costly to run (not retryable: the same query is refused again). Neither is retried within the read.",
+      when: "A query this read sent to CELLAR ran past the time budget the read's queries share (retryable: CELLAR's response time varies, so a later read can finish), or CELLAR refused it as too costly to run (not retryable: the same query is refused again). Neither is retried within the read, apart from one re-send, inside the same budget, of a lookup CELLAR leaves unanswered for 20 s.",
       recovery:
         'When the error is retryable, read the resource again shortly; or fetch the metadata with the eurlex_get_document tool and content_mode "metadata_only".',
       thrownBy: 'service',
@@ -103,9 +103,12 @@ export const eurlex_document_resource = resource('eurlex://document/{celexNumber
     ]);
     const workUri = resolved.get(celexNumber);
     if (!workUri) {
-      throw ctx.fail('not_found', `No CELLAR work found for CELEX: ${celexNumber}`, {
-        celexNumber,
-      });
+      // A CELEX one numbering convention away from a held CELEX names it (#196).
+      const miss = celexMissError(
+        `No CELLAR work found for CELEX: ${celexNumber}`,
+        await findHeldCelex(svc, celexNumber, ctx),
+      );
+      throw ctx.fail('not_found', miss.message, { celexNumber, ...miss.data }, miss.options);
     }
     const baseAct = consolidation?.base;
     const actWork = baseAct?.workUri ?? workUri;

@@ -3,6 +3,7 @@
  * @module tests/tools/eurlex-search-documents.tool.test
  */
 
+import type { z } from '@cyanheads/mcp-ts-core';
 import {
   JsonRpcErrorCode,
   serviceUnavailable,
@@ -290,8 +291,8 @@ describe('eurlex_search_documents', () => {
 
     expect(result).toMatchObject({ documents: [], total: 0, offset: 0, has_more: false });
     expect(result.next_offset).toBeUndefined();
-    expect(getEnrichment(ctx).notice).toContain(
-      'Broaden the search by removing filters, trying a shorter keyword, or expanding the date range.',
+    expect(getEnrichment(ctx).notice).toMatch(
+      /\)\. Broaden the search by trying a shorter keyword\.$/,
     );
   });
 
@@ -657,9 +658,8 @@ describe('eurlex_search_documents', () => {
     expect(result.total).toBe(1);
     expect(result.documents).toHaveLength(1);
     // Both types resolve, de-duplicate, sort, and join — neither is silently dropped.
-    // CORRIGENDUM carries a curated label (#86); BUDGET has none, so it still falls
-    // back to its raw authority code, and the two forms coexist on one row.
-    expect(result.documents[0]?.resource_type).toBe('BUDGET, Corrigendum');
+    // CORRIGENDUM (#86) and BUDGET (#192) both carry their authority labels.
+    expect(result.documents[0]?.resource_type).toBe('Budget, Corrigendum');
   });
 
   it('the limit bounds distinct documents (cap applied after GROUP BY CELEX)', async () => {
@@ -1879,9 +1879,9 @@ describe('eurlex_search_documents', () => {
       expect(structured).not.toHaveProperty('next_offset');
       expect(structured).not.toHaveProperty('truncated');
       const notice = structured.notice as string;
-      expect(notice).toContain('keyword=zzqxunmatchablephrase');
-      expect(notice).toContain(
-        'Broaden the search by removing filters, trying a shorter keyword, or expanding the date range.',
+      // It names the one filter the call set (#186).
+      expect(notice).toBe(
+        'No documents matched the search criteria (keyword=zzqxunmatchablephrase, include_consolidated=false, include_corrigenda=false). Broaden the search by trying a shorter keyword.',
       );
 
       const text = contentText(result);
@@ -1924,6 +1924,84 @@ describe('eurlex_search_documents', () => {
       expect(structured.notice).toContain('author_institution=zzqx agency');
       expect(contentText(result)).toContain(`> ${structured.notice as string}`);
       expect(searchQueries()[0]).toContain(`bif:contains "'zzqx agency'"`);
+    });
+
+    // --- #186: the broadening steps name only filters the call set ---
+
+    it('names document_type and author_institution, and neither a keyword nor a date range, when those are what the call set', async () => {
+      mockQuery.mockResolvedValue([]);
+
+      const result = await runToolContract(eurlex_search_documents, {
+        document_type: 'REG',
+        author_institution: 'Supremo Tribunal de Justiça',
+      });
+
+      const notice = (result.structuredContent as { notice: string }).notice;
+      expect(notice).toBe(
+        'No documents matched the search criteria (document_type=REG, include_consolidated=false, include_corrigenda=false, author_institution=Supremo Tribunal de Justiça). Broaden the search by removing document_type or author_institution.',
+      );
+      expect(readCommonMark(contentText(result))).toContain(
+        `⟨blockquote_open⟩\n\n${notice}\n\n⟨blockquote_close⟩`,
+      );
+    });
+
+    it('lists every broadening step a call set in one sentence', async () => {
+      mockQuery.mockResolvedValue([]);
+
+      const result = await runToolContract(eurlex_search_documents, {
+        keyword: 'zzqx',
+        document_type: 'DIR',
+        date_from: '2020-01-01',
+        eurovoc_concept: 'http://eurovoc.europa.eu/2828',
+        author_institution: 'Council',
+        in_force: true,
+      });
+
+      expect((result.structuredContent as { notice: string }).notice).toMatch(
+        /\)\. Broaden the search by trying a shorter keyword, expanding the date range, or removing document_type, eurovoc_concept, author_institution, or in_force\.$/,
+      );
+    });
+
+    // --- #186: a removal is named only when the call keeps a filter after it ---
+
+    it.each([
+      [
+        'author_institution alone',
+        { author_institution: 'Supremo Tribunal de Justiça' },
+        'author_institution=Supremo Tribunal de Justiça',
+        'trying a different author_institution',
+      ],
+      ['in_force alone', { in_force: true }, 'in_force=true', 'setting in_force to false'],
+    ])(
+      'points a search on %s at another value, never at removing its one filter',
+      async (_label, args, echoed, step) => {
+        mockQuery.mockResolvedValue([]);
+
+        const result = await runToolContract(eurlex_search_documents, args);
+
+        const notice = (result.structuredContent as { notice: string }).notice;
+        expect(notice).toBe(
+          `No documents matched the search criteria (include_consolidated=false, include_corrigenda=false, ${echoed}). Broaden the search by ${step}.`,
+        );
+        // Removing the one filter leaves a call the no_filters gate rejects.
+        expect(notice).not.toContain('removing');
+        expect(readCommonMark(contentText(result))).toContain(
+          `⟨blockquote_open⟩\n\n${notice}\n\n⟨blockquote_close⟩`,
+        );
+      },
+    );
+
+    it('keeps naming each removal while the call has another filter to fall back on', async () => {
+      mockQuery.mockResolvedValue([]);
+
+      const result = await runToolContract(eurlex_search_documents, {
+        author_institution: 'Supremo Tribunal de Justiça',
+        in_force: false,
+      });
+
+      expect((result.structuredContent as { notice: string }).notice).toMatch(
+        /\)\. Broaden the search by removing author_institution or in_force\.$/,
+      );
     });
 
     it.each(['-', '()', '!!!', '/_-'])(
@@ -2013,8 +2091,6 @@ describe('eurlex_search_documents', () => {
 
     describe('EuroVoc search for case law (#176)', () => {
       const CONCEPT = 'http://eurovoc.europa.eu/5595';
-      const GENERIC_GUIDANCE =
-        'Broaden the search by removing filters, trying a shorter keyword, or expanding the date range.';
       const CASE_LAW_GUIDANCE =
         'CELLAR indexes no judgment, order, or Advocate General opinion of the Court of Justice or General Court by EuroVoc concept; only EFTA Court judgments carry one. Search case law by subject with eurlex_get_cases subject (e.g. "personal data"), or omit document_type and pass keyword "Case" to list the Judicial Information Notices that announce cases under this concept, each naming the case number eurlex_get_cases takes.';
 
@@ -2100,20 +2176,41 @@ describe('eurlex_search_documents', () => {
         expect(contentText(result)).not.toMatch(/^> /m);
       });
 
+      // The generic steps name the filters each call set, a lone one by another value (#186).
       it.each([
-        ['JUDG without a concept', { document_type: 'JUDG', date_from: '2026-11-02' }],
-        ['OPIN_AG without a concept', { document_type: 'OPIN_AG', keyword: 'zzqx' }],
-        ['JUDG with a blank concept', { document_type: 'JUDG', eurovoc_concept: '' }],
-        ['a concept with REG', { document_type: 'REG', eurovoc_concept: CONCEPT }],
-        ['a concept with no document_type', { eurovoc_concept: CONCEPT }],
-      ])('keeps the generic broadening notice for %s', async (_label, args) => {
+        [
+          'JUDG without a concept',
+          { document_type: 'JUDG', date_from: '2026-11-02' },
+          'expanding the date range or removing document_type',
+        ],
+        [
+          'OPIN_AG without a concept',
+          { document_type: 'OPIN_AG', keyword: 'zzqx' },
+          'trying a shorter keyword or removing document_type',
+        ],
+        [
+          'JUDG with a blank concept',
+          { document_type: 'JUDG', eurovoc_concept: '' },
+          'trying a different document_type',
+        ],
+        [
+          'a concept with REG',
+          { document_type: 'REG', eurovoc_concept: CONCEPT },
+          'removing document_type or eurovoc_concept',
+        ],
+        [
+          'a concept with no document_type',
+          { eurovoc_concept: CONCEPT },
+          'trying a different eurovoc_concept',
+        ],
+      ])('keeps the generic broadening notice for %s', async (_label, args, steps) => {
         mockQuery.mockResolvedValue([]);
 
         const result = await runToolContract(eurlex_search_documents, args);
 
         const notice = (result.structuredContent as { notice?: string }).notice ?? '';
         expect(notice).toMatch(/^No documents matched the search criteria \(.+\)\. /);
-        expect(notice.endsWith(`). ${GENERIC_GUIDANCE}`)).toBe(true);
+        expect(notice.endsWith(`). Broaden the search by ${steps}.`)).toBe(true);
         expect(notice).not.toContain('eurlex_get_cases');
       });
 
@@ -2838,6 +2935,70 @@ describe('eurlex_search_documents', () => {
   });
 });
 
+// --- #194: `query`, the name callers guess for keyword ---
+
+describe('eurlex_search_documents input aliases (#194)', () => {
+  beforeEach(() => {
+    mockQuery.mockReset();
+    mockQuery.mockImplementation(async (q: string) =>
+      q.includes('GROUP BY ?celexNumber')
+        ? [
+            makeDocBinding('32001L0083', {
+              types: `${RESOURCE_TYPE_BASE}DIR`,
+              date: '2001-11-06',
+              title: 'Directive 2001/83/EC on the Community code relating to medicinal products',
+            }),
+          ]
+        : [],
+    );
+  });
+
+  /** The SPARQL text of every query the handler sent, in order. */
+  function sentQueries(): string[] {
+    return mockQuery.mock.calls.map((c) => c[0] as string);
+  }
+
+  /** Call the tool with arguments as a client sends them, keys the schema omits included. */
+  function callTool(args: Record<string, unknown>) {
+    return runToolContract(
+      eurlex_search_documents,
+      args as z.input<typeof eurlex_search_documents.input>,
+    );
+  }
+
+  it('serves query as keyword: the same queries, page, and content[]', async () => {
+    const viaKeyword = await callTool({ keyword: 'medicinal products', document_type: 'DIR' });
+    const keywordQueries = sentQueries();
+    mockQuery.mockClear();
+
+    const viaQuery = await callTool({ query: 'medicinal products', document_type: 'DIR' });
+
+    expect(viaQuery.isError).toBeFalsy();
+    expect(viaQuery.structuredContent).toMatchObject({
+      total: 1,
+      documents: [{ celex_number: '32001L0083' }],
+      query_echo: { keyword: 'medicinal products', document_type: 'DIR' },
+    });
+    expect(viaQuery.structuredContent).toStrictEqual(viaKeyword.structuredContent);
+    expect(viaQuery.content).toStrictEqual(viaKeyword.content);
+    expect(sentQueries()).toStrictEqual(keywordQueries);
+    expect(keywordQueries.some((q) => q.includes("'medicinal products'"))).toBe(true);
+  });
+
+  it('rejects query sent beside keyword with the alias hint, before any CELLAR request', async () => {
+    const result = await callTool({ keyword: 'medicinal products', query: 'medicinal products' });
+
+    expect(result.isError).toBe(true);
+    expect((result.structuredContent as { error: { code: number } }).error.code).toBe(
+      JsonRpcErrorCode.InvalidParams,
+    );
+    expect(contentText(result)).toContain(
+      'query is an alias of keyword; send one of them, not both.',
+    );
+    expect(mockQuery).not.toHaveBeenCalled();
+  });
+});
+
 // --- #145: CELLAR's typed failures reach the wire with this tool's own recovery ---
 
 describe('eurlex_search_documents CELLAR failure contract (#145)', () => {
@@ -2847,7 +3008,8 @@ describe('eurlex_search_documents CELLAR failure contract (#145)', () => {
 
   /*
    * The service throws these without a recovery hint (its own test pins that), so
-   * the hint on the wire is the one this tool's contract declares.
+   * the hint on the wire is the one this tool's contract declares. A Virtuoso cost
+   * refusal (SP031) of the page query adds the filters the call left unset (#186).
    */
   it.each([
     [
@@ -2861,6 +3023,7 @@ describe('eurlex_search_documents CELLAR failure contract (#145)', () => {
             retryable: false,
           },
         ),
+      '',
     ],
     [
       'sparql_timeout',
@@ -2870,10 +3033,11 @@ describe('eurlex_search_documents CELLAR failure contract (#145)', () => {
           reason: 'sparql_timeout',
           retryable: false,
         }),
+      ' Setting document_type or eurovoc_concept also narrows it.',
     ],
   ] as const)(
     'reports %s with its declared code and the tool’s recovery',
-    async (reason, code, error) => {
+    async (reason, code, error, unsetFilters) => {
       mockQuery.mockRejectedValue(error());
       const declared = eurlex_search_documents.errors?.find((e) => e.reason === reason);
 
@@ -2885,17 +3049,110 @@ describe('eurlex_search_documents CELLAR failure contract (#145)', () => {
 
       expect(result.isError).toBe(true);
       const structured = result.structuredContent as {
-        error?: { code?: number; data?: { reason?: string; recovery?: { hint?: string } } };
+        error?: {
+          code?: number;
+          data?: { reason?: string; retryable?: boolean; recovery?: { hint?: string } };
+        };
       };
       expect(declared?.code).toBe(code);
       expect(structured.error?.code).toBe(code);
       expect(structured.error?.data?.reason).toBe(reason);
-      expect(structured.error?.data?.recovery?.hint).toBe(declared?.recovery);
-      expect(contentText(result)).toContain(declared?.recovery ?? '<missing>');
+      expect(structured.error?.data?.retryable).toBe(false);
+      const hint = `${declared?.recovery}${unsetFilters}`;
+      expect(structured.error?.data?.recovery?.hint).toBe(hint);
+      expect(contentText(result)).toContain(hint);
       // The hint names this tool's levers, never the raw-SPARQL tool's.
       expect(declared?.recovery).not.toMatch(/timeout_hint|cdm: prefix|SPARQL query syntax/);
     },
   );
+
+  // --- #186: a timeout's recovery names only the filters the call left unset ---
+
+  const LISTED_FILTERS = ['document_type', 'eurovoc_concept', 'author_institution'];
+  const BUDGET_SPENT = 'CELLAR SPARQL queries for this request ran past the time budget they share';
+  const recoveryOf = (reason: string) =>
+    eurlex_search_documents.errors?.find((e) => e.reason === reason)?.recovery ?? '<missing>';
+  /** Whether `text` names `filter` as a word of its own. */
+  const names = (text: string, filter: string) => new RegExp(`\\b${filter}\\b`).test(text);
+  const errorOf = (result: { structuredContent?: unknown }) =>
+    (
+      result.structuredContent as {
+        error?: {
+          code?: number;
+          message?: string;
+          data?: { reason?: string; retryable?: boolean; recovery?: { hint?: string } };
+        };
+      }
+    ).error;
+
+  it('names no listed filter in the sparql_timeout contract recovery', () => {
+    for (const filter of LISTED_FILTERS) {
+      expect(names(recoveryOf('sparql_timeout'), filter), filter).toBe(false);
+    }
+  });
+
+  it('adds the filters a timed-out page query left unset, keeping the timeout as thrown, on both surfaces', async () => {
+    mockQuery.mockRejectedValue(
+      serviceUnavailable(BUDGET_SPENT, { reason: 'sparql_timeout', retryable: true }),
+    );
+
+    const result = await runToolContract(eurlex_search_documents, {
+      document_type: 'REG',
+      keyword: 'data protection',
+    });
+
+    const error = errorOf(result);
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      message: BUDGET_SPENT,
+      data: { reason: 'sparql_timeout', retryable: true },
+    });
+    const hint = error?.data?.recovery?.hint ?? '';
+    expect(hint).toBe(
+      `${recoveryOf('sparql_timeout')} Setting eurovoc_concept or author_institution also narrows it.`,
+    );
+    expect(names(hint, 'document_type')).toBe(false);
+    expect(contentText(result)).toContain(hint);
+    // The page query is the one that ran out of time.
+    expect(mockQuery).toHaveBeenCalledTimes(1);
+    expect(searchQueries()).toHaveLength(1);
+  });
+
+  it('gives a timed-out page query of a call that set every listed filter the contract recovery alone', async () => {
+    mockQuery.mockRejectedValue(
+      serviceUnavailable('CELLAR SPARQL query timed out on Virtuoso', {
+        reason: 'sparql_timeout',
+        retryable: false,
+      }),
+    );
+
+    const result = await runToolContract(eurlex_search_documents, {
+      document_type: 'REG',
+      eurovoc_concept: 'http://eurovoc.europa.eu/2828',
+      author_institution: 'Council',
+    });
+
+    expect(searchQueries()).toHaveLength(1);
+    expect(errorOf(result)?.data).toMatchObject({
+      reason: 'sparql_timeout',
+      retryable: false,
+      recovery: { hint: recoveryOf('sparql_timeout') },
+    });
+    expect(contentText(result)).toContain(recoveryOf('sparql_timeout'));
+  });
+
+  it('keeps the contract recovery alone for a timeout at the exact-CELEX keyword lookup, before the page query', async () => {
+    mockQuery.mockRejectedValue(
+      serviceUnavailable(BUDGET_SPENT, { reason: 'sparql_timeout', retryable: true }),
+    );
+
+    const result = await runToolContract(eurlex_search_documents, { keyword: '32016R0679' });
+
+    expect(mockQuery).toHaveBeenCalledTimes(1);
+    expect(mockQuery.mock.calls[0]?.[0]).toContain('VALUES ?kwCelex');
+    expect(searchQueries()).toEqual([]);
+    expect(errorOf(result)?.data?.recovery?.hint).toBe(recoveryOf('sparql_timeout'));
+  });
 });
 
 // --- #154: pages stop at CELLAR's 10,000-row sort window ---
@@ -3040,11 +3297,59 @@ describe('eurlex_search_documents CELLAR sort window (#154)', () => {
       ).error;
       expect(error?.code).toBe(JsonRpcErrorCode.ValidationError);
       expect(error?.data?.reason).toBe('offset_past_window');
-      expect(error?.data?.recovery?.hint).toBe(declared?.recovery);
+      // The contract recovery, then the filters the call left unset (#186).
+      expect(error?.data?.recovery?.hint).toBe(
+        `${declared?.recovery} Setting eurovoc_concept or author_institution also narrows it.`,
+      );
       expect(declared?.recovery).toContain('date_to');
       expect(contentText(result)).toContain('10,000');
       expect(mockQuery).not.toHaveBeenCalled();
     });
+  });
+
+  // --- #186: an offset past the window is offered only the filters the call left unset ---
+
+  const offsetRecovery = () =>
+    eurlex_search_documents.errors?.find((e) => e.reason === 'offset_past_window')?.recovery ??
+    '<missing>';
+  const hintOf = (result: { structuredContent?: unknown }) =>
+    (result.structuredContent as { error?: { data?: { recovery?: { hint?: string } } } }).error
+      ?.data?.recovery?.hint ?? '';
+
+  it('names no listed filter in the offset_past_window contract recovery', () => {
+    for (const filter of ['document_type', 'eurovoc_concept', 'author_institution']) {
+      expect(new RegExp(`\\b${filter}\\b`).test(offsetRecovery()), filter).toBe(false);
+    }
+  });
+
+  it('offers an offset past the window the filters it left unset or blank, and not document_type', async () => {
+    const result = await runToolContract(eurlex_search_documents, {
+      document_type: 'REG',
+      keyword: 'customs',
+      author_institution: '   ',
+      offset: 10_000,
+    });
+
+    const hint = hintOf(result);
+    expect(hint).toBe(
+      `${offsetRecovery()} Setting eurovoc_concept or author_institution also narrows it.`,
+    );
+    expect(hint).not.toMatch(/\bdocument_type\b/);
+    expect(contentText(result)).toContain(hint);
+    expect(mockQuery).not.toHaveBeenCalled();
+  });
+
+  it('gives an offset past the window that set every listed filter the contract recovery alone', async () => {
+    const result = await runToolContract(eurlex_search_documents, {
+      document_type: 'DEC',
+      eurovoc_concept: 'http://eurovoc.europa.eu/2828',
+      author_institution: 'Council',
+      offset: 10_500,
+    });
+
+    expect(hintOf(result)).toBe(offsetRecovery());
+    expect(contentText(result)).toContain(offsetRecovery());
+    expect(mockQuery).not.toHaveBeenCalled();
   });
 
   it('walks next_offset to row 10,000 and promises nothing past it', async () => {

@@ -46,9 +46,18 @@ export function canonicalEurovocConceptUri(value: string): string | undefined {
 }
 
 /**
- * CDM resource-type URI → human-readable short label.
- * Covers common legislation types, case law types, and preparatory acts.
- * Falls back to the last URI path segment when not in the map.
+ * CDM resource-type URI → human-readable label, for every resource-type a work with a
+ * CELEX carries (206 types, 2026-11-09). A label is the authority concept's English
+ * `skos:prefLabel` in Title Case: every word is capitalized, as is each part of a
+ * hyphenated word and the first word after `(` or an em dash; elsewhere `a`, `an`,
+ * `the`, `and`, `or`, and the prepositions `at`, `between`, `by`, `for`, `in`, `of`,
+ * `on`, `to`, `with`, `without` are lowercased; acronyms, ordinals, and punctuation are
+ * kept as written (`EU`, `1st`, `’`, `—`). Codes the authority labels alike share the
+ * label (`DEC` / `DEC_ENTSCHEID` "Decision", `NOTICE` / `NOTICE_INFO` "Notice"). Ten
+ * labels are curated rather than prefLabels and are kept: `INFO_JUDICIAL`, `INFO_JUR`,
+ * `ABSTRACT_JUR`, `SUM_JUR`, `OPIN_AG`, `VIEW_AG`, `MEAS_NATION_IMPL`, and the three
+ * `*_ADOPT_INTERNATION` types. A type absent from the map, such as one CELLAR adds
+ * later, falls back to its code, the last URI path segment.
  */
 const RESOURCE_TYPE_LABEL_ENTRIES: Record<string, string> = {
   'http://publications.europa.eu/resource/authority/resource-type/REG': 'Regulation',
@@ -72,7 +81,6 @@ const RESOURCE_TYPE_LABEL_ENTRIES: Record<string, string> = {
   'http://publications.europa.eu/resource/authority/resource-type/JUDG': 'Judgment',
   'http://publications.europa.eu/resource/authority/resource-type/ORDER': 'Order',
   'http://publications.europa.eu/resource/authority/resource-type/OPIN_AG': 'AG Opinion',
-  'http://publications.europa.eu/resource/authority/resource-type/AG_OPI': 'AG Opinion',
   'http://publications.europa.eu/resource/authority/resource-type/VIEW_AG': 'AG View',
   'http://publications.europa.eu/resource/authority/resource-type/RULING': 'Ruling',
   'http://publications.europa.eu/resource/authority/resource-type/AMEND_PROP': 'Amended Proposal',
@@ -117,7 +125,6 @@ const RESOURCE_TYPE_LABEL_ENTRIES: Record<string, string> = {
     'Recommendation for a Recommendation',
   'http://publications.europa.eu/resource/authority/resource-type/RECO_REG':
     'Recommendation for a Regulation',
-  'http://publications.europa.eu/resource/authority/resource-type/REC_SOFT': 'Recommendation',
   'http://publications.europa.eu/resource/authority/resource-type/RES': 'Resolution',
   'http://publications.europa.eu/resource/authority/resource-type/AGREE_INTERNATION':
     'International Agreement',
@@ -161,6 +168,229 @@ const RESOURCE_TYPE_LABEL_ENTRIES: Record<string, string> = {
   'http://publications.europa.eu/resource/authority/resource-type/THIRDPARTY_PROCEED':
     'Third-Party Proceedings',
   'http://publications.europa.eu/resource/authority/resource-type/DATPRO': 'Provisional Data',
+  // Every other type a work with a CELEX carries (#192): preparatory, Commission,
+  // Council, and Parliament documents, budgets, notices, and questions. The Commission
+  // document lookup lands on these (COMMUNIC, IMPACT_ASSESS, JOINT_COMMUNIC), and
+  // QUEST_WRITTEN alone types 173,681 works (2026-11-09).
+  'http://publications.europa.eu/resource/authority/resource-type/ACKNOWLEDGE_RECP':
+    'Acknowledgement Receipt',
+  'http://publications.europa.eu/resource/authority/resource-type/ACT': 'Act',
+  'http://publications.europa.eu/resource/authority/resource-type/ACT_DRAFT': 'Draft Act',
+  'http://publications.europa.eu/resource/authority/resource-type/ACT_OTHER': 'Other Acts',
+  'http://publications.europa.eu/resource/authority/resource-type/ACT_PREP': 'Preparatory Act',
+  'http://publications.europa.eu/resource/authority/resource-type/ADD': 'Addendum',
+  'http://publications.europa.eu/resource/authority/resource-type/AGREE': 'Agreement',
+  'http://publications.europa.eu/resource/authority/resource-type/AGREE_AMEND':
+    'Amendment to an Agreement',
+  'http://publications.europa.eu/resource/authority/resource-type/AGREE_EUMS':
+    'Agreement between Member States',
+  'http://publications.europa.eu/resource/authority/resource-type/AGREE_INTERINSTIT':
+    'Interinstitutional Agreement',
+  'http://publications.europa.eu/resource/authority/resource-type/AGREE_INTERINSTIT_DRAFT':
+    'Draft Interinstitutional Agreement',
+  'http://publications.europa.eu/resource/authority/resource-type/AGREE_INTERNAL':
+    'Internal Agreement',
+  'http://publications.europa.eu/resource/authority/resource-type/AGREE_PROT':
+    'Protocol to the Agreement',
+  'http://publications.europa.eu/resource/authority/resource-type/AID_STATE': 'State Aid',
+  'http://publications.europa.eu/resource/authority/resource-type/ANNEX': 'Annex',
+  'http://publications.europa.eu/resource/authority/resource-type/ANNOUNC': 'Announcements',
+  'http://publications.europa.eu/resource/authority/resource-type/ARRANG': 'Arrangement',
+  'http://publications.europa.eu/resource/authority/resource-type/ASSENT': 'Assent',
+  'http://publications.europa.eu/resource/authority/resource-type/ASSENT_REQ': 'Request for Assent',
+  'http://publications.europa.eu/resource/authority/resource-type/BALANCE': 'Balance',
+  'http://publications.europa.eu/resource/authority/resource-type/BUDGET': 'Budget',
+  'http://publications.europa.eu/resource/authority/resource-type/BUDGET_DRAFT': 'Draft Budget',
+  'http://publications.europa.eu/resource/authority/resource-type/BUDGET_DRAFT_PRELIM':
+    'Preliminary Draft Budget',
+  'http://publications.europa.eu/resource/authority/resource-type/BUDGET_DRAFT_PRELIM_SUPPL':
+    'Preliminary Draft Supplementary Budget',
+  'http://publications.europa.eu/resource/authority/resource-type/BUDGET_DRAFT_SUPPL_AMEND':
+    'Draft Supplementary and Amending Budget',
+  'http://publications.europa.eu/resource/authority/resource-type/BUDGET_SUPPL_AMEND':
+    'Supplementary and Amending Budget',
+  'http://publications.europa.eu/resource/authority/resource-type/CALL_EXPR_INTEREST':
+    'Call for Expression of Interest',
+  'http://publications.europa.eu/resource/authority/resource-type/CALL_PROP': 'Call for Proposals',
+  'http://publications.europa.eu/resource/authority/resource-type/CENSURE_RJ':
+    'Rejected Motion of Censure',
+  'http://publications.europa.eu/resource/authority/resource-type/CENSURE_WDW':
+    'Withdrawn Motion of Censure',
+  'http://publications.europa.eu/resource/authority/resource-type/COMMUNIC': 'Communication',
+  'http://publications.europa.eu/resource/authority/resource-type/COMMUNIC_DRAFT':
+    'Draft Communication',
+  'http://publications.europa.eu/resource/authority/resource-type/COMMUNIC_POSIT':
+    'Communication of the Commission on Council’s Position at 1st Reading',
+  'http://publications.europa.eu/resource/authority/resource-type/COMPOS': 'Common Position',
+  'http://publications.europa.eu/resource/authority/resource-type/COMPOS_ACCEPT':
+    'Acceptance of Common Position',
+  'http://publications.europa.eu/resource/authority/resource-type/COMPOS_AMEND':
+    'Amendment to Common Position',
+  'http://publications.europa.eu/resource/authority/resource-type/COMPOS_RJ':
+    'Rejection of the Common Position',
+  'http://publications.europa.eu/resource/authority/resource-type/CONCL': 'Council Conclusions',
+  'http://publications.europa.eu/resource/authority/resource-type/CONVENTION': 'Convention',
+  'http://publications.europa.eu/resource/authority/resource-type/DECLAR': 'Declaration',
+  'http://publications.europa.eu/resource/authority/resource-type/DECLAR_DRAFT':
+    'Draft Declaration',
+  'http://publications.europa.eu/resource/authority/resource-type/DEC_DRAFT': 'Draft Decision',
+  'http://publications.europa.eu/resource/authority/resource-type/DIR_DRAFT': 'Draft Directive',
+  'http://publications.europa.eu/resource/authority/resource-type/EVL': 'Evaluation',
+  'http://publications.europa.eu/resource/authority/resource-type/EVL_SUM_EXE':
+    'Executive Summary of the Evaluation',
+  'http://publications.europa.eu/resource/authority/resource-type/EXCH_LET': 'Exchange of Letters',
+  'http://publications.europa.eu/resource/authority/resource-type/EXCH_RATE': 'Exchange Rate',
+  'http://publications.europa.eu/resource/authority/resource-type/EXCH_RATE_MRO':
+    'Interest Rate — Euro Exchange Rates',
+  'http://publications.europa.eu/resource/authority/resource-type/EXPL_MEMORANDUM':
+    'Explanatory Memorandum',
+  'http://publications.europa.eu/resource/authority/resource-type/FC': 'Fitness Check',
+  'http://publications.europa.eu/resource/authority/resource-type/FC_SUM_EXE':
+    'Executive Summary of the Fitness Check',
+  'http://publications.europa.eu/resource/authority/resource-type/GUIDELINE': 'Guideline',
+  'http://publications.europa.eu/resource/authority/resource-type/GUIDELINE_GEN':
+    'General Guidelines',
+  'http://publications.europa.eu/resource/authority/resource-type/GUIDELINE_LIGNES': 'Guideline',
+  'http://publications.europa.eu/resource/authority/resource-type/IMPACT_ASSESS':
+    'Impact Assessment',
+  'http://publications.europa.eu/resource/authority/resource-type/IMPACT_ASSESS_SUM':
+    'Summary of Impact Assessment',
+  'http://publications.europa.eu/resource/authority/resource-type/IMPL_PLAN': 'Implementation Plan',
+  'http://publications.europa.eu/resource/authority/resource-type/INFO': 'Information',
+  'http://publications.europa.eu/resource/authority/resource-type/INFO_COMMUNIC': 'Information',
+  'http://publications.europa.eu/resource/authority/resource-type/INI': 'Initiative',
+  'http://publications.europa.eu/resource/authority/resource-type/JOINT_ACTION': 'Joint Action',
+  'http://publications.europa.eu/resource/authority/resource-type/JOINT_COMMUNIC':
+    'Joint Communication',
+  'http://publications.europa.eu/resource/authority/resource-type/JOINT_DEC': 'Joint Decision',
+  'http://publications.europa.eu/resource/authority/resource-type/JOINT_IMPACT_ASSESS':
+    'Joint Impact Assessment',
+  'http://publications.europa.eu/resource/authority/resource-type/JOINT_IMPACT_ASSESS_SUM':
+    'Joint Impact Assessment Summary',
+  'http://publications.europa.eu/resource/authority/resource-type/JOINT_PAPER_WHITE':
+    'Joint White Paper',
+  'http://publications.europa.eu/resource/authority/resource-type/JOINT_REPORT': 'Joint Report',
+  'http://publications.europa.eu/resource/authority/resource-type/JOINT_SWD':
+    'Joint Staff Working Document',
+  'http://publications.europa.eu/resource/authority/resource-type/JOINT_SYNOPSIS_REPORT_CONSULT':
+    'Joint Synopsis Report of the Public Consultation',
+  'http://publications.europa.eu/resource/authority/resource-type/JOINT_TEXT': 'Joint Text',
+  'http://publications.europa.eu/resource/authority/resource-type/JOINT_TEXT_APR':
+    'Approved Joint Text',
+  'http://publications.europa.eu/resource/authority/resource-type/JOINT_TEXT_RJ':
+    'Rejected Joint Text',
+  'http://publications.europa.eu/resource/authority/resource-type/LET': 'Letter',
+  'http://publications.europa.eu/resource/authority/resource-type/LET_AMEND': 'Letter of Amendment',
+  'http://publications.europa.eu/resource/authority/resource-type/LIST': 'List',
+  'http://publications.europa.eu/resource/authority/resource-type/MEMORANDUM': 'Memorandum',
+  'http://publications.europa.eu/resource/authority/resource-type/MEMORANDUM_UNDERST':
+    'Memorandum of Understanding',
+  'http://publications.europa.eu/resource/authority/resource-type/MINUTES': 'Minutes',
+  'http://publications.europa.eu/resource/authority/resource-type/NOTE': 'Note',
+  'http://publications.europa.eu/resource/authority/resource-type/NOTE_COVER': 'Cover Note',
+  'http://publications.europa.eu/resource/authority/resource-type/NOTE_GUID': 'Guidance Note',
+  'http://publications.europa.eu/resource/authority/resource-type/NOTICE': 'Notice',
+  'http://publications.europa.eu/resource/authority/resource-type/NOTICE_AWARD': 'Award Notice',
+  'http://publications.europa.eu/resource/authority/resource-type/NOTICE_CONTRACT':
+    'Contract Notice',
+  'http://publications.europa.eu/resource/authority/resource-type/NOTICE_INFO': 'Notice',
+  'http://publications.europa.eu/resource/authority/resource-type/NOTICE_READER':
+    'Notice to Readers',
+  'http://publications.europa.eu/resource/authority/resource-type/NOTIF': 'Notification',
+  'http://publications.europa.eu/resource/authority/resource-type/OJ': 'Official Journal',
+  'http://publications.europa.eu/resource/authority/resource-type/OPIN': 'Opinion',
+  'http://publications.europa.eu/resource/authority/resource-type/OPIN_ADDIT': 'Additional Opinion',
+  'http://publications.europa.eu/resource/authority/resource-type/OPIN_AMEND_EP':
+    'Opinion on the European Parliament’s Amendments',
+  'http://publications.europa.eu/resource/authority/resource-type/OPIN_DISPUT_LB':
+    'Opinion Disputing a Legal Base',
+  'http://publications.europa.eu/resource/authority/resource-type/OPIN_DRAFT_NATION_LEGIS':
+    'Opinion on Draft National Legislation',
+  'http://publications.europa.eu/resource/authority/resource-type/OPIN_EVL':
+    'Opinion on Evaluation',
+  'http://publications.europa.eu/resource/authority/resource-type/OPIN_EXPLOR':
+    'Exploratory Opinion',
+  'http://publications.europa.eu/resource/authority/resource-type/OPIN_FC':
+    'Opinion on Fitness Check',
+  'http://publications.europa.eu/resource/authority/resource-type/OPIN_IMPACT_ASSESS':
+    'Opinion on Impact Assessment',
+  'http://publications.europa.eu/resource/authority/resource-type/OPIN_NO_PROP_AMEND':
+    'Opinion Not Proposing Amendment',
+  'http://publications.europa.eu/resource/authority/resource-type/OPIN_NO_REPORT':
+    'Opinion without Report',
+  'http://publications.europa.eu/resource/authority/resource-type/OPIN_PROP_AMEND':
+    'Opinion Proposing Amendment',
+  'http://publications.europa.eu/resource/authority/resource-type/OPIN_PROP_RJ':
+    'Opinion Proposing Rejection',
+  'http://publications.europa.eu/resource/authority/resource-type/OPIN_QUAL_APR':
+    'Opinion with Qualified Approval',
+  'http://publications.europa.eu/resource/authority/resource-type/OWNINI_OPIN':
+    'Own-Initiative Opinion',
+  'http://publications.europa.eu/resource/authority/resource-type/OWNINI_OPIN_ADDIT':
+    'Additional Own-Initiative Opinion',
+  'http://publications.europa.eu/resource/authority/resource-type/OWNINI_OPIN_DRAFT_NATION_LEGIS':
+    'Own-Initiative Opinion on Draft National Legislation',
+  'http://publications.europa.eu/resource/authority/resource-type/OWNINI_REPORT':
+    'Own-Initiative Report',
+  'http://publications.europa.eu/resource/authority/resource-type/OWNINI_RES':
+    'Own-Initiative Resolution',
+  'http://publications.europa.eu/resource/authority/resource-type/PAPER_GREEN': 'Green Paper',
+  'http://publications.europa.eu/resource/authority/resource-type/PAPER_REFLEC': 'Reflection Paper',
+  'http://publications.europa.eu/resource/authority/resource-type/PAPER_WHITE': 'White Paper',
+  'http://publications.europa.eu/resource/authority/resource-type/POSIT': 'Position',
+  'http://publications.europa.eu/resource/authority/resource-type/PROCEED_MINUTES':
+    'Minutes of Proceeding',
+  'http://publications.europa.eu/resource/authority/resource-type/PROC_ADMIN':
+    'Administrative Procedures',
+  'http://publications.europa.eu/resource/authority/resource-type/PROC_INTERNAL':
+    'Rules of Procedure',
+  'http://publications.europa.eu/resource/authority/resource-type/PROC_RULES': 'Rules of Procedure',
+  'http://publications.europa.eu/resource/authority/resource-type/PROGRAM': 'Programme',
+  'http://publications.europa.eu/resource/authority/resource-type/PROP_AMEND':
+    'Amendments to the Proposal',
+  'http://publications.europa.eu/resource/authority/resource-type/PROT': 'Protocol',
+  'http://publications.europa.eu/resource/authority/resource-type/QUEST_ORAL': 'Oral Question',
+  'http://publications.europa.eu/resource/authority/resource-type/QUEST_TIME':
+    'Question at Question Time',
+  'http://publications.europa.eu/resource/authority/resource-type/QUEST_WRITTEN':
+    'Written Question',
+  'http://publications.europa.eu/resource/authority/resource-type/RECO_DRAFT':
+    'Draft Recommendation',
+  'http://publications.europa.eu/resource/authority/resource-type/RECRUIT': 'Recruitment',
+  'http://publications.europa.eu/resource/authority/resource-type/REG_DRAFT': 'Draft Regulation',
+  'http://publications.europa.eu/resource/authority/resource-type/REPORT': 'Report',
+  'http://publications.europa.eu/resource/authority/resource-type/REPORT_ANNUAL': 'Annual Report',
+  'http://publications.europa.eu/resource/authority/resource-type/REPORT_ANNUAL_BUDGET':
+    'Annual Report on the EU General Budget',
+  'http://publications.europa.eu/resource/authority/resource-type/REPORT_ANNUAL_DAS':
+    'Annual Report with the Statement of Assurance',
+  'http://publications.europa.eu/resource/authority/resource-type/REPORT_ANNUAL_EDF':
+    'Annual Report on the Activities Funded by the European Development Fund',
+  'http://publications.europa.eu/resource/authority/resource-type/REPORT_ANNUAL_SPECIF':
+    'Specific Annual Report',
+  'http://publications.europa.eu/resource/authority/resource-type/REPORT_SPECIAL': 'Special Report',
+  'http://publications.europa.eu/resource/authority/resource-type/RES_DRAFT': 'Draft Resolution',
+  'http://publications.europa.eu/resource/authority/resource-type/RES_LEGIS':
+    'Legislative Resolution',
+  'http://publications.europa.eu/resource/authority/resource-type/STAT': 'Statement',
+  'http://publications.europa.eu/resource/authority/resource-type/STATUTE': 'Statute',
+  'http://publications.europa.eu/resource/authority/resource-type/STAT_REASON':
+    'Statement of Reasons',
+  'http://publications.europa.eu/resource/authority/resource-type/STRATEGY_COMMON':
+    'Common Strategy',
+  'http://publications.europa.eu/resource/authority/resource-type/SUM': 'Summary',
+  'http://publications.europa.eu/resource/authority/resource-type/SWD': 'Staff Working Document',
+  'http://publications.europa.eu/resource/authority/resource-type/SYNOPSIS_REPORT_CONSULT':
+    'Synopsis Report of the Public Consultation',
+  'http://publications.europa.eu/resource/authority/resource-type/TRANSFER_APPROPR':
+    'Transfer of Appropriations',
+  'http://publications.europa.eu/resource/authority/resource-type/TREATY_DRAFT': 'Draft Treaty',
+  'http://publications.europa.eu/resource/authority/resource-type/VERBATIM_REPORT':
+    'Verbatim Report',
+  'http://publications.europa.eu/resource/authority/resource-type/WARN': 'Warning',
+  'http://publications.europa.eu/resource/authority/resource-type/WITHD_AGREE':
+    'Withdrawal Agreement',
+  'http://publications.europa.eu/resource/authority/resource-type/WORK_DOC': 'Working Document',
 };
 
 /**

@@ -3,6 +3,7 @@
  * @module tests/tools/eurlex-get-cases.tool.test
  */
 
+import type { z } from '@cyanheads/mcp-ts-core';
 import {
   JsonRpcErrorCode,
   serviceUnavailable,
@@ -2555,9 +2556,9 @@ describe('eurlex_get_cases', () => {
       expect(structured).not.toHaveProperty('next_offset');
       expect(structured).not.toHaveProperty('truncated');
       const notice = structured.notice as string;
-      expect(notice).toContain('keyword=zzqxunmatchablephrase');
-      expect(notice).toContain(
-        'Try a different keyword, broader date range, or remove the court/case_type filter.',
+      // It names the one filter the call set (#186).
+      expect(notice).toBe(
+        'No case law records matched the search criteria (keyword=zzqxunmatchablephrase, include_derivative=false). Broaden the search by trying a different keyword.',
       );
 
       const text = contentText(result);
@@ -3369,6 +3370,64 @@ describe('eurlex_get_cases', () => {
   });
 });
 
+// --- #194: `query`, the name callers guess for keyword ---
+
+describe('eurlex_get_cases input aliases (#194)', () => {
+  beforeEach(() => {
+    mockQuery.mockReset();
+    mockQuery.mockResolvedValue([
+      makeCaseBinding('62012CJ0131', {
+        date: '2014-05-13',
+        title: 'Google Spain SL v AEPD',
+        types: 'http://publications.europa.eu/resource/authority/resource-type/JUDG',
+        ecli: 'ECLI:EU:C:2014:317',
+      }),
+    ]);
+  });
+
+  /** The SPARQL text of every query the handler sent, in order. */
+  function sentQueries(): string[] {
+    return mockQuery.mock.calls.map((c) => c[0] as string);
+  }
+
+  /** Call the tool with arguments as a client sends them, keys the schema omits included. */
+  function callTool(args: Record<string, unknown>) {
+    return runToolContract(eurlex_get_cases, args as z.input<typeof eurlex_get_cases.input>);
+  }
+
+  it('serves query as keyword: the same queries, page, and content[]', async () => {
+    const viaKeyword = await callTool({ keyword: 'Google Spain', court: 'CJEU' });
+    const keywordQueries = sentQueries();
+    mockQuery.mockClear();
+
+    const viaQuery = await callTool({ query: 'Google Spain', court: 'CJEU' });
+
+    expect(viaQuery.isError).toBeFalsy();
+    expect(viaQuery.structuredContent).toMatchObject({
+      total: 1,
+      cases: [{ celex_number: '62012CJ0131', ecli: 'ECLI:EU:C:2014:317' }],
+      query_echo: { keyword: 'Google Spain', court: 'CJEU' },
+    });
+    expect(viaQuery.structuredContent).toStrictEqual(viaKeyword.structuredContent);
+    expect(viaQuery.content).toStrictEqual(viaKeyword.content);
+    expect(sentQueries()).toStrictEqual(keywordQueries);
+    expect(keywordQueries.some((q) => q.includes("'Google Spain'"))).toBe(true);
+  });
+
+  it('rejects query sent beside keyword with the alias hint, before any CELLAR request', async () => {
+    const result = await callTool({ keyword: 'Google Spain', query: 'Google Spain' });
+
+    expect(result.isError).toBe(true);
+    expect((result.structuredContent as { error: { code: number } }).error.code).toBe(
+      JsonRpcErrorCode.InvalidParams,
+    );
+    expect(contentText(result)).toContain(
+      'query is an alias of keyword; send one of them, not both.',
+    );
+    expect(mockQuery).not.toHaveBeenCalled();
+  });
+});
+
 // --- #145: CELLAR's typed failures reach the wire with this tool's own recovery ---
 
 describe('eurlex_get_cases CELLAR failure contract (#145)', () => {
@@ -3378,7 +3437,8 @@ describe('eurlex_get_cases CELLAR failure contract (#145)', () => {
 
   /*
    * The service throws these without a recovery hint (its own test pins that), so
-   * the hint on the wire is the one this tool's contract declares.
+   * the hint on the wire is the one this tool's contract declares. A Virtuoso cost
+   * refusal (SP031) of the page query adds the filters the call left unset (#186).
    */
   it.each([
     [
@@ -3389,6 +3449,7 @@ describe('eurlex_get_cases CELLAR failure contract (#145)', () => {
           reason: 'sparql_error',
           retryable: false,
         }),
+      '',
     ],
     [
       'sparql_timeout',
@@ -3398,10 +3459,11 @@ describe('eurlex_get_cases CELLAR failure contract (#145)', () => {
           reason: 'sparql_timeout',
           retryable: false,
         }),
+      ' Setting court, case_type, case_number, member_state, procedure_type, outcome, or subject also narrows it.',
     ],
   ] as const)(
     'reports %s with its declared code and the tool’s recovery',
-    async (reason, code, error) => {
+    async (reason, code, error, unsetFilters) => {
       mockQuery.mockRejectedValue(error());
       const declared = eurlex_get_cases.errors?.find((e) => e.reason === reason);
 
@@ -3412,13 +3474,18 @@ describe('eurlex_get_cases CELLAR failure contract (#145)', () => {
 
       expect(result.isError).toBe(true);
       const structured = result.structuredContent as {
-        error?: { code?: number; data?: { reason?: string; recovery?: { hint?: string } } };
+        error?: {
+          code?: number;
+          data?: { reason?: string; retryable?: boolean; recovery?: { hint?: string } };
+        };
       };
       expect(declared?.code).toBe(code);
       expect(structured.error?.code).toBe(code);
       expect(structured.error?.data?.reason).toBe(reason);
-      expect(structured.error?.data?.recovery?.hint).toBe(declared?.recovery);
-      expect(contentText(result)).toContain(declared?.recovery ?? '<missing>');
+      expect(structured.error?.data?.retryable).toBe(false);
+      const hint = `${declared?.recovery}${unsetFilters}`;
+      expect(structured.error?.data?.recovery?.hint).toBe(hint);
+      expect(contentText(result)).toContain(hint);
       // The hint names this tool's levers, never the raw-SPARQL tool's.
       expect(declared?.recovery).not.toMatch(/timeout_hint|cdm: prefix|SPARQL query syntax/);
     },
@@ -3587,7 +3654,8 @@ describe('eurlex_get_cases CELLAR sort window (#154)', () => {
     ).error;
     expect(error?.code).toBe(JsonRpcErrorCode.ValidationError);
     expect(error?.data?.reason).toBe('offset_past_window');
-    expect(error?.data?.recovery?.hint).toBe(declared?.recovery);
+    // The contract recovery leads; the filters the call left unset follow it (#186).
+    expect(error?.data?.recovery?.hint?.startsWith(`${declared?.recovery} `)).toBe(true);
     expect(declared?.recovery).toContain('date_to');
     expect(contentText(result)).toContain('10,000');
     expect(mockQuery).not.toHaveBeenCalled();
@@ -4441,8 +4509,9 @@ describe('eurlex_get_cases case-law facts (#178)', () => {
 
       const notice = (result.structuredContent as { notice: string }).notice;
       expect(notice).toContain('member_state=MLT, procedure_type=appeal, subject=trade mark');
-      expect(notice).toContain(
-        'Try a different keyword, broader date range, or remove the court/case_type filter. Or drop one of member_state, procedure_type, subject: each matches only the cases CELLAR records its fact for.',
+      // The call set no other filter, so the fact sentence stands alone (#186).
+      expect(notice).toMatch(
+        /\)\. Drop one of member_state, procedure_type, subject: each matches only the cases CELLAR records its fact for\.$/,
       );
       expect(readCommonMark(contentText(result))).toContain(
         `⟨blockquote_open⟩\n\n${notice}\n\n⟨blockquote_close⟩`,
@@ -4458,27 +4527,209 @@ describe('eurlex_get_cases case-law facts (#178)', () => {
       });
 
       expect((result.structuredContent as { notice: string }).notice).toMatch(
-        /remove the court\/case_type filter\. Or drop procedure_type: it matches only the cases CELLAR records that fact for\.$/,
+        /\)\. Broaden the search by trying a different case_number\. Or drop procedure_type: it matches only the cases CELLAR records that fact for\.$/,
       );
     });
 
-    it('keeps the v0.20.0 empty-page notice when no fact filter is set', async () => {
+    it('ends the empty-page notice at the broadening sentence when no fact filter is set', async () => {
       fakeCellar([]);
 
       const result = await runToolContract(eurlex_get_cases, { keyword: 'zzqx' });
 
       expect((result.structuredContent as { notice: string }).notice).toMatch(
-        /remove the court\/case_type filter\.$/,
+        /\)\. Broaden the search by trying a different keyword\.$/,
       );
     });
 
-    it('names the fact filters in the offset_past_window and sparql_error recoveries', () => {
-      for (const reason of ['offset_past_window', 'sparql_error']) {
-        const recovery = eurlex_get_cases.errors?.find((e) => e.reason === reason)?.recovery;
-        for (const filter of ['member_state', 'procedure_type', 'outcome', 'subject']) {
-          expect(recovery, reason).toContain(filter);
-        }
+    it('names the fact filters in the sparql_error recovery', () => {
+      const recovery = eurlex_get_cases.errors?.find((e) => e.reason === 'sparql_error')?.recovery;
+      for (const filter of ['member_state', 'procedure_type', 'outcome', 'subject']) {
+        expect(recovery).toContain(filter);
       }
+    });
+
+    // --- #186: each hint names only what the call can still change ---
+
+    const LISTED_FILTERS = [
+      'court',
+      'case_type',
+      'case_number',
+      'member_state',
+      'procedure_type',
+      'outcome',
+      'subject',
+    ];
+    const BUDGET_SPENT =
+      'CELLAR SPARQL queries for this request ran past the time budget they share';
+    const recoveryOf = (reason: string) =>
+      eurlex_get_cases.errors?.find((e) => e.reason === reason)?.recovery ?? '<missing>';
+    /** Whether `text` names `filter` as a word of its own (`case` does not name `case_type`). */
+    const names = (text: string, filter: string) => new RegExp(`\\b${filter}\\b`).test(text);
+    const errorOf = (result: { structuredContent?: unknown }) =>
+      (
+        result.structuredContent as {
+          error?: {
+            code?: number;
+            message?: string;
+            data?: { reason?: string; retryable?: boolean; recovery?: { hint?: string } };
+          };
+        }
+      ).error;
+
+    it.each(['sparql_timeout', 'offset_past_window'])(
+      'names no listed filter in the %s contract recovery',
+      (reason) => {
+        for (const filter of LISTED_FILTERS) {
+          expect(names(recoveryOf(reason), filter), filter).toBe(false);
+        }
+      },
+    );
+
+    it('adds the filters a timed-out page query left unset, keeping the timeout as thrown, on both surfaces', async () => {
+      mockQuery.mockRejectedValue(
+        serviceUnavailable(BUDGET_SPENT, { reason: 'sparql_timeout', retryable: true }),
+      );
+
+      const result = await runToolContract(eurlex_get_cases, {
+        court: 'CJEU',
+        case_number: 'C-131/12',
+      });
+
+      const error = errorOf(result);
+      expect(error).toMatchObject({
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        message: BUDGET_SPENT,
+        data: { reason: 'sparql_timeout', retryable: true },
+      });
+      const hint = error?.data?.recovery?.hint ?? '';
+      expect(hint).toBe(
+        `${recoveryOf('sparql_timeout')} Setting case_type, member_state, procedure_type, outcome, or subject also narrows it.`,
+      );
+      expect(names(hint, 'court')).toBe(false);
+      expect(names(hint, 'case_number')).toBe(false);
+      expect(contentText(result)).toContain(hint);
+      // The page query is the one that ran out of time.
+      expect(sentQueries()).toEqual([pageQuery()]);
+    });
+
+    it('gives a timed-out page query of a call that set every listed filter the contract recovery alone', async () => {
+      mockQuery.mockImplementation(async (q: string) => {
+        if (isSubjectLookup(q)) return SUBJECT_ROWS;
+        throw serviceUnavailable('CELLAR SPARQL query timed out on Virtuoso', {
+          reason: 'sparql_timeout',
+          retryable: false,
+        });
+      });
+
+      const result = await runToolContract(eurlex_get_cases, {
+        court: 'CJEU',
+        case_type: 'judgment',
+        case_number: 'C-131/12',
+        member_state: 'ES',
+        procedure_type: 'preliminary_ruling',
+        outcome: 'successful',
+        subject: 'data protection',
+      });
+
+      expect(pageQuery()).not.toBe('');
+      expect(errorOf(result)?.data).toMatchObject({
+        reason: 'sparql_timeout',
+        retryable: false,
+        recovery: { hint: recoveryOf('sparql_timeout') },
+      });
+      expect(contentText(result)).toContain(recoveryOf('sparql_timeout'));
+    });
+
+    it('keeps the contract recovery alone for a timeout at the subject lookup, before the page query', async () => {
+      mockQuery.mockRejectedValue(
+        serviceUnavailable(BUDGET_SPENT, { reason: 'sparql_timeout', retryable: true }),
+      );
+
+      const result = await runToolContract(eurlex_get_cases, { subject: 'data protection' });
+
+      expect(sentQueries().map(isSubjectLookup)).toEqual([true]);
+      expect(errorOf(result)?.data?.recovery?.hint).toBe(recoveryOf('sparql_timeout'));
+    });
+
+    it('adds the filters an offset past the window left unset or blank, before any query', async () => {
+      const result = await runToolContract(eurlex_get_cases, {
+        court: 'CJEU',
+        case_type: 'judgment',
+        subject: '  ',
+        offset: 10_000,
+      });
+
+      const error = errorOf(result);
+      expect(error?.data?.reason).toBe('offset_past_window');
+      const hint = error?.data?.recovery?.hint ?? '';
+      expect(hint).toBe(
+        `${recoveryOf('offset_past_window')} Setting case_number, member_state, procedure_type, outcome, or subject also narrows it.`,
+      );
+      expect(names(hint, 'court')).toBe(false);
+      expect(names(hint, 'case_type')).toBe(false);
+      expect(contentText(result)).toContain(hint);
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    it('gives an offset past the window that set every listed filter the contract recovery alone', async () => {
+      const result = await runToolContract(eurlex_get_cases, {
+        court: 'GC',
+        case_type: 'order',
+        case_number: 'T-97/23',
+        member_state: 'DE',
+        procedure_type: 'annulment',
+        outcome: 'unfounded',
+        subject: 'trade mark',
+        offset: 12_000,
+      });
+
+      expect(errorOf(result)?.data?.recovery?.hint).toBe(recoveryOf('offset_past_window'));
+      expect(contentText(result)).toContain(recoveryOf('offset_past_window'));
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    it('names the date range and the fact filters, and no keyword, court, or case_type, on an empty first page that set only those', async () => {
+      fakeCellar([]);
+
+      const result = await runToolContract(eurlex_get_cases, {
+        member_state: 'MT',
+        procedure_type: 'arbitration_clause',
+        date_from: '2020-01-01',
+      });
+
+      const notice = (result.structuredContent as { notice: string }).notice;
+      expect(notice).toBe(
+        'No case law records matched the search criteria (member_state=MLT, procedure_type=arbitration_clause, include_derivative=false, date_from=2020-01-01). Broaden the search by expanding the date range. Or drop one of member_state, procedure_type: each matches only the cases CELLAR records its fact for.',
+      );
+      expect(readCommonMark(contentText(result))).toContain(
+        `⟨blockquote_open⟩\n\n${notice}\n\n⟨blockquote_close⟩`,
+      );
+    });
+
+    it('names case_number on an empty first page of a search by case number alone', async () => {
+      fakeCellar([]);
+
+      const result = await runToolContract(eurlex_get_cases, { case_number: 'C-990/12' });
+
+      expect((result.structuredContent as { notice: string }).notice).toBe(
+        'No case law records matched the search criteria (case_number=C-990/12, celex_fragment=2012C*0990, include_derivative=false). Broaden the search by trying a different case_number.',
+      );
+    });
+
+    it('lists every broadening step a call set in one sentence', async () => {
+      fakeCellar([]);
+
+      const result = await runToolContract(eurlex_get_cases, {
+        keyword: 'zzqx',
+        case_number: 'T-97/23',
+        court: 'GC',
+        case_type: 'order',
+        date_to: '2020-12-31',
+      });
+
+      expect((result.structuredContent as { notice: string }).notice).toMatch(
+        /\)\. Broaden the search by trying a different keyword or case_number, expanding the date range, or removing court or case_type\.$/,
+      );
     });
 
     it('pages an annulment search to row 10,000 and returns the window-end notice', async () => {

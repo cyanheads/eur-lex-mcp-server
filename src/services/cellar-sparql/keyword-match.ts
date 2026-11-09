@@ -62,15 +62,21 @@ export const CELEX_TYPE_CODES = {
   E: 'A C G J P X'.split(' '),
 } as const satisfies Record<string, readonly string[]>;
 
-/** The sector character every CELEX opens with. */
-const CELEX_SECTORS = Object.keys(CELEX_TYPE_CODES) as (keyof typeof CELEX_TYPE_CODES)[];
+/** A CELEX sector: the character every CELEX opens with. */
+export type CelexSector = keyof typeof CELEX_TYPE_CODES;
+
+/**
+ * The twelve sector characters, `0`–`9`, `C`, `E`, in that order: every CELEX in
+ * CELLAR opens with one of them, and no other (1,137,777 values, 2026-11-09).
+ */
+export const CELEX_SECTORS = Object.keys(CELEX_TYPE_CODES) as readonly CelexSector[];
 
 /**
  * Earliest year a CELEX carries after its sector character. A live check of the
  * index hits (2026-09-25) found no sector-and-year prefix in 1900–1950, nor any
  * past the current year.
  */
-const FIRST_CELEX_YEAR = 1951;
+export const FIRST_CELEX_YEAR = 1951;
 
 /**
  * Fewest characters a full-text prefix term may hold before its `*`. CELLAR rejects a

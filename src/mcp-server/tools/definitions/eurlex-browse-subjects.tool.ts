@@ -28,6 +28,7 @@ import {
   readWindowedPage,
   windowedLimit,
 } from '@/services/cellar-sparql/sort-window.js';
+import { normalizeLanguageCode } from '@/services/eurlex-content/eurlex-content-service.js';
 
 /** Concepts served per call; a larger `limit` is clamped to it. */
 const MAX_PAGE_SIZE = 50;
@@ -46,6 +47,7 @@ export const eurlex_browse_subjects = tool('eurlex_browse_subjects', {
       ),
     language: z
       .string()
+      .overwrite(normalizeLanguageCode)
       .regex(/^[A-Za-z]{2,3}$/)
       .default('en')
       .describe(
@@ -69,6 +71,8 @@ export const eurlex_browse_subjects = tool('eurlex_browse_subjects', {
         'Maximum number of EuroVoc concepts to return, served up to 50 per call; a larger value (up to 10,000) is served at 50 and reported in limit_clamp. Defaults to 20.',
       ),
   }),
+  // The name callers guess for keyword (#194); tools/list still advertises keyword alone.
+  inputAliases: { query: 'keyword' },
   output: z.object({
     concepts: z
       .array(

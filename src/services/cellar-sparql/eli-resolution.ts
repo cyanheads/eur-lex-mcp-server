@@ -21,13 +21,15 @@
  * EUR-Lex page or a browser URL takes to the canonical one, and return every other
  * value trimmed, so each field's existing check still decides it. The schemas apply
  * them with `.overwrite()`, never `z.preprocess`: an overwrite keeps the field a
- * plain string, so its advertised JSON Schema is unchanged and the lexical-safety
- * test still reaches it. The case-number grammar eurlex_get_cases matches and
- * eurlex_lookup_celex routes on sits beside them.
+ * plain string, so its advertised JSON Schema is unchanged and the framework's
+ * rejection of a mistyped value still names the type to send, where behind a
+ * transform it only restates the issue. The case-number grammar eurlex_get_cases
+ * matches and eurlex_lookup_celex routes on sits beside them.
  * @module services/cellar-sparql/eli-resolution
  */
 
 import type { Context } from '@cyanheads/mcp-ts-core';
+import { LANGUAGE_TO_ISO_639_2 } from '@/services/eurlex-content/eurlex-content-service.js';
 import type { CellarSparqlService } from './cellar-sparql-service.js';
 import type { SparqlBinding } from './types.js';
 
@@ -194,32 +196,7 @@ const ELI_ROOT = /^(?:https?:\/\/)?(?:data|eur-lex)\.europa\.eu\/eli\//i;
  * The ISO 639-2/T codes of the 24 EUR-Lex languages, the language segment an ELI
  * carries after its manifestation (`…/oj/eng`).
  */
-const ELI_LANGUAGE_SEGMENTS: ReadonlySet<string> = new Set([
-  'bul',
-  'ces',
-  'dan',
-  'deu',
-  'ell',
-  'eng',
-  'est',
-  'fin',
-  'fra',
-  'gle',
-  'hrv',
-  'hun',
-  'ita',
-  'lav',
-  'lit',
-  'mlt',
-  'nld',
-  'pol',
-  'por',
-  'ron',
-  'slk',
-  'slv',
-  'spa',
-  'swe',
-]);
+const ELI_LANGUAGE_SEGMENTS: ReadonlySet<string> = new Set(Object.values(LANGUAGE_TO_ISO_639_2));
 
 /** A point-in-time ELI segment (`…/2016-05-04`). */
 const ELI_POINT_IN_TIME = /^\d{4}-\d{2}-\d{2}$/;

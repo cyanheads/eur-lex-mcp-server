@@ -4,12 +4,18 @@
  * @module tests/services/cellar-sparql-service.test
  */
 
+import type { Context } from '@cyanheads/mcp-ts-core';
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
-import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
+import {
+  createMockContext,
+  type MockContextLogger,
+  runToolContract,
+} from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ServerConfig } from '@/config/server-config.js';
+import { eurlex_lookup_celex } from '@/mcp-server/tools/definitions/eurlex-lookup-celex.tool.js';
 import { eurlex_query_sparql } from '@/mcp-server/tools/definitions/eurlex-query-sparql.tool.js';
 import {
   CellarSparqlService,
@@ -946,5 +952,381 @@ describe('CellarSparqlService per-call deadline', () => {
     elapse(5_000);
 
     await expect(service.query(QUERY, createMockContext())).resolves.toHaveLength(1);
+  });
+});
+
+// --- #193: a lookup whose first request stalls is aborted at 20 s and re-sent once ---
+
+describe('CellarSparqlService stalled lookup re-send (#193)', () => {
+  const QUERY = 'SELECT ?work WHERE { ?s ?p ?o } LIMIT 1';
+  const START = new Date('2026-11-09T12:00:00Z').getTime();
+  const BUDGET_SPENT = {
+    code: JsonRpcErrorCode.ServiceUnavailable,
+    message: 'CELLAR SPARQL queries for this request ran past the time budget they share',
+    data: { reason: 'sparql_timeout', retryable: true },
+  };
+
+  /*
+   * The stall timer, the retry backoff, and the call's deadline all run on the faked
+   * clock. Jitter is pinned, so the ladder's first backoff is exactly 1,500 ms and
+   * its second 3,000 ms.
+   */
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    vi.setSystemTime(START);
+    vi.spyOn(Math, 'random').mockReturnValue(0.5);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  /** Advance the faked clock to `ms` past the call's start. */
+  const clockAt = (ms: number) => vi.advanceTimersByTimeAsync(START + ms - Date.now());
+
+  /**
+   * How CELLAR answers each request, in order: `stall` never answers, `stall-body`
+   * sends headers and never the body, `rows` answers at once with one row, `502` a
+   * gateway page, and `{ rowsAfterMs }` one row after that long. A request past the
+   * plan stalls. An unanswered request rejects with its signal's reason when that
+   * signal aborts, as a real fetch does.
+   */
+  type Answer = 'stall' | 'stall-body' | 'rows' | 502 | { rowsAfterMs: number };
+
+  function stubCellar(plan: readonly Answer[]) {
+    const untilAborted = (signal: AbortSignal) =>
+      new Promise<never>((_resolve, reject) => {
+        if (signal.aborted) reject(signal.reason);
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      });
+    const rows = { ok: true, status: 200, text: async () => JSON.stringify(rowsPayload(1)) };
+    let sent = 0;
+    const fetchMock = vi.fn(async (_url: string, init: { signal: AbortSignal }) => {
+      const answer = plan[sent++] ?? 'stall';
+      if (answer === 'rows') return rows;
+      if (answer === 502) return { ok: false, status: 502, text: async () => GATEWAY_PAGE };
+      if (answer === 'stall-body') {
+        return { ok: true, status: 200, text: () => untilAborted(init.signal) };
+      }
+      if (answer === 'stall') return untilAborted(init.signal);
+      return Promise.race([
+        new Promise((resolve) => setTimeout(() => resolve(rows), answer.rowsAfterMs)),
+        untilAborted(init.signal),
+      ]);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+
+  /** The signal request `n` (1-based) was sent with. */
+  function signalOf(fetchMock: ReturnType<typeof stubCellar>, n: number): AbortSignal {
+    const init = fetchMock.mock.calls[n - 1]?.[1];
+    if (!init) throw new Error(`Request ${n} was never sent`);
+    return init.signal;
+  }
+
+  /** `pending`'s outcome, readable while the faked clock is still being advanced. */
+  function track(pending: Promise<unknown>) {
+    const outcome: { settled: boolean; value?: unknown; error?: unknown } = { settled: false };
+    pending.then(
+      (value) => Object.assign(outcome, { settled: true, value }),
+      (error: unknown) => Object.assign(outcome, { settled: true, error }),
+    );
+    return outcome;
+  }
+
+  /** A service at the default 55 s budget, or the one given. */
+  const service = (sparqlQueryTimeoutMs = 55_000) => makeService({ sparqlQueryTimeoutMs });
+
+  it.each([
+    ['before its headers', 'stall'],
+    ['partway through its body', 'stall-body'],
+  ] as const)(
+    'aborts a first request still silent %s at 20 s and resolves with the re-send’s rows',
+    async (_label, first) => {
+      const fetchMock = stubCellar([first, 'rows']);
+      const ctx = createMockContext();
+      const outcome = track(service().query(QUERY, ctx));
+
+      await clockAt(19_999);
+      expect(signalOf(fetchMock, 1).aborted).toBe(false);
+      expect((ctx.log as MockContextLogger).calls).toEqual([]);
+
+      await clockAt(20_000);
+      expect(signalOf(fetchMock, 1).aborted).toBe(true);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect((ctx.log as MockContextLogger).calls).toEqual([
+        {
+          level: 'warning',
+          msg: 'CELLAR SPARQL request stalled with no complete response; aborted to send it again',
+          data: { stalledMs: 20_000 },
+        },
+      ]);
+
+      // The re-send goes out after the ladder's first backoff, never alongside the first request.
+      await clockAt(21_499);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      await clockAt(21_500);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(outcome).toEqual({
+        settled: true,
+        value: [{ work: { type: 'uri', value: 'http://work/0' } }],
+      });
+    },
+  );
+
+  it('fails as the budget’s sparql_timeout after exactly two requests when the re-send stalls too', async () => {
+    const fetchMock = stubCellar(['stall', 'stall']);
+    const pending = service().query(QUERY, createMockContext());
+    const outcome = track(pending);
+
+    await clockAt(54_999);
+    expect(outcome.settled).toBe(false);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    // The re-send is not itself cut at 20 s: it has the rest of the budget.
+    expect(signalOf(fetchMock, 2).aborted).toBe(false);
+
+    await clockAt(55_000);
+    expect(outcome.settled).toBe(true);
+    await expect(pending).rejects.toMatchObject(BUDGET_SPENT);
+    expect(signalOf(fetchMock, 2).aborted).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('reports the budget’s sparql_timeout when too little is left for the backoff after a stall', async () => {
+    const fetchMock = stubCellar(['stall']);
+    // 1,000 ms are left at the stall, under the 1,500 ms backoff: the ladder stops before sleeping.
+    const pending = service(21_000).query(QUERY, createMockContext());
+    const outcome = track(pending);
+
+    await clockAt(19_999);
+    expect(outcome.settled).toBe(false);
+
+    await clockAt(20_000);
+    expect(signalOf(fetchMock, 1).aborted).toBe(true);
+    expect(outcome.settled).toBe(true);
+    // Never the ladder's own retry_deadline_exceeded, nor the stall itself.
+    await expect(pending).rejects.toMatchObject(BUDGET_SPENT);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports the budget’s sparql_timeout when the budget ends during the backoff after a stall', async () => {
+    const fetchMock = stubCellar(['stall']);
+    // The deadline lands on the backoff's last instant, and its clock fires first.
+    const pending = service(21_500).query(QUERY, createMockContext());
+    const outcome = track(pending);
+
+    await clockAt(20_000);
+    expect(signalOf(fetchMock, 1).aborted).toBe(true);
+    await clockAt(21_499);
+    expect(outcome.settled).toBe(false);
+
+    await clockAt(21_500);
+    expect(outcome.settled).toBe(true);
+    await expect(pending).rejects.toMatchObject(BUDGET_SPENT);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps retrying an outage the re-send meets, on the ladder’s own backoff', async () => {
+    const fetchMock = stubCellar(['stall', 502, 'rows']);
+    const pending = service().query(QUERY, createMockContext());
+    const outcome = track(pending);
+
+    await clockAt(21_500);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    await clockAt(24_499);
+    expect(outcome.settled).toBe(false);
+
+    await clockAt(24_500);
+    expect(outcome.settled).toBe(true);
+    await expect(pending).resolves.toHaveLength(1);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it('re-sends only a first request: one that follows an outage keeps the rest of the budget', async () => {
+    const fetchMock = stubCellar([502, 'stall']);
+    const pending = service().query(QUERY, createMockContext());
+    const outcome = track(pending);
+
+    await clockAt(1_500);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    await clockAt(54_999);
+    expect(signalOf(fetchMock, 2).aborted).toBe(false);
+    expect(outcome.settled).toBe(false);
+
+    await clockAt(55_000);
+    await expect(pending).rejects.toMatchObject(BUDGET_SPENT);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('sends a lookup answered at once one request, with no clock moved and no timer left', async () => {
+    const fetchMock = stubCellar(['rows']);
+    const ctx = createMockContext();
+
+    await expect(service().query(QUERY, ctx)).resolves.toHaveLength(1);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(Date.now()).toBe(START);
+    expect(vi.getTimerCount()).toBe(0);
+    expect((ctx.log as MockContextLogger).calls).toEqual([]);
+  });
+
+  it('sends a lookup answered just under 20 s one request', async () => {
+    const fetchMock = stubCellar([{ rowsAfterMs: 19_999 }]);
+    const pending = service().query(QUERY, createMockContext());
+
+    await clockAt(19_999);
+    await expect(pending).resolves.toHaveLength(1);
+    expect(signalOf(fetchMock, 1).aborted).toBe(false);
+    await clockAt(30_000);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each([20_000, 15_000])(
+    'sends one request under a %i ms SPARQL_QUERY_TIMEOUT_MS',
+    async (budgetMs) => {
+      const fetchMock = stubCellar(['stall']);
+      const pending = service(budgetMs).query(QUERY, createMockContext());
+      const outcome = track(pending);
+
+      await clockAt(budgetMs - 1);
+      expect(signalOf(fetchMock, 1).aborted).toBe(false);
+      expect(outcome.settled).toBe(false);
+
+      await clockAt(budgetMs);
+      await expect(pending).rejects.toMatchObject(BUDGET_SPENT);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('sends one request for a lookup that starts with 20 s or less of the budget left', async () => {
+    const fetchMock = stubCellar(['rows', 'stall']);
+    const s = service();
+    const ctx = createMockContext();
+
+    await s.query(QUERY, ctx);
+    await clockAt(35_000);
+    const pending = s.query(QUERY, ctx);
+    const outcome = track(pending);
+
+    await clockAt(54_999);
+    expect(signalOf(fetchMock, 2).aborted).toBe(false);
+    expect(outcome.settled).toBe(false);
+
+    await clockAt(55_000);
+    await expect(pending).rejects.toMatchObject(BUDGET_SPENT);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('ends every later attempt of a chained call by the deadline its first query set', async () => {
+    const fetchMock = stubCellar(['stall', 'rows', 'stall', 'stall']);
+    const s = service();
+    const ctx = createMockContext();
+
+    const first = track(s.query(QUERY, ctx));
+    await clockAt(21_500);
+    expect(first.settled).toBe(true);
+    expect(first.value).toHaveLength(1);
+
+    // 33,500 ms are left, so this lookup's first request is re-sent too, at 43 s.
+    const pending = s.query(QUERY, ctx);
+    const outcome = track(pending);
+    await clockAt(41_500);
+    expect(signalOf(fetchMock, 3).aborted).toBe(true);
+    await clockAt(54_999);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(signalOf(fetchMock, 4).aborted).toBe(false);
+    expect(outcome.settled).toBe(false);
+
+    await clockAt(55_000);
+    expect(outcome.settled).toBe(true);
+    await expect(pending).rejects.toMatchObject(BUDGET_SPENT);
+    expect(signalOf(fetchMock, 4).aborted).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
+  it.each([
+    [
+      'a search or relation page',
+      (s: CellarSparqlService, ctx: Context) => s.queryWithContinuation(QUERY, ctx),
+    ],
+    [
+      'an eurlex_query_sparql query',
+      (s: CellarSparqlService, ctx: Context) => s.queryWithVars(QUERY, ctx),
+    ],
+    [
+      'an eurlex_query_sparql query at timeout_hint 55000',
+      (s: CellarSparqlService, ctx: Context) => s.queryWithVars(QUERY, ctx, 55_000),
+    ],
+  ])('sends %s once, unanswered, and fails it at the budget as today', async (_label, run) => {
+    const fetchMock = stubCellar(['stall']);
+    const pending = run(service(), createMockContext());
+    const outcome = track(pending);
+
+    await clockAt(54_999);
+    expect(signalOf(fetchMock, 1).aborted).toBe(false);
+    expect(outcome.settled).toBe(false);
+
+    await clockAt(55_000);
+    await expect(pending).rejects.toMatchObject(BUDGET_SPENT);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['before 20 s', ['stall'], 10_000, 1],
+    ['during the backoff', ['stall'], 20_500, 1],
+    ['during the re-send', ['stall', 'stall'], 25_000, 2],
+  ] as const)(
+    'rejects with the caller’s abort %s and sends nothing after it',
+    async (_label, plan, abortAtMs, requests) => {
+      const fetchMock = stubCellar(plan);
+      const controller = new AbortController();
+      const outcome = track(
+        service().query(QUERY, createMockContext({ signal: controller.signal })),
+      );
+
+      await clockAt(abortAtMs);
+      expect(fetchMock).toHaveBeenCalledTimes(requests);
+      expect(signalOf(fetchMock, 1).aborted).toBe(abortAtMs >= 20_000);
+
+      controller.abort();
+      await clockAt(abortAtMs);
+      expect(outcome).toEqual({ settled: true, error: controller.signal.reason });
+
+      await clockAt(60_000);
+      expect(fetchMock).toHaveBeenCalledTimes(requests);
+    },
+  );
+
+  it('surfaces a stall the budget cuts short as sparql_timeout in both channels of a tool', async () => {
+    initCellarSparqlService({} as AppConfig, {} as StorageService, {
+      ...TEST_SERVER_CONFIG,
+      sparqlQueryTimeoutMs: 21_000,
+    });
+    const fetchMock = stubCellar(['stall']);
+    const pending = runToolContract(eurlex_lookup_celex, {
+      identifier: '32016R0679',
+      identifier_type: 'celex',
+    });
+    const outcome = track(pending);
+
+    await clockAt(20_000);
+    expect(outcome.settled).toBe(true);
+    const result = await pending;
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(result.isError).toBe(true);
+    const recovery = eurlex_lookup_celex.errors?.find(
+      (e) => e.reason === 'sparql_timeout',
+    )?.recovery;
+    expect((result.structuredContent as { error: unknown }).error).toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      data: { reason: 'sparql_timeout', retryable: true, recovery: { hint: recovery } },
+    });
+    const text = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+    expect(text).toContain(BUDGET_SPENT.message);
+    expect(text.trimEnd().endsWith('(reason sparql_timeout · retryable)')).toBe(true);
   });
 });

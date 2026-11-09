@@ -3,6 +3,7 @@
  * @module tests/tools/eurlex-browse-subjects.tool.test
  */
 
+import { z } from '@cyanheads/mcp-ts-core';
 import {
   JsonRpcErrorCode,
   serviceUnavailable,
@@ -142,6 +143,47 @@ describe('eurlex_browse_subjects', () => {
     const sparql = mockQuery.mock.calls[0]?.[0] as string;
     expect(sparql).toContain('"fr"');
     expect(sparql).not.toContain('"FR"');
+  });
+
+  it.each([
+    ['fra', 'fr'],
+    ['FRE', 'fr'],
+    ['Deu', 'de'],
+  ])('reads the three-letter code %s as language %s (#195)', async (language, tag) => {
+    mockQuery.mockResolvedValue([
+      makeConceptBinding({ uri: 'http://eurovoc.europa.eu/1', label: 'vie privée' }),
+    ]);
+    const result = await runToolContract(eurlex_browse_subjects, { keyword: 'vie', language });
+
+    expect(result.isError).toBeFalsy();
+    expect(sentQuery()).toContain(`FILTER(LANG(?label) = "${tag}")`);
+    expect(result.structuredContent).toMatchObject({ total: 1 });
+    expect(contentText(result)).toContain('vie privée');
+  });
+
+  it('searches a three-letter code with no single reading as sent (#195)', async () => {
+    mockQuery.mockResolvedValue([]);
+    const result = await runToolContract(eurlex_browse_subjects, {
+      keyword: 'vie',
+      language: 'slo',
+    });
+
+    expect(sentQuery()).toContain('FILTER(LANG(?label) = "slo")');
+    expect(result.structuredContent).toMatchObject({ total: 0 });
+    expect((result.structuredContent as { notice?: string }).notice).toContain('in language "slo"');
+  });
+
+  it('advertises language in tools/list exactly as before (#195)', () => {
+    const schema = z.toJSONSchema(eurlex_browse_subjects.input, { io: 'input' }) as {
+      properties: Record<string, unknown>;
+    };
+    expect(schema.properties.language).toStrictEqual({
+      default: 'en',
+      description:
+        'Language code for concept labels (e.g. "en", "fr", "de"). Case-insensitive — "EN" and "en" behave identically. Defaults to English.',
+      type: 'string',
+      pattern: '^[A-Za-z]{2,3}$',
+    });
   });
 
   it('restricts results to the EuroVoc namespace so every URI is filter-compatible (issue #11)', async () => {
@@ -1130,6 +1172,63 @@ describe('eurlex_browse_subjects', () => {
         ].join('\n\n'),
       );
     });
+  });
+});
+
+// --- #194: `query`, the name callers guess for keyword ---
+
+describe('eurlex_browse_subjects input aliases (#194)', () => {
+  beforeEach(() => {
+    mockQuery.mockReset();
+    mockQuery.mockResolvedValue([
+      makeConceptBinding({
+        uri: 'http://eurovoc.europa.eu/5181',
+        label: 'data protection',
+        code: '5181',
+        broaderLabel: 'information policy',
+        tier: 1,
+      }),
+    ]);
+  });
+
+  /** Call the tool with arguments as a client sends them, keys the schema omits included. */
+  function callTool(args: Record<string, unknown>) {
+    return runToolContract(
+      eurlex_browse_subjects,
+      args as z.input<typeof eurlex_browse_subjects.input>,
+    );
+  }
+
+  it('serves query as keyword: the same query, page, and content[]', async () => {
+    const viaKeyword = await callTool({ keyword: 'data protection', language: 'fr' });
+    const keywordQuery = sentQuery();
+    mockQuery.mockClear();
+
+    const viaQuery = await callTool({ query: 'data protection', language: 'fr' });
+
+    expect(viaQuery.isError).toBeFalsy();
+    expect(viaQuery.structuredContent).toMatchObject({
+      total: 1,
+      concepts: [{ concept_uri: 'http://eurovoc.europa.eu/5181', pref_label: 'data protection' }],
+    });
+    expect(viaQuery.structuredContent).toStrictEqual(viaKeyword.structuredContent);
+    expect(viaQuery.content).toStrictEqual(viaKeyword.content);
+    expect(mockQuery).toHaveBeenCalledTimes(1);
+    expect(sentQuery()).toBe(keywordQuery);
+    expect(keywordQuery).toContain('"data protection"');
+  });
+
+  it('rejects query sent beside keyword with the alias hint, before any CELLAR request', async () => {
+    const result = await callTool({ keyword: 'data protection', query: 'data protection' });
+
+    expect(result.isError).toBe(true);
+    expect((result.structuredContent as { error: { code: number } }).error.code).toBe(
+      JsonRpcErrorCode.InvalidParams,
+    );
+    expect(contentText(result)).toContain(
+      'query is an alias of keyword; send one of them, not both.',
+    );
+    expect(mockQuery).not.toHaveBeenCalled();
   });
 });
 

@@ -464,6 +464,231 @@ const SECTOR_6_RESOURCE_TYPES = [
   'RULING',
 ];
 
+/**
+ * The 60 resource-types carried by works with a CELEX that had a label before #192,
+ * with that label, from a live survey of CELLAR (works with
+ * `cdm:resource_legal_id_celex`, grouped by `cdm:work_has_resource-type`,
+ * 2026-11-09). #192 leaves every one unchanged.
+ */
+const LABELS_BEFORE_192: Record<string, string> = {
+  ABSTRACT_JUR: 'Case Abstract',
+  AGREE_INTERNATION: 'International Agreement',
+  AMEND_PROP: 'Amended Proposal',
+  AMEND_PROP_DEC: 'Amended Proposal for a Decision',
+  AMEND_PROP_DIR: 'Amended Proposal for a Directive',
+  AMEND_PROP_REG: 'Amended Proposal for a Regulation',
+  CONS_TEXT: 'Consolidated Text',
+  CORRIGENDUM: 'Corrigendum',
+  DATPRO: 'Provisional Data',
+  DEC: 'Decision',
+  DEC_ADOPT_INTERNATION: 'Decision Adopted by International Bodies',
+  DEC_DEL: 'Delegated Decision',
+  DEC_ENTSCHEID: 'Decision',
+  DEC_FRAMW: 'Framework Decision',
+  DEC_IMPL: 'Implementing Decision',
+  DEC_NC: 'Decision by National Courts in the Field of European Union Law',
+  DEC_REVIEW: 'Decision to Review',
+  DIR: 'Directive',
+  DIR_DEL: 'Delegated Directive',
+  DIR_IMPL: 'Implementing Directive',
+  GARNISHEE_ORDER: 'Attachment Order',
+  INFO_JUDICIAL: 'Judicial Information Notice',
+  INFO_JUR: 'Information Notice',
+  JOINT_PROP_DEC: 'Joint Proposal for a Decision',
+  JOINT_PROP_REG: 'Joint Proposal for a Regulation',
+  JUDG: 'Judgment',
+  JUDG_EXTRACT: 'Judgment (Extracts)',
+  MEAS_NATION_IMPL: 'National Implementing Measure',
+  OPIN_AG: 'AG Opinion',
+  OPIN_JUR: 'Opinion of the Court',
+  ORDER: 'Order',
+  ORDER_EXTRACT: 'Order (Extracts)',
+  PROP_ACT: 'Proposal for an Act',
+  PROP_DEC: 'Proposal for a Decision',
+  PROP_DEC_IMPL: 'Proposal for an Implementing Decision',
+  PROP_DEC_NO_ADDRESSEE: 'Proposal for a Decision without Addressee',
+  PROP_DIR: 'Proposal for a Directive',
+  PROP_DRAFT: 'Draft Proposal',
+  PROP_JOINT_ACTION: 'Proposal for a Joint Action',
+  PROP_OPIN: 'Proposal for an Opinion',
+  PROP_RECO: 'Proposal for a Recommendation',
+  PROP_REG: 'Proposal for a Regulation',
+  PROP_REG_IMPL: 'Proposal for an Implementing Regulation',
+  PROP_RES: 'Proposal for a Resolution',
+  RECO: 'Recommendation',
+  RECO_ADOPT_INTERNATION: 'Recommendation Adopted by International Bodies',
+  RECO_DEC: 'Recommendation for a Decision',
+  RECO_RECO: 'Recommendation for a Recommendation',
+  RECO_REG: 'Recommendation for a Regulation',
+  REG: 'Regulation',
+  REG_ADOPT_INTERNATION: 'Regulation Adopted by International Bodies',
+  REG_DEL: 'Delegated Regulation',
+  REG_FINANC: 'Financial Regulation',
+  REG_IMPL: 'Implementing Regulation',
+  RES: 'Resolution',
+  RULING: 'Ruling',
+  SUM_JUR: 'Case Summary',
+  THIRDPARTY_PROCEED: 'Third-Party Proceedings',
+  TREATY: 'Treaty',
+  VIEW_AG: 'AG View',
+};
+
+/**
+ * The 146 resource-types carried by works with a CELEX that had no label before
+ * #192 (same survey, 2026-11-09), each with its authority concept's English
+ * `skos:prefLabel` in the map's Title Case. Codes the authority labels alike share
+ * the label (NOTICE / NOTICE_INFO, INFO / INFO_COMMUNIC, GUIDELINE /
+ * GUIDELINE_LIGNES, PROC_INTERNAL / PROC_RULES).
+ */
+const LABELS_192: Record<string, string> = {
+  ACKNOWLEDGE_RECP: 'Acknowledgement Receipt',
+  ACT: 'Act',
+  ACT_DRAFT: 'Draft Act',
+  ACT_OTHER: 'Other Acts',
+  ACT_PREP: 'Preparatory Act',
+  ADD: 'Addendum',
+  AGREE: 'Agreement',
+  AGREE_AMEND: 'Amendment to an Agreement',
+  AGREE_EUMS: 'Agreement between Member States',
+  AGREE_INTERINSTIT: 'Interinstitutional Agreement',
+  AGREE_INTERINSTIT_DRAFT: 'Draft Interinstitutional Agreement',
+  AGREE_INTERNAL: 'Internal Agreement',
+  AGREE_PROT: 'Protocol to the Agreement',
+  AID_STATE: 'State Aid',
+  ANNEX: 'Annex',
+  ANNOUNC: 'Announcements',
+  ARRANG: 'Arrangement',
+  ASSENT: 'Assent',
+  ASSENT_REQ: 'Request for Assent',
+  BALANCE: 'Balance',
+  BUDGET: 'Budget',
+  BUDGET_DRAFT: 'Draft Budget',
+  BUDGET_DRAFT_PRELIM: 'Preliminary Draft Budget',
+  BUDGET_DRAFT_PRELIM_SUPPL: 'Preliminary Draft Supplementary Budget',
+  BUDGET_DRAFT_SUPPL_AMEND: 'Draft Supplementary and Amending Budget',
+  BUDGET_SUPPL_AMEND: 'Supplementary and Amending Budget',
+  CALL_EXPR_INTEREST: 'Call for Expression of Interest',
+  CALL_PROP: 'Call for Proposals',
+  CENSURE_RJ: 'Rejected Motion of Censure',
+  CENSURE_WDW: 'Withdrawn Motion of Censure',
+  COMMUNIC: 'Communication',
+  COMMUNIC_DRAFT: 'Draft Communication',
+  COMMUNIC_POSIT: 'Communication of the Commission on Council’s Position at 1st Reading',
+  COMPOS: 'Common Position',
+  COMPOS_ACCEPT: 'Acceptance of Common Position',
+  COMPOS_AMEND: 'Amendment to Common Position',
+  COMPOS_RJ: 'Rejection of the Common Position',
+  CONCL: 'Council Conclusions',
+  CONVENTION: 'Convention',
+  DECLAR: 'Declaration',
+  DECLAR_DRAFT: 'Draft Declaration',
+  DEC_DRAFT: 'Draft Decision',
+  DIR_DRAFT: 'Draft Directive',
+  EVL: 'Evaluation',
+  EVL_SUM_EXE: 'Executive Summary of the Evaluation',
+  EXCH_LET: 'Exchange of Letters',
+  EXCH_RATE: 'Exchange Rate',
+  EXCH_RATE_MRO: 'Interest Rate — Euro Exchange Rates',
+  EXPL_MEMORANDUM: 'Explanatory Memorandum',
+  FC: 'Fitness Check',
+  FC_SUM_EXE: 'Executive Summary of the Fitness Check',
+  GUIDELINE: 'Guideline',
+  GUIDELINE_GEN: 'General Guidelines',
+  GUIDELINE_LIGNES: 'Guideline',
+  IMPACT_ASSESS: 'Impact Assessment',
+  IMPACT_ASSESS_SUM: 'Summary of Impact Assessment',
+  IMPL_PLAN: 'Implementation Plan',
+  INFO: 'Information',
+  INFO_COMMUNIC: 'Information',
+  INI: 'Initiative',
+  JOINT_ACTION: 'Joint Action',
+  JOINT_COMMUNIC: 'Joint Communication',
+  JOINT_DEC: 'Joint Decision',
+  JOINT_IMPACT_ASSESS: 'Joint Impact Assessment',
+  JOINT_IMPACT_ASSESS_SUM: 'Joint Impact Assessment Summary',
+  JOINT_PAPER_WHITE: 'Joint White Paper',
+  JOINT_REPORT: 'Joint Report',
+  JOINT_SWD: 'Joint Staff Working Document',
+  JOINT_SYNOPSIS_REPORT_CONSULT: 'Joint Synopsis Report of the Public Consultation',
+  JOINT_TEXT: 'Joint Text',
+  JOINT_TEXT_APR: 'Approved Joint Text',
+  JOINT_TEXT_RJ: 'Rejected Joint Text',
+  LET: 'Letter',
+  LET_AMEND: 'Letter of Amendment',
+  LIST: 'List',
+  MEMORANDUM: 'Memorandum',
+  MEMORANDUM_UNDERST: 'Memorandum of Understanding',
+  MINUTES: 'Minutes',
+  NOTE: 'Note',
+  NOTE_COVER: 'Cover Note',
+  NOTE_GUID: 'Guidance Note',
+  NOTICE: 'Notice',
+  NOTICE_AWARD: 'Award Notice',
+  NOTICE_CONTRACT: 'Contract Notice',
+  NOTICE_INFO: 'Notice',
+  NOTICE_READER: 'Notice to Readers',
+  NOTIF: 'Notification',
+  OJ: 'Official Journal',
+  OPIN: 'Opinion',
+  OPIN_ADDIT: 'Additional Opinion',
+  OPIN_AMEND_EP: 'Opinion on the European Parliament’s Amendments',
+  OPIN_DISPUT_LB: 'Opinion Disputing a Legal Base',
+  OPIN_DRAFT_NATION_LEGIS: 'Opinion on Draft National Legislation',
+  OPIN_EVL: 'Opinion on Evaluation',
+  OPIN_EXPLOR: 'Exploratory Opinion',
+  OPIN_FC: 'Opinion on Fitness Check',
+  OPIN_IMPACT_ASSESS: 'Opinion on Impact Assessment',
+  OPIN_NO_PROP_AMEND: 'Opinion Not Proposing Amendment',
+  OPIN_NO_REPORT: 'Opinion without Report',
+  OPIN_PROP_AMEND: 'Opinion Proposing Amendment',
+  OPIN_PROP_RJ: 'Opinion Proposing Rejection',
+  OPIN_QUAL_APR: 'Opinion with Qualified Approval',
+  OWNINI_OPIN: 'Own-Initiative Opinion',
+  OWNINI_OPIN_ADDIT: 'Additional Own-Initiative Opinion',
+  OWNINI_OPIN_DRAFT_NATION_LEGIS: 'Own-Initiative Opinion on Draft National Legislation',
+  OWNINI_REPORT: 'Own-Initiative Report',
+  OWNINI_RES: 'Own-Initiative Resolution',
+  PAPER_GREEN: 'Green Paper',
+  PAPER_REFLEC: 'Reflection Paper',
+  PAPER_WHITE: 'White Paper',
+  POSIT: 'Position',
+  PROCEED_MINUTES: 'Minutes of Proceeding',
+  PROC_ADMIN: 'Administrative Procedures',
+  PROC_INTERNAL: 'Rules of Procedure',
+  PROC_RULES: 'Rules of Procedure',
+  PROGRAM: 'Programme',
+  PROP_AMEND: 'Amendments to the Proposal',
+  PROT: 'Protocol',
+  QUEST_ORAL: 'Oral Question',
+  QUEST_TIME: 'Question at Question Time',
+  QUEST_WRITTEN: 'Written Question',
+  RECO_DRAFT: 'Draft Recommendation',
+  RECRUIT: 'Recruitment',
+  REG_DRAFT: 'Draft Regulation',
+  REPORT: 'Report',
+  REPORT_ANNUAL: 'Annual Report',
+  REPORT_ANNUAL_BUDGET: 'Annual Report on the EU General Budget',
+  REPORT_ANNUAL_DAS: 'Annual Report with the Statement of Assurance',
+  REPORT_ANNUAL_EDF: 'Annual Report on the Activities Funded by the European Development Fund',
+  REPORT_ANNUAL_SPECIF: 'Specific Annual Report',
+  REPORT_SPECIAL: 'Special Report',
+  RES_DRAFT: 'Draft Resolution',
+  RES_LEGIS: 'Legislative Resolution',
+  STAT: 'Statement',
+  STATUTE: 'Statute',
+  STAT_REASON: 'Statement of Reasons',
+  STRATEGY_COMMON: 'Common Strategy',
+  SUM: 'Summary',
+  SWD: 'Staff Working Document',
+  SYNOPSIS_REPORT_CONSULT: 'Synopsis Report of the Public Consultation',
+  TRANSFER_APPROPR: 'Transfer of Appropriations',
+  TREATY_DRAFT: 'Draft Treaty',
+  VERBATIM_REPORT: 'Verbatim Report',
+  WARN: 'Warning',
+  WITHD_AGREE: 'Withdrawal Agreement',
+  WORK_DOC: 'Working Document',
+};
+
 describe('resolveResourceTypeLabel', () => {
   it('resolves a Commission Implementing Regulation to its label, not the raw REG_IMPL code (issue #43)', () => {
     expect(resolveResourceTypeLabel(REG_IMPL_URI)).toBe('Implementing Regulation');
@@ -526,6 +751,62 @@ describe('resolveResourceTypeLabel', () => {
     }
   });
 
+  it('keeps the label of every resource-type labelled before #192', () => {
+    for (const [code, label] of Object.entries(LABELS_BEFORE_192)) {
+      expect(resolveResourceTypeLabel(`${RESOURCE_TYPE_BASE}${code}`), code).toBe(label);
+    }
+  });
+
+  it('labels each resource-type #192 adds with its authority label in Title Case (#192)', () => {
+    expect(Object.keys(LABELS_192)).toHaveLength(146);
+    for (const [code, label] of Object.entries(LABELS_192)) {
+      expect(resolveResourceTypeLabel(`${RESOURCE_TYPE_BASE}${code}`), code).toBe(label);
+    }
+  });
+
+  it('labels every resource-type a work with a CELEX carries — none falls back to its code (#192)', () => {
+    const carried = [...Object.keys(LABELS_BEFORE_192), ...Object.keys(LABELS_192)];
+    expect(new Set(carried).size).toBe(206);
+    for (const code of carried) {
+      expect(resolveResourceTypeLabel(`${RESOURCE_TYPE_BASE}${code}`), code).not.toBe(code);
+    }
+  });
+
+  it.each([
+    // a preposition lowercased mid-label, its noun capitalized
+    ['QUEST_TIME', 'Question at Question Time'],
+    // "not" is no preposition
+    ['OPIN_NO_PROP_AMEND', 'Opinion Not Proposing Amendment'],
+    // each part of a hyphenated word capitalized
+    ['OWNINI_OPIN_DRAFT_NATION_LEGIS', 'Own-Initiative Opinion on Draft National Legislation'],
+    // an acronym kept as written
+    ['REPORT_ANNUAL_BUDGET', 'Annual Report on the EU General Budget'],
+    // a curly apostrophe and an ordinal kept as written
+    ['COMMUNIC_POSIT', 'Communication of the Commission on Council’s Position at 1st Reading'],
+    // the word after an em dash capitalized, the dash kept
+    ['EXCH_RATE_MRO', 'Interest Rate — Euro Exchange Rates'],
+  ])('applies the Title Case rule to %s (#192)', (code, label) => {
+    expect(resolveResourceTypeLabel(`${RESOURCE_TYPE_BASE}${code}`)).toBe(label);
+  });
+
+  it('resolves the Commission document types the preparatory lookup lands on (#192)', () => {
+    expect(resolveResourceTypeLabel(`${RESOURCE_TYPE_BASE}COMMUNIC`)).toBe('Communication');
+    expect(resolveResourceTypeLabel(`${RESOURCE_TYPE_BASE}IMPACT_ASSESS`)).toBe(
+      'Impact Assessment',
+    );
+    expect(resolveResourceTypeLabel(`${RESOURCE_TYPE_BASE}JOINT_COMMUNIC`)).toBe(
+      'Joint Communication',
+    );
+  });
+
+  it('carries no label for AG_OPI or REC_SOFT, codes no work carries', () => {
+    // OPIN_AG and RECO keep the labels these two duplicated.
+    expect(resolveResourceTypeLabel(`${RESOURCE_TYPE_BASE}AG_OPI`)).toBe('AG_OPI');
+    expect(resolveResourceTypeLabel(`${RESOURCE_TYPE_BASE}REC_SOFT`)).toBe('REC_SOFT');
+    expect(resolveResourceTypeLabel(`${RESOURCE_TYPE_BASE}OPIN_AG`)).toBe('AG Opinion');
+    expect(resolveResourceTypeLabel(`${RESOURCE_TYPE_BASE}RECO`)).toBe('Recommendation');
+  });
+
   it('falls back to the last path segment for an unmapped resource-type URI', () => {
     expect(resolveResourceTypeLabel(`${RESOURCE_TYPE_BASE}UNKNOWN_TYPE`)).toBe('UNKNOWN_TYPE');
   });
@@ -583,6 +864,15 @@ describe('resolveResourceTypeLabels', () => {
       resolveResourceTypeLabels(`${RESOURCE_TYPE_BASE}ORDER ${RESOURCE_TYPE_BASE}ORDER_EXTRACT`),
     ).toBe('Order, Order (Extracts)');
     expect(resolveResourceTypeLabels(`${RESOURCE_TYPE_BASE}OPIN_JUR`)).toBe('Opinion of the Court');
+  });
+
+  it('reads a co-typed budget corrigendum and two codes sharing one label (#192)', () => {
+    expect(resolveResourceTypeLabels(`${RESOURCE_TYPE_BASE}BUDGET ${CORRIGENDUM_URI}`)).toBe(
+      'Budget, Corrigendum',
+    );
+    expect(
+      resolveResourceTypeLabels(`${RESOURCE_TYPE_BASE}NOTICE ${RESOURCE_TYPE_BASE}NOTICE_INFO`),
+    ).toBe('Notice');
   });
 
   it('resolves a lone CONS_TEXT and MEAS_NATION_IMPL through the multi-type path (#86)', () => {

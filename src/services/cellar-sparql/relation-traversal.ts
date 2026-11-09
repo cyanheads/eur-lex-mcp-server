@@ -11,6 +11,7 @@ import { McpError } from '@cyanheads/mcp-ts-core/errors';
 import { ENG_LANGUAGE_URI } from './cdm-labels.js';
 import { CellarSparqlService } from './cellar-sparql-service.js';
 import { celexLiteral, escapeSparqlLiteral, isSafeSparqlIri } from './eli-resolution.js';
+import type { CelexSector } from './keyword-match.js';
 import { cellarDate, readWindowedPage, windowedLimit } from './sort-window.js';
 import type { SparqlBinding, WorkRelation } from './types.js';
 
@@ -339,13 +340,33 @@ export const PER_TYPE_LIMIT_CEILING = 100;
 /**
  * CELEX constraint pushed into a relation arm before LIMIT/OFFSET and continuation
  * proof. Consolidations require a CELEX; national transposition measures require a
- * sector-`7` CELEX with the source directive's act core. Requiring and filtering the
- * related CELEX before grouping also makes one work with several CELEX values occupy
- * exactly one page row. Client-side checks remain as belt-and-suspenders.
+ * sector-`7` CELEX with the source directive's act core; a caller's `relatedSectors`
+ * requires one opening with a listed sector. Requiring and filtering the related
+ * CELEX before grouping also makes one work with several CELEX values occupy exactly
+ * one page row, reported by a CELEX that passed. Client-side checks remain as
+ * belt-and-suspenders for the pattern.
  */
 interface CelexConstraint {
   /** Regular expression applied to the related work's required CELEX identifier. */
   pattern?: string;
+  /** Sectors the related work's required CELEX must open with. */
+  sectors?: readonly CelexSector[];
+}
+
+/**
+ * The FILTERs a CELEX constraint applies to `variable`, the related work's CELEX. The
+ * sector test lists members of the closed sector set, so no caller character reaches
+ * it; the pattern is built from the source act core and member-state codes.
+ */
+function celexFilters(variable: string, celex: CelexConstraint): string[] {
+  return [
+    ...(celex.pattern ? [`FILTER(REGEX(STR(${variable}), "${celex.pattern}"))`] : []),
+    ...(celex.sectors
+      ? [
+          `FILTER(SUBSTR(STR(${variable}), 1, 1) IN (${celex.sectors.map((sector) => `"${sector}"`).join(', ')}))`,
+        ]
+      : []),
+  ];
 }
 
 /** One direction's graph pattern for a relation predicate, tagged with its direction. */
@@ -365,8 +386,10 @@ function relationArm(
   const celexTriple = celex
     ? `?relatedWork cdm:resource_legal_id_celex ?relatedCelex .`
     : `OPTIONAL { ?relatedWork cdm:resource_legal_id_celex ?relatedCelex . }`;
-  const celexFilter = celex?.pattern
-    ? `\n    FILTER(REGEX(STR(?relatedCelex), "${celex.pattern}"))`
+  const celexFilter = celex
+    ? celexFilters('?relatedCelex', celex)
+        .map((filter) => `\n    ${filter}`)
+        .join('')
     : '';
   const articleFilter = article
     ? `\n    ${articleFilterClause(workUri, '?relatedWork', predicate, direction, article)}`
@@ -722,8 +745,8 @@ export interface RelationWindowEnd {
  * Ungrouped by design: CELLAR evaluates a grouped `MAX` over the date wrongly (see
  * {@link buildRelationQuery}), so a work with several dates or CELEX numbers repeats
  * rather than being aggregated. The CELEX constraint of the relation type carries
- * over, and so does an `article` filter, so the rows are the ones the traversal
- * would have returned.
+ * over, `relatedSectors` included, and so does an `article` filter, so the rows are
+ * the ones the traversal would have returned.
  */
 function continuationQuery(
   workUri: string,
@@ -739,7 +762,9 @@ function continuationQuery(
       : `?work ${predicate} <${workUri}> .`;
   const celexPattern = `${
     celex
-      ? `?work cdm:resource_legal_id_celex ?celex .${celex.pattern ? ` FILTER(REGEX(STR(?celex), "${celex.pattern}"))` : ''}`
+      ? `?work cdm:resource_legal_id_celex ?celex .${celexFilters('?celex', celex)
+          .map((filter) => ` ${filter}`)
+          .join('')}`
       : 'OPTIONAL { ?work cdm:resource_legal_id_celex ?celex }'
   }${article ? ` ${articleFilterClause(workUri, '?work', predicate, direction, article)}` : ''}`;
   return lastDate
@@ -796,6 +821,13 @@ function continuationQuery(
  * that article ({@link articleLocationPattern}), pushed into the paged query and its
  * window-end continuation; every other type ignores it.
  *
+ * `relatedSectors`, when non-empty, keeps the related works whose CELEX opens with
+ * one of those sectors, in every type: each arm requires the CELEX and tests its first
+ * character before grouping, so paging and `hasMore` count matching works only, and
+ * a related work with no CELEX is left out. `national_transposition` is sector 7 by
+ * its pattern, so with `7` listed its query is the unfiltered one, and without `7` it
+ * returns no rows and sends no query.
+ *
  * With `provisions` set, each page row of an annotated type (see
  * {@link RELATION_SPECS}) carries the distinct designators its edge's location
  * axioms record, compacted ({@link compactProvision}) and sorted; a row with none
@@ -818,6 +850,7 @@ export async function traverseRelations(
     offset?: number;
     perTypeLimit: number;
     provisions?: boolean;
+    relatedSectors?: readonly CelexSector[] | undefined;
     sourceCelex?: string | undefined;
   },
 ): Promise<{
@@ -826,7 +859,8 @@ export async function traverseRelations(
   relations: WorkRelation[];
   windowEnds: RelationWindowEnd[];
 }> {
-  const { article, memberStates, offset = 0, perTypeLimit, sourceCelex } = options;
+  const { article, memberStates, offset = 0, perTypeLimit, relatedSectors, sourceCelex } = options;
+  const sectors = relatedSectors?.length ? relatedSectors : undefined;
   const articleFor = (type: RelationType) => (type === 'interpreted_by' ? article : undefined);
   const sourceActCore = sourceCelex ? celexActCore(sourceCelex) : undefined;
   const fetchLimit = windowedLimit(offset, perTypeLimit);
@@ -837,18 +871,22 @@ export async function traverseRelations(
       ): Promise<{ type: RelationType; bindings: SparqlBinding[]; celex?: CelexConstraint }> => {
         /**
          * Push relation-specific CELEX validity into the query before pagination:
-         * CELEX-bearing consolidations and sector-7 same-act national measures.
+         * sector-7 same-act national measures, the caller's sectors, and CELEX-bearing
+         * consolidations.
          */
         let celex: CelexConstraint | undefined;
-        if (type === 'consolidated_version') {
-          celex = {};
-        } else if (type === 'national_transposition') {
+        if (type === 'national_transposition') {
           // With no source act core there is no pattern that selects this act's
-          // implementing measures, and every row is dropped either way. Return the
-          // empty result directly rather than spending a CELLAR round-trip on a
+          // implementing measures, and every row is dropped either way; nor without
+          // sector 7 among the caller's sectors, since every measure is sector 7. Return
+          // the empty result directly rather than spending a CELLAR round-trip on a
           // query whose filter can match nothing.
-          if (!sourceActCore) return { type, bindings: [] };
+          if (!sourceActCore || (sectors && !sectors.includes('7'))) return { type, bindings: [] };
           celex = { pattern: nationalMeasureCelexPattern(sourceActCore, memberStates) };
+        } else if (sectors) {
+          celex = { sectors };
+        } else if (type === 'consolidated_version') {
+          celex = {};
         }
         return {
           type,

@@ -3,6 +3,7 @@
  * @module tests/tools/eurlex-query-sparql.tool.test
  */
 
+import type { z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -1029,6 +1030,56 @@ describe('eurlex_query_sparql', () => {
         ].join('\n\n'),
       );
     });
+  });
+});
+
+// --- #194: `query`, the SPARQL protocol's own name for sparql_query ---
+
+describe('eurlex_query_sparql input aliases (#194)', () => {
+  const QUERY = 'SELECT ?work WHERE { ?work cdm:resource_legal_id_celex "32016R0679"^^xsd:string }';
+
+  beforeEach(() => {
+    mockQueryWithVars.mockReset();
+    mockQueryWithVars.mockResolvedValue({
+      variables: ['work'],
+      bindings: workRows(1),
+      limitEnforced: true,
+    });
+  });
+
+  /** Call the tool with arguments as a client sends them, keys the schema omits included. */
+  function callTool(args: Record<string, unknown>) {
+    return runToolContract(eurlex_query_sparql, args as z.input<typeof eurlex_query_sparql.input>);
+  }
+
+  it('serves query as sparql_query: the same query, timeout, rows, and content[]', async () => {
+    const viaTarget = await callTool({ sparql_query: QUERY, timeout_hint: 20000 });
+    const targetCall = mockQueryWithVars.mock.calls[0];
+    mockQueryWithVars.mockClear();
+
+    const viaQuery = await callTool({ query: QUERY, timeout_hint: 20000 });
+
+    expect(viaQuery.isError).toBeFalsy();
+    expect(viaQuery.structuredContent).toMatchObject({ variables: ['work'], total: 1 });
+    expect(viaQuery.structuredContent).toStrictEqual(viaTarget.structuredContent);
+    expect(viaQuery.content).toStrictEqual(viaTarget.content);
+    expect(mockQueryWithVars).toHaveBeenCalledTimes(1);
+    const queryCall = mockQueryWithVars.mock.calls[0];
+    expect([queryCall?.[0], queryCall?.[2]]).toStrictEqual([QUERY, 20000]);
+    expect([queryCall?.[0], queryCall?.[2]]).toStrictEqual([targetCall?.[0], targetCall?.[2]]);
+  });
+
+  it('rejects query sent beside sparql_query with the alias hint, before any CELLAR request', async () => {
+    const result = await callTool({ sparql_query: QUERY, query: QUERY });
+
+    expect(result.isError).toBe(true);
+    expect((result.structuredContent as { error: { code: number } }).error.code).toBe(
+      JsonRpcErrorCode.InvalidParams,
+    );
+    expect(contentText(result)).toContain(
+      'query is an alias of sparql_query; send one of them, not both.',
+    );
+    expect(mockQueryWithVars).not.toHaveBeenCalled();
   });
 });
 

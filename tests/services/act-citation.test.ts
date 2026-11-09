@@ -1,16 +1,19 @@
 /**
  * @fileoverview Tests for the act citation facts (#169): the citation query (#173)
  * and the reader that turns its aggregates into the ELI, the Official Journal
- * reference, typed dates of effect, and transposition deadlines.
+ * reference, typed dates of effect, and transposition deadlines; and the query and
+ * reader for the amending acts of a date-setting article (#188).
  * @module tests/services/act-citation.test
  */
 
 import { describe, expect, it } from 'vitest';
 import {
   actCitationQuery,
+  dateAmendmentsQuery,
   formatOjReference,
   type OjFacts,
   readActCitation,
+  readDateAmendments,
 } from '@/services/cellar-sparql/act-citation.js';
 import { encodedComment } from '../fixtures/cellar-consolidations.js';
 import { bestCpuMs, CPU_TIMED_TEST_TIMEOUT_MS } from '../helpers/cpu-time.js';
@@ -184,6 +187,41 @@ describe('readActCitation', () => {
         { date: '2021-03-01' },
       ],
     });
+  });
+
+  it.each(['1001-01-01', '1002-02-02'])(
+    'drops a %s date of effect and transposition deadline, keeping the real ones in order (#187)',
+    (placeholder) => {
+      expect(
+        readActCitation({
+          datesOfEffect: literal(
+            [
+              `${placeholder}|{MA|${FD_335}MA}|${encodedComment('{MA/PART} {V} {ART} 123.3(d) {ET} 123.3(e)')}`,
+              `2021-05-26|{MA|${FD_335}MA}|${encodedComment('{V} {ART} 123.2')}`,
+              `2017-05-25|{EV|${FD_335}EV}|${encodedComment('{DATPUB} +20 {V} {ART} 123.1')}`,
+              `${placeholder}|{EV|${FD_335}EV}|`,
+              `${placeholder}||`,
+            ].join(' '),
+          ),
+          transposition: literal(`2027-12-31 ${placeholder} 2025-12-31`),
+        }),
+      ).toEqual({
+        dates_of_effect: [
+          { date: '2017-05-25', type: 'entry_into_force', provision: 'Article 123.1' },
+          { date: '2021-05-26', type: 'application', provision: 'Article 123.2' },
+        ],
+        transposition_deadlines: ['2025-12-31', '2027-12-31'],
+      });
+    },
+  );
+
+  it('reports no dates of effect or deadlines when every value is a placeholder (#187)', () => {
+    expect(
+      readActCitation({
+        datesOfEffect: literal(`1002-02-02|{EV|${FD_335}EV}| 1001-01-01|{MA|${FD_335}MA}|`),
+        transposition: literal('1001-01-01 1002-02-02'),
+      }),
+    ).toEqual({});
   });
 
   it('prefers the act-by-act publication over an issue', () => {
@@ -378,14 +416,206 @@ describe('actCitationQuery', () => {
   });
 });
 
+describe('amending acts of a date-setting article (#188)', () => {
+  const OWL = 'http://www.w3.org/2002/07/owl#';
+  const ANNOTATION = 'http://publications.europa.eu/ontology/annotation#';
+  const AR = '{AR|http://publications.europa.eu/resource/authority/fd_370/AR} ';
+  const query = dateAmendmentsQuery(ACT);
+
+  it("reads the article locations of the act's amendment axioms, each with its amending act's CELEX", () => {
+    expect(query).toMatch(
+      new RegExp(
+        `\\?(\\w+) <${OWL}annotatedTarget> <${ACT}> ;\\s*<${OWL}annotatedProperty> cdm:resource_legal_amends_resource_legal ;\\s*<${OWL}annotatedSource> \\?amender ;\\s*<${ANNOTATION}reference_to_modified_location> \\?location \\.`,
+      ),
+    );
+    expect(query).toContain(`FILTER(STRSTARTS(STR(?location), "${AR}"))`);
+    expect(query).toContain('?amender cdm:resource_legal_id_celex ?amenderCelex .');
+    expect(query).toMatch(/SELECT DISTINCT \?amenderCelex \?location\s+WHERE \{/);
+    expect(query.split(`<${ACT}>`)).toHaveLength(2);
+  });
+
+  it('joins no date of effect and aggregates nothing, and carries no LIMIT for the service to cap', () => {
+    // The form joining the dated comments to the amendments ran past 60 s on REACH and the AI Act.
+    expect(query).not.toContain('resource_legal_date_entry-into-force');
+    expect(query).not.toContain('comment_on_date');
+    expect(query).not.toContain('GROUP');
+    expect(query).not.toContain('OPTIONAL');
+    expect(query).not.toContain('AS ?datesOfEffect)');
+    // CellarSparqlService.query caps a top-level LIMIT at MAX_SPARQL_RESULTS (100);
+    // the most article locations an act has is 1,404.
+    expect(query).not.toMatch(/\bLIMIT\b/i);
+  });
+
+  /** A citation row whose `?datesOfEffect` aggregate carries `items`. */
+  const citation = (...items: string[]) => ({ datesOfEffect: literal(items.join(' ')) });
+  const row = (celex: string, location: string) => ({
+    amenderCelex: literal(celex),
+    location: literal(location),
+  });
+
+  it('matches a location equal to the article, or continuing with a space or a dot', () => {
+    const dates = citation(
+      effectItem('2099-02-01', 'EV', '{DATPUB} +20 {V} {ART} 5'),
+      effectItem('2099-06-01', 'MA', '{MA/PART} {V} {ART} 5.2(a)'),
+    );
+    expect(
+      readDateAmendments(
+        [
+          row('32099R0001', `${AR}5`),
+          row('32099R0002', `${AR}5 PA 2`),
+          row('32099R0003', `${AR}5.2 PTA (a)`),
+          // A longer number, a lettered article, a zero-padded or compact number, another
+          // article, and the token with no space before the number.
+          row('32099R0009', `${AR}50`),
+          row('32099R0009', `${AR}5a`),
+          row('32099R0009', `${AR}05`),
+          row('32099R0009', `${AR}05.2`),
+          row('32099R0009', 'A5P2'),
+          row('32099R0009', `${AR}15 PA 5`),
+          row('32099R0009', `${AR.trimEnd()}5`),
+        ],
+        dates,
+      ),
+    ).toEqual([
+      { celex: '32099R0001', articles: ['5'] },
+      { celex: '32099R0002', articles: ['5'] },
+      { celex: '32099R0003', articles: ['5'] },
+    ]);
+  });
+
+  it('reads the article after the first {ART} code: its leading digits and an optional letter', () => {
+    const dates = citation(
+      effectItem('2024-08-01', 'EV', '{DATPUB} +20 {V} {ART} 113(c)'),
+      effectItem('2021-05-26', 'MA', '{MA/PART} {V} {ART} 123.3(d) {ET} 123.3(e)'),
+      // No {V} code: the comment still names the article.
+      effectItem('2011-12-28', 'MA', '{MA/PART} {ART} 8P1'),
+      effectItem('2020-01-01', 'MA', '{V} {ART} 6a'),
+      effectItem('2020-02-01', 'MA', '{V} {ART} 7 {ET} {ART} 9'),
+    );
+    expect(
+      readDateAmendments(
+        [
+          row('32099R0001', `${AR}113 PA 3 PTA (a)`),
+          row('32099R0001', `${AR}123.3`),
+          row('32099R0001', `${AR}8 PO 5 TXT`),
+          row('32099R0001', `${AR}6a`),
+          row('32099R0001', `${AR}7`),
+          // Article 9 is the second {ART} of its comment; Article 6 is not 6a.
+          row('32099R0002', `${AR}9`),
+          row('32099R0002', `${AR}6 PA 1`),
+        ],
+        dates,
+      ),
+    ).toEqual([{ celex: '32099R0001', articles: ['6a', '7', '8', '113', '123'] }]);
+  });
+
+  it('keeps an article that opens with no digit whole, so only a location naming exactly it matches', () => {
+    const dates = citation(
+      effectItem('1995-01-01', 'EV', '{V} {ART} XV.1'),
+      effectItem('1995-02-01', 'MA', '{V} {ART} II'),
+    );
+    expect(
+      readDateAmendments(
+        [
+          row('31999R0001', `${AR}XV.1 PA 2`),
+          row('31999R0001', `${AR}II.2`),
+          row('31999R0002', `${AR}XV PA 1`),
+          row('31999R0002', `${AR}III`),
+        ],
+        dates,
+      ),
+    ).toEqual([{ celex: '31999R0001', articles: ['II', 'XV.1'] }]);
+  });
+
+  it('takes no article from a placeholder-dated stage', () => {
+    const dates = citation(
+      effectItem('1001-01-01', 'MA', '{MA/PART} {ART} 8P1'),
+      effectItem('1002-02-02', 'MA', '{V} {ART} 9'),
+      effectItem('2011-12-28', 'EV', '{DATPUB} + 20 {V} {ART} 22'),
+    );
+    expect(
+      readDateAmendments(
+        [
+          row('32024R1789', `${AR}8 PO 5 TXT`),
+          row('32024R1789', `${AR}9`),
+          row('32024R1106', `${AR}22 PA 1`),
+        ],
+        dates,
+      ),
+    ).toEqual([{ celex: '32024R1106', articles: ['22'] }]);
+  });
+
+  it('lists each amending act once in CELEX order, its articles distinct and in numeric order, and skips a row naming no CELEX or location', () => {
+    const dates = citation(
+      effectItem('2020-01-01', 'EV', '{V} {ART} 10'),
+      effectItem('2020-02-01', 'MA', '{V} {ART} 2'),
+      effectItem('2020-03-01', 'MA', '{V} {ART} 38'),
+    );
+    expect(
+      readDateAmendments(
+        [
+          row('32025R2650', `${AR}38`),
+          row('32020R0001', `${AR}10 PA 1`),
+          row('32020R0001', `${AR}2`),
+          row('32020R0001', `${AR}10.2`),
+          row('32020R0001', `${AR}2`),
+          row('32024R3234', `${AR}38 PA 2`),
+          { location: literal(`${AR}38`) },
+          { amenderCelex: literal('32021R0001') },
+          { amenderCelex: literal('32021R0002'), location: literal('') },
+        ],
+        dates,
+      ),
+    ).toEqual([
+      { celex: '32020R0001', articles: ['2', '10'] },
+      { celex: '32024R3234', articles: ['38'] },
+      { celex: '32025R2650', articles: ['38'] },
+    ]);
+  });
+
+  it('is empty with no rows, no citation row, or no dates of effect', () => {
+    const rows = [row('32020R0001', `${AR}2`)];
+    expect(readDateAmendments([], citation(effectItem('2020-01-01', 'EV', '{V} {ART} 2')))).toEqual(
+      [],
+    );
+    expect(readDateAmendments(rows, undefined)).toEqual([]);
+    // CELLAR's aggregate for an act with no date of effect.
+    expect(readDateAmendments(rows, citation('||'))).toEqual([]);
+    expect(readDateAmendments(rows, citation(effectItem('2020-01-01', 'EV')))).toEqual([]);
+  });
+});
+
 /**
- * Upstream-sized aggregates the reader scans: a GROUP_CONCAT of page pairs or dates
+ * Upstream-sized aggregates the readers scan: a GROUP_CONCAT of page pairs or dates
  * is bounded only by what CELLAR returns. Each shape grows by doubling from 5k to
  * 320k characters; each size is checked before the next runs, and the full span
  * must stay far below quadratic (64× input, ratio < 256).
  */
-describe('readActCitation scales linearly', () => {
-  const shapes: [string, (n: number) => Record<string, { type: string; value: string }>][] = [
+describe('the citation readers scale linearly', () => {
+  type Binding = Record<string, { type: string; value: string }>;
+  // #181: the comment is decoded, its tokens reduced, and its tail read as a provision.
+  const commentShapes = (
+    [
+      [
+        'a comment on one long line ending in a break',
+        (n) => `{V} {ART} ${'§1 x'.repeat(n / 4)}\ny`,
+      ],
+      ['a comment of breaks throughout', (n) => `{V} {ART} ${'  \r\n'.repeat(n / 4)}`],
+      ['a comment of token openers with no closer', (n) => '{V|'.repeat(n / 3)],
+      [
+        'a comment of one token opener with a long unclosed tail',
+        (n) => `{a|${'b|'.repeat(n / 2)}`,
+      ],
+      ['a comment of repeated see codes', (n) => '{V} '.repeat(n / 4)],
+      ['a provision number of dotted parts', (n) => `{V} {ART} ${'1.'.repeat(n / 2)}1`],
+      ['a provision number of subdivisions', (n) => `{V} {ART} 1${'(a)'.repeat(n / 3)}`],
+      ['a provision number of one long digit run', (n) => `{V} {ART} ${'1'.repeat(n)}`],
+    ] as [string, (n: number) => string][]
+  ).map(([label, comment]): [string, (n: number) => Binding] => [
+    label,
+    (n) => ({ datesOfEffect: literal(effectItem('2020-01-01', 'MA', comment(n))) }),
+  ]);
+  const shapes: [string, (n: number) => Binding][] = [
     [
       'page pairs on one long line ending in a break',
       (n) => ({
@@ -415,44 +645,42 @@ describe('readActCitation scales linearly', () => {
       'dates of effect of repeated openers with no closer',
       (n) => ({ datesOfEffect: literal(`2020-01-01|{${'{'.repeat(n)}`) }),
     ],
-    // #181: the comment is decoded, its tokens reduced, and its tail read as a provision.
-    ...(
-      [
-        [
-          'a comment on one long line ending in a break',
-          (n) => `{V} {ART} ${'§1 x'.repeat(n / 4)}\ny`,
-        ],
-        ['a comment of breaks throughout', (n) => `{V} {ART} ${'  \r\n'.repeat(n / 4)}`],
-        ['a comment of token openers with no closer', (n) => '{V|'.repeat(n / 3)],
-        [
-          'a comment of one token opener with a long unclosed tail',
-          (n) => `{a|${'b|'.repeat(n / 2)}`,
-        ],
-        ['a comment of repeated see codes', (n) => '{V} '.repeat(n / 4)],
-        ['a provision number of dotted parts', (n) => `{V} {ART} ${'1.'.repeat(n / 2)}1`],
-        ['a provision number of subdivisions', (n) => `{V} {ART} 1${'(a)'.repeat(n / 3)}`],
-        ['a provision number of one long digit run', (n) => `{V} {ART} ${'1'.repeat(n)}`],
-      ] as [string, (n: number) => string][]
-    ).map(([label, comment]): (typeof shapes)[number] => [
-      label,
-      (n) => ({ datesOfEffect: literal(effectItem('2020-01-01', 'MA', comment(n))) }),
-    ]),
+    ...commentShapes,
   ];
+
+  /** `read` timed over `build(n)` at each size, checked before the next size runs. */
+  const expectLinear = async (
+    build: (n: number) => Binding,
+    read: (binding: Binding) => unknown,
+  ) => {
+    const sizes = [5_000, 10_000, 20_000, 40_000, 80_000, 160_000, 320_000];
+    const times: number[] = [];
+    for (const n of sizes) {
+      const binding = build(n);
+      const t = await bestCpuMs(() => read(binding));
+      expect(t, `${t.toFixed(3)} ms at ${n}`).toBeLessThan(250);
+      times.push(t);
+    }
+    const ratio = (times.at(-1) as number) / Math.max(times[0] as number, 0.01);
+    expect(ratio, times.map((t) => t.toFixed(3)).join(', ')).toBeLessThan(256);
+  };
 
   it.each(shapes)(
     '%s',
-    async (_label, build) => {
-      const sizes = [5_000, 10_000, 20_000, 40_000, 80_000, 160_000, 320_000];
-      const times: number[] = [];
-      for (const n of sizes) {
-        const binding = build(n);
-        const t = await bestCpuMs(() => readActCitation(binding));
-        expect(t, `${t.toFixed(3)} ms at ${n}`).toBeLessThan(250);
-        times.push(t);
-      }
-      const ratio = (times.at(-1) as number) / Math.max(times[0] as number, 0.01);
-      expect(ratio, times.map((t) => t.toFixed(3)).join(', ')).toBeLessThan(256);
+    (_label, build) => expectLinear(build, readActCitation),
+    CPU_TIMED_TEST_TIMEOUT_MS,
+  );
+
+  // #188: the articles setting the dates are read from the same comments.
+  const amendment = [
+    {
+      amenderCelex: literal('32099R0001'),
+      location: literal('{AR|http://publications.europa.eu/resource/authority/fd_370/AR} 1'),
     },
+  ];
+  it.each(commentShapes)(
+    'the date-setting articles of %s',
+    (_label, build) => expectLinear(build, (binding) => readDateAmendments(amendment, binding)),
     CPU_TIMED_TEST_TIMEOUT_MS,
   );
 });

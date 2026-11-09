@@ -198,6 +198,18 @@ describe('query builders', () => {
     expect(query).toContain('<http://www.w3.org/2002/07/owl#sameAs> ?initiator');
     expect(query).not.toContain('resource/procedure');
   });
+
+  it('reads the CELEX of each act a dossier produced in its own OPTIONAL of the same query (#190)', () => {
+    const query = buildProcedureQuery(PROCEDURE_2021_106);
+
+    expect(query).toContain('SELECT DISTINCT ?dossier ?celex ?producedCelex WHERE {');
+    // Its own OPTIONAL, so a dossier with no initiating act still answers its produced acts.
+    expect(query).toMatch(
+      /OPTIONAL \{\s*\?dossier cdm:dossier_produces_resource_legal \?produced \.\s*\?produced cdm:resource_legal_id_celex \?producedCelex \.\s*\}/,
+    );
+    expect(query.match(/OPTIONAL \{/g)).toHaveLength(2);
+    expect(query).toContain('} LIMIT 100');
+  });
 });
 
 /** A fake service answering each query with the rows `answer` gives it. */
@@ -207,9 +219,11 @@ function fakeService(answer: (query: string) => SparqlBinding[]) {
 }
 
 const literal = (value: string) => ({ type: 'literal', value });
-const dossier = (id: string, celex?: string): SparqlBinding => ({
+/** One procedure-query row: the dossier, its initiating act's CELEX, and one act it produced. */
+const dossier = (id: string, celex?: string, producedCelex?: string): SparqlBinding => ({
   dossier: { type: 'uri', value: `http://publications.europa.eu/resource/cellar/${id}` },
   ...(celex ? { celex: literal(celex) } : {}),
+  ...(producedCelex ? { producedCelex: literal(producedCelex) } : {}),
 });
 
 describe('resolvePreparatoryReference', () => {
@@ -257,12 +271,64 @@ describe('resolvePreparatoryReference', () => {
       { kind: 'one', celex: '52023PC0177' },
     ],
     [
-      'reports a dossier with no initiating act',
+      'reports a dossier with no initiating act and nothing produced',
       '2021/0053(COD)',
       [dossier('d1')],
-      { kind: 'no_initiating_act' },
+      { kind: 'no_initiating_act', produced: [] },
     ],
     ['is a miss when no dossier holds the reference', '2021/2040(INI)', [], { kind: 'not_held' }],
+    // #190: a procedure with no initiating act carries the acts it produced.
+    [
+      'names the act a procedure with no initiating act produced',
+      '2014/0204(NLE)',
+      [dossier('d1', undefined, '32014R0747')],
+      { kind: 'no_initiating_act', produced: ['32014R0747'] },
+    ],
+    [
+      'names every act it produced, in CELEX order',
+      '1981/1012(CNS)',
+      ['31982R3082', '31985R3307', '31981R3577'].map((c) => dossier('d1', undefined, c)),
+      { kind: 'no_initiating_act', produced: ['31981R3577', '31982R3082', '31985R3307'] },
+    ],
+    [
+      'reads the produced acts of every dossier holding the reference',
+      '1979/1030(CNS)',
+      [dossier('d1', undefined, '31980R3308'), dossier('d2')],
+      { kind: 'no_initiating_act', produced: ['31980R3308'] },
+    ],
+    [
+      'lists a corrigendum among the produced acts, as adopted_acts does',
+      '2002/0296(CNS)',
+      [dossier('d1', undefined, '32004R0139R(03)'), dossier('d1', undefined, '32004R0139')],
+      { kind: 'no_initiating_act', produced: ['32004R0139', '32004R0139R(03)'] },
+    ],
+    [
+      'names an act two dossiers both produced once',
+      '1990/0123(CNS)',
+      [dossier('d1', undefined, '31991R0001'), dossier('d2', undefined, '31991R0001')],
+      { kind: 'no_initiating_act', produced: ['31991R0001'] },
+    ],
+    [
+      'resolves the initiating act and ignores the acts produced',
+      '2016/0282(COD)',
+      [
+        dossier('d1', '52016PC0605', '32018R1046'),
+        dossier('d1', '52016PC0605', '32017R2393'),
+        dossier('d2', undefined, '32017R2393'),
+      ],
+      { kind: 'one', celex: '52016PC0605' },
+    ],
+    [
+      'names each initiating act, never a produced one, across several dossiers',
+      '2000/0247(ACC)',
+      [
+        dossier('d1', '52000PC0641', '32000R2228'),
+        dossier('d2', '52000PC0609', '32000R2313'),
+        dossier('d3', '52000PC0640', '32000R2227'),
+        dossier('d4', '52000PC0616'),
+      ],
+      { kind: 'several', celex: ['52000PC0609', '52000PC0616', '52000PC0640', '52000PC0641'] },
+    ],
   ])('%s', async (_label, text, rows, expected) => {
     const reference = parsePreparatoryReference(text);
     if (!reference) throw new Error(`not a reference: ${text}`);
