@@ -4,7 +4,7 @@ All notable changes to this project. Each entry links to its full per-version fi
 
 ## [0.20.2](changelog/0.20.x/0.20.2.md) — 2026-11-09
 
-Names the CELEX CELLAR holds when a CELEX misses by one numbering convention, accepts input aliases, three-letter language codes and a flexible select, adds eurlex_get_relations related_sectors, and re-sends a stalled lookup once. Dates of effect drop CELLAR's no-date placeholders and flag a date an amending act moved.
+Names the CELEX CELLAR holds when a CELEX misses by one numbering convention, accepts input aliases, three-letter language codes and a flexible select, adds eurlex_get_relations related_sectors, and re-sends a stalled lookup once. Dates of effect drop CELLAR's no-date placeholders and flag a date an amending act may have moved.
 
 ## [0.20.1](changelog/0.20.x/0.20.1.md) — 2026-11-03
 
