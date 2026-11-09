@@ -1,6 +1,6 @@
 # eur-lex-mcp-server - Directory Structure
 
-Generated on: 2026-11-04 02:22:02
+Generated on: 2026-11-09 21:04:30
 
 ```text
 eur-lex-mcp-server/
@@ -195,6 +195,7 @@ eur-lex-mcp-server/
 │   │   │   ├── cdm-labels.ts
 │   │   │   ├── cellar-sparql-service.ts
 │   │   │   ├── eli-resolution.ts
+│   │   │   ├── held-celex.ts
 │   │   │   ├── keyword-match.ts
 │   │   │   ├── legislative-procedures.ts
 │   │   │   ├── oj-reference.ts
@@ -248,6 +249,7 @@ eur-lex-mcp-server/
 │   │   ├── eli-resolution.test.ts
 │   │   ├── eurlex-content-service.test.ts
 │   │   ├── formex-package.test.ts
+│   │   ├── held-celex.test.ts
 │   │   ├── html-to-markdown.test.ts
 │   │   ├── keyword-match.test.ts
 │   │   ├── legislative-procedures.test.ts

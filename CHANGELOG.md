@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.20.2](changelog/0.20.x/0.20.2.md) — 2026-11-09
+
+Names the CELEX CELLAR holds when a CELEX misses by one numbering convention, accepts input aliases, three-letter language codes and a flexible select, adds eurlex_get_relations related_sectors, and re-sends a stalled lookup once. Dates of effect drop CELLAR's no-date placeholders and flag a date an amending act moved.
+
 ## [0.20.1](changelog/0.20.x/0.20.1.md) — 2026-11-03
 
 Reports legislative procedure status and the provision behind each date of effect, filters case law by member state, procedure type and outcome, and subject, resolves COM numbers and procedure references, and counts transposition per member state. eurlex_get_relations pages by limit alone, default 10.
