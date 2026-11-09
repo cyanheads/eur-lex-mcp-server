@@ -417,15 +417,16 @@ describe('actCitationQuery', () => {
 });
 
 describe('amending acts of a date-setting article (#188)', () => {
-  const OWL = 'http://www.w3.org/2002/07/owl#';
-  const ANNOTATION = 'http://publications.europa.eu/ontology/annotation#';
+  // Escaped for the pattern below, so a dot in a host or path matches only a dot.
+  const OWL = RegExp.escape('http://www.w3.org/2002/07/owl#');
+  const ANNOTATION = RegExp.escape('http://publications.europa.eu/ontology/annotation#');
   const AR = '{AR|http://publications.europa.eu/resource/authority/fd_370/AR} ';
   const query = dateAmendmentsQuery(ACT);
 
   it("reads the article locations of the act's amendment axioms, each with its amending act's CELEX", () => {
     expect(query).toMatch(
       new RegExp(
-        `\\?(\\w+) <${OWL}annotatedTarget> <${ACT}> ;\\s*<${OWL}annotatedProperty> cdm:resource_legal_amends_resource_legal ;\\s*<${OWL}annotatedSource> \\?amender ;\\s*<${ANNOTATION}reference_to_modified_location> \\?location \\.`,
+        `\\?(\\w+) <${OWL}annotatedTarget> <${RegExp.escape(ACT)}> ;\\s*<${OWL}annotatedProperty> cdm:resource_legal_amends_resource_legal ;\\s*<${OWL}annotatedSource> \\?amender ;\\s*<${ANNOTATION}reference_to_modified_location> \\?location \\.`,
       ),
     );
     expect(query).toContain(`FILTER(STRSTARTS(STR(?location), "${AR}"))`);
