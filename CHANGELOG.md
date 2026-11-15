@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.20.3](changelog/0.20.x/0.20.3.md) — 2026-11-14
+
+`eurlex_get_relations` reads a treaty article's incoming edges across all four Lisbon versions, `eurlex_lookup_celex` returns a work's title and every resource type, and `eurlex_get_cases` returns the notices filed under a case number with no judgment. `document_type` adds `COMMUNIC`, `REPORT`, `SWD`, and `AGREE`.
+
 ## [0.20.2](changelog/0.20.x/0.20.2.md) — 2026-11-09
 
 Names the CELEX CELLAR holds when a CELEX misses by one numbering convention, accepts input aliases, three-letter language codes and a flexible select, adds eurlex_get_relations related_sectors, and re-sends a stalled lookup once. Dates of effect drop CELLAR's no-date placeholders and flag a date an amending act may have moved.
