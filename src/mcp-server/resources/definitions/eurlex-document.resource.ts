@@ -6,7 +6,10 @@
 import { resource, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { actCitationQuery, readActCitation } from '@/services/cellar-sparql/act-citation.js';
-import { ENG_LANGUAGE_URI, resolveResourceTypeLabel } from '@/services/cellar-sparql/cdm-labels.js';
+import {
+  ENG_LANGUAGE_URI,
+  resolveResourceTypeLabels,
+} from '@/services/cellar-sparql/cdm-labels.js';
 import {
   CellarSparqlService,
   getCellarSparqlService,
@@ -45,7 +48,7 @@ function collectResolved(
 
 export const eurlex_document_resource = resource('eurlex://document/{celexNumber}', {
   name: 'EUR-Lex document metadata',
-  description: `Metadata snapshot for a CELLAR work by CELEX number — human-readable document type, authors by English authority label (an EU institution or body, a member state, an MEP, or a national court; each usable as the author_institution filter of eurlex_search_documents), Advocates General of a case-law record, date, English title, in-force flag, ELI (eli), Official Journal reference (oj_reference, e.g. OJ L 119, 4.5.2016, p. 1–88), every date of effect with its type and the clause that sets it (dates_of_effect: [{ date, type?, provision? }], type one of entry_into_force, application, partial_application, provisional_application, takes_effect, takes_partial_effect; provision e.g. Article 113(a), numbered as CELLAR records it), a directive's transposition deadlines (transposition_deadlines), each list leaving out the values CELLAR records for no date (${UNDATED_PLACEHOLDERS.join(', ')}) and reading CELLAR's dates, which can lag an amending act that moves one (eurlex_get_document names such an act and the current consolidated version, whose text states the dates that apply), legal basis acts (work URI plus CELEX), EuroVoc subjects (concept URI plus English label), and the legislative procedures the act belongs to, sorted (procedures: [{ reference, status?, withdrawal_date?, adopted_acts? }], reference e.g. 2021/0106(COD), status one of adopted, withdrawn, pending, not_adopted and absent when CELLAR flags none or several, withdrawal_date when CELLAR flags the procedure withdrawn, adopted_acts the CELEX numbers the procedure produced). A consolidated text keeps its own type, date, title, and ELI, and reports its base act (base_act_celex) with that act's authors, in-force flag, OJ reference, dates of effect, transposition deadlines, legal bases, subjects, and procedures.`,
+  description: `Metadata snapshot for a CELLAR work by CELEX number — human-readable document type (each type, comma-separated, for a work filed under several), authors by English authority label (an EU institution or body, a member state, an MEP, or a national court; each usable as the author_institution filter of eurlex_search_documents), Advocates General of a case-law record, date, English title, in-force flag, ELI (eli), Official Journal reference (oj_reference, e.g. OJ L 119, 4.5.2016, p. 1–88), every date of effect with its type and the clause that sets it (dates_of_effect: [{ date, type?, provision? }], type one of entry_into_force, application, partial_application, provisional_application, takes_effect, takes_partial_effect; provision e.g. Article 113(a), numbered as CELLAR records it), a directive's transposition deadlines (transposition_deadlines), each list leaving out the values CELLAR records for no date (${UNDATED_PLACEHOLDERS.join(', ')}) and reading CELLAR's dates, which can lag an amending act that moves one (eurlex_get_document names such an act and the current consolidated version, whose text states the dates that apply), legal basis acts (work URI plus CELEX), EuroVoc subjects (concept URI plus English label), and the legislative procedures the act belongs to, sorted (procedures: [{ reference, status?, withdrawal_date?, adopted_acts? }], reference e.g. 2021/0106(COD), status one of adopted, withdrawn, pending, not_adopted and absent when CELLAR flags none or several, withdrawal_date when CELLAR flags the procedure withdrawn, adopted_acts the CELEX numbers the procedure produced). A consolidated text keeps its own type, date, title, and ELI, and reports its base act (base_act_celex) with that act's authors, in-force flag, OJ reference, dates of effect, transposition deadlines, legal bases, subjects, and procedures.`,
   mimeType: 'application/json',
   params: z.object({
     celexNumber: z
@@ -113,18 +116,24 @@ export const eurlex_document_resource = resource('eurlex://document/{celexNumber
     const baseAct = consolidation?.base;
     const actWork = baseAct?.workUri ?? workUri;
 
+    // Every type of the work rides as one space-separated `?type` (#197), as on
+    // search rows, and the English title as its greatest value, so an empty title
+    // literal CELLAR records beside the real one never wins. The query
+    // eurlex_get_document runs reads them the same way.
     const sparql = `
-SELECT ?type ?date ?title ?inForce
+SELECT ?date ?inForce
+  (GROUP_CONCAT(DISTINCT STR(?typeValue); separator=" ") AS ?type)
+  (MAX(STR(?titleValue)) AS ?title)
 WHERE {
-  OPTIONAL { <${workUri}> cdm:work_has_resource-type ?type . }
+  OPTIONAL { <${workUri}> cdm:work_has_resource-type ?typeValue . }
   OPTIONAL { <${workUri}> cdm:work_date_document ?date . }
   OPTIONAL {
     ?expr cdm:expression_belongs_to_work <${workUri}> .
     ?expr cdm:expression_uses_language <${ENG_LANGUAGE_URI}> .
-    ?expr cdm:expression_title ?title .
+    ?expr cdm:expression_title ?titleValue .
   }
   OPTIONAL { <${actWork}> cdm:resource_legal_in-force ?inForce . }
-} LIMIT 5`;
+} GROUP BY ?date ?inForce LIMIT 5`;
     // The citation facts (#169) come from their own query (#173), the one
     // eurlex_get_document runs: the served work's ELI, the act's OJ reference,
     // typed dates of effect, and transposition deadlines.
@@ -169,10 +178,10 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
     const result: Record<string, unknown> = { celex_number: celexNumber, work_uri: workUri };
     if (baseAct) result.base_act_celex = baseAct.celex;
 
-    // Resolve the raw CDM authority URI to a human-readable label, matching the
+    // Resolve the raw CDM authority URIs to human-readable labels, matching the
     // eurlex_get_document tool (previously the resource leaked the raw URI).
-    const resourceType = CellarSparqlService.bindingValue(first, 'type');
-    if (resourceType) result.resource_type = resolveResourceTypeLabel(resourceType);
+    const resourceType = resolveResourceTypeLabels(CellarSparqlService.bindingValue(first, 'type'));
+    if (resourceType) result.resource_type = resourceType;
     const date = cellarDate(CellarSparqlService.bindingValue(first, 'date'));
     if (date) result.date = date;
     const title = CellarSparqlService.bindingValue(first, 'title');

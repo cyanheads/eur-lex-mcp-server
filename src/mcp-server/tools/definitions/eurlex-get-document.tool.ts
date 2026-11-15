@@ -28,7 +28,7 @@ import {
   ENG_LANGUAGE_URI,
   LANGUAGE_AUTHORITY_URI,
   parseCaseLawTitle,
-  resolveResourceTypeLabel,
+  resolveResourceTypeLabels,
 } from '@/services/cellar-sparql/cdm-labels.js';
 import {
   CellarSparqlService,
@@ -541,7 +541,7 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       .string()
       .optional()
       .describe(
-        'Human-readable document type label (e.g. "Regulation", "Directive"). Absent for some older works.',
+        'Human-readable document type label (e.g. "Regulation", "Directive"). Works with several resource-types (e.g. corrigenda) list all, comma-separated. Absent for some older works.',
       ),
     author_institution: z
       .string()
@@ -997,12 +997,13 @@ export const eurlex_get_document = tool('eurlex_get_document', {
     } else if (celexInput) {
       requestedCelex = celexInput;
     } else if (eliInput) {
-      const binding = await withTimeoutAlternative(
+      // Every row of the ELI's work carries its CELEX, so the first is read.
+      const [binding] = await withTimeoutAlternative(
         ctx,
         ELI_LOOKUP_ALTERNATIVE,
         resolveEliToWork(sparqlSvc, eliInput, ctx),
       );
-      const resolvedCelex = binding && CellarSparqlService.bindingValue(binding, 'celexNumber');
+      const resolvedCelex = CellarSparqlService.bindingValue(binding, 'celexNumber');
       if (!resolvedCelex) {
         throw ctx.fail('not_found', `No CELLAR work found for ELI: ${eliInput}`);
       }
@@ -1157,18 +1158,25 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       // one: the served work's ELI, and the act's OJ reference, typed dates of
       // effect, and transposition deadlines. Folded into the core query, their
       // OPTIONALs multiplied its rows and cost more than the two queries run apart.
+      //
+      // Every type of the work rides as one space-separated `?type` (#197), as on
+      // search rows, and the English title as its greatest value, so an empty title
+      // literal CELLAR records beside the real one (12020W/PRO/01) never wins. The
+      // row is one per date and in-force flag, whatever the row order.
       const citationQuery = actCitationQuery(workUri, actWork, baseAct ? baseAct.celex : celex);
       const coreQuery = `
-SELECT ?type ?date ?title ?inForce
+SELECT ?date ?inForce
+  (GROUP_CONCAT(DISTINCT STR(?typeValue); separator=" ") AS ?type)
+  (MAX(STR(?titleValue)) AS ?title)
   (MAX(STR(?endOfValidityDate)) AS ?endOfValidity)
   (GROUP_CONCAT(DISTINCT STR(?repealerCelex); separator=" ") AS ?repealedBy)${ecliSelect}${languageTitleSelect}
 WHERE {${ecliPatterns}
-  OPTIONAL { <${workUri}> cdm:work_has_resource-type ?type . }
+  OPTIONAL { <${workUri}> cdm:work_has_resource-type ?typeValue . }
   OPTIONAL { <${workUri}> cdm:work_date_document ?date . }
   OPTIONAL {
     ?expr cdm:expression_belongs_to_work <${workUri}> .
     ?expr cdm:expression_uses_language <${ENG_LANGUAGE_URI}> .
-    ?expr cdm:expression_title ?title .
+    ?expr cdm:expression_title ?titleValue .
   }${languageTitlePattern}
   OPTIONAL { <${actWork}> cdm:resource_legal_in-force ?inForce . }
   OPTIONAL {
@@ -1179,7 +1187,7 @@ WHERE {${ecliPatterns}
     ?repealer cdm:resource_legal_repeals_resource_legal <${actWork}> .
     ?repealer cdm:resource_legal_id_celex ?repealerCelex .
   }
-} GROUP BY ?type ?date ?title ?inForce LIMIT 5`;
+} GROUP BY ?date ?inForce LIMIT 5`;
       // Legal bases and EuroVoc subjects resolve inline (#67): each dimension
       // query joins the identifying literal (CELEX / language-filtered
       // skos:prefLabel) as an OPTIONAL and groups per URI, so the label rides the
@@ -1270,7 +1278,7 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
         workUri,
         nationalMeasure: Object.keys(nationalMeasure).length ? nationalMeasure : undefined,
         baseActCelex: baseAct?.celex,
-        resourceType: CellarSparqlService.bindingValue(first, 'type'),
+        resourceType: resolveResourceTypeLabels(CellarSparqlService.bindingValue(first, 'type')),
         date: cellarDate(CellarSparqlService.bindingValue(first, 'date')),
         title: CellarSparqlService.bindingValue(first, 'title'),
         languageTitle: CellarSparqlService.bindingValue(first, 'languageTitle'),
@@ -1481,9 +1489,7 @@ SELECT ?eurovoc (SAMPLE(?labelValue) AS ?label) WHERE {
     Object.assign(result, metaResult.caseLawFacts);
     if (metaResult.ecli) result.ecli = metaResult.ecli;
     if (metaResult.date) result.date = metaResult.date;
-    if (metaResult.resourceType) {
-      result.resource_type = resolveResourceTypeLabel(metaResult.resourceType);
-    }
+    if (metaResult.resourceType) result.resource_type = metaResult.resourceType;
     // #33: surface every author. author_institution stays the primary (first) for
     // back-compat; author_institutions carries the full set. Advocates General are
     // people, not institutions, so they get their own field (#96).

@@ -30,6 +30,7 @@
 
 import type { Context } from '@cyanheads/mcp-ts-core';
 import { LANGUAGE_TO_ISO_639_2 } from '@/services/eurlex-content/eurlex-content-service.js';
+import { ENG_LANGUAGE_URI } from './cdm-labels.js';
 import type { CellarSparqlService } from './cellar-sparql-service.js';
 import type { SparqlBinding } from './types.js';
 
@@ -359,22 +360,32 @@ export function isSafeSparqlIri(value: string): boolean {
 }
 
 /**
- * ELI exact-match query: resolve the single work whose canonical ELI literal
- * (`cdm:resource_legal_eli`, an `xsd:anyURI` literal) equals `safeEli`, reading
- * its CELEX, type, and date. `safeEli` must be pre-escaped.
+ * ELI exact-match query: the work whose canonical ELI literal
+ * (`cdm:resource_legal_eli`, an `xsd:anyURI` literal) equals `safeEli`, one row per
+ * combination of its types and English titles, each with its CELEX and date.
+ * `safeEli` must be pre-escaped.
+ *
+ * It has no `LIMIT`: every row counts, and the literal bounds the result to one work
+ * — CELLAR holds each of its 294,684 ELI literals on one work, and no work carrying
+ * an ELI carries two CELEX (2026-11-14).
  */
 export function buildEliQuery(safeEli: string): string {
   return `
-SELECT ?work ?celexNumber ?type ?date WHERE {
+SELECT ?work ?celexNumber ?type ?date ?title WHERE {
   ?work cdm:resource_legal_eli "${safeEli}"^^xsd:anyURI .
   ?work cdm:resource_legal_id_celex ?celexNumber .
   OPTIONAL { ?work cdm:work_has_resource-type ?type . }
   OPTIONAL { ?work cdm:work_date_document ?date . }
-} LIMIT 5`;
+  OPTIONAL {
+    ?expr cdm:expression_belongs_to_work ?work .
+    ?expr cdm:expression_uses_language <${ENG_LANGUAGE_URI}> .
+    ?expr cdm:expression_title ?title .
+  }
+}`;
 }
 
 /**
- * Resolve an ELI URI to its canonical CELLAR work binding.
+ * Resolve an ELI URI to the rows of its CELLAR work.
  *
  * Exact-matches the ELI literal; a bare work-level ELI that misses is retried
  * once with `/oj` appended — a deterministic, one-to-one normalization to the
@@ -382,14 +393,14 @@ SELECT ?work ?celexNumber ?type ?date WHERE {
  * ELIs, so a manifestation-suffixed ELI (e.g. a `/YYYY-MM-DD` consolidated
  * version) never silently falls back to the original act.
  *
- * Returns the first matching binding (with `?work ?celexNumber ?type ?date`),
- * or `null` when the ELI resolves to no work.
+ * Returns every row {@link buildEliQuery} reads (`?work ?celexNumber ?type ?date
+ * ?title`), all of one work, or none when the ELI resolves to no work.
  */
 export async function resolveEliToWork(
   svc: Pick<CellarSparqlService, 'query'>,
   eli: string,
   ctx: Context,
-): Promise<SparqlBinding | null> {
+): Promise<SparqlBinding[]> {
   const trimmed = eli.trim();
   let bindings = await svc.query(buildEliQuery(escapeSparqlLiteral(trimmed)), ctx);
 
@@ -402,5 +413,5 @@ export async function resolveEliToWork(
     bindings = await svc.query(buildEliQuery(escapeSparqlLiteral(ojEli)), ctx);
   }
 
-  return bindings[0] ?? null;
+  return bindings;
 }

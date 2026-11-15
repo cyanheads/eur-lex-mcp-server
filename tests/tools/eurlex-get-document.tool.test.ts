@@ -870,7 +870,7 @@ describe('eurlex_get_document', () => {
       // A work with several French titles yields the greatest one on every call.
       expect(query).toMatch(/\(MAX\(STR\(\?languageTitleValue\)\) AS \?languageTitle\)/);
       expect(query).not.toContain('SAMPLE(?languageTitleValue)');
-      expect(query).toMatch(/GROUP BY \?type \?date \?title \?inForce/);
+      expect(query).toMatch(/GROUP BY \?date \?inForce/);
       expect(query).not.toMatch(/GROUP BY[^\n]*\?languageTitle/);
     });
 
@@ -912,6 +912,90 @@ describe('eurlex_get_document', () => {
       const [query] = titleQueries();
       expect(query).not.toContain('?languageExpr');
       expect(query).not.toContain('languageTitle');
+    });
+  });
+
+  // --- #197: every type of the work, and a non-empty English title, in the core row ---
+
+  describe('every type and the greatest English title in the core row (#197)', () => {
+    const literal = (value: string) => ({ type: 'literal', value });
+    const RESOURCE_TYPE = 'http://publications.europa.eu/resource/authority/resource-type/';
+
+    /** Answer the core query with `core`, its one grouped row, and every other metadata query with nothing. */
+    const routeCore = (core: Record<string, { type: string; value: string }>) =>
+      mockSparqlQuery.mockImplementation(async (sparql: string) => {
+        if (isResolutionQuery(sparql)) return resolutionRows(sparql);
+        return sparql.includes('cdm:work_has_resource-type') ? [core] : [];
+      });
+    const coreQuery = () =>
+      mockSparqlQuery.mock.calls
+        .map((c) => c[0] as string)
+        .find((q) => q.includes('cdm:work_has_resource-type')) as string;
+    const getDocument = async (celex: string) => {
+      const result = await runToolContract(eurlex_get_document, {
+        celex_number: celex,
+        content_mode: 'metadata_only',
+      });
+      expect(result.isError).toBeFalsy();
+      const text = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+      return { structured: eurlex_get_document.output.parse(result.structuredContent), text };
+    };
+
+    it('reports the one type of a single-typed work on both surfaces (characterization)', async () => {
+      routeCore({ type: literal(`${RESOURCE_TYPE}REG`), date: literal('2016-04-27') });
+
+      const { structured, text } = await getDocument('32016R0679');
+
+      expect(structured.resource_type).toBe('Regulation');
+      expect(readCommonMark(text).split('\n')).toContain('⟨strong⟩Type:⟨/strong⟩ Regulation');
+    });
+
+    it.each([
+      ['32016R0679R(02)', ['CORRIGENDUM', 'REG'], 'Corrigendum, Regulation'],
+      [
+        '52020SC0084',
+        ['EVL_SUM_EXE', 'SWD'],
+        'Executive Summary of the Evaluation, Staff Working Document',
+      ],
+      [
+        '32015B0367R(01)',
+        ['BUDGET', 'BUDGET_SUPPL_AMEND', 'CORRIGENDUM'],
+        'Budget, Corrigendum, Supplementary and Amending Budget',
+      ],
+      ['31980D1219', ['DEC', 'DEC_ENTSCHEID'], 'Decision'],
+      ['32099R0001', ['NEW_TYPE_2099', 'REG'], 'NEW_TYPE_2099, Regulation'],
+    ])(
+      'labels every type CELLAR concatenates for %s, on both surfaces',
+      async (celex, codes, label) => {
+        routeCore({ type: literal(codes.map((code) => `${RESOURCE_TYPE}${code}`).join(' ')) });
+
+        const { structured, text } = await getDocument(celex);
+
+        expect(structured.resource_type).toBe(label);
+        expect(readCommonMark(text).split('\n')).toContain(`⟨strong⟩Type:⟨/strong⟩ ${label}`);
+      },
+    );
+
+    it('omits resource_type and title when the work records no type and only an empty title', async () => {
+      routeCore({ type: literal(''), title: literal('') });
+
+      const { structured, text } = await getDocument('32016R0679');
+
+      expect(structured).not.toHaveProperty('resource_type');
+      expect(structured).not.toHaveProperty('title');
+      expect(text).not.toContain('**Type:**');
+    });
+
+    it('aggregates the types and the greatest English title into one row per date and in-force flag', async () => {
+      routeCore({});
+      await getDocument('32016R0679');
+
+      const query = coreQuery();
+      expect(query).toContain('(GROUP_CONCAT(DISTINCT STR(?typeValue); separator=" ") AS ?type)');
+      expect(query).toContain('(MAX(STR(?titleValue)) AS ?title)');
+      expect(query).toContain(`<${CELLAR}32016R0679> cdm:work_has_resource-type ?typeValue .`);
+      expect(query).toContain('?expr cdm:expression_title ?titleValue .');
+      expect(query).toMatch(/\} GROUP BY \?date \?inForce LIMIT 5$/);
     });
   });
 

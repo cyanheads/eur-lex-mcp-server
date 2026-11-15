@@ -13,7 +13,13 @@ import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mc
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_lookup_celex } from '@/mcp-server/tools/definitions/eurlex-lookup-celex.tool.js';
 import { escapeSparqlLiteral } from '@/services/cellar-sparql/eli-resolution.js';
-import { CELEX_WORKS, CELLAR, canonicalWork, celexWorkRows } from '../fixtures/cellar-works.js';
+import {
+  CELEX_WORKS,
+  CELLAR,
+  canonicalWork,
+  celexWorkRows,
+  fixtureWork,
+} from '../fixtures/cellar-works.js';
 import { readCommonMark } from '../helpers/commonmark.js';
 import { bestCpuMs, CPU_TIMED_TEST_TIMEOUT_MS } from '../helpers/cpu-time.js';
 
@@ -1994,7 +2000,8 @@ describe('eurlex_lookup_celex', () => {
         celex: '3*2016*R_0679 `x`',
         ecli: 'ECLI:EU:C:2014:317 [x](y) <b>z</b>',
         work: 'http://publications.europa.eu/resource/cellar/a_b|c\\',
-        type: '# Heading | 1. *x*',
+        // A type is an IRI's last segment, which never holds whitespace (#197 splits on it).
+        type: '#_Heading_|1.*x*',
         date: '- 2016-04-27 ~~x~~',
       };
       mockQuery.mockResolvedValue([
@@ -2427,5 +2434,428 @@ describe('eurlex_lookup_celex sparql_timeout recovery (#177)', () => {
     expect(mockQuery).toHaveBeenCalledTimes(2);
     expect(data).toMatchObject({ reason: 'sparql_timeout', retryable: true });
     expect(data.recovery?.hint).toBe(CONTRACT);
+  });
+});
+
+// --- #197 every type of the resolved work, #202 its English title ---
+
+describe('eurlex_lookup_celex reads every row of the resolved work (#197, #202)', () => {
+  /** A CELLAR work as the lookup's three queries reach it. */
+  interface LookupWork {
+    canonical?: boolean;
+    celex: string;
+    date?: string;
+    ecli?: string;
+    eli?: string;
+    /** English expression titles, as CELLAR stores them (an empty literal included). */
+    titles?: string[];
+    /** Resource-type codes, e.g. `REG`. */
+    types: string[];
+    uri: string;
+  }
+
+  const literal = (value: string) => ({ type: 'literal', value });
+  const iri = (value: string) => ({ type: 'uri', value });
+
+  /**
+   * CELLAR answering the CELEX (typed CELEX literal), ECLI (`VALUES ?ecli`), and ELI
+   * (typed ELI literal) lookups from `works`, in their listed order: one row per type
+   * and English title of each matching work, each column bound only when the query
+   * reads it, and `?canonicalAlias` only on the canonical work of a query reading it.
+   */
+  const lookupCellar = (works: LookupWork[]) => async (q: string) => {
+    const ecliValues = /VALUES \?ecli \{([^}]*)\}/.exec(q)?.[1];
+    const eli = /cdm:resource_legal_eli "([^"]+)"\^\^xsd:anyURI/.exec(q)?.[1];
+    const matched = works.filter((w) =>
+      ecliValues !== undefined
+        ? w.ecli !== undefined && ecliValues.includes(`"${w.ecli}"^^xsd:string`)
+        : eli !== undefined
+          ? w.eli === eli
+          : q.includes(`cdm:resource_legal_id_celex "${w.celex}"^^xsd:string`),
+    );
+    const readsType = q.includes('cdm:work_has_resource-type ?type');
+    const readsTitle = q.includes('cdm:expression_title ?title');
+    return matched.flatMap((w) => {
+      const types: (string | undefined)[] = readsType && w.types.length > 0 ? w.types : [undefined];
+      const titles: (string | undefined)[] =
+        readsTitle && w.titles && w.titles.length > 0 ? w.titles : [undefined];
+      return types.flatMap((type) =>
+        titles.map((title) => ({
+          celexNumber: literal(w.celex),
+          work: iri(w.uri),
+          ...(type ? { type: iri(`${RESOURCE_TYPE}${type}`) } : {}),
+          ...(title !== undefined ? { title: literal(title) } : {}),
+          ...(w.date && q.includes('cdm:work_date_document ?date')
+            ? { date: literal(w.date) }
+            : {}),
+          ...(w.ecli && (ecliValues !== undefined || q.includes('cdm:case-law_ecli ?ecli'))
+            ? { ecli: literal(w.ecli) }
+            : {}),
+          ...(w.canonical && q.includes('owl#sameAs')
+            ? { canonicalAlias: iri(`http://publications.europa.eu/resource/celex/${w.celex}`) }
+            : {}),
+        })),
+      );
+    });
+  };
+
+  /** The lines a CommonMark parse of `content[]` reads as. */
+  const readLines = (text: string) => readCommonMark(text).split('\n');
+
+  /** One lookup through the contract runner: both surfaces, and the queries it sent. */
+  async function lookup(works: LookupWork[], identifier: string) {
+    mockQuery.mockImplementation(lookupCellar(works));
+    const result = await runToolContract(eurlex_lookup_celex, { identifier });
+    expect(result.isError).toBeFalsy();
+    const structured = eurlex_lookup_celex.output.parse(result.structuredContent);
+    const text = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+    return { structured, text, queries: mockQuery.mock.calls.map((c) => c[0] as string) };
+  }
+
+  const GDPR_TITLE =
+    'Regulation (EU) 2016/679 of the European Parliament and of the Council of 27 April 2016 on the protection of natural persons with regard to the processing of personal data and on the free movement of such data, and repealing Directive 95/46/EC (General Data Protection Regulation) (Text with EEA relevance)';
+  const LED_TITLE =
+    'Directive (EU) 2016/680 of the European Parliament and of the Council of 27 April 2016 on the protection of natural persons with regard to the processing of personal data by competent authorities';
+  const GOOGLE_SPAIN_TITLE =
+    'Judgment of the Court (Grand Chamber), 13 May 2014.#Google Spain SL and Google Inc. v Agencia Española de Protección de Datos (AEPD) and Mario Costeja González.#Request for a preliminary ruling from the Audiencia Nacional.#Personal data — Protection of individuals with regard to the processing of such data — Directive 95/46/EC.#Case C-131/12.';
+  const PROTOCOL_TITLE =
+    'Agreement on the withdrawal of the United Kingdom of Great Britain and Northern Ireland from the European Union and the European Atomic Energy Community - PROTOCOL ON IRELAND/NORTHERN IRELAND';
+
+  const GDPR: LookupWork = {
+    celex: '32016R0679',
+    uri: canonicalWork('32016R0679'),
+    canonical: true,
+    types: ['REG'],
+    date: '2016-04-27',
+    eli: 'http://data.europa.eu/eli/reg/2016/679/oj',
+  };
+  /** 62012CJ0131 as CELLAR holds it: a `do_not_index` copy listed first, then the titled judgment. */
+  const GOOGLE_SPAIN: LookupWork[] = [
+    {
+      celex: '62012CJ0131',
+      uri: fixtureWork('62012CJ0131', 0),
+      types: ['JUDG'],
+      date: '2014-05-13',
+      ecli: 'ECLI:EU:C:2014:317',
+    },
+    {
+      celex: '62012CJ0131',
+      uri: canonicalWork('62012CJ0131'),
+      canonical: true,
+      types: ['JUDG'],
+      titles: [GOOGLE_SPAIN_TITLE],
+      date: '2014-05-13',
+      ecli: 'ECLI:EU:C:2014:317',
+    },
+  ];
+  /** The corrigendum CELLAR files under both CORRIGENDUM and REG, with its ELI. */
+  const GDPR_CORRIGENDUM: LookupWork = {
+    celex: '32016R0679R(02)',
+    uri: `${CELLAR}683d5816-5e52-11e8-ab9c-01aa75ed71a1`,
+    canonical: true,
+    types: ['REG', 'CORRIGENDUM'],
+    date: '2018-05-23',
+    eli: 'http://data.europa.eu/eli/reg/2016/679/corrigendum/2018-05-23/oj',
+  };
+
+  beforeEach(() => {
+    mockQuery.mockReset();
+  });
+
+  describe('a single-typed work (characterization)', () => {
+    it.each([
+      ['CELEX', '32016R0679', [GDPR], 'Regulation', canonicalWork('32016R0679')],
+      [
+        'ELI',
+        'http://data.europa.eu/eli/reg/2016/679/oj',
+        [GDPR],
+        'Regulation',
+        canonicalWork('32016R0679'),
+      ],
+      [
+        'ECLI',
+        'ECLI:EU:C:2014:317',
+        GOOGLE_SPAIN.map((w) => ({ ...w, titles: [] })),
+        'Judgment',
+        canonicalWork('62012CJ0131'),
+      ],
+    ] as const)(
+      'reports its one type on the %s branch, in one query, on both surfaces',
+      async (_branch, identifier, works, label, workUri) => {
+        const { structured, text, queries } = await lookup([...works], identifier);
+
+        expect(structured).toMatchObject({ found: true, work_uri: workUri, resource_type: label });
+        expect(readLines(text)).toContain(`⟨strong⟩Type:⟨/strong⟩ ${label}`);
+        expect(queries).toHaveLength(1);
+      },
+    );
+  });
+
+  describe('every type (#197)', () => {
+    it.each([
+      ['32016R0679R(02)', ['REG', 'CORRIGENDUM'], 'Corrigendum, Regulation'],
+      [
+        '52020SC0084',
+        ['SWD', 'EVL_SUM_EXE'],
+        'Executive Summary of the Evaluation, Staff Working Document',
+      ],
+      [
+        '32015B0367R(01)',
+        ['CORRIGENDUM', 'BUDGET_SUPPL_AMEND', 'BUDGET'],
+        'Budget, Corrigendum, Supplementary and Amending Budget',
+      ],
+      // Two codes sharing one label render it once.
+      ['31980D1219', ['DEC_ENTSCHEID', 'DEC'], 'Decision'],
+      // An unlabelled code keeps its place in the sorted list.
+      ['32099R0001', ['REG', 'NEW_TYPE_2099'], 'NEW_TYPE_2099, Regulation'],
+    ])(
+      'lists every type of %s, sorted and comma-separated, on both surfaces',
+      async (celex, types, label) => {
+        const work: LookupWork = { celex, uri: `${CELLAR}${celex}`, canonical: true, types };
+
+        const { structured, text, queries } = await lookup([work], celex);
+
+        expect(structured.resource_type).toBe(label);
+        expect(readLines(text)).toContain(`⟨strong⟩Type:⟨/strong⟩ ${label}`);
+        expect(queries).toHaveLength(1);
+      },
+    );
+
+    it('reports the corrigendum ELI with both of its types', async () => {
+      const { structured, text, queries } = await lookup(
+        [GDPR_CORRIGENDUM],
+        GDPR_CORRIGENDUM.eli as string,
+      );
+
+      expect(structured).toMatchObject({
+        celex_number: '32016R0679R(02)',
+        resource_type: 'Corrigendum, Regulation',
+        date: '2018-05-23',
+      });
+      expect(readLines(text)).toContain('⟨strong⟩Type:⟨/strong⟩ Corrigendum, Regulation');
+      expect(queries).toHaveLength(1);
+    });
+
+    it('returns both types of a two-typed ECLI row set', async () => {
+      const works: LookupWork[] = [
+        { ...GOOGLE_SPAIN[0], types: ['JUDG'] } as LookupWork,
+        { ...GOOGLE_SPAIN[1], types: ['JUDG_EXTRACT', 'JUDG'] } as LookupWork,
+      ];
+
+      const { structured, text, queries } = await lookup(works, 'ECLI:EU:C:2014:317');
+
+      expect(structured).toMatchObject({
+        work_uri: canonicalWork('62012CJ0131'),
+        ecli: 'ECLI:EU:C:2014:317',
+        resource_type: 'Judgment, Judgment (Extracts)',
+      });
+      expect(readLines(text)).toContain('⟨strong⟩Type:⟨/strong⟩ Judgment, Judgment (Extracts)');
+      expect(queries).toHaveLength(1);
+    });
+
+    it('reads every type from the CELEX query an ECLI falls back to', async () => {
+      // The ECLI sits only on a copy, so the CELEX is resolved on its own works.
+      const works: LookupWork[] = [
+        {
+          celex: '62015TO0235(01)',
+          uri: fixtureWork('62015TO0235(01)', 0),
+          types: ['ORDER'],
+          ecli: 'ECLI:EU:T:2015:587',
+        },
+        {
+          celex: '62015TO0235(01)',
+          uri: canonicalWork('62015TO0235(01)'),
+          canonical: true,
+          types: ['ORDER', 'CORRIGENDUM'],
+          titles: ['Order of the General Court'],
+        },
+      ];
+
+      const { structured, queries } = await lookup(works, 'ECLI:EU:T:2015:587');
+
+      expect(structured).toMatchObject({
+        work_uri: canonicalWork('62015TO0235(01)'),
+        ecli: 'ECLI:EU:T:2015:587',
+        resource_type: 'Corrigendum, Order',
+        title: 'Order of the General Court',
+      });
+      expect(queries).toHaveLength(2);
+    });
+
+    it("reports the resolved work's types alone for a CELEX several works hold", async () => {
+      // 51987PC0204 (live): the copy, listed first, is typed PROP_DEC.
+      const works: LookupWork[] = [
+        {
+          celex: '51987PC0204',
+          uri: `${CELLAR}5c86cbc8-copy`,
+          types: ['PROP_DEC'],
+          titles: ['Proposal for a COUNCIL DECISION concluding a Convention'],
+        },
+        {
+          celex: '51987PC0204',
+          uri: `${CELLAR}bc270448-main`,
+          canonical: true,
+          types: ['PROP_DEC_NO_ADDRESSEE'],
+          titles: ['PROPOSAL FOR A COUNCIL DECISION CONCLUDING A CONVENTION'],
+        },
+      ];
+
+      const { structured } = await lookup(works, '51987PC0204');
+
+      expect(structured).toMatchObject({
+        work_uri: `${CELLAR}bc270448-main`,
+        resource_type: 'Proposal for a Decision without Addressee',
+        // The copy's title sorts above the resolved work's, and never stands in for it.
+        title: 'PROPOSAL FOR A COUNCIL DECISION CONCLUDING A CONVENTION',
+      });
+    });
+  });
+
+  describe('English title (#202)', () => {
+    it('returns the title on the CELEX branch, after the type and date in content[]', async () => {
+      const { structured, text, queries } = await lookup(
+        [{ ...GDPR, titles: [GDPR_TITLE] }],
+        '32016R0679',
+      );
+
+      expect(structured).toEqual({
+        found: true,
+        work_uri: canonicalWork('32016R0679'),
+        celex_number: '32016R0679',
+        resource_type: 'Regulation',
+        date: '2016-04-27',
+        title: GDPR_TITLE,
+      });
+      expect(text).toContain(`**Title:** ${GDPR_TITLE}`);
+      const at = (label: string) => text.indexOf(`**${label}:**`);
+      expect(at('Type')).toBeLessThan(at('Date'));
+      expect(at('Date')).toBeLessThan(at('Title'));
+      expect(queries).toHaveLength(1);
+      expect(queries[0]).toContain('?expr cdm:expression_belongs_to_work ?work .');
+      expect(queries[0]).toContain(
+        '?expr cdm:expression_uses_language <http://publications.europa.eu/resource/authority/language/ENG> .',
+      );
+    });
+
+    it('returns the raw case-law title on the ECLI branch, from the resolved work', async () => {
+      const { structured, text, queries } = await lookup(GOOGLE_SPAIN, 'ECLI:EU:C:2014:317');
+
+      expect(structured.title).toBe(GOOGLE_SPAIN_TITLE);
+      expect(readCommonMark(text)).toContain(`⟨strong⟩Title:⟨/strong⟩ ${GOOGLE_SPAIN_TITLE}`);
+      expect(queries).toHaveLength(1);
+      expect(queries[0]).toContain('cdm:expression_title ?title');
+    });
+
+    it('returns the title on the ELI branch', async () => {
+      const { structured, queries } = await lookup(
+        [{ ...GDPR, titles: [GDPR_TITLE] }],
+        'http://data.europa.eu/eli/reg/2016/679/oj',
+      );
+
+      expect(structured).toMatchObject({ celex_number: '32016R0679', title: GDPR_TITLE });
+      expect(queries).toHaveLength(1);
+      expect(queries[0]).toContain('cdm:expression_title ?title');
+    });
+
+    it('returns the title of the act an OJ citation names, in the one CELEX query', async () => {
+      const led: LookupWork = {
+        celex: '32016L0680',
+        uri: `${CELLAR}182703d1-11bd-11e6-ba9a-01aa75ed71a1`,
+        canonical: true,
+        types: ['DIR'],
+        titles: [LED_TITLE],
+        date: '2016-04-27',
+      };
+
+      const { structured, text, queries } = await lookup([led], 'Directive (EU) 2016/680');
+
+      expect(structured).toMatchObject({
+        celex_number: '32016L0680',
+        resource_type: 'Directive',
+        title: LED_TITLE,
+      });
+      expect(text).toContain(`**Title:** ${LED_TITLE}`);
+      expect(queries).toHaveLength(1);
+    });
+
+    it.each([
+      ['after', ['', PROTOCOL_TITLE]],
+      ['before', [PROTOCOL_TITLE, '']],
+    ])(
+      'returns the non-empty title whatever the row order (empty literal %s)',
+      async (_order, titles) => {
+        const protocol: LookupWork = {
+          celex: '12020W/PRO/01',
+          uri: `${CELLAR}74ee38e8-fd21-11ec-b94a-01aa75ed71a1`,
+          canonical: true,
+          types: ['WITHD_AGREE'],
+          titles,
+        };
+
+        const { structured } = await lookup([protocol], '12020W/PRO/01');
+
+        expect(structured).toMatchObject({
+          resource_type: 'Withdrawal Agreement',
+          title: PROTOCOL_TITLE,
+        });
+      },
+    );
+
+    it('returns the lexically greatest of several English titles', async () => {
+      const work: LookupWork = {
+        celex: '32099R0002',
+        uri: `${CELLAR}32099R0002`,
+        canonical: true,
+        types: ['REG'],
+        titles: ['Regulation B', 'Regulation C', 'Regulation A'],
+      };
+
+      expect((await lookup([work], '32099R0002')).structured.title).toBe('Regulation C');
+    });
+
+    it('omits the title of a work with no English title, and never takes another work’s', async () => {
+      const measure: LookupWork = {
+        celex: '72016L0680DEU_261768',
+        uri: `${CELLAR}530f2417-a176-4f32-807a-2c42666add8b`,
+        canonical: true,
+        types: ['MEAS_NATION_IMPL'],
+      };
+      const single = await lookup([measure], '72016L0680DEU_261768');
+      expect(single.structured.found).toBe(true);
+      expect('title' in single.structured).toBe(false);
+      expect(single.text).not.toContain('**Title:**');
+
+      mockQuery.mockReset();
+      const untitledMain = await lookup(
+        [
+          { ...GOOGLE_SPAIN[0], titles: ['A copy title'] } as LookupWork,
+          { ...GOOGLE_SPAIN[1], titles: [] } as LookupWork,
+        ],
+        '62012CJ0131',
+      );
+      expect(untitledMain.structured.work_uri).toBe(canonicalWork('62012CJ0131'));
+      expect('title' in untitledMain.structured).toBe(false);
+    });
+
+    it.each([
+      ['a CELEX no work holds', '32099R9999'],
+      ['a case number', 'C-131/12'],
+    ])('carries no title on found false for %s', async (_label, identifier) => {
+      mockQuery.mockImplementation(lookupCellar([{ ...GDPR, titles: [GDPR_TITLE] }]));
+      const result = await runToolContract(eurlex_lookup_celex, { identifier });
+
+      expect(result.structuredContent).toMatchObject({ found: false });
+      expect(result.structuredContent).not.toHaveProperty('title');
+      const text = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+      expect(text).not.toContain('**Title:**');
+    });
+
+    it('renders a title carrying Markdown specials so content[] reads back as written', async () => {
+      const title = 'Decision *x* of [the](y) <b>Council</b> | _a_ \\ #Case 1.';
+      const { structured, text } = await lookup([{ ...GDPR, titles: [title] }], '32016R0679');
+
+      expect(structured.title).toBe(title);
+      expect(readCommonMark(text)).toContain(`⟨strong⟩Title:⟨/strong⟩ ${title}`);
+    });
   });
 });

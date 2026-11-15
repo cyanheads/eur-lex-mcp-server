@@ -59,10 +59,19 @@ export function pickResolvedWork(bindings: readonly SparqlBinding[]): string | u
   return best?.work;
 }
 
-/** The first row of the work {@link pickResolvedWork} selects, or `null` for no rows. */
-export function resolvedWorkRow(bindings: readonly SparqlBinding[]): SparqlBinding | null {
+/**
+ * Every row of the work {@link pickResolvedWork} selects, in their order: one per
+ * combination of its column values (each type, each title), so a reader sees the
+ * whole work rather than whichever row came first. Empty for no rows.
+ */
+export function resolvedWorkRows(bindings: readonly SparqlBinding[]): SparqlBinding[] {
   const work = pickResolvedWork(bindings);
-  return bindings.find((b) => CellarSparqlService.bindingValue(b, 'work') === work) ?? null;
+  return bindings.filter((b) => CellarSparqlService.bindingValue(b, 'work') === work);
+}
+
+/** The values a column takes across rows, sorted by code unit. */
+export function columnValues(rows: readonly SparqlBinding[], column: string): string[] {
+  return rows.flatMap((b) => CellarSparqlService.bindingValue(b, column) ?? []).sort();
 }
 
 /**

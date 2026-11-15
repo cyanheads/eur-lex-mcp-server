@@ -1,7 +1,7 @@
 /**
  * @fileoverview Tests for CELEX → CELLAR work resolution (#97): the canonical-work
- * rule, its order independence and fallback, the batched `VALUES` query, and the
- * per-work columns read beside it (#146).
+ * rule, its order independence and fallback, every row of the resolved work (#197),
+ * the batched `VALUES` query, and the per-work columns read beside it (#146).
  * @module tests/services/work-resolution.test
  */
 
@@ -12,7 +12,7 @@ import {
   pickResolvedWork,
   resolveCelexWorkRows,
   resolveCelexWorks,
-  resolvedWorkRow,
+  resolvedWorkRows,
 } from '@/services/cellar-sparql/work-resolution.js';
 import {
   CASE_LAW_WORKS,
@@ -60,23 +60,29 @@ describe('pickResolvedWork', () => {
     );
   });
 
-  it('returns undefined for no rows, and resolvedWorkRow null', () => {
+  it('returns undefined for no rows, and resolvedWorkRows none', () => {
     expect(pickResolvedWork([])).toBeUndefined();
-    expect(resolvedWorkRow([])).toBeNull();
+    expect(resolvedWorkRows([])).toEqual([]);
   });
 
-  it('returns the first row of the resolved work, keeping its other columns', () => {
+  it('returns every row of the resolved work, in order, keeping its other columns', () => {
     const typed = (uri: string, type: string, canonical = false): Row => ({
       ...work(uri, canonical),
       type: { type: 'uri', value: type },
     });
-    const row = resolvedWorkRow([
+    const rows = resolvedWorkRows([
+      typed(`${CELLAR}main`, 'JUDG_EXTRACT', true),
       typed(`${CELLAR}copy`, 'JUDG'),
       typed(`${CELLAR}main`, 'JUDG', true),
-      typed(`${CELLAR}main`, 'JUDG_EXTRACT', true),
+      typed(`${CELLAR}copy`, 'CORRIGENDUM'),
     ]);
-    expect(row?.work?.value).toBe(`${CELLAR}main`);
-    expect(row?.type?.value).toBe('JUDG');
+    expect(rows.map((b) => b.work?.value)).toEqual([`${CELLAR}main`, `${CELLAR}main`]);
+    expect(rows.map((b) => b.type?.value)).toEqual(['JUDG_EXTRACT', 'JUDG']);
+  });
+
+  it('returns the rows of the lowest work URI when no work carries the alias', () => {
+    const rows = resolvedWorkRows([work(`${CELLAR}b`), work(`${CELLAR}a`), work(`${CELLAR}a`)]);
+    expect(rows.map((b) => b.work?.value)).toEqual([`${CELLAR}a`, `${CELLAR}a`]);
   });
 });
 

@@ -12,7 +12,8 @@ import { renderNoticeBlockquote } from '@/mcp-server/tools/markdown-render.js';
 import { withTimeoutAlternative } from '@/mcp-server/tools/timeout-alternative.js';
 import {
   DERIVATIVE_RESOURCE_TYPES,
-  resolveResourceTypeLabel,
+  ENG_LANGUAGE_URI,
+  resolveResourceTypeLabels,
 } from '@/services/cellar-sparql/cdm-labels.js';
 import {
   CellarSparqlService,
@@ -47,8 +48,9 @@ import { cellarDate, UNDATED_PLACEHOLDER } from '@/services/cellar-sparql/sort-w
 import type { SparqlBinding } from '@/services/cellar-sparql/types.js';
 import {
   canonicalAliasPattern,
+  columnValues,
   isCanonicalRow,
-  resolvedWorkRow,
+  resolvedWorkRows,
 } from '@/services/cellar-sparql/work-resolution.js';
 
 /**
@@ -248,6 +250,16 @@ function preparatoryNotice(
 }
 
 /**
+ * The English expression title of `?work` (#202), read as the `eurlex://document`
+ * resource and search rows read it. Titles live on expressions, not works.
+ */
+const ENGLISH_TITLE_PATTERN = `OPTIONAL {
+    ?expr cdm:expression_belongs_to_work ?work .
+    ?expr cdm:expression_uses_language <${ENG_LANGUAGE_URI}> .
+    ?expr cdm:expression_title ?title .
+  }`;
+
+/**
  * ECLI lookup query. CELLAR stores `cdm:case-law_ecli` as an `xsd:string`-typed
  * literal, so the match is a typed exact join — an untyped literal matches nothing,
  * and a `STR()` comparison scans. `literals` must be pre-escaped; each becomes one
@@ -257,33 +269,36 @@ function preparatoryNotice(
 function buildEcliQuery(literals: readonly string[]): string {
   const values = literals.map((literal) => `"${literal}"^^xsd:string`).join(' ');
   return `
-SELECT ?work ?celexNumber ?type ?date ?ecli ?canonicalAlias WHERE {
+SELECT ?work ?celexNumber ?type ?date ?ecli ?canonicalAlias ?title WHERE {
   VALUES ?ecli { ${values} }
   ?work cdm:case-law_ecli ?ecli .
   ?work cdm:resource_legal_id_celex ?celexNumber .
   ${canonicalAliasPattern('?celexNumber')}
   OPTIONAL { ?work cdm:work_has_resource-type ?type . }
   OPTIONAL { ?work cdm:work_date_document ?date . }
+  ${ENGLISH_TITLE_PATTERN}
 } LIMIT 100`;
 }
 
 /**
  * CELEX lookup query: every work holding the CELEX, bound back to ?celexNumber so
  * every branch projects the same row shape, with `?canonicalAlias` on the work the
- * CELEX resolves to (#97). The `LIMIT` covers every row of every work — a few types
- * each, and no CELEX has been seen with more than four works — so no work's rows are
- * cut before the resolved one is picked.
+ * CELEX resolves to (#97). A work answers one row per combination of its types,
+ * ECLIs, and English titles. The `LIMIT` covers every row of every work — a few
+ * types and one or two titles each, and no CELEX has been seen with more than four
+ * works — so no work's rows are cut before the resolved one is picked.
  */
 function buildCelexQuery(celex: string): string {
   const literal = celexLiteral(celex);
   return `
-SELECT ?work ?celexNumber ?type ?date ?ecli ?canonicalAlias WHERE {
+SELECT ?work ?celexNumber ?type ?date ?ecli ?canonicalAlias ?title WHERE {
   ?work cdm:resource_legal_id_celex ${literal} .
   BIND(${literal} AS ?celexNumber)
   ${canonicalAliasPattern(literal)}
   OPTIONAL { ?work cdm:work_has_resource-type ?type . }
   OPTIONAL { ?work cdm:work_date_document ?date . }
   OPTIONAL { ?work cdm:case-law_ecli ?ecli . }
+  ${ENGLISH_TITLE_PATTERN}
 } LIMIT 100`;
 }
 
@@ -326,7 +341,7 @@ const CELEX_LOOKUP_ALTERNATIVE =
 export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
   title: 'Resolve EU Legal Citation',
   description:
-    'Resolve an EU legal citation — a CELEX number, ELI URI, ECLI, an OJ citation naming its act type and year (e.g. "Regulation (EU) 2016/679", "Directive 95/46/EC"), an Official Journal reference naming its issue, date, and first page (e.g. "OJ L 119, 4.5.2016, p. 1"), a Commission document number (e.g. "COM(2021) 206 final", also SEC, SWD, JOIN), or an interinstitutional procedure reference (e.g. "2021/0106(COD)", resolved to the act that initiated it) — to its canonical CELLAR work, confirming it exists before you fetch or traverse it. Returns the work URI, confirmed CELEX number, document type, date, and the ECLI of a case that carries one. A CELEX that CELLAR holds under several works resolves to the one the EUR-Lex content resolver serves. An ECLI shared by several records (a judgment and its abstract or extract, or a joined AG opinion) resolves to the primary record with the lowest CELEX. An OJ reference whose first page starts several acts, a document number CELLAR holds in several parts, and a procedure with several initiating acts return found false, the notice naming each CELEX; a procedure with no initiating act returns found false, the notice naming the CELEX of each act it produced.',
+    'Resolve an EU legal citation — a CELEX number, ELI URI, ECLI, an OJ citation naming its act type and year (e.g. "Regulation (EU) 2016/679", "Directive 95/46/EC"), an Official Journal reference naming its issue, date, and first page (e.g. "OJ L 119, 4.5.2016, p. 1"), a Commission document number (e.g. "COM(2021) 206 final", also SEC, SWD, JOIN), or an interinstitutional procedure reference (e.g. "2021/0106(COD)", resolved to the act that initiated it) — to its canonical CELLAR work, confirming it exists before you fetch or traverse it. Returns the work URI, confirmed CELEX number, document type, date, English title, and the ECLI of a case that carries one. A CELEX that CELLAR holds under several works resolves to the one the EUR-Lex content resolver serves. An ECLI shared by several records (a judgment and its abstract or extract, or a joined AG opinion) resolves to the primary record with the lowest CELEX. An OJ reference whose first page starts several acts, a document number CELLAR holds in several parts, and a procedure with several initiating acts return found false, the notice naming each CELEX; a procedure with no initiating act returns found false, the notice naming the CELEX of each act it produced.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     identifier: z
@@ -376,13 +391,19 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
       .string()
       .optional()
       .describe(
-        'Human-readable document category resolved from the CDM resource type (e.g. "Regulation", "Directive", "Judgment"). An authority value with no known label falls back to its code. Absent for some works.',
+        'Human-readable document category resolved from the CDM resource type (e.g. "Regulation", "Directive", "Judgment"). Works with several resource-types (e.g. corrigenda) list all, comma-separated ("Corrigendum, Regulation"). An authority value with no known label falls back to its code. Absent for some works.',
       ),
     date: z
       .string()
       .optional()
       .describe(
         `Document date in ISO 8601 format (YYYY-MM-DD). Absent when CELLAR records no real document date — none, or the ${UNDATED_PLACEHOLDER} it records for an undated work.`,
+      ),
+    title: z
+      .string()
+      .optional()
+      .describe(
+        'English title of the resolved work as CELLAR records it, a case-law title with its "#"-separated segments. Absent when the work records no English title.',
       ),
   }),
 
@@ -511,7 +532,12 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
     // shared canonical-work rule (#97). No work carrying an ELI carries an ECLI
     // (legislation is cited by ELI, case law by ECLI), so only the CELEX and ECLI
     // branches bind one.
-    let binding: SparqlBinding | null;
+    //
+    // Each branch ends with every row of the work it resolved to, one per type and
+    // English title, so the result reads the whole work (#197, #202) rather than
+    // whichever row CELLAR sent first.
+    let rows: SparqlBinding[];
+    let ecli: string | undefined;
     if (effectiveType === 'celex') {
       /**
        * An ECLI names the case, not one copy of it: the canonical work can carry none
@@ -519,12 +545,10 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
        * each with its own ECLI, so the resolved work's ECLI is kept when it has one
        * and otherwise the lowest ECLI any work of the CELEX records is reported.
        */
-      const rows = await svc.query(buildCelexQuery(identifier), ctx);
-      const resolved = resolvedWorkRow(rows);
-      const [caseEcli] = rows
-        .flatMap((b) => b.ecli ?? [])
-        .sort((a, b) => (a.value < b.value ? -1 : 1));
-      binding = resolved && !resolved.ecli && caseEcli ? { ...resolved, ecli: caseEcli } : resolved;
+      const celexRows = await svc.query(buildCelexQuery(identifier), ctx);
+      rows = resolvedWorkRows(celexRows);
+      const [caseEcli] = columnValues(celexRows, 'ecli');
+      ecli = CellarSparqlService.bindingValue(rows[0], 'ecli') ?? caseEcli;
     } else if (effectiveType === 'ecli') {
       /**
        * Every EU ECLI in CELLAR is uppercase, so a lowercase EU ECLI resolves
@@ -546,28 +570,30 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
       const celexRows = selectEcliCelexRows(bindings, identifier);
       const [first] = celexRows;
       if (!first || celexRows.some(isCanonicalRow)) {
-        binding = resolvedWorkRow(celexRows);
+        rows = resolvedWorkRows(celexRows);
+        ecli = CellarSparqlService.bindingValue(rows[0], 'ecli');
       } else {
         const celex = CellarSparqlService.bindingValue(first, 'celexNumber') ?? '';
-        const resolved = resolvedWorkRow(await svc.query(buildCelexQuery(celex), ctx));
-        binding = resolved && { ...resolved, ...(first.ecli ? { ecli: first.ecli } : {}) };
+        rows = resolvedWorkRows(await svc.query(buildCelexQuery(celex), ctx));
+        ecli = CellarSparqlService.bindingValue(first, 'ecli');
       }
     } else {
-      binding = await withTimeoutAlternative(
+      rows = await withTimeoutAlternative(
         ctx,
         CELEX_LOOKUP_ALTERNATIVE,
         resolveEliToWork(svc, identifier, ctx),
       );
     }
+    const [resolved] = rows;
 
     ctx.log.info('Citation lookup', {
       identifier,
       ...(identifier === citation ? {} : { citation }),
       type: effectiveType,
-      found: binding !== null,
+      found: resolved !== undefined,
     });
 
-    if (!binding) {
+    if (!resolved) {
       /**
        * A well-formed identifier that resolves to no work is a clean negative, not an
        * error — the documented "validate before fetch" role depends on a boolean here.
@@ -588,15 +614,21 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
       return { found: false };
     }
 
-    const typeUri = CellarSparqlService.bindingValue(binding, 'type');
-    const ecli = CellarSparqlService.bindingValue(binding, 'ecli');
+    /**
+     * Every type of the work, labelled as an eurlex_get_cases row labels it, and its
+     * greatest non-empty English title: CELLAR records an empty title literal beside
+     * the real one on some works (12020W/PRO/01). Neither is read from another work.
+     */
+    const resourceType = resolveResourceTypeLabels(columnValues(rows, 'type').join(' '));
+    const title = columnValues(rows, 'title').at(-1);
     return {
       found: true,
-      work_uri: CellarSparqlService.bindingValue(binding, 'work'),
-      celex_number: CellarSparqlService.bindingValue(binding, 'celexNumber'),
+      work_uri: CellarSparqlService.bindingValue(resolved, 'work'),
+      celex_number: CellarSparqlService.bindingValue(resolved, 'celexNumber'),
       ...(ecli ? { ecli } : {}),
-      ...(typeUri ? { resource_type: resolveResourceTypeLabel(typeUri) } : {}),
-      date: cellarDate(CellarSparqlService.bindingValue(binding, 'date')),
+      ...(resourceType ? { resource_type: resourceType } : {}),
+      date: cellarDate(CellarSparqlService.bindingValue(resolved, 'date')),
+      ...(title ? { title } : {}),
     };
   },
 
@@ -611,6 +643,7 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
     field('Work URI', result.work_uri);
     field('Type', result.resource_type);
     field('Date', result.date);
+    field('Title', result.title);
     return [{ type: 'text', text: lines.join('\n') }];
   },
 });

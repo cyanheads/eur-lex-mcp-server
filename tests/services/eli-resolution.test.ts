@@ -2,12 +2,14 @@
  * @fileoverview Tests for the SPARQL-safety primitives shared by every CELLAR
  * query builder — `escapeSparqlLiteral` (values interpolated into a `"…"` literal)
  * and `isSafeSparqlIri` (URIs interpolated into a `<…>` IRI) — plus the shared
- * input-validity primitives `CELEX_PATTERN` and `isValidCalendarDate`, and the
- * CELEX, ELI, and work-URI normalizers and case-number detection (#147).
+ * input-validity primitives `CELEX_PATTERN` and `isValidCalendarDate`, the CELEX,
+ * ELI, and work-URI normalizers and case-number detection (#147), and ELI
+ * resolution to every row of its work (#197).
  * @module tests/services/eli-resolution.test
  */
 
-import { describe, expect, it } from 'vitest';
+import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { describe, expect, it, vi } from 'vitest';
 import {
   CELEX_PATTERN,
   celexOfAliasUri,
@@ -19,6 +21,7 @@ import {
   normalizeCelex,
   normalizeEli,
   normalizeWorkUri,
+  resolveEliToWork,
 } from '@/services/cellar-sparql/eli-resolution.js';
 import { LANGUAGE_TO_ISO_639_2 } from '@/services/eurlex-content/eurlex-content-service.js';
 import { bestCpuMs, CPU_TIMED_TEST_TIMEOUT_MS } from '../helpers/cpu-time.js';
@@ -540,6 +543,73 @@ describe('isPrefixedCaseNumber', () => {
     'ECLI:EU:C:2014:317',
   ])('does not match %s', (value) => {
     expect(isPrefixedCaseNumber(value)).toBe(false);
+  });
+});
+
+describe('resolveEliToWork (#197, #202)', () => {
+  const ctx = createMockContext();
+  const literal = (value: string) => ({ type: 'literal', value });
+  const RESOURCE_TYPE = 'http://publications.europa.eu/resource/authority/resource-type/';
+  const CORRIGENDUM_ELI = 'http://data.europa.eu/eli/reg/2016/679/corrigendum/2018-05-23/oj';
+  /** The rows CELLAR answers the corrigendum ELI with: one per type of its one work. */
+  const corrigendumRows = ['CORRIGENDUM', 'REG'].map((type) => ({
+    work: { type: 'uri', value: CELLAR_WORK_URI },
+    celexNumber: literal('32016R0679R(02)'),
+    type: { type: 'uri', value: `${RESOURCE_TYPE}${type}` },
+    title: literal('Corrigendum to Regulation (EU) 2016/679'),
+  }));
+  type Rows = typeof corrigendumRows;
+
+  it('returns every row of the work, its types and English title included', async () => {
+    const query = vi.fn(async (_q: string): Promise<Rows> => corrigendumRows);
+
+    const rows = await resolveEliToWork({ query }, CORRIGENDUM_ELI, ctx);
+
+    expect(rows).toEqual(corrigendumRows);
+    expect(query).toHaveBeenCalledTimes(1);
+  });
+
+  it('matches the typed ELI literal, reads the English expression title, and sends no LIMIT', async () => {
+    const query = vi.fn(async (_q: string): Promise<Rows> => corrigendumRows);
+    await resolveEliToWork({ query }, CORRIGENDUM_ELI, ctx);
+
+    const sparql = query.mock.calls[0]?.[0] as string;
+    expect(sparql).toContain(`?work cdm:resource_legal_eli "${CORRIGENDUM_ELI}"^^xsd:anyURI .`);
+    expect(sparql).toMatch(/^\nSELECT \?work \?celexNumber \?type \?date \?title WHERE \{/);
+    expect(sparql).toContain('?expr cdm:expression_belongs_to_work ?work .');
+    expect(sparql).toContain(
+      '?expr cdm:expression_uses_language <http://publications.europa.eu/resource/authority/language/ENG> .',
+    );
+    expect(sparql).toContain('?expr cdm:expression_title ?title .');
+    expect(sparql).not.toContain('LIMIT');
+  });
+
+  it('retries a bare work-level ELI once with /oj and returns that work’s rows', async () => {
+    const query = vi
+      .fn(async (_q: string): Promise<Rows> => [])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce(corrigendumRows);
+
+    const rows = await resolveEliToWork({ query }, 'http://data.europa.eu/eli/reg/2016/679', ctx);
+
+    expect(rows).toEqual(corrigendumRows);
+    expect(query).toHaveBeenCalledTimes(2);
+    expect(query.mock.calls[1]?.[0]).toContain(
+      '"http://data.europa.eu/eli/reg/2016/679/oj"^^xsd:anyURI',
+    );
+  });
+
+  it('returns no rows for an ELI no work carries, without retrying a manifestation ELI', async () => {
+    const query = vi.fn(async (_q: string): Promise<Rows> => []);
+
+    const rows = await resolveEliToWork(
+      { query },
+      'http://data.europa.eu/eli/reg/2016/679/2016-05-04',
+      ctx,
+    );
+
+    expect(rows).toEqual([]);
+    expect(query).toHaveBeenCalledTimes(1);
   });
 });
 
