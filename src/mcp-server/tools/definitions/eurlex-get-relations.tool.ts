@@ -34,15 +34,24 @@ import {
 import { CELEX_SECTORS } from '@/services/cellar-sparql/keyword-match.js';
 import {
   ARTICLE_INPUT_PATTERN,
+  type ArticleFilter,
   articleLabel,
   MEMBER_STATE_CODES,
   PER_TYPE_LIMIT_CEILING,
   parseArticle,
   RELATION_TYPES,
   type RelationType,
+  readsIncoming,
+  resolvedVersions,
+  SOURCE_CELEX_MAX_LENGTH,
+  SOURCE_WORK_URI_MAX_LENGTH,
   summarizeTransposition,
+  type TreatyArticleRoute,
+  type TreatyVersion,
   toMemberStateCode,
   traverseRelations,
+  treatyArticleRoute,
+  treatyVersionCelex,
 } from '@/services/cellar-sparql/relation-traversal.js';
 import { isPastSortWindow, UNDATED_PLACEHOLDER } from '@/services/cellar-sparql/sort-window.js';
 import { resolveCelexWorks } from '@/services/cellar-sparql/work-resolution.js';
@@ -53,7 +62,7 @@ const RelationsOutputSchema = z.object({
     .string()
     .optional()
     .describe(
-      'CELEX number of the source work whose relations were traversed — the celex_number input, or the CELEX resolved from work_uri when the addressed work carries exactly one. Absent when the addressed work carries none, carries several, or its identity was not resolved because no requested relation type needs it.',
+      'CELEX number of the source work whose relations were traversed — the celex_number input, or the CELEX resolved from work_uri when the addressed work carries exactly one. Absent when the addressed work carries none, carries several, or its identity was not resolved because every requested relation type is outgoing (amends, repeals, implicitly_repeals, legal_basis, interprets, adopts).',
     ),
   work_uri: z
     .string()
@@ -99,7 +108,13 @@ const RelationsOutputSchema = z.object({
             .array(z.string())
             .optional()
             .describe(
-              "The provisions CELLAR records this edge as targeting, distinct and sorted. They belong to the edge's object: this act on an incoming row (the articles a ruling interprets, the provisions an amending act changes), the related work on an outgoing one. Read for amends, amended_by, repeals, repealed_by, implicitly_repeals, implicitly_repealed_by, interprets, interpreted_by, adopts, and adopted_by; absent on other types and on an edge CELLAR records no provision for, which does not mean the edge reaches the whole act. Compact codes read A article, P paragraph, L point letter or subparagraph number, PT numbered point, T indent, and BIS/TER/QUATER… the Latin ordinal of a lettered article (A17P1LC is Article 17(1)(c), A28QUATER Article 28c). Authority codes precede numbers, each {CODE|URI} token written as its CODE: AR article, PA paragraph, PO or PTA point, AN annex, ALN unnumbered paragraph, TIRE indent, CHA chapter, TXT text (AR 43 PA 4 is Article 43(4)).",
+              "The provisions CELLAR records this edge as targeting, distinct and sorted. They belong to the edge's object: this act on an incoming row (the articles a ruling interprets, the provisions an amending act changes) — on a treaty article, relative to that article, in the versions recorded_against names — the related work on an outgoing one. Read for amends, amended_by, repeals, repealed_by, implicitly_repeals, implicitly_repealed_by, interprets, interpreted_by, adopts, and adopted_by; absent on other types and on an edge CELLAR records no provision for, which does not mean the edge reaches the whole act. Compact codes read A article, P paragraph, L point letter or subparagraph number, PT numbered point, T indent, and BIS/TER/QUATER… the Latin ordinal of a lettered article (A17P1LC is Article 17(1)(c), A28QUATER Article 28c). Authority codes precede numbers, each {CODE|URI} token written as its CODE: AR article, PA paragraph, PO or PTA point, AN annex, ALN unnumbered paragraph, TIRE indent, CHA chapter, TXT text (AR 43 PA 4 is Article 43(4)).",
+            ),
+          recorded_against: z
+            .array(z.string())
+            .optional()
+            .describe(
+              'On an incoming row of a TFEU, TEU, or Charter article or whole text: the CELEX of the versions this edge is recorded against, sorted (12008E102, 12016E102). CELLAR files each edge against one of the four versions — TFEU and TEU of 2008, 2010, 2012, and 2016; the Charter of 2007, 2010, 2012, and 2016 — and every incoming type but national_transposition reads all four as one, so a related work recorded against two versions is one row naming both. Absent on outgoing rows and on every other work.',
             ),
         })
         .describe('A single CDM relation between the source work and a related work.'),
@@ -229,10 +244,66 @@ const relationEnrichment = {
     .string()
     .optional()
     .describe(
-      'Guidance for the next call: on an empty first page, how to widen the traversal; on a first page where member_states matched no national_transposition measures, the codes it named; on a first page with related_sectors, the sectors and the requested types that returned no related work in them; with article, that interpreted_by leaves out rulings CELLAR records no provision for, or on a first page with none, the article it named; on a page with more rows, the offset to continue from; on a page ending at row 10,000, the relation types and directions that reached it, each with a ready-to-run eurlex_query_sparql query listing its older works; the relation types whose provisions CELLAR did not return; and on a first page with national_transposition, that CELLAR did not return transposition_summary.',
+      'Guidance for the next call: on an empty first page, how to widen the traversal and, for a treaty article or text, the versions its incoming edges were read against; on a first page where member_states matched no national_transposition measures, the codes it named; on a first page with related_sectors, the sectors and the requested types that returned no related work in them; with article, that interpreted_by leaves out rulings CELLAR records no provision for, or on a first page with none, the article it named — on a treaty text, the versions of the article it read, and on a treaty article naming another article, that the CELEX already names its own; on a page with more rows, the offset to continue from; on a page ending at row 10,000, the relation types and directions that reached it, each with a ready-to-run eurlex_query_sparql query listing its older works; the relation types whose provisions CELLAR did not return; and on a first page with national_transposition, that CELLAR did not return transposition_summary.',
     ),
   limit_clamp: limitClampEnrichment,
 };
+
+const LIST_FORMAT = new Intl.ListFormat('en', { type: 'conjunction' });
+
+/** CELEX numbers as a sentence lists them: `A, B, and C`. */
+function celexList(celex: readonly string[]): string {
+  return LIST_FORMAT.format(celex);
+}
+
+/** What a Lisbon treaty source reads beyond its own work (#199). */
+interface TreatyScope {
+  /** The route `article` takes on it; absent without article or off the treaty versions. */
+  route?: TreatyArticleRoute;
+  /** Every CELEX to resolve for it: its versions, then the article's on the text route. */
+  toResolve: string[];
+  /** Its versions, oldest first, when an incoming type is traversed; else empty. */
+  versionCelex: string[];
+}
+
+function treatyScope(
+  celex: string | undefined,
+  article: ArticleFilter | undefined,
+  traversesIncoming: boolean,
+): TreatyScope {
+  const versionCelex = (celex && traversesIncoming && treatyVersionCelex(celex)) || [];
+  const route =
+    celex && article && versionCelex.length > 0 ? treatyArticleRoute(celex, article) : undefined;
+  return {
+    versionCelex,
+    ...(route ? { route } : {}),
+    toResolve: [...versionCelex, ...(route?.kind === 'text' ? route.versionCelex : [])],
+  };
+}
+
+/**
+ * The notice of a first page with no interpreted_by ruling under `article` on a treaty
+ * CELEX: on a text, the article's versions read, or that it names none; on an article,
+ * that the CELEX already names its own.
+ */
+function treatyArticleNotice(
+  celex: string,
+  article: string,
+  route: TreatyArticleRoute,
+  read: readonly TreatyVersion[],
+): string {
+  const text = `${celex.slice(0, 6)}/TXT`;
+  switch (route.kind) {
+    case 'text':
+      return read.length > 0
+        ? `No interpreted_by rulings on Article ${article} of ${celex} were found in ${celexList(read.map((v) => v.celex))}. Name another article, or drop article to list the rulings interpreting the text as a whole.`
+        : `Article ${article} names no article of ${celex} in any of its versions, so no interpreted_by ruling is recorded on it. Name an article of the text, or drop article to list the rulings interpreting the text as a whole.`;
+    case 'same':
+      return `No interpreted_by rulings on ${celex} were found in ${celexList(read.map((v) => v.celex))}.`;
+    case 'other':
+      return `${celex} already names Article ${route.celexArticle}, so article ${article} lists no interpreted_by ruling: article narrows a whole-text CELEX to one of its articles. Drop article to list the rulings on Article ${route.celexArticle}, or pass celex_number ${text} with article ${article}.`;
+  }
+}
 
 export const eurlex_get_relations = tool('eurlex_get_relations', {
   title: 'Get CELLAR Relationship Graph',
@@ -256,7 +327,7 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
       ])
       .optional()
       .describe(
-        'CELEX number of the work to traverse (e.g. 32016R0679). Provide exactly one of celex_number or work_uri.',
+        'CELEX number of the work to traverse (e.g. 32016R0679). A TFEU, TEU, or Charter article (12016E102) or whole text (12016E/TXT) of any Lisbon version reads its incoming edges in all four versions. Provide exactly one of celex_number or work_uri.',
       ),
     work_uri: z
       .string()
@@ -267,7 +338,7 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
       })
       .optional()
       .describe(
-        'CELLAR work resource URI to traverse (e.g. http://publications.europa.eu/resource/cellar/3e485e15-11bd-11e6-ba9a-01aa75ed71a1). Used directly as the addressed work; its CELEX identity is resolved for the national_transposition act match, which stands down when the work carries several CELEX numbers — address such a work by celex_number to name the act you mean. Provide exactly one of celex_number or work_uri.',
+        'CELLAR work resource URI to traverse (e.g. http://publications.europa.eu/resource/cellar/3e485e15-11bd-11e6-ba9a-01aa75ed71a1). Used directly as the addressed work; when an incoming type is traversed, its CELEX identity is resolved for the national_transposition act match and the versions of a treaty article, both of which stand down when the work carries several CELEX numbers — address such a work by celex_number to name the act you mean. Provide exactly one of celex_number or work_uri.',
       ),
     relation_types: z
       .array(enumInput(RELATION_TYPES, z.enum([...RELATION_TYPES])))
@@ -298,7 +369,7 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
       )
       .optional()
       .describe(
-        'Narrow interpreted_by to the rulings with a recorded provision in this article of the act: an article number with at most one letter (17, 6a), optionally prefixed "Article", "Art." or "Art", in any case. The article matches at any depth (17 matches provisions recorded in Article 17(1)(c)), leading zeros are ignored, and a letter also matches its Latin ordinal (28c matches Article 28 quater). Rulings CELLAR records no provision for are left out. Paging, has_more, and next_offset then count matching rulings only; other relation types are unaffected. With an explicit relation_types, include interpreted_by. A blank value is the same as omitting it.',
+        'Narrow interpreted_by to the rulings with a recorded provision in this article of the act: an article number with at most one letter (17, 6a), optionally prefixed "Article", "Art." or "Art", in any case. The article matches at any depth (17 matches provisions recorded in Article 17(1)(c)), leading zeros are ignored, and a letter also matches its Latin ordinal (28c matches Article 28 quater). Rulings CELLAR records no provision for are left out. Paging, has_more, and next_offset then count matching rulings only; other relation types are unaffected. On a TFEU, TEU, or Charter whole text (12016E/TXT), interpreted_by instead lists the rulings on that article in all four versions (12008E102 … 12016E102), every one of them, since CELLAR records no provision on a whole text; on a treaty article (12016E102), naming that article lists its rulings unfiltered and any other article lists none. With an explicit relation_types, include interpreted_by. A blank value is the same as omitting it.',
       ),
     related_sectors: z
       .array(
@@ -402,7 +473,10 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
       );
     }
     const svc = getCellarSparqlService();
-    const requestedTypes: readonly RelationType[] = input.relation_types ?? RELATION_TYPES;
+    // A type named twice is traversed, and echoed, once.
+    const requestedTypes: readonly RelationType[] = input.relation_types
+      ? [...new Set(input.relation_types)]
+      : RELATION_TYPES;
 
     // Normalize to the three-letter codes a sector-7 CELEX carries; the schema has
     // already rejected anything that names no member state. An empty list is absent.
@@ -446,6 +520,9 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
     const traversesTransposition =
       requestedTypes.includes('national_transposition') &&
       (!relatedSectors || relatedSectors.includes('7'));
+    // Incoming edges of a Lisbon treaty article or text are read across its versions
+    // (#199), which only the CELEX identity of the source names.
+    const traversesIncoming = requestedTypes.some(readsIncoming);
 
     // Accept exactly one identifier. Treat empty/whitespace as absent so
     // form-based clients sending "" for an omitted field hit the friendly guard.
@@ -461,26 +538,33 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
     // resource directly — use it as-is, skipping the CELEX→work resolution that
     // would otherwise throw not_found before the URI could be used. A
     // celex_number is resolved to its work first.
+    // No CELLAR work URI is longer than SOURCE_WORK_URI_MAX_LENGTH, so a longer one has
+    // no edge to read and is traversed without a query: an empty page.
+    const addressable = !workUriInput || workUriInput.length <= SOURCE_WORK_URI_MAX_LENGTH;
     let workUri: string;
     let sourceCelexNumber = celexNumber;
+    /** Works of the versions a treaty source reads (#199), by CELEX. */
+    let works = new Map<string, string>();
+    let scope: TreatyScope;
     if (workUriInput && !celexNumber) {
       workUri = workUriInput;
       /**
        * Establish the addressed work's CELEX identity, which gates the
-       * `national_transposition` act-core constraint. Two rows are requested
-       * rather than one so an ambiguous identity is detectable: a CELLAR work can
-       * carry many CELEX values — a national implementing measure holds one per
-       * directive it transposes, dozens in practice — and there is no principled
-       * basis for choosing among them. Picking the first would silently constrain
-       * the traversal to an arbitrary act, so an ambiguous work supplies no source
-       * CELEX at all and `national_transposition` returns nothing rather than
-       * measures selected against an act the caller never named.
+       * `national_transposition` act-core constraint and names a treaty article's
+       * versions. Two rows are requested rather than one so an ambiguous identity is
+       * detectable: a CELLAR work can carry many CELEX values — a national
+       * implementing measure holds one per directive it transposes, dozens in
+       * practice — and there is no principled basis for choosing among them. Picking
+       * the first would silently constrain the traversal to an arbitrary act, so an
+       * ambiguous work supplies no source CELEX at all and `national_transposition`
+       * returns nothing rather than measures selected against an act the caller never
+       * named, and no other version is read.
        *
-       * Only `national_transposition` consumes that identity, so the lookup runs
-       * only when it is traversed — requested, and not excluded by related_sectors —
-       * and a traversal of any other type spends no CELLAR round-trip on it.
+       * Only the incoming arms consume that identity, `national_transposition` among
+       * them, so the lookup runs only when one is traversed, and a traversal of
+       * outgoing types alone spends no CELLAR round-trip on it.
        */
-      if (traversesTransposition) {
+      if (traversesIncoming && addressable) {
         const sourceIdentitySparql = `
 SELECT ?sourceCelex WHERE {
   <${workUri}> cdm:resource_legal_id_celex ?sourceCelex .
@@ -502,15 +586,28 @@ SELECT ?sourceCelex WHERE {
           });
         }
       }
+      // A treaty work's other versions take one more round trip on this path.
+      scope = treatyScope(sourceCelexNumber, article, traversesIncoming);
+      if (scope.toResolve.length > 0 && sourceCelexNumber) {
+        works = await resolveCelexWorks(svc, scope.toResolve, ctx);
+        works.set(sourceCelexNumber, workUri);
+      }
     } else if (celexNumber && !workUriInput) {
       // A CELEX held by several works resolves to its canonical work (#97), so the
-      // traversal never runs on a copy that lacks edges.
-      const resolved = (await resolveCelexWorks(svc, [celexNumber], ctx)).get(celexNumber);
+      // traversal never runs on a copy that lacks edges. A treaty article's versions
+      // resolve in the same request (#199). No CELEX CELLAR holds is longer than
+      // SOURCE_CELEX_MAX_LENGTH, so a longer one is a miss without a query.
+      scope = treatyScope(celexNumber, article, traversesIncoming);
+      if (celexNumber.length <= SOURCE_CELEX_MAX_LENGTH) {
+        works = await resolveCelexWorks(svc, [celexNumber, ...scope.toResolve], ctx);
+      }
+      const resolved = works.get(celexNumber);
       if (!resolved) {
         // A celex_number one numbering convention away from a held CELEX names it (#196).
-        const held: HeldCelex = celexInput
-          ? await findHeldCelex(svc, celexNumber, ctx)
-          : { kind: 'none' };
+        const held: HeldCelex =
+          celexInput && celexNumber.length <= SOURCE_CELEX_MAX_LENGTH
+            ? await findHeldCelex(svc, celexNumber, ctx)
+            : { kind: 'none' };
         const miss = celexMissError(
           `No CELLAR work found for CELEX: ${echoValue(celexNumber)}`,
           held,
@@ -545,18 +642,32 @@ SELECT ?sourceCelex WHERE {
     // continuation proof. A first page that traverses national_transposition also
     // tallies its measures per member state (#182), beside the page queries rather
     // than after them; later pages would repeat the same tally.
+    /*
+     * A Lisbon treaty source reads every version's incoming edges (#199). On a treaty
+     * text, article reads that article's versions instead of filtering provisions,
+     * which a whole text's edges never record; on a treaty article, naming it needs no
+     * filter and naming another reads nothing.
+     */
+    const versions =
+      scope.versionCelex.length > 0 ? resolvedVersions(scope.versionCelex, works) : undefined;
+    const { route } = scope;
+    const articleVersions =
+      route?.kind === 'text' ? resolvedVersions(route.versionCelex, works) : undefined;
+    const articleFilter = route ? undefined : article;
     const [
       { relations: workRelations, hasMore, windowEnds, provisionsUnavailable },
       transposition,
     ] = await Promise.all([
-      traverseRelations(svc, workUri, requestedTypes, ctx, {
+      traverseRelations(svc, workUri, addressable ? requestedTypes : [], ctx, {
         sourceCelex: sourceCelexNumber,
         perTypeLimit: perDirectionLimit,
         offset: input.offset,
         memberStates,
-        article,
+        article: articleFilter,
         relatedSectors,
         provisions: true,
+        versions,
+        interpretedByVersions: route?.kind === 'other' ? [] : articleVersions,
       }),
       input.offset === 0 && traversesTransposition
         ? summarizeTransposition(svc, workUri, sourceCelexNumber, memberStates, ctx)
@@ -597,9 +708,9 @@ SELECT ?sourceCelex WHERE {
     const notices: string[] = [];
     const presentTypes = new Set(workRelations.map((r) => r.relationType));
     const interpretingRulings = presentTypes.has('interpreted_by');
-    if (article && interpretingRulings) {
+    if (articleFilter && interpretingRulings) {
       notices.push(
-        `interpreted_by lists only the rulings with a recorded provision in Article ${articleLabel(article)}; rulings CELLAR records no provision for are left out.`,
+        `interpreted_by lists only the rulings with a recorded provision in Article ${articleLabel(articleFilter)}; rulings CELLAR records no provision for are left out.`,
       );
     }
     if (input.offset === 0) {
@@ -614,11 +725,18 @@ SELECT ?sourceCelex WHERE {
       const articleNotice = article && !interpretingRulings;
       if (articleNotice) {
         filterNotices.push(
-          `No interpreted_by rulings with a recorded provision in Article ${articleLabel(article)} were found for ${source}; rulings CELLAR records no provision for are left out. Name another article, or drop article to list every interpreting ruling.`,
+          route
+            ? treatyArticleNotice(
+                celexNumber ?? sourceCelexNumber ?? source,
+                articleLabel(article),
+                route,
+                articleVersions ?? versions ?? [],
+              )
+            : `No interpreted_by rulings with a recorded provision in Article ${articleLabel(article)} were found for ${source}; rulings CELLAR records no provision for are left out. Name another article, or drop article to list every interpreting ruling.`,
         );
       }
       const unmatchedTypes = relatedSectors
-        ? [...new Set(requestedTypes)].filter(
+        ? requestedTypes.filter(
             (type) =>
               !presentTypes.has(type) &&
               !(type === 'national_transposition' && transpositionNotice) &&
@@ -633,10 +751,14 @@ SELECT ?sourceCelex WHERE {
       if (filterNotices.length > 0) {
         notices.push(...filterNotices);
       } else if (workRelations.length === 0) {
+        // A treaty source names the versions its incoming edges were read against (#199).
+        const read = versions
+          ? `; its incoming edges were read against ${celexList(versions.map((v) => v.celex))}`
+          : '';
         notices.push(
           RELATION_TYPES.every((type) => requestedTypes.includes(type))
-            ? `Work ${source} has no CDM relations of any type.`
-            : `Work ${source} has no CDM relations of the requested types. Try other relation_types or omit the filter to fetch all available relation types.`,
+            ? `Work ${source} has no CDM relations of any type${read}.`
+            : `Work ${source} has no CDM relations of the requested types${read}. Try other relation_types or omit the filter to fetch all available relation types.`,
         );
       }
       if (workRelations.length === 0 && !celexNumber) {
@@ -682,6 +804,7 @@ SELECT ?sourceCelex WHERE {
       ...(r.relatedDate ? { related_date: r.relatedDate } : {}),
       ...(r.relatedTitle ? { related_title: r.relatedTitle } : {}),
       ...(r.provisions ? { provisions: r.provisions } : {}),
+      ...(r.recordedAgainst ? { recorded_against: r.recordedAgainst } : {}),
     }));
 
     const nextOffset = input.offset + perDirectionLimit;
@@ -814,6 +937,9 @@ function formatRelationsPage(result: RelationsPage): { type: 'text'; text: strin
       const title = item.related_title ? ` · ${md(item.related_title)}` : '';
       lines.push(`- ${label}${memberState}${date}${title}`);
       if (item.provisions) lines.push(`  - provisions: ${item.provisions.map(md).join(', ')}`);
+      if (item.recorded_against) {
+        lines.push(`  - recorded against: ${item.recorded_against.map(md).join(', ')}`);
+      }
     }
     lines.push('');
   }

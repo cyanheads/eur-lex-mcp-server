@@ -325,6 +325,8 @@ describe('eurlex_get_relations', () => {
       .slice(0, 3)
       .map((row) => ({ ...row, direction: { type: 'literal', value: 'outgoing' } }));
     mockQuery.mockImplementation(async (q: string) => {
+      // An incoming arm reads the work's CELEX identity first (#199); it names none here.
+      if (q.includes('SELECT ?sourceCelex WHERE')) return [];
       const clause = pagingClauses(q)[0];
       if (!clause) throw new Error('Expected relation paging clause');
       const { limit, offset } = clause;
@@ -865,7 +867,7 @@ describe('eurlex_get_relations', () => {
     ]);
   });
 
-  it('follows the based-on link on the work_uri path without resolving source identity (#73, #109)', async () => {
+  it('follows the based-on link on the work_uri path without filtering on source identity (#73, #109, #199)', async () => {
     const ctx = createMockContext({ errors: eurlex_get_relations.errors });
     mockQuery.mockImplementation(
       routeQuery({
@@ -895,8 +897,11 @@ describe('eurlex_get_relations', () => {
     expect(result.relations.map((r) => r.related_celex_number)).toEqual(['02016R0679-20160504']);
 
     const queries = mockQuery.mock.calls.map((call) => call[0] as string);
-    // The link is specific to this act, so no CELEX identity is needed to filter it.
-    expect(queries).not.toContainEqual(expect.stringContaining('SELECT ?sourceCelex WHERE'));
+    // The link is specific to this act, so no CELEX identity is needed to filter it; the
+    // identity an incoming arm reads names a treaty's versions alone (#199), and a
+    // non-treaty CELEX resolves nothing more.
+    expect(queries.filter((query) => query.includes('SELECT ?sourceCelex WHERE'))).toHaveLength(1);
+    expect(queries.some(isResolutionQuery)).toBe(false);
     const traversalSparql = queries.find((query) =>
       query.includes('cdm:act_consolidated_based_on_resource_legal'),
     )!;
@@ -1729,6 +1734,31 @@ describe('eurlex_get_relations', () => {
     expect(result.total).toBe(1);
   });
 
+  it('traverses and echoes a relation type named twice once', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_relations.errors });
+    mockQuery.mockImplementation(
+      routeQuery({
+        resolve: [makeResolveBinding(GDPR_WORK_URI)],
+        legalBasis: [
+          makeRelationBinding({ relatedWork: `${CELLAR}lb-work`, direction: 'outgoing' }),
+        ],
+      }),
+    );
+
+    const input = eurlex_get_relations.input.parse({
+      celex_number: '32016R0679',
+      relation_types: ['legal_basis', 'legal_basis'],
+    });
+    const result = await eurlex_get_relations.handler(input, ctx);
+
+    const relCalls = mockQuery.mock.calls
+      .map((c) => c[0] as string)
+      .filter((q) => !isResolutionQuery(q));
+    expect(relCalls).toHaveLength(1);
+    expect(result.requested_relation_types).toEqual(['legal_basis']);
+    expect(result.relations).toHaveLength(1);
+  });
+
   it('filters to requested relation_types only', async () => {
     const ctx = createMockContext({ errors: eurlex_get_relations.errors });
     mockQuery.mockImplementation(
@@ -1875,7 +1905,7 @@ describe('eurlex_get_relations', () => {
 
   // --- work_uri alternative (issue #8) ---
 
-  it('uses work_uri directly and skips source identity for a type that does not need it', async () => {
+  it('reads the source identity on the work_uri path for an incoming type, and nothing more for an act (#199)', async () => {
     const ctx = createMockContext({ errors: eurlex_get_relations.errors });
     mockQuery.mockImplementation(
       routeQuery({
@@ -1890,20 +1920,56 @@ describe('eurlex_get_relations', () => {
       }),
     );
 
+    const result = await eurlex_get_relations.handler(
+      eurlex_get_relations.input.parse({ work_uri: GDPR_WORK_URI, relation_types: ['amended_by'] }),
+      ctx,
+    );
+
+    // The identity names a treaty article's versions; an act's names none, so the
+    // page reads the work alone, and the identity is echoed.
+    expect(result.celex_number).toBe('32016R0679');
+    expect(result.relations.map((r) => [r.relation_type, r.recorded_against])).toEqual([
+      ['amended_by', undefined],
+    ]);
+    const sent = mockQuery.mock.calls.map((call) => call[0] as string);
+    expect(sent.filter((q) => q.includes('SELECT ?sourceCelex WHERE'))).toHaveLength(1);
+    expect(sent.some(isResolutionQuery)).toBe(false);
+    expect(pageQueries()).toEqual([
+      expect.stringContaining(
+        `?relatedWork cdm:resource_legal_amends_resource_legal <${GDPR_WORK_URI}>`,
+      ),
+    ]);
+  });
+
+  it('uses work_uri directly and skips source identity for a type that does not need it', async () => {
+    const ctx = createMockContext({ errors: eurlex_get_relations.errors });
+    mockQuery.mockImplementation(
+      routeQuery({
+        sourceCelex: [makeSourceCelexBinding('32016R0679')],
+        amends: [
+          makeRelationBinding({
+            relatedWork: 'http://publications.europa.eu/resource/cellar/amend-work',
+            direction: 'outgoing',
+            relatedCelex: '32022R0000',
+          }),
+        ],
+      }),
+    );
+
     const input = eurlex_get_relations.input.parse({
       work_uri: GDPR_WORK_URI,
-      relation_types: ['amended_by'],
+      relation_types: ['amends'],
     });
     const result = await eurlex_get_relations.handler(input, ctx);
 
     expect(result.work_uri).toBe(GDPR_WORK_URI);
-    // Only consolidated_version and national_transposition consume the source
-    // CELEX identity, so amended_by alone resolves none — and echoes none.
+    // Only the incoming types consume the source CELEX identity (#199), so the
+    // outgoing amends alone resolves none — and echoes none.
     expect(result.celex_number).toBeUndefined();
     expect(result.total).toBe(1);
-    expect(result.relations[0]?.relation_type).toBe('amended_by');
+    expect(result.relations[0]?.relation_type).toBe('amends');
 
-    // The traversal alone — the amended_by page query and its provisions follow-up
+    // The traversal alone — the amends page query and its provisions follow-up
     // (#168): no CELEX→work lookup, and no source-identity lookup.
     expect(mockQuery).toHaveBeenCalledTimes(2);
     expect(isProvisionsQuery(mockQuery.mock.calls[1]?.[0] as string)).toBe(true);
@@ -2038,6 +2104,45 @@ describe('eurlex_get_relations', () => {
       data: { reason: 'not_found' },
       message: `No CELLAR work found for CELEX: ${celex.slice(0, 100)}…`,
     });
+  });
+
+  it('fails a CELEX longer than any CELLAR holds as not_found without a query (#199)', async () => {
+    mockQuery.mockImplementation(routeQuery({ resolve: [] }));
+    const longest = `32016R0679${'0'.repeat(90)}`;
+    const fail = (celex_number: string) =>
+      expect(
+        eurlex_get_relations.handler(
+          eurlex_get_relations.input.parse({ celex_number }),
+          createMockContext({ errors: eurlex_get_relations.errors }),
+        ),
+      ).rejects.toMatchObject({ code: JsonRpcErrorCode.NotFound, data: { reason: 'not_found' } });
+
+    await fail(longest);
+    expect(mockQuery.mock.calls.some(([q]) => isResolutionQuery(q as string))).toBe(true);
+
+    mockQuery.mockClear();
+    await fail(`${longest}0`);
+    expect(mockQuery).not.toHaveBeenCalled();
+  });
+
+  it('traverses a work_uri longer than any CELLAR work URI as an empty page without a query (#199)', async () => {
+    mockQuery.mockImplementation(routeQuery({}));
+    const read = (length: number) =>
+      eurlex_get_relations.handler(
+        eurlex_get_relations.input.parse({
+          work_uri: `${CELLAR}${'a'.repeat(length - CELLAR.length)}`,
+        }),
+        createMockContext({ errors: eurlex_get_relations.errors }),
+      );
+
+    await read(256);
+    expect(mockQuery).toHaveBeenCalled();
+
+    mockQuery.mockClear();
+    const result = await read(257);
+    expect(result.total).toBe(0);
+    expect(result.relations).toEqual([]);
+    expect(mockQuery).not.toHaveBeenCalled();
   });
 
   describe('#196 a celex_number one numbering convention away from a held CELEX', () => {
@@ -2705,7 +2810,7 @@ describe('eurlex_get_relations', () => {
       expect(sourceIdentitySparql).toContain('LIMIT 2');
     });
 
-    it('follows consolidated_version for an ambiguous work without resolving its identity (#109)', async () => {
+    it('follows consolidated_version for an ambiguous work without filtering on its identity (#109, #199)', async () => {
       const ctx = createMockContext({ errors: eurlex_get_relations.errors });
       // A national implementing measure carries one CELEX per directive it
       // transposes; there is no principled basis for picking one of them.
@@ -2736,9 +2841,13 @@ describe('eurlex_get_relations', () => {
       const result = await eurlex_get_relations.handler(input, ctx);
 
       const queries = mockQuery.mock.calls.map((call) => call[0] as string);
-      // The based-on link needs no act identity, so the work's several CELEX values
-      // are never read.
-      expect(queries).not.toContainEqual(expect.stringContaining('SELECT ?sourceCelex WHERE'));
+      // The based-on link needs no act identity. An incoming arm reads it for a treaty's
+      // versions (#199); the work's several CELEX values name no one identity, so no
+      // other version is resolved or read.
+      expect(queries.filter((query) => query.includes('SELECT ?sourceCelex WHERE'))).toHaveLength(
+        1,
+      );
+      expect(queries.some(isResolutionQuery)).toBe(false);
       const traversalSparql = queries.find((query) =>
         query.includes('cdm:act_consolidated_based_on_resource_legal'),
       )!;
@@ -3981,7 +4090,7 @@ describe('eurlex_get_relations', () => {
         followUps: 1,
       },
     ])(
-      'returns identical rows for celex_number and work_uri on $types, with no source-CELEX lookup',
+      'returns identical rows for celex_number and work_uri on $types, with no CELEX→work lookup',
       async ({ types, rows, followUps }) => {
         mockQuery.mockImplementation(
           routeQuery({ resolve: [makeResolveBinding(GDPR_WORK_URI)], ...rows }),
@@ -4011,7 +4120,9 @@ describe('eurlex_get_relations', () => {
         expect(byWorkUri.relations).toEqual(byCelex.relations);
         expect(byWorkUri.relations).toHaveLength(Object.values(rows).flat().length);
         const calls = mockQuery.mock.calls.map((c) => c[0] as string);
-        expect(calls.some((q) => q.includes('SELECT ?sourceCelex WHERE'))).toBe(false);
+        // Each list holds an incoming type, which reads the source identity for a
+        // treaty's versions (#199); an act's names none, so nothing more resolves.
+        expect(calls.filter((q) => q.includes('SELECT ?sourceCelex WHERE'))).toHaveLength(1);
         expect(calls.some(isResolutionQuery)).toBe(false);
         expect(pageQueries()).toHaveLength(types.length);
         expect(calls.filter(isProvisionsQuery)).toHaveLength(followUps);
@@ -4515,6 +4626,7 @@ describe('eurlex_get_relations', () => {
         'related_date',
         'related_title',
         'provisions',
+        'recorded_against',
       ]);
     });
 
@@ -6159,7 +6271,7 @@ describe('eurlex_get_relations', () => {
       );
     });
 
-    it('skips the source-CELEX lookup on the work_uri path without 7', async () => {
+    it('sends no national_transposition query on the work_uri path without 7', async () => {
       mockQuery.mockImplementation(cellar());
 
       const result = await runToolContract(eurlex_get_relations, {
@@ -6170,9 +6282,10 @@ describe('eurlex_get_relations', () => {
 
       expect(result.isError).toBeFalsy();
       const sent = mockQuery.mock.calls.map((c) => c[0] as string);
-      expect(sent.some((q) => q.includes('SELECT ?sourceCelex WHERE'))).toBe(false);
-      expect(sent).toHaveLength(1);
-      expect(sent[0]).toContain(CITES);
+      // cites reads the source identity for a treaty's versions (#199), which names none here.
+      expect(sent.filter((q) => q.includes('SELECT ?sourceCelex WHERE'))).toHaveLength(1);
+      expect(pageQueries()).toHaveLength(1);
+      expect(pageQueries()[0]).toContain(CITES);
       expect(result.structuredContent).not.toHaveProperty('celex_number');
     });
   });

@@ -19,6 +19,7 @@ import {
   celexWorkRows,
   isResolutionQuery,
   requestedCelex,
+  resolutionRows,
 } from '../fixtures/cellar-works.js';
 import { pagingClauses } from '../helpers/sort-window.js';
 
@@ -611,6 +612,62 @@ describe('eurlex_document_relations_resource', () => {
     // The 26th based-on work is the private sentinel proving more exist.
     expect(result.truncated).toBe(true);
     expect(result.continuation).toMatchObject({ tool: 'eurlex_get_relations' });
+  });
+
+  it('reads a treaty article’s incoming edges in all four Lisbon versions, naming each row’s versions (#199)', async () => {
+    const ctx = createMockContext({
+      tenantId: 'test-tenant',
+      errors: eurlex_document_relations_resource.errors,
+    });
+    const versions = ['12008E102', '12010E102', '12012E102', '12016E102'];
+    const work = (celex: string) => `${CELLAR}${celex}`;
+    const interpretedByArm = '?relatedWork cdm:case-law_interpretes_resource_legal ?versionWork';
+    mockQuery.mockImplementation(async (q: string) => {
+      if (isResolutionQuery(q)) return resolutionRows(q);
+      if (!q.includes(interpretedByArm)) return [];
+      return [
+        {
+          relatedWork: { type: 'uri', value: `${CELLAR}ruling` },
+          direction: { type: 'literal', value: 'incoming' },
+          relatedCelexSample: { type: 'literal', value: '62008CJ0052' },
+          recordedAgainst: {
+            type: 'literal',
+            value: `${work('12010E102')} ${work('12008E102')}`,
+          },
+        },
+      ];
+    });
+
+    const params = eurlex_document_relations_resource.params!.parse({ celexNumber: '12016E102' });
+    const result = (await eurlex_document_relations_resource.handler(params, ctx)) as Record<
+      string,
+      unknown
+    >;
+    const calls = mockQuery.mock.calls.map(([q]) => q as string);
+
+    // Every version resolves in the one resolution request.
+    const resolutions = calls.filter(isResolutionQuery);
+    expect(resolutions).toHaveLength(1);
+    expect([...new Set(requestedCelex(resolutions[0] ?? ''))].sort()).toEqual(versions);
+    // The incoming arm binds every version's work; the outgoing arm reads the article alone.
+    const incoming = calls.find((q) => q.includes(interpretedByArm)) ?? '';
+    for (const celex of versions) expect(incoming).toContain(`<${work(celex)}>`);
+    const outgoing = calls.find((q) =>
+      q.includes(`<${work('12016E102')}> cdm:case-law_interpretes_resource_legal ?relatedWork`),
+    );
+    expect(outgoing).toBeDefined();
+    expect(outgoing).not.toContain('?versionWork');
+
+    const relations = result.relations as Array<Record<string, unknown>>;
+    expect(relations.filter((r) => r.relation_type === 'interpreted_by')).toEqual([
+      {
+        relation_type: 'interpreted_by',
+        direction: 'incoming',
+        related_work_uri: `${CELLAR}ruling`,
+        related_celex_number: '62008CJ0052',
+        recorded_against: ['12008E102', '12010E102'],
+      },
+    ]);
   });
 
   // --- #167: the proposal an act adopts ---

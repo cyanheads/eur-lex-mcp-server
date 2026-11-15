@@ -8,7 +8,13 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getCellarSparqlService } from '@/services/cellar-sparql/cellar-sparql-service.js';
 import { CELEX_PATTERN, normalizeCelex } from '@/services/cellar-sparql/eli-resolution.js';
 import { celexMissError, findHeldCelex } from '@/services/cellar-sparql/held-celex.js';
-import { RELATION_TYPES, traverseRelations } from '@/services/cellar-sparql/relation-traversal.js';
+import {
+  RELATION_TYPES,
+  resolvedVersions,
+  SOURCE_CELEX_MAX_LENGTH,
+  traverseRelations,
+  treatyVersionCelex,
+} from '@/services/cellar-sparql/relation-traversal.js';
 import { resolveCelexWorks } from '@/services/cellar-sparql/work-resolution.js';
 
 /**
@@ -23,7 +29,7 @@ export const eurlex_document_relations_resource = resource(
   {
     name: 'EUR-Lex document relations',
     description:
-      'One-hop CDM relationship summary for a CELLAR work by CELEX number: amendment and repeal chain, consolidations, national transposition measures, legal basis and the works adopted under it, the proposal it adopts (or, for a proposal, the act that adopted it), interpreting rulings (or, for a ruling, what it interprets), and citations — the newest 25 per relation type and direction. Each related work carries its CELEX, its document date, and its English title where it has them.',
+      'One-hop CDM relationship summary for a CELLAR work by CELEX number: amendment and repeal chain, consolidations, national transposition measures, legal basis and the works adopted under it, the proposal it adopts (or, for a proposal, the act that adopted it), interpreting rulings (or, for a ruling, what it interprets), and citations — the newest 25 per relation type and direction. Each related work carries its CELEX, its document date, and its English title where it has them. A TFEU, TEU, or Charter article reads its incoming edges in all four Lisbon versions, each such row naming in recorded_against the versions its edge is recorded against.',
     mimeType: 'application/json',
     params: z.object({
       celexNumber: z
@@ -69,13 +75,20 @@ export const eurlex_document_relations_resource = resource(
       const celexNumber = params.celexNumber.trim();
 
       // Resolve to the CELEX's canonical work first (#97), so a CELEX held by
-      // several works never summarizes a copy that lacks edges.
-      const workUri = (await resolveCelexWorks(svc, [celexNumber], ctx)).get(celexNumber);
+      // several works never summarizes a copy that lacks edges; a treaty article's
+      // versions resolve in the same request (#199). No CELEX CELLAR holds is longer
+      // than SOURCE_CELEX_MAX_LENGTH, so a longer one is a miss without a query.
+      const versionCelex = treatyVersionCelex(celexNumber) ?? [];
+      const addressable = celexNumber.length <= SOURCE_CELEX_MAX_LENGTH;
+      const works = addressable
+        ? await resolveCelexWorks(svc, [celexNumber, ...versionCelex], ctx)
+        : new Map<string, string>();
+      const workUri = works.get(celexNumber);
       if (!workUri) {
         // A CELEX one numbering convention away from a held CELEX names it (#196).
         const miss = celexMissError(
           `No CELLAR work found for CELEX: ${celexNumber}`,
-          await findHeldCelex(svc, celexNumber, ctx),
+          addressable ? await findHeldCelex(svc, celexNumber, ctx) : { kind: 'none' },
         );
         throw ctx.fail('not_found', miss.message, { celexNumber, ...miss.data }, miss.options);
       }
@@ -96,7 +109,11 @@ export const eurlex_document_relations_resource = resource(
         workUri,
         RELATION_TYPES,
         ctx,
-        { sourceCelex: celexNumber, perTypeLimit },
+        {
+          sourceCelex: celexNumber,
+          perTypeLimit,
+          ...(versionCelex.length > 0 ? { versions: resolvedVersions(versionCelex, works) } : {}),
+        },
       );
       const relations = workRelations.map((r) => ({
         relation_type: r.relationType,
@@ -106,6 +123,7 @@ export const eurlex_document_relations_resource = resource(
         ...(r.relatedMemberState ? { related_member_state: r.relatedMemberState } : {}),
         ...(r.relatedDate ? { related_date: r.relatedDate } : {}),
         ...(r.relatedTitle ? { related_title: r.relatedTitle } : {}),
+        ...(r.recordedAgainst ? { recorded_against: r.recordedAgainst } : {}),
       }));
 
       return {

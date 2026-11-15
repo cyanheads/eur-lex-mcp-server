@@ -25,37 +25,6 @@ export interface SparqlResultsJson {
   results: { bindings: SparqlBinding[] };
 }
 
-/** A resolved CELLAR work record. */
-export interface CellarWork {
-  authorInstitution?: string;
-  celexNumber: string;
-  date?: string;
-  eurovocConcepts?: string[];
-  inForce?: boolean;
-  resourceType?: string;
-  title?: string;
-  workUri: string;
-}
-
-/** A search result entry from CELLAR. */
-export interface WorkSearchResult {
-  celexNumber: string;
-  date?: string;
-  resourceType?: string;
-  title?: string;
-  workUri: string;
-}
-
-/** A CJEU/GC case law result entry. */
-export interface CaseResult {
-  celexNumber: string;
-  court?: string;
-  date?: string;
-  resourceType?: string;
-  title?: string;
-  workUri: string;
-}
-
 /** A single CDM relation between works. */
 export interface WorkRelation {
   direction: 'outgoing' | 'incoming';
@@ -65,6 +34,11 @@ export interface WorkRelation {
    * traversal reads provisions and the edge records at least one.
    */
   provisions?: string[];
+  /**
+   * CELEX of the versions of a Lisbon treaty article or text the edge targets, sorted.
+   * Set on the incoming rows of a traversal that reads every version (#199).
+   */
+  recordedAgainst?: string[];
   relatedCelexNumber?: string;
   /**
    * The related work's document date (`YYYY-MM-DD`), the value its page is ordered by.
@@ -80,12 +54,4 @@ export interface WorkRelation {
   relatedTitle?: string;
   relatedWorkUri: string;
   relationType: string;
-}
-
-/** An EuroVoc concept from the thesaurus. */
-export interface EuroVocConcept {
-  broaderLabel?: string;
-  conceptCode?: string;
-  conceptUri: string;
-  prefLabel: string;
 }

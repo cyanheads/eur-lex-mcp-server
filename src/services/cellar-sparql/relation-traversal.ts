@@ -156,6 +156,11 @@ const RELATION_SPECS: Record<
   },
 };
 
+/** True when `type` reads edges that point at the source work: every type but the outgoing six. */
+export function readsIncoming(type: RelationType): boolean {
+  return RELATION_SPECS[type].direction !== 'outgoing';
+}
+
 const OWL = 'http://www.w3.org/2002/07/owl#';
 const MODIFIED_LOCATION =
   '<http://publications.europa.eu/ontology/annotation#reference_to_modified_location>';
@@ -177,13 +182,122 @@ function locationAxiom(
   return `${axiom} <${OWL}annotatedSource> ${source} ; <${OWL}annotatedProperty> ${predicate} ; <${OWL}annotatedTarget> ${target} ; ${MODIFIED_LOCATION} ${location} .`;
 }
 
-/** An edge's two ends: the related work's variable on one side, the source work on the other. */
+/**
+ * An edge's two ends: the related work's variable on one side, on the other the term
+ * the source reads — its work `<…>`, or {@link VERSION_WORK} over a version set.
+ */
 function edgeEnds(
-  workUri: string,
+  source: string,
   related: string,
   direction: 'outgoing' | 'incoming',
 ): [source: string, target: string] {
-  return direction === 'outgoing' ? [`<${workUri}>`, related] : [related, `<${workUri}>`];
+  return direction === 'outgoing' ? [source, related] : [related, source];
+}
+
+/**
+ * The consolidated versions of the post-Lisbon treaties, each numbered with its own
+ * sector-1 CELEX: the TFEU (`E`) and TEU (`M`) of 2008, 2010, 2012, and 2016, and the
+ * Charter of Fundamental Rights (`P`) of 2007, 2010, 2012, and 2016. A provision keeps
+ * its number in every version, and CELLAR files its incoming edges against whichever
+ * version their author cited (#199): rulings mostly on 2007/2008, legal-basis links on
+ * the later versions, citations on all four. No predicate links the versions to one
+ * another, so the set is the CELEX suffix under the four prefixes.
+ */
+const LISBON_TREATY_YEARS = new Map<string, readonly string[]>([
+  ['E', ['2008', '2010', '2012', '2016']],
+  ['M', ['2008', '2010', '2012', '2016']],
+  ['P', ['2007', '2010', '2012', '2016']],
+]);
+
+/** A Lisbon treaty article (`12016E102`, three digits) or whole text (`12016E/TXT`). */
+const LISBON_TREATY_CELEX = /^1(\d{4})([EMP])(\d{3}|\/TXT)$/;
+
+/**
+ * The same-numbered CELEX of every version of the Lisbon treaty article or whole text
+ * `celex` names, oldest first, `celex` among them; `undefined` for any other CELEX —
+ * a protocol, annex, or declaration, a pre-Lisbon treaty, every act.
+ */
+export function treatyVersionCelex(celex: string): string[] | undefined {
+  const [, year = '', treaty = '', part = ''] = LISBON_TREATY_CELEX.exec(celex) ?? [];
+  const years = LISBON_TREATY_YEARS.get(treaty);
+  return years?.includes(year) ? years.map((version) => `1${version}${treaty}${part}`) : undefined;
+}
+
+/** One version of a Lisbon treaty article or text: its CELEX and the work CELLAR files it under. */
+export interface TreatyVersion {
+  celex: string;
+  workUri: string;
+}
+
+/** The versions among `celexNumbers` that resolved to a work, in that order. */
+export function resolvedVersions(
+  celexNumbers: readonly string[],
+  works: ReadonlyMap<string, string>,
+): TreatyVersion[] {
+  return celexNumbers.flatMap((celex) => {
+    const workUri = works.get(celex);
+    return workUri ? [{ celex, workUri }] : [];
+  });
+}
+
+/**
+ * Where `article` points on a Lisbon treaty CELEX (#199):
+ *  - `text`: on a whole text, the article's own versions (`12016P/TXT` with 47 reads
+ *    `12007P047` … `12016P047`). Interpretation edges on a whole text record no
+ *    provision, so the provision filter would match nothing there. No Lisbon treaty
+ *    article carries a letter or a four-digit number, so such an article names none;
+ *  - `same`: on an article, the article it names, which needs no filter;
+ *  - `other`: on an article, any other article — provisions recorded on an article's
+ *    work are relative to it (`L2LA`), so no other article can match.
+ * `undefined` for any other CELEX, whose `interpreted_by` the provision filter narrows.
+ */
+export type TreatyArticleRoute =
+  | { kind: 'text'; versionCelex: string[] }
+  | { kind: 'same' }
+  | { kind: 'other'; celexArticle: string };
+
+export function treatyArticleRoute(
+  celex: string,
+  article: ArticleFilter,
+): TreatyArticleRoute | undefined {
+  const versions = treatyVersionCelex(celex);
+  if (!versions) return;
+  // After the sector, year, and treaty letter: `102` or `/TXT`.
+  const part = celex.slice(6);
+  if (part === '/TXT') {
+    const named = !article.letter && article.number.length <= 3;
+    const number = article.number.padStart(3, '0');
+    return {
+      kind: 'text',
+      versionCelex: named ? versions.map((version) => version.replace('/TXT', number)) : [],
+    };
+  }
+  const celexArticle = part.replace(/^0+/, '');
+  return !article.letter && article.number === celexArticle
+    ? { kind: 'same' }
+    : { kind: 'other', celexArticle };
+}
+
+/** The variable a version set's arms bind to each version's work. */
+const VERSION_WORK = '?versionWork';
+
+/**
+ * `VALUES` binding `variable` to each IRI the IRI guard accepts; CELLAR's own work
+ * URIs always pass.
+ */
+function iriValues(variable: string, iris: readonly string[]): string {
+  return `VALUES ${variable} { ${iris
+    .filter(isSafeSparqlIri)
+    .map((iri) => `<${iri}>`)
+    .join(' ')} }`;
+}
+
+/** The `VALUES` block binding {@link VERSION_WORK} to a version set's works. */
+function versionValues(versions: readonly TreatyVersion[]): string {
+  return iriValues(
+    VERSION_WORK,
+    versions.map((version) => version.workUri),
+  );
 }
 
 /**
@@ -315,13 +429,13 @@ export function articleLocationPattern(article: ArticleFilter): string {
  * the sentinel row count matching rulings alone.
  */
 function articleFilterClause(
-  workUri: string,
+  sourceTerm: string,
   related: string,
   predicate: string,
   direction: 'outgoing' | 'incoming',
   article: ArticleFilter,
 ): string {
-  const [source, target] = edgeEnds(workUri, related, direction);
+  const [source, target] = edgeEnds(sourceTerm, related, direction);
   return `FILTER EXISTS { ${locationAxiom('?articleAxiom', source, predicate, target, '?articleLocation')} FILTER(REGEX(STR(?articleLocation), "${escapeSparqlLiteral(articleLocationPattern(article))}")) }`;
 }
 
@@ -369,18 +483,21 @@ function celexFilters(variable: string, celex: CelexConstraint): string[] {
   ];
 }
 
-/** One direction's graph pattern for a relation predicate, tagged with its direction. */
+/**
+ * One direction's graph pattern for a relation predicate, tagged with its direction.
+ * With `versions`, the edge reaches any of the version works rather than `workUri`.
+ */
 function relationArm(
   workUri: string,
   predicate: string,
   direction: 'outgoing' | 'incoming',
   celex?: CelexConstraint,
   article?: ArticleFilter,
+  versions?: readonly TreatyVersion[],
 ): string {
-  const edge =
-    direction === 'outgoing'
-      ? `<${workUri}> ${predicate} ?relatedWork .`
-      : `?relatedWork ${predicate} <${workUri}> .`;
+  const sourceTerm = versions ? VERSION_WORK : `<${workUri}>`;
+  const [source, target] = edgeEnds(sourceTerm, '?relatedWork', direction);
+  const edge = `${versions ? `${versionValues(versions)}\n    ` : ''}${source} ${predicate} ${target} .`;
   // A pushed constraint requires the related CELEX; other relation types keep it
   // OPTIONAL so CELEX-less related works still return.
   const celexTriple = celex
@@ -392,7 +509,7 @@ function relationArm(
         .join('')
     : '';
   const articleFilter = article
-    ? `\n    ${articleFilterClause(workUri, '?relatedWork', predicate, direction, article)}`
+    ? `\n    ${articleFilterClause(sourceTerm, '?relatedWork', predicate, direction, article)}`
     : '';
   // `?relatedDate` drives the per-direction ordering below; it stays OPTIONAL so
   // related works without a document date still return (they sort last under DESC).
@@ -443,6 +560,12 @@ function relationArm(
  * caller slices each direction to `perTypeLimit` after grouping the rows by
  * direction — so an arbitrary interleaving can place the private continuation
  * sentinel inside the kept slice and drop a real relation instead.
+ *
+ * With `versions` (#199), the incoming arm binds {@link VERSION_WORK} to each version's
+ * work in a `VALUES` block and follows the edge to any of them, so a related work whose
+ * edges reach two versions still groups into one row, dated and paged once. A `FILTER`
+ * joining the versions' CELEX literals instead was timed at 51–117 s on Charter Article
+ * 47; the `VALUES` arm answers in well under a second there.
  */
 function buildRelationQuery(
   workUri: string,
@@ -451,26 +574,36 @@ function buildRelationQuery(
   offset: number,
   celex?: CelexConstraint,
   article?: ArticleFilter,
+  versions?: readonly TreatyVersion[],
 ): string {
   const projection =
     'SELECT ?relatedWork (SAMPLE(?relatedCelex) AS ?relatedCelexSample) ?direction (MAX(STR(?relatedDate)) AS ?relatedDateMax)';
+  // Over a version set, the incoming arm also names the versions each related work's
+  // edges reach: at most four work URIs, far inside the size a grouped concatenation
+  // fails at (SR319, about 4 KB).
+  const recordedAgainst = versions
+    ? ` (GROUP_CONCAT(DISTINCT STR(${VERSION_WORK}); separator=" ") AS ?recordedAgainst)`
+    : '';
   const paging = `GROUP BY ?relatedWork ?direction ORDER BY DESC(?relatedDateMax) ?relatedWork LIMIT ${limit} OFFSET ${offset}`;
-  const subquery = (direction: 'outgoing' | 'incoming') =>
-    `{ ${projection} WHERE {
-    ${relationArm(workUri, spec.predicate, direction, celex, article)}
+  const subquery = (direction: 'outgoing' | 'incoming') => {
+    const armVersions = direction === 'incoming' ? versions : undefined;
+    return `{ ${projection}${armVersions ? recordedAgainst : ''} WHERE {
+    ${relationArm(workUri, spec.predicate, direction, celex, article, armVersions)}
   } ${paging} }`;
+  };
   const page =
     spec.direction === 'both'
       ? `${subquery('outgoing')} UNION ${subquery('incoming')}`
       : subquery(spec.direction);
-  return `SELECT ?relatedWork ?relatedCelexSample ?direction ?relatedDateMax (MAX(STR(?relatedTitle)) AS ?relatedTitleMax) WHERE {
+  const recorded = versions ? ' ?recordedAgainst' : '';
+  return `SELECT ?relatedWork ?relatedCelexSample ?direction ?relatedDateMax${recorded} (MAX(STR(?relatedTitle)) AS ?relatedTitleMax) WHERE {
   ${page}
   OPTIONAL {
     ?relatedExpr cdm:expression_belongs_to_work ?relatedWork .
     ?relatedExpr cdm:expression_uses_language <${ENG_LANGUAGE_URI}> .
     ?relatedExpr cdm:expression_title ?relatedTitle .
   }
-} GROUP BY ?relatedWork ?relatedCelexSample ?direction ?relatedDateMax ORDER BY ?direction DESC(?relatedDateMax) ?relatedWork`;
+} GROUP BY ?relatedWork ?relatedCelexSample ?direction ?relatedDateMax${recorded} ORDER BY ?direction DESC(?relatedDateMax) ?relatedWork`;
 }
 
 /**
@@ -755,21 +888,24 @@ function continuationQuery(
   lastDate: string | undefined,
   celex?: CelexConstraint,
   article?: ArticleFilter,
+  versions?: readonly TreatyVersion[],
 ): string {
-  const edge =
-    direction === 'outgoing'
-      ? `<${workUri}> ${predicate} ?work .`
-      : `?work ${predicate} <${workUri}> .`;
+  // Over a version set (#199) the edge reaches any version, and DISTINCT lists a work
+  // whose edges reach two of them once per date and CELEX, as without one.
+  const sourceTerm = versions ? VERSION_WORK : `<${workUri}>`;
+  const [source, target] = edgeEnds(sourceTerm, '?work', direction);
+  const edge = `${versions ? `${versionValues(versions)} ` : ''}${source} ${predicate} ${target} .`;
+  const select = versions ? 'SELECT DISTINCT' : 'SELECT';
   const celexPattern = `${
     celex
       ? `?work cdm:resource_legal_id_celex ?celex .${celexFilters('?celex', celex)
           .map((filter) => ` ${filter}`)
           .join('')}`
       : 'OPTIONAL { ?work cdm:resource_legal_id_celex ?celex }'
-  }${article ? ` ${articleFilterClause(workUri, '?work', predicate, direction, article)}` : ''}`;
+  }${article ? ` ${articleFilterClause(sourceTerm, '?work', predicate, direction, article)}` : ''}`;
   return lastDate
-    ? `SELECT ?work ?celex ?date WHERE { ${edge} ?work cdm:work_date_document ?date . ${celexPattern} FILTER(?date <= "${lastDate}"^^xsd:date) } ORDER BY DESC(?date) ?work`
-    : `SELECT ?work ?celex WHERE { ${edge} ${celexPattern} FILTER NOT EXISTS { ?work cdm:work_date_document ?date } } ORDER BY ?work`;
+    ? `${select} ?work ?celex ?date WHERE { ${edge} ?work cdm:work_date_document ?date . ${celexPattern} FILTER(?date <= "${lastDate}"^^xsd:date) } ORDER BY DESC(?date) ?work`
+    : `${select} ?work ?celex WHERE { ${edge} ${celexPattern} FILTER NOT EXISTS { ?work cdm:work_date_document ?date } } ORDER BY ?work`;
 }
 
 /**
@@ -835,9 +971,19 @@ function continuationQuery(
  * with rows on the page, keyed on those rows (`VALUES`) and ungrouped: a
  * `GROUP_CONCAT` inside the paged query fails once an edge's designators pass
  * about 4 KB (Virtuoso SR319, HTTP 500). The follow-up runs after the page query,
- * so it adds one round-trip to the call. A follow-up CELLAR fails is reported in
- * `provisionsUnavailable` and its rows are returned without provisions; the
- * caller's cancellation still ends the call.
+ * so it adds one round-trip to the call; its keys are split into as many requests as
+ * CELLAR's body limit needs ({@link chunkKeys}), sent together. A follow-up CELLAR
+ * fails, in any of its requests, is reported in `provisionsUnavailable` and the type's
+ * rows are returned without provisions; the caller's cancellation still ends the call.
+ *
+ * `versions`, for a Lisbon treaty article or text (#199), are its versions, the source
+ * work among them: every incoming arm but `national_transposition` (a measure's CELEX
+ * names the one act it transposes) reads the edges reaching any of them as one arm —
+ * one row per related work, paged as one, its provisions read from the versions its
+ * edges reach — and each of its rows carries `recordedAgainst`, the CELEX of those
+ * versions. `interpretedByVersions` replaces them for `interpreted_by`, which then reads
+ * no provision filter: an article's versions on a whole text, or none, when no query
+ * is sent. Outgoing arms read the source work alone.
  */
 export async function traverseRelations(
   svc: Pick<CellarSparqlService, 'query' | 'queryWithContinuation'>,
@@ -846,12 +992,14 @@ export async function traverseRelations(
   ctx: Context,
   options: {
     article?: ArticleFilter | undefined;
+    interpretedByVersions?: readonly TreatyVersion[] | undefined;
     memberStates?: readonly MemberStateCode[] | undefined;
     offset?: number;
     perTypeLimit: number;
     provisions?: boolean;
     relatedSectors?: readonly CelexSector[] | undefined;
     sourceCelex?: string | undefined;
+    versions?: readonly TreatyVersion[] | undefined;
   },
 ): Promise<{
   hasMore: boolean;
@@ -862,13 +1010,26 @@ export async function traverseRelations(
   const { article, memberStates, offset = 0, perTypeLimit, relatedSectors, sourceCelex } = options;
   const sectors = relatedSectors?.length ? relatedSectors : undefined;
   const articleFor = (type: RelationType) => (type === 'interpreted_by' ? article : undefined);
+  const versionsFor = (type: RelationType): readonly TreatyVersion[] | undefined => {
+    if (type === 'interpreted_by' && options.interpretedByVersions) {
+      return options.interpretedByVersions;
+    }
+    return readsIncoming(type) && type !== 'national_transposition' ? options.versions : undefined;
+  };
   const sourceActCore = sourceCelex ? celexActCore(sourceCelex) : undefined;
   const fetchLimit = windowedLimit(offset, perTypeLimit);
   const perType = await Promise.all(
     types.map(
       async (
         type,
-      ): Promise<{ type: RelationType; bindings: SparqlBinding[]; celex?: CelexConstraint }> => {
+      ): Promise<{
+        type: RelationType;
+        bindings: SparqlBinding[];
+        celex?: CelexConstraint;
+        versions?: readonly TreatyVersion[];
+      }> => {
+        const versions = versionsFor(type);
+        if (versions?.length === 0) return { type, bindings: [] };
         /**
          * Push relation-specific CELEX validity into the query before pagination:
          * sector-7 same-act national measures, the caller's sectors, and CELEX-bearing
@@ -898,10 +1059,12 @@ export async function traverseRelations(
               offset,
               celex,
               articleFor(type),
+              versions,
             ),
             ctx,
           ),
           ...(celex ? { celex } : {}),
+          ...(versions ? { versions } : {}),
         };
       },
     ),
@@ -914,7 +1077,8 @@ export async function traverseRelations(
   const windowEnds: RelationWindowEnd[] = [];
   const pageRowsByType = new Map<RelationType, WorkRelation[]>();
   let hasMore = false;
-  for (const { type, bindings, celex } of perType) {
+  for (const { type, bindings, celex, versions } of perType) {
+    const versionCelex = new Map(versions?.map((version) => [version.workUri, version.celex]));
     // Each row beside the date its page sorted it on, CELLAR's undated placeholder
     // included: the row reports a real date alone, and a window end continues from
     // the sort date.
@@ -935,6 +1099,14 @@ export async function traverseRelations(
       const sortDate = CellarSparqlService.bindingValue(b, 'relatedDateMax')?.slice(0, 10);
       const relatedDate = cellarDate(sortDate);
       const relatedTitle = CellarSparqlService.bindingValue(b, 'relatedTitleMax');
+      // The version works the grouped incoming row's edges reach, as their CELEX.
+      const recordedAgainst = [
+        ...new Set(
+          (CellarSparqlService.bindingValue(b, 'recordedAgainst') ?? '')
+            .split(' ')
+            .flatMap((versionWork) => versionCelex.get(versionWork) ?? []),
+        ),
+      ].toSorted();
 
       // Keep CELEX-constrained relation lists trustworthy at a glance. These
       // checks mirror the SPARQL filters as client-side belt-and-suspenders.
@@ -963,6 +1135,7 @@ export async function traverseRelations(
           ...(relatedMemberState ? { relatedMemberState } : {}),
           ...(relatedDate ? { relatedDate } : {}),
           ...(relatedTitle ? { relatedTitle } : {}),
+          ...(recordedAgainst.length > 0 ? { recordedAgainst } : {}),
         },
         sortDate,
       });
@@ -992,6 +1165,7 @@ export async function traverseRelations(
             lastSortDate,
             celex,
             articleFor(type),
+            direction === 'incoming' ? versions : undefined,
           ),
         });
       }
@@ -1006,7 +1180,7 @@ export async function traverseRelations(
         .map(async ([type, rows]) => {
           let byWork: Map<string, string[]>;
           try {
-            byWork = await readProvisions(svc, workUri, type, rows, ctx);
+            byWork = await readProvisions(svc, workUri, type, rows, ctx, versionsFor(type));
           } catch (error) {
             // Best effort: rows stay, without provisions, and the type is reported.
             // Cancellation and anything that is not a CELLAR failure still end the call.
@@ -1128,10 +1302,65 @@ export async function summarizeTransposition(
   };
 }
 
+/** CELLAR refuses a SPARQL POST body over this many bytes, form-encoded (HTTP 403). */
+const CELLAR_BODY_LIMIT_BYTES = 8192;
+
+/**
+ * The longest source CELEX and work URI a traversal is sent for. No CELLAR work holds
+ * a longer one — its longest CELEX has 27 characters, its work URIs 82 (2026-11-14) —
+ * and every query built from them stays within {@link CELLAR_BODY_LIMIT_BYTES}.
+ */
+export const SOURCE_CELEX_MAX_LENGTH = 100;
+export const SOURCE_WORK_URI_MAX_LENGTH = 256;
+
+/**
+ * Room each body keeps for what the service sends around a query: the `query=` key,
+ * its PREFIX block, and the results-format field, 271 encoded bytes (2026-11-14).
+ */
+const SERVICE_BODY_ALLOWANCE_BYTES = 512;
+
+/**
+ * The bytes `text` takes form-encoded, as the service posts a query. Encoding is per
+ * character, so the size of a concatenation is the sum of its parts' sizes.
+ */
+function encodedBytes(text: string): number {
+  return new URLSearchParams({ q: text }).toString().length - 'q='.length;
+}
+
+/**
+ * `keys` split, in order, into the fewest runs whose query `queryFor` builds fits
+ * CELLAR's body limit, each key counted at its encoded `<…>` and separating space.
+ */
+function chunkKeys(
+  keys: readonly string[],
+  queryFor: (chunk: readonly string[]) => string,
+): string[][] {
+  const budget =
+    CELLAR_BODY_LIMIT_BYTES - SERVICE_BODY_ALLOWANCE_BYTES - encodedBytes(queryFor([]));
+  const chunks: string[][] = [];
+  let chunk: string[] = [];
+  let size = 0;
+  for (const key of keys) {
+    const cost = encodedBytes(` <${key}>`);
+    if (chunk.length > 0 && size + cost > budget) {
+      chunks.push(chunk);
+      chunk = [];
+      size = 0;
+    }
+    chunk.push(key);
+    size += cost;
+  }
+  if (chunk.length > 0) chunks.push(chunk);
+  return chunks;
+}
+
 /**
  * The compacted, de-duplicated, sorted designators each page row of an annotated
- * type records, by related work URI: one ungrouped query keyed on the rows. Only a
- * URI the IRI guard accepts is keyed; CELLAR's own work URIs always pass.
+ * type records, by related work URI: ungrouped queries keyed on the rows, split so
+ * each request fits CELLAR's body limit and sent together. Only a URI the IRI guard
+ * accepts is keyed; CELLAR's own work URIs always pass. With `versions`, the axioms
+ * are those of the edges reaching any version, each designator read from the version
+ * its edge targets. Every request settles before a failure among them is thrown.
  */
 async function readProvisions(
   svc: Pick<CellarSparqlService, 'query'>,
@@ -1139,16 +1368,26 @@ async function readProvisions(
   type: RelationType,
   rows: readonly WorkRelation[],
   ctx: Context,
+  versions?: readonly TreatyVersion[],
 ): Promise<Map<string, string[]>> {
   const keys = [...new Set(rows.map((row) => row.relatedWorkUri))].filter(isSafeSparqlIri);
   if (keys.length === 0) return new Map();
   const { predicate, direction } = RELATION_SPECS[type];
   // Annotated types are one-directional by construction.
-  const [source, target] = edgeEnds(workUri, '?relatedWork', direction as 'outgoing' | 'incoming');
-  const bindings = await svc.query(
-    `SELECT DISTINCT ?relatedWork ?location WHERE { VALUES ?relatedWork { ${keys.map((key) => `<${key}>`).join(' ')} } ${locationAxiom('?axiom', source, predicate, target, '?location')} }`,
-    ctx,
+  const [source, target] = edgeEnds(
+    versions ? VERSION_WORK : `<${workUri}>`,
+    '?relatedWork',
+    direction as 'outgoing' | 'incoming',
   );
+  const versionBlock = versions ? `${versionValues(versions)} ` : '';
+  const queryFor = (chunk: readonly string[]) =>
+    `SELECT DISTINCT ?relatedWork ?location WHERE { ${iriValues('?relatedWork', chunk)} ${versionBlock}${locationAxiom('?axiom', source, predicate, target, '?location')} }`;
+  const settled = await Promise.allSettled(
+    chunkKeys(keys, queryFor).map((chunk) => svc.query(queryFor(chunk), ctx)),
+  );
+  const failed = settled.find((result) => result.status === 'rejected');
+  if (failed) throw failed.reason;
+  const bindings = settled.flatMap((result) => (result.status === 'fulfilled' ? result.value : []));
   const sets = new Map<string, Set<string>>();
   for (const binding of bindings) {
     const work = CellarSparqlService.bindingValue(binding, 'relatedWork');
