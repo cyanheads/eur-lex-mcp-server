@@ -3,7 +3,7 @@
  * @module tests/tools/eurlex-search-documents.tool.test
  */
 
-import type { z } from '@cyanheads/mcp-ts-core';
+import { z } from '@cyanheads/mcp-ts-core';
 import {
   JsonRpcErrorCode,
   serviceUnavailable,
@@ -46,6 +46,41 @@ const EXPECTED_DOCUMENT_TYPE_FAMILIES = {
     'PROP_RES',
   ],
   REC: ['RECO', 'RECO_ADOPT_INTERNATION', 'RECO_DEC', 'RECO_RECO', 'RECO_REG'],
+  COMMUNIC: ['COMMUNIC', 'JOINT_COMMUNIC', 'COMMUNIC_POSIT'],
+  REPORT: [
+    'REPORT',
+    'JOINT_REPORT',
+    'REPORT_SPECIAL',
+    'REPORT_ANNUAL',
+    'REPORT_ANNUAL_SPECIF',
+    'REPORT_ANNUAL_DAS',
+    'REPORT_ANNUAL_BUDGET',
+    'REPORT_ANNUAL_EDF',
+  ],
+  SWD: [
+    'SWD',
+    'JOINT_SWD',
+    'IMPACT_ASSESS',
+    'IMPACT_ASSESS_SUM',
+    'JOINT_IMPACT_ASSESS',
+    'JOINT_IMPACT_ASSESS_SUM',
+    'EVL',
+    'EVL_SUM_EXE',
+    'FC',
+    'FC_SUM_EXE',
+    'SYNOPSIS_REPORT_CONSULT',
+    'JOINT_SYNOPSIS_REPORT_CONSULT',
+  ],
+  AGREE: [
+    'AGREE_INTERNATION',
+    'AGREE_PROT',
+    'AGREE_AMEND',
+    'CONVENTION',
+    'EXCH_LET',
+    'ARRANG',
+    'MEMORANDUM_UNDERST',
+    'WITHD_AGREE',
+  ],
 } as const;
 
 // --- Service mock ---
@@ -231,6 +266,102 @@ describe('eurlex_search_documents', () => {
     expect(sparql).not.toContain(`<${RESOURCE_TYPE_BASE}DIRECTORY>`);
   });
 
+  it.each(['COMMUNIC', 'REPORT', 'SWD', 'AGREE'] as const)(
+    'keeps Treaty protocols, intra-EU agreements, Parliament resolutions, and drafts out of %s (#201)',
+    async (documentType) => {
+      const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+      mockQuery.mockResolvedValue([makeDocBinding('52020DC0301')]);
+
+      await eurlex_search_documents.handler(
+        eurlex_search_documents.input.parse({ document_type: documentType }),
+        ctx,
+      );
+
+      const valuesBlock =
+        /VALUES \?selectedType \{([^}]*)\}/.exec(mockQuery.mock.calls[0]?.[0] as string)?.[1] ?? '';
+      for (const code of EXPECTED_DOCUMENT_TYPE_FAMILIES[documentType]) {
+        expect(valuesBlock).toContain(`resource-type/${code}>`);
+      }
+      for (const excluded of [
+        'PROT',
+        'AGREE',
+        'AGREE_EUMS',
+        'AGREE_INTERINSTIT',
+        'AGREE_INTERNAL',
+        'INFO_COMMUNIC',
+        'OWNINI_REPORT',
+        'VERBATIM_REPORT',
+        'WORK_DOC',
+      ]) {
+        expect(valuesBlock).not.toContain(`resource-type/${excluded}>`);
+      }
+      expect(valuesBlock).not.toMatch(/_DRAFT>/);
+    },
+  );
+
+  it('admits consolidated international agreements under AGREE through the basic act (#201)', async () => {
+    const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+    mockQuery.mockResolvedValue([
+      makeDocBinding('02002A0430(06)-20121022', {
+        types: `${RESOURCE_TYPE_BASE}CONS_TEXT`,
+        title: 'Agreement on Government Procurement (consolidated)',
+      }),
+    ]);
+
+    const result = await eurlex_search_documents.handler(
+      eurlex_search_documents.input.parse({ document_type: 'AGREE', include_consolidated: true }),
+      ctx,
+    );
+
+    const sparql = mockQuery.mock.calls[0]?.[0] as string;
+    expect(sparql).toContain(`<${RESOURCE_TYPE_BASE}CONS_TEXT>`);
+    expect(sparql).toContain('cdm:act_consolidated_based_on_resource_legal ?basicAct');
+    expect(sparql).toContain('?basicAct cdm:work_has_resource-type ?selectedType');
+    expect(sparql).toContain(`<${RESOURCE_TYPE_BASE}AGREE_INTERNATION>`);
+    expect(result.documents[0]?.is_consolidated).toBe(true);
+  });
+
+  it.each([
+    ['JOINT_SWD', 'SWD', 'Joint Staff Working Document'],
+    [
+      'COMMUNIC_POSIT',
+      'COMMUNIC',
+      'Communication of the Commission on Council’s Position at 1st Reading',
+    ],
+    ['WITHD_AGREE', 'AGREE', 'Withdrawal Agreement'],
+  ])(
+    'labels a %s row admitted by %s on both surfaces (#201)',
+    async (code, documentType, label) => {
+      const ctx = createMockContext({ errors: eurlex_search_documents.errors });
+      mockQuery.mockResolvedValue([
+        makeDocBinding('52021SC0084', { types: `${RESOURCE_TYPE_BASE}${code}`, title: 'Example' }),
+      ]);
+
+      const result = await eurlex_search_documents.handler(
+        eurlex_search_documents.input.parse({ document_type: documentType }),
+        ctx,
+      );
+
+      expect(result.documents[0]?.resource_type).toBe(label);
+      const text = (eurlex_search_documents.format!(result)[0] as { text: string }).text;
+      expect(text).toContain(`**Type:** ${label}`);
+    },
+  );
+
+  it('names every document category in both document_type descriptions (#201)', () => {
+    const { properties } = z.toJSONSchema(eurlex_search_documents.input, { io: 'input' });
+    const descriptions = [
+      ...JSON.stringify(properties?.document_type).matchAll(/"description":"((?:[^"\\]|\\.)*)"/g),
+    ].map(([, text]) => text ?? '');
+    const categoryDescriptions = descriptions.filter((text) => text.includes('REG='));
+    expect(categoryDescriptions).toHaveLength(2);
+    for (const text of categoryDescriptions) {
+      for (const family of Object.keys(EXPECTED_DOCUMENT_TYPE_FAMILIES)) {
+        expect(text).toContain(`${family}=`);
+      }
+    }
+  });
+
   it('targets live RECO types instead of the unbound REC_SOFT code', async () => {
     const ctx = createMockContext({ errors: eurlex_search_documents.errors });
     mockQuery.mockResolvedValue([makeDocBinding('32026H1835')]);
@@ -346,6 +477,10 @@ describe('eurlex_search_documents', () => {
     ['Dir', 'DIR'],
     [' opin-ag ', 'OPIN_AG'],
     ['Opin_Ag', 'OPIN_AG'],
+    ['communic', 'COMMUNIC'],
+    [' Report ', 'REPORT'],
+    ['swd', 'SWD'],
+    ['agree', 'AGREE'],
   ])('serves document_type %j as %s and filters on it (#143)', async (value, member) => {
     mockQuery.mockResolvedValue([makeDocBinding('32016R0679')]);
     const result = await runToolContract(eurlex_search_documents, {
@@ -355,7 +490,9 @@ describe('eurlex_search_documents', () => {
     expect(result.isError).toBeFalsy();
     const structured = eurlex_search_documents.output.parse(result.structuredContent);
     expect(structured.query_echo.document_type).toBe(member);
-    expect(mockQuery.mock.calls[0]?.[0] as string).toContain(`resource-type/${member}>`);
+    const firstCode =
+      EXPECTED_DOCUMENT_TYPE_FAMILIES[member as keyof typeof EXPECTED_DOCUMENT_TYPE_FAMILIES][0];
+    expect(mockQuery.mock.calls[0]?.[0] as string).toContain(`resource-type/${firstCode}>`);
   });
 
   it('still reads "" as unset and rejects a document_type naming no category (#143)', () => {

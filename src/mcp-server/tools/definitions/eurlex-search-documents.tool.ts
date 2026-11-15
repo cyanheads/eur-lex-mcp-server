@@ -51,7 +51,20 @@ const RESOURCE_TYPE_BASE = 'http://publications.europa.eu/resource/authority/res
 /** Documents served per call; a larger `limit` is clamped to it. */
 const MAX_PAGE_SIZE = 100;
 
-const DOCUMENT_TYPES = ['REG', 'DIR', 'DEC', 'TREATY', 'JUDG', 'OPIN_AG', 'PROP', 'REC'] as const;
+const DOCUMENT_TYPES = [
+  'REG',
+  'DIR',
+  'DEC',
+  'TREATY',
+  'JUDG',
+  'OPIN_AG',
+  'PROP',
+  'REC',
+  'COMMUNIC',
+  'REPORT',
+  'SWD',
+  'AGREE',
+] as const;
 type DocumentType = (typeof DOCUMENT_TYPES)[number];
 
 /**
@@ -61,6 +74,13 @@ type DocumentType = (typeof DOCUMENT_TYPES)[number];
  * category membership cannot be derived from a hierarchy or URI prefix. Draft
  * regulation/directive/decision/recommendation concepts describe proposals and
  * are deliberately excluded from the corresponding adopted-act families.
+ *
+ * AGREE leaves out `PROT`, mostly protocols annexed to the Treaties (agreement
+ * protocols since 2020 are typed `AGREE_PROT`), and `AGREE`, `AGREE_EUMS`,
+ * `AGREE_INTERINSTIT`, and `AGREE_INTERNAL`, agreements within the EU. REPORT leaves
+ * out `OWNINI_REPORT`, which marks European Parliament resolutions, and
+ * `VERBATIM_REPORT`; COMMUNIC leaves out `INFO_COMMUNIC` ("Information"); no family
+ * takes `WORK_DOC` (#201).
  */
 const DOCUMENT_TYPE_FAMILIES = {
   REG: ['REG', 'REG_ADOPT_INTERNATION', 'REG_DEL', 'REG_FINANC', 'REG_IMPL'],
@@ -90,6 +110,41 @@ const DOCUMENT_TYPE_FAMILIES = {
     'PROP_RES',
   ],
   REC: ['RECO', 'RECO_ADOPT_INTERNATION', 'RECO_DEC', 'RECO_RECO', 'RECO_REG'],
+  COMMUNIC: ['COMMUNIC', 'JOINT_COMMUNIC', 'COMMUNIC_POSIT'],
+  REPORT: [
+    'REPORT',
+    'JOINT_REPORT',
+    'REPORT_SPECIAL',
+    'REPORT_ANNUAL',
+    'REPORT_ANNUAL_SPECIF',
+    'REPORT_ANNUAL_DAS',
+    'REPORT_ANNUAL_BUDGET',
+    'REPORT_ANNUAL_EDF',
+  ],
+  SWD: [
+    'SWD',
+    'JOINT_SWD',
+    'IMPACT_ASSESS',
+    'IMPACT_ASSESS_SUM',
+    'JOINT_IMPACT_ASSESS',
+    'JOINT_IMPACT_ASSESS_SUM',
+    'EVL',
+    'EVL_SUM_EXE',
+    'FC',
+    'FC_SUM_EXE',
+    'SYNOPSIS_REPORT_CONSULT',
+    'JOINT_SYNOPSIS_REPORT_CONSULT',
+  ],
+  AGREE: [
+    'AGREE_INTERNATION',
+    'AGREE_PROT',
+    'AGREE_AMEND',
+    'CONVENTION',
+    'EXCH_LET',
+    'ARRANG',
+    'MEMORANDUM_UNDERST',
+    'WITHD_AGREE',
+  ],
 } as const satisfies Record<DocumentType, readonly string[]>;
 
 /**
@@ -140,7 +195,7 @@ const NARROWING_FILTERS = ['document_type', 'eurovoc_concept', 'author_instituti
 export const eurlex_search_documents = tool('eurlex_search_documents', {
   title: 'Search EU Documents',
   description:
-    'Search EU legislation, treaties, and preparatory acts across the CELLAR corpus by document type, date range, EuroVoc subject, author institution, and in-force status. Keyword matches English titles and CELEX strings only — there is no full-text body search. Corrigenda are excluded by default so primary acts fill the page (set include_corrigenda to include them). Returns a page of CELEX numbers, work URIs, type labels, dates, and titles, newest first, each flagged with is_consolidated and is_corrigendum. At least one filter is required.',
+    'Search EU legislation, treaties, international agreements, preparatory acts, and Commission communications, reports, and staff working documents across the CELLAR corpus by document type, date range, EuroVoc subject, author institution, and in-force status. Keyword matches English titles and CELEX strings only — there is no full-text body search. Corrigenda are excluded by default so primary acts fill the page (set include_corrigenda to include them). Returns a page of CELEX numbers, work URIs, type labels, dates, and titles, newest first, each flagged with is_consolidated and is_corrigendum. At least one filter is required.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
     keyword: z
@@ -157,12 +212,12 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
           z
             .enum(DOCUMENT_TYPES)
             .describe(
-              'Document type: REG=Regulation, DIR=Directive, DEC=Decision, TREATY=Treaty, JUDG=Judgment, OPIN_AG=AG Opinion, PROP=Proposal, REC=Recommendation.',
+              'Document type: REG=Regulation, DIR=Directive, DEC=Decision, TREATY=Treaty, JUDG=Judgment, OPIN_AG=AG Opinion, PROP=Proposal, REC=Recommendation, COMMUNIC=Communication, REPORT=Report, SWD=Staff Working Document, AGREE=International Agreement.',
             ),
         ])
         .optional()
         .describe(
-          'Document category: REG=Regulations, DIR=Directives, DEC=Decisions, TREATY=Treaties, JUDG=Judgments, OPIN_AG=AG Opinions, PROP=Proposals, REC=Recommendations. Each category includes its explicit CELLAR authority variants (for example, delegated and implementing regulations). Omit to search all types. Consolidated texts are excluded unless include_consolidated is true. Search case law by court, case number, or subject with eurlex_get_cases.',
+          'Document category: REG=Regulations, DIR=Directives, DEC=Decisions, TREATY=Treaties, JUDG=Judgments, OPIN_AG=AG Opinions, PROP=Proposals, REC=Recommendations, COMMUNIC=Communications, REPORT=Reports (special and annual reports included), SWD=Staff working documents (impact assessments, evaluations, fitness checks, and their summaries included), AGREE=International agreements (protocols, amendments, conventions, exchanges of letters, arrangements, memoranda of understanding). Each category includes its explicit CELLAR authority variants (for example, delegated and implementing regulations, joint communications). Omit to search all types. Consolidated texts are excluded unless include_consolidated is true. Search case law by court, case number, or subject with eurlex_get_cases.',
         ),
     ),
     include_consolidated: z
