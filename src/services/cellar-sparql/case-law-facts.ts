@@ -73,27 +73,18 @@ function factValue(fact: CaseLawFact, code: string, label: string | undefined): 
 }
 
 /**
- * Read the case-law facts of `workUris` in one query: one row per work, fact, and
- * value, as a `UNION` arm per fact, each value's English label joined inline. The
- * query is ungrouped, so a work's values never multiply across facts, and has no
- * `LIMIT`, since the `VALUES` list bounds it. Pass resolved works: a `do_not_index`
- * copy carries none of these facts.
- *
- * A work CELLAR records none of the facts for is absent from the map, and a fact it
- * records no value for is absent from the work's entry, never an empty list. The
- * "Provisional data" placeholder is never reported. An empty list sends no query.
+ * Works one facts query names. CELLAR refuses a SPARQL POST body over 8,192 bytes
+ * with HTTP 403. Form-encoded, a work URI (`…/resource/cellar/{uuid}`) takes 101
+ * bytes of the body and the rest of the query about 1,100, so 50 works send about
+ * 6.2 KB, and a 100-row eurlex_get_cases page reads its facts in two queries.
  */
-export async function fetchCaseLawFacts(
-  svc: Pick<CellarSparqlService, 'query'>,
-  workUris: readonly string[],
-  ctx: Context,
-): Promise<Map<string, CaseLawFacts>> {
-  const distinct = [...new Set(workUris)];
-  if (distinct.length === 0) return new Map();
+const WORKS_PER_QUERY = 50;
 
-  const query = `
+/** The facts query for `works`, each fact a `UNION` arm. */
+function factsQuery(works: readonly string[]): string {
+  return `
 SELECT ?work ?fact ?code ?label WHERE {
-  VALUES ?work { ${distinct.map((uri) => `<${uri}>`).join(' ')} }
+  VALUES ?work { ${works.map((uri) => `<${uri}>`).join(' ')} }
   {
     ?work cdm:case-law_originates_in_country ?code .
     BIND("countries" AS ?fact)
@@ -110,9 +101,36 @@ SELECT ?work ?fact ?code ?label WHERE {
     BIND("procedure_languages" AS ?fact)
   }
 }`;
+}
+
+/**
+ * Read the case-law facts of `workUris`: one row per work, fact, and value, as a
+ * `UNION` arm per fact, each value's English label joined inline. The query is
+ * ungrouped, so a work's values never multiply across facts, and has no `LIMIT`,
+ * since the `VALUES` list bounds it. Pass resolved works: a `do_not_index` copy
+ * carries none of these facts.
+ *
+ * Up to {@link WORKS_PER_QUERY} works go in one query; more are split across
+ * queries sent together, each naming its own works, within the call's shared
+ * SPARQL budget.
+ *
+ * A work CELLAR records none of the facts for is absent from the map, and a fact it
+ * records no value for is absent from the work's entry, never an empty list. The
+ * "Provisional data" placeholder is never reported. An empty list sends no query.
+ */
+export async function fetchCaseLawFacts(
+  svc: Pick<CellarSparqlService, 'query'>,
+  workUris: readonly string[],
+  ctx: Context,
+): Promise<Map<string, CaseLawFacts>> {
+  const distinct = [...new Set(workUris)];
+  const batches = Array.from({ length: Math.ceil(distinct.length / WORKS_PER_QUERY) }, (_, i) =>
+    distinct.slice(i * WORKS_PER_QUERY, (i + 1) * WORKS_PER_QUERY),
+  );
+  const rows = await Promise.all(batches.map((works) => svc.query(factsQuery(works), ctx)));
 
   const values = new Map<string, Map<CaseLawFact, Set<string>>>();
-  for (const b of await svc.query(query, ctx)) {
+  for (const b of rows.flat()) {
     const work = CellarSparqlService.bindingValue(b, 'work');
     const fact = CellarSparqlService.bindingValue(b, 'fact');
     const code = CellarSparqlService.bindingValue(b, 'code');

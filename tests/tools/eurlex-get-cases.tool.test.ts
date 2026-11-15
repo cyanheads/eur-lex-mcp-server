@@ -4196,8 +4196,11 @@ describe('eurlex_get_cases case-law facts (#178)', () => {
           `?concept skos:inScheme <http://publications.europa.eu/resource/authority/case-law-subject-matter> .`,
         );
         expect(lookup).not.toMatch(/LIMIT/);
+        // Each concept by its code under the declared subject namespace, so a phrase
+        // matching most labels still fits the 8,192-byte request CELLAR accepts.
+        expect(pageQuery().startsWith(`PREFIX subject: <${SUBJECT_MATTER}>\nSELECT`)).toBe(true);
         expect(pageQuery()).toContain(
-          `VALUES ?subject { ${codes.map((code) => `<${SUBJECT_MATTER}${code}>`).join(' ')} }\n  ?work cdm:case-law_is-about_case-law-subject-matter ?subject .`,
+          `VALUES ?subject { ${codes.map((code) => `subject:${code}`).join(' ')} }\n  ?work cdm:case-law_is-about_case-law-subject-matter ?subject .`,
         );
         expect(result.structuredContent).toMatchObject({
           query_echo: { subject, subject_labels: labels },
@@ -4219,7 +4222,7 @@ describe('eurlex_get_cases case-law facts (#178)', () => {
       const result = await runToolContract(eurlex_get_cases, { subject: 'a' });
 
       expect(pageQuery()).toContain(
-        `VALUES ?subject { ${['AID', 'AIDE', 'MARQ', 'PDON', 'PRIN'].map((code) => `<${SUBJECT_MATTER}${code}>`).join(' ')} }`,
+        `VALUES ?subject { ${['AID', 'AIDE', 'MARQ', 'PDON', 'PRIN'].map((code) => `subject:${code}`).join(' ')} }`,
       );
       expect(result.structuredContent).toMatchObject({
         query_echo: {
@@ -4330,7 +4333,7 @@ describe('eurlex_get_cases case-law facts (#178)', () => {
 
     expect(pageQuery()).toBe(
       [
-        '',
+        `PREFIX subject: <${SUBJECT_MATTER}>`,
         'SELECT',
         '  (SAMPLE(?celexNumber) AS ?celex)',
         '  (SAMPLE(?date) AS ?docDate)',
@@ -4342,7 +4345,7 @@ describe('eurlex_get_cases case-law facts (#178)', () => {
         `  ?work cdm:case-law_originates_in_country <${AUTHORITY}country/ESP> .`,
         '  ?work cdm:case-law_has_type_procedure_concept_type_procedure ?procedure .',
         `  FILTER(?procedure = <${AUTHORITY}fd_100/PREJ> || STRSTARTS(STR(?procedure), "${AUTHORITY}fd_100/PREJ%3D") || ?procedure = <${AUTHORITY}fd_100/REFER_PREL_URG> || STRSTARTS(STR(?procedure), "${AUTHORITY}fd_100/REFER_PREL_URG%3D"))`,
-        `  VALUES ?subject { <${SUBJECT_MATTER}PDON> }`,
+        '  VALUES ?subject { subject:PDON }',
         '  ?work cdm:case-law_is-about_case-law-subject-matter ?subject .',
         '  FILTER(STRSTARTS(STR(?celexNumber), "6"))',
         '  FILTER(SUBSTR(STR(?celexNumber), 6, 1) = "C")',
@@ -4711,17 +4714,19 @@ describe('eurlex_get_cases case-law facts (#178)', () => {
 
       const result = await runToolContract(eurlex_get_cases, { case_number: 'C-990/12' });
 
+      // After its second page query, with derivative records admitted, also found none (#200).
       expect((result.structuredContent as { notice: string }).notice).toBe(
-        'No case law records matched the search criteria (case_number=C-990/12, celex_fragment=2012C*0990, include_derivative=false). Broaden the search by trying a different case_number.',
+        'No case law records matched the search criteria (case_number=C-990/12, celex_fragment=2012C*0990, include_derivative=false). No derivative record (notice, abstract, summary, or corrigendum) is filed under the case number either. Broaden the search by trying a different case_number.',
       );
     });
 
     it('lists every broadening step a call set in one sentence', async () => {
       fakeCellar([]);
 
+      // court GC is another court than the case number's, so removing it broadens (#200).
       const result = await runToolContract(eurlex_get_cases, {
         keyword: 'zzqx',
-        case_number: 'T-97/23',
+        case_number: 'C-97/23',
         court: 'GC',
         case_type: 'order',
         date_to: '2020-12-31',
@@ -4761,5 +4766,615 @@ describe('eurlex_get_cases case-law facts (#178)', () => {
       expect(notice).toContain('date_from=2015-01-01, date_to=2015-06-30');
       expect(contentText(result)).toContain(`> ${notice}`);
     });
+  });
+});
+
+// --- #200: a case number CELLAR files only notices under ---
+
+describe('eurlex_get_cases derivative records of a case number with no primary record (#200)', () => {
+  beforeEach(() => {
+    mockQuery.mockReset();
+    mockMaxResults = 100;
+  });
+
+  const TYPE = 'http://publications.europa.eu/resource/authority/resource-type/';
+  const DERIVATIVE_TYPES = new Set([
+    'INFO_JUDICIAL',
+    'INFO_JUR',
+    'ABSTRACT_JUR',
+    'SUM_JUR',
+    'CORRIGENDUM',
+  ]);
+  const BUDGET_SPENT = 'CELLAR SPARQL queries for this request ran past the time budget they share';
+
+  /** A record CELLAR files under a case number. */
+  interface CaseRecord {
+    celex: string;
+    date: string;
+    ecli?: string;
+    title?: string;
+    type: string;
+  }
+
+  /**
+   * Every record CELLAR files under C-866/25 (lodged, undecided), C-22/24 (closed by an
+   * order published only as a notice), C-131/12, and C-2/25 (live, 2026-11-14). It files
+   * none under C-990/12.
+   */
+  const RECORDS: CaseRecord[] = [
+    {
+      celex: '62025CN0866',
+      type: 'INFO_JUDICIAL',
+      date: '2025-12-31',
+      title:
+        'Case C-866/25, Einlagensicherung: Request for a preliminary ruling from the Oberster Gerichtshof (Austria) lodged on 31 December 2025',
+    },
+    { celex: '62024CB0022', type: 'INFO_JUDICIAL', date: '2024-04-02' },
+    { celex: '62012CJ0131', type: 'JUDG', date: '2014-05-13', ecli: 'ECLI:EU:C:2014:317' },
+    { celex: '62012CA0131', type: 'INFO_JUDICIAL', date: '2014-05-13' },
+    { celex: '62012CC0131', type: 'OPIN_AG', date: '2013-06-25', ecli: 'ECLI:EU:C:2013:424' },
+    { celex: '62012CN0131', type: 'INFO_JUDICIAL', date: '2012-03-09' },
+    { celex: '62025CB0002', type: 'INFO_JUDICIAL', date: '2025-03-24' },
+    { celex: '62025CN0002', type: 'INFO_JUDICIAL', date: '2025-01-03' },
+  ];
+  const RECORD_BY_CELEX = new Map(RECORDS.map((record) => [record.celex, record]));
+
+  const isPageQuery = (sparql: string) => sparql.includes('GROUP BY ?celexNumber');
+  /** The page query that admits the notice letters, as include_derivative does. */
+  const admitsNotices = (sparql: string) => /\[[A-Z]*ABN\]/.test(sparql);
+  const pageQueries = () =>
+    mockQuery.mock.calls.map((call) => call[0] as string).filter(isPageQuery);
+
+  /**
+   * The records a page query reaches, as CELLAR answers it: its CELEX index terms and
+   * filters, its required resource type, the derivative exclusion, and its date bounds,
+   * newest first and then by CELEX, cut to its LIMIT and OFFSET. These records carry no
+   * case-law fact and no title a keyword matches, so a fact pattern or a keyword's title
+   * arm admits none of them.
+   */
+  function pageRows(sparql: string): Binding[] {
+    if (/cdm:case-law_|\?kwTitle/.test(sparql)) return [];
+    const typeTriple = /\?work cdm:work_has_resource-type <[^>]*\/([A-Z_]+)> \./.exec(sparql)?.[1];
+    const typeValues = /VALUES \?selectedCaseType \{([^}]*)\}/.exec(sparql)?.[1];
+    const required = typeTriple
+      ? [typeTriple]
+      : typeValues
+        ? [...typeValues.matchAll(/\/([A-Z_]+)>/g)].map((m) => m[1])
+        : undefined;
+    const excludesDerivative = sparql.includes('FILTER NOT EXISTS');
+    const from = /FILTER\(\?date >= "([^"]+)"/.exec(sparql)?.[1];
+    const to = /FILTER\(\?date <= "([^"]+)"/.exec(sparql)?.[1];
+    const [, limit = '0', offset = '0'] = /LIMIT (\d+) OFFSET (\d+)/.exec(sparql) ?? [];
+    return RECORDS.filter(
+      (r) =>
+        reaches(sparql, r.celex) &&
+        (!required || required.includes(r.type)) &&
+        !(excludesDerivative && DERIVATIVE_TYPES.has(r.type)) &&
+        (!from || r.date >= from) &&
+        (!to || r.date <= to),
+    )
+      .sort((a, b) => (a.date === b.date ? (a.celex < b.celex ? -1 : 1) : a.date < b.date ? 1 : -1))
+      .slice(Number(offset), Number(offset) + Number(limit))
+      .map((r) => makeCaseBinding(r.celex, { date: r.date }));
+  }
+
+  /**
+   * CELLAR holding {@link RECORDS}, answering each query by what it asks: the subject
+   * lookup, the page queries, the resolution of the page's CELEX, and the facts.
+   * `requery` replaces the answer to the page query that admits the notice letters.
+   */
+  function serveRecords(requery?: () => Promise<Binding[]>) {
+    mockQuery.mockImplementation(async (sparql: string) => {
+      if (sparql.includes('skos:inScheme')) {
+        return [
+          {
+            concept: {
+              type: 'uri',
+              value:
+                'http://publications.europa.eu/resource/authority/case-law-subject-matter/PDON',
+            },
+            label: { type: 'literal', value: 'Protection of personal data' },
+          },
+        ];
+      }
+      if (isResolutionQuery(sparql)) {
+        return requestedCelex(sparql).flatMap((celex) => {
+          const record = RECORD_BY_CELEX.get(celex);
+          return record
+            ? [
+                makeCaseBinding(celex, {
+                  date: record.date,
+                  types: `${TYPE}${record.type}`,
+                  ...(record.ecli ? { ecli: record.ecli } : {}),
+                  ...(record.title ? { title: record.title } : {}),
+                }),
+              ]
+            : [];
+        });
+      }
+      if (isCaseLawFactsQuery(sparql)) return [];
+      if (isPageQuery(sparql)) {
+        return requery && admitsNotices(sparql) ? requery() : pageRows(sparql);
+      }
+      return [];
+    });
+  }
+
+  const FALLBACK_NOTICE =
+    'CELLAR holds no judgment, order, or AG opinion under the case number, so the derivative records filed under it are returned instead: the case may be pending, or closed by an order published only as a notice.';
+  const NONE_FILED =
+    'No derivative record (notice, abstract, summary, or corrigendum) is filed under the case number either.';
+  const UNCHECKED =
+    'CELLAR did not answer whether derivative records are filed under the case number; call again with include_derivative=true to check.';
+
+  type Structured = {
+    cases: { celex_number: string; resource_type?: string; ecli?: string }[];
+    has_more: boolean;
+    next_offset?: number;
+    notice?: string;
+    query_echo: Record<string, unknown>;
+    total: number;
+  };
+
+  /** Both surfaces of a result: the structured page and the CommonMark reading of content[]. */
+  function surfaces(result: Awaited<ReturnType<typeof runToolContract>>) {
+    expect(result.isError).toBeFalsy();
+    return {
+      structured: eurlex_get_cases.output.parse(result.structuredContent) as Structured,
+      notice: (result.structuredContent as { notice?: string }).notice,
+      text: contentText(result),
+      read: readCommonMark(contentText(result)),
+    };
+  }
+
+  describe('calls that never re-query (characterization)', () => {
+    it('returns the judgment and AG opinion of C-131/12 alone, after one page query', async () => {
+      serveRecords();
+
+      const { structured, notice } = surfaces(
+        await runToolContract(eurlex_get_cases, { case_number: 'C-131/12' }),
+      );
+
+      expect(structured.cases.map((c) => [c.celex_number, c.resource_type])).toEqual([
+        ['62012CJ0131', 'Judgment'],
+        ['62012CC0131', 'AG Opinion'],
+      ]);
+      expect(structured.query_echo.include_derivative).toBe(false);
+      expect(notice).toBeUndefined();
+      expect(pageQueries()).toHaveLength(1);
+    });
+
+    it.each([
+      ['include_derivative: true', { include_derivative: true }, ['62025CN0866']],
+      ['an offset above 0', { offset: 1 }, []],
+    ])('sends one page query for C-866/25 with %s', async (_label, extra, celex) => {
+      serveRecords();
+
+      const { structured } = surfaces(
+        await runToolContract(eurlex_get_cases, { case_number: 'C-866/25', ...extra }),
+      );
+
+      expect(structured.cases.map((c) => c.celex_number)).toEqual(celex);
+      expect(pageQueries()).toHaveLength(1);
+    });
+
+    it('sends one page query for a CELEX-substring case_number', async () => {
+      serveRecords();
+
+      const { structured } = surfaces(
+        await runToolContract(eurlex_get_cases, { case_number: '62025CN0866' }),
+      );
+
+      expect(structured.cases).toEqual([]);
+      expect(structured.query_echo).not.toHaveProperty('celex_fragment');
+      expect(pageQueries()).toHaveLength(1);
+    });
+
+    it.each([
+      ['keyword', { keyword: 'Einlagensicherung' }],
+      ['case_type', { case_type: 'judgment' }],
+      ['member_state', { member_state: 'AT' }],
+      ['procedure_type', { procedure_type: 'preliminary_ruling' }],
+      ['outcome', { outcome: 'successful' }],
+      ['subject', { subject: 'personal data' }],
+      ['date_from', { date_from: '2025-01-01' }],
+      ['date_to', { date_to: '2026-12-31' }],
+    ])(
+      'sends one page query and no re-query when %s is set beside a case number',
+      async (_label, extra) => {
+        serveRecords();
+
+        const { structured } = surfaces(
+          await runToolContract(eurlex_get_cases, { case_number: 'C-866/25', ...extra }),
+        );
+
+        expect(structured.cases).toEqual([]);
+        expect(structured.query_echo.include_derivative).toBe(false);
+        expect(pageQueries()).toHaveLength(1);
+      },
+    );
+
+    it('returns an empty page for C-131/12 in a 2012 date window after one page query', async () => {
+      serveRecords();
+
+      const { structured } = surfaces(
+        await runToolContract(eurlex_get_cases, {
+          case_number: 'C-131/12',
+          date_from: '2012-01-01',
+          date_to: '2012-12-31',
+        }),
+      );
+
+      expect(structured.cases).toEqual([]);
+      expect(pageQueries()).toHaveLength(1);
+    });
+  });
+
+  describe('the derivative records of a case number CELLAR files no primary record under', () => {
+    it.each([
+      ['C-866/25', '62025CN0866'],
+      ['C-22/24', '62024CB0022'],
+    ])(
+      'returns the notice filed under %s, echoing include_derivative true, on both surfaces',
+      async (caseNumber, celex) => {
+        serveRecords();
+
+        const { structured, notice, text, read } = surfaces(
+          await runToolContract(eurlex_get_cases, { case_number: caseNumber }),
+        );
+
+        expect(structured.cases.map((c) => [c.celex_number, c.resource_type])).toEqual([
+          [celex, 'Judicial Information Notice'],
+        ]);
+        expect(structured.cases[0]).not.toHaveProperty('ecli');
+        expect(structured).toMatchObject({ total: 1, has_more: false });
+        expect(structured).not.toHaveProperty('next_offset');
+        expect(structured.query_echo.include_derivative).toBe(true);
+        expect(notice).toBe(FALLBACK_NOTICE);
+        expect(text).toContain(`### ${celex}`);
+        expect(text).toContain('**Type:** Judicial Information Notice');
+        expect(read).toContain('include_derivative=true');
+        expect(read).not.toContain('include_derivative=false');
+        expect(read).toContain(`⟨blockquote_open⟩\n\n${notice}\n\n⟨blockquote_close⟩`);
+        expect(pageQueries()).toHaveLength(2);
+      },
+    );
+
+    it('re-runs the page query an include_derivative call sends, in the same call budget', async () => {
+      serveRecords();
+      await runToolContract(eurlex_get_cases, {
+        case_number: 'C-866/25',
+        include_derivative: true,
+      });
+      const [included] = pageQueries();
+      mockQuery.mockClear();
+
+      const ctx = createMockContext({ errors: eurlex_get_cases.errors });
+      await eurlex_get_cases.handler(
+        eurlex_get_cases.input.parse({ case_number: 'C-866/25' }),
+        ctx,
+      );
+
+      const [first, requery] = pageQueries();
+      expect(first).toContain('FILTER NOT EXISTS');
+      expect(requery).toBe(included);
+      // The service keys the call's shared SPARQL deadline by its context.
+      const pageCalls = mockQuery.mock.calls.filter((call) => isPageQuery(call[0] as string));
+      expect(pageCalls.map((call) => call[1])).toEqual([ctx, ctx]);
+    });
+
+    it.each([
+      ['court CJEU, the number’s own court', { court: 'CJEU' }],
+      [
+        'every other filter sent blank',
+        {
+          court: '',
+          keyword: '  ',
+          case_type: '',
+          member_state: ' ',
+          procedure_type: '',
+          outcome: '',
+          subject: '  ',
+          date_from: '',
+          date_to: '',
+        },
+      ],
+    ])('falls back with %s', async (_label, extra) => {
+      serveRecords();
+
+      const { structured, notice } = surfaces(
+        await runToolContract(eurlex_get_cases, { case_number: 'C-866/25', ...extra }),
+      );
+
+      expect(structured.cases.map((c) => c.celex_number)).toEqual(['62025CN0866']);
+      expect(structured.query_echo.include_derivative).toBe(true);
+      expect(notice).toBe(FALLBACK_NOTICE);
+    });
+
+    it('does not fall back under court GC, which can never hold a C- case, and offers removing court', async () => {
+      serveRecords();
+
+      const { structured, notice } = surfaces(
+        await runToolContract(eurlex_get_cases, { case_number: 'C-866/25', court: 'GC' }),
+      );
+
+      expect(structured.cases).toEqual([]);
+      expect(structured.query_echo.include_derivative).toBe(false);
+      expect(notice).toBe(
+        'No case law records matched the search criteria (case_number=C-866/25, celex_fragment=2025C*0866, court=GC, include_derivative=false). Broaden the search by trying a different case_number or removing court.',
+      );
+      expect(pageQueries()).toHaveLength(1);
+    });
+
+    it('pages a fallback page with a continuation that names include_derivative', async () => {
+      serveRecords();
+
+      const first = surfaces(
+        await runToolContract(eurlex_get_cases, { case_number: 'C-2/25', limit: 1 }),
+      );
+
+      expect(first.structured.cases.map((c) => c.celex_number)).toEqual(['62025CB0002']);
+      expect(first.structured).toMatchObject({ total: 1, has_more: true, next_offset: 1 });
+      expect(first.structured.query_echo.include_derivative).toBe(true);
+      expect(first.notice).toBe(
+        `${FALLBACK_NOTICE} More records match beyond this page; call again with include_derivative=true and offset=1.`,
+      );
+      expect(first.text).toContain('**Next offset:** 1');
+      expect(first.read).toContain(`⟨blockquote_open⟩\n\n${first.notice}\n\n⟨blockquote_close⟩`);
+
+      // The continuation the notice names reads the next record.
+      mockQuery.mockClear();
+      const second = surfaces(
+        await runToolContract(eurlex_get_cases, {
+          case_number: 'C-2/25',
+          limit: 1,
+          include_derivative: true,
+          offset: 1,
+        }),
+      );
+      expect(second.structured.cases.map((c) => c.celex_number)).toEqual(['62025CN0002']);
+      expect(second.structured.has_more).toBe(false);
+      expect(pageQueries()).toHaveLength(1);
+    });
+
+    it('says no derivative record is filed under C-990/12 after its second page query', async () => {
+      serveRecords();
+
+      const { structured, notice, read } = surfaces(
+        await runToolContract(eurlex_get_cases, { case_number: 'C-990/12' }),
+      );
+
+      expect(structured.cases).toEqual([]);
+      expect(structured.query_echo.include_derivative).toBe(false);
+      expect(notice).toBe(
+        `No case law records matched the search criteria (case_number=C-990/12, celex_fragment=2012C*0990, include_derivative=false). ${NONE_FILED} Broaden the search by trying a different case_number.`,
+      );
+      expect(read).toContain(`⟨blockquote_open⟩\n\n${notice}\n\n⟨blockquote_close⟩`);
+      expect(pageQueries()).toHaveLength(2);
+    });
+
+    it('does not offer removing court when it names the case number’s own court', async () => {
+      serveRecords();
+
+      const { notice } = surfaces(
+        await runToolContract(eurlex_get_cases, { case_number: 'C-990/12', court: 'CJEU' }),
+      );
+
+      expect(notice).toBe(
+        `No case law records matched the search criteria (case_number=C-990/12, celex_fragment=2012C*0990, court=CJEU, include_derivative=false). ${NONE_FILED} Broaden the search by trying a different case_number.`,
+      );
+      expect(pageQueries()).toHaveLength(2);
+    });
+
+    it('does not offer removing the own court beside a filter that disables the fallback', async () => {
+      serveRecords();
+
+      const { notice } = surfaces(
+        await runToolContract(eurlex_get_cases, {
+          case_number: 'T-97/23',
+          court: 'GC',
+          date_to: '2020-12-31',
+        }),
+      );
+
+      expect(notice).toBe(
+        'No case law records matched the search criteria (case_number=T-97/23, celex_fragment=2023T*0097, court=GC, include_derivative=false, date_to=2020-12-31). Broaden the search by trying a different case_number or expanding the date range.',
+      );
+      expect(pageQueries()).toHaveLength(1);
+    });
+  });
+
+  describe('a re-query CELLAR does not answer', () => {
+    it.each([
+      [
+        'a spent call budget',
+        () => serviceUnavailable(BUDGET_SPENT, { reason: 'sparql_timeout', retryable: true }),
+      ],
+      [
+        'an outage',
+        () =>
+          serviceUnavailable('CELLAR SPARQL HTTP 503 (failed after 4 attempts)', { status: 503 }),
+      ],
+    ])(
+      'keeps the empty page after %s, saying the records went unchecked',
+      async (_label, error) => {
+        serveRecords(async () => {
+          throw error();
+        });
+
+        const { structured, notice, read } = surfaces(
+          await runToolContract(eurlex_get_cases, { case_number: 'C-866/25' }),
+        );
+
+        expect(structured).toMatchObject({ cases: [], total: 0, has_more: false });
+        expect(structured.query_echo.include_derivative).toBe(false);
+        expect(notice).toBe(
+          `No case law records matched the search criteria (case_number=C-866/25, celex_fragment=2025C*0866, include_derivative=false). ${UNCHECKED} Broaden the search by trying a different case_number.`,
+        );
+        expect(read).toContain(`⟨blockquote_open⟩\n\n${notice}\n\n⟨blockquote_close⟩`);
+        expect(pageQueries()).toHaveLength(2);
+      },
+    );
+
+    it('ends the call when the caller cancels during the re-query', async () => {
+      const controller = new AbortController();
+      serveRecords(async () => {
+        controller.abort();
+        throw serviceUnavailable('CELLAR SPARQL request aborted', { reason: 'sparql_timeout' });
+      });
+
+      await expect(
+        eurlex_get_cases.handler(
+          eurlex_get_cases.input.parse({ case_number: 'C-866/25' }),
+          createMockContext({ errors: eurlex_get_cases.errors, signal: controller.signal }),
+        ),
+      ).rejects.toThrow('aborted');
+      expect(pageQueries()).toHaveLength(2);
+    });
+
+    it('fails with sparql_error when CELLAR rejects the re-query', async () => {
+      serveRecords(async () => {
+        throw validationError('CELLAR SPARQL error: Virtuoso 37000 Error SQ156', {
+          reason: 'sparql_error',
+          retryable: false,
+        });
+      });
+
+      const result = await runToolContract(eurlex_get_cases, { case_number: 'C-866/25' });
+
+      expect(result.isError).toBe(true);
+      const error = (
+        result.structuredContent as { error?: { code?: number; data?: { reason?: string } } }
+      ).error;
+      expect(error?.code).toBe(JsonRpcErrorCode.ValidationError);
+      expect(error?.data?.reason).toBe('sparql_error');
+      expect(contentText(result)).toContain('CELLAR SPARQL error');
+    });
+  });
+});
+
+// --- CELLAR refuses a SPARQL POST body over 8,192 bytes with HTTP 403 ---
+
+describe('eurlex_get_cases request size', () => {
+  beforeEach(() => {
+    mockQuery.mockReset();
+    mockMaxResults = 100;
+  });
+
+  const BODY_LIMIT_BYTES = 8_192;
+  const SUBJECT_MATTER =
+    'http://publications.europa.eu/resource/authority/case-law-subject-matter/';
+
+  /** The form-encoded POST body the real CELLAR service sends for `sparql`, in bytes. */
+  async function wireBytes(sparql: string): Promise<number> {
+    const actual = await vi.importActual<
+      typeof import('@/services/cellar-sparql/cellar-sparql-service.js')
+    >('@/services/cellar-sparql/cellar-sparql-service.js');
+    const svc = new actual.CellarSparqlService({} as never, {} as never, {
+      cellarSparqlEndpoint: 'http://cellar.test/sparql',
+      eurLexContentBaseUrl: 'http://content.test',
+      sparqlQueryTimeoutMs: 5_000,
+      maxSparqlResults: 100,
+    });
+    let bytes = 0;
+    vi.stubGlobal('fetch', async (_url: string, init: { body: string }) => {
+      bytes = Buffer.byteLength(init.body);
+      return new Response(JSON.stringify({ head: { vars: [] }, results: { bindings: [] } }));
+    });
+    try {
+      await svc.queryWithContinuation(sparql, createMockContext());
+    } finally {
+      vi.unstubAllGlobals();
+    }
+    return bytes;
+  }
+
+  /** The concept IRIs a page query's `VALUES ?subject` list names, prefixed names expanded. */
+  function subjectValues(sparql: string): string[] {
+    const prefixes = new Map(
+      [...sparql.matchAll(/PREFIX (\w*): <([^>]*)>/g)].map(([, name, iri]) => [name, iri]),
+    );
+    const values = /VALUES \?subject \{([^}]*)\}/.exec(sparql)?.[1] ?? '';
+    return values
+      .trim()
+      .split(/\s+/)
+      .map((term) => {
+        if (term.startsWith('<')) return term.slice(1, -1);
+        const [name = '', local = ''] = term.split(':');
+        const iri = prefixes.get(name);
+        if (iri === undefined) throw new Error(`Undeclared prefix in ${term}`);
+        return `${iri}${local}`;
+      });
+  }
+
+  it('reads a 100-row page and its facts in queries CELLAR accepts, facts on every row', async () => {
+    const work = (i: number) =>
+      `${CELLAR}${String(i).padStart(8, '0')}-8b3f-11e3-8c37-01aa75ed71a1`;
+    const celexFor = (i: number) => `62024CJ${String(i).padStart(4, '0')}`;
+    mockQuery.mockImplementation(async (sparql: string) => {
+      if (isResolutionQuery(sparql)) {
+        return requestedCelex(sparql).map((celex) =>
+          makeCaseBinding(celex, { workUri: work(Number(celex.slice(-4))) }),
+        );
+      }
+      if (isCaseLawFactsQuery(sparql)) {
+        // Each work named in this facts query, and only those, answer with their country.
+        const named = /VALUES \?work \{([^}]*)\}/.exec(sparql)?.[1] ?? '';
+        return [...named.matchAll(/<([^>]+)>/g)].map(([, uri]) => ({
+          work: { type: 'uri', value: uri ?? '' },
+          fact: { type: 'literal', value: 'countries' },
+          code: {
+            type: 'uri',
+            value: 'http://publications.europa.eu/resource/authority/country/AUT',
+          },
+        }));
+      }
+      return Array.from({ length: 101 }, (_, i) =>
+        makeCaseBinding(celexFor(i), { date: '2024-06-01' }),
+      );
+    });
+
+    const result = await runToolContract(eurlex_get_cases, { keyword: 'competition', limit: 100 });
+
+    expect(result.isError).toBeFalsy();
+    const structured = eurlex_get_cases.output.parse(result.structuredContent);
+    expect(structured.cases).toHaveLength(100);
+    expect(structured.cases.every((c) => c.countries?.[0] === 'AUT')).toBe(true);
+    expect((contentText(result).match(/\*\*Countries:\*\* AUT/g) ?? []).length).toBe(100);
+    const sent = mockQuery.mock.calls.map((call) => call[0] as string);
+    for (const sparql of sent) {
+      expect(await wireBytes(sparql), sparql.slice(0, 80)).toBeLessThanOrEqual(BODY_LIMIT_BYTES);
+    }
+    // Every work of the page is read for its facts exactly once.
+    const factWorks = sent
+      .filter(isCaseLawFactsQuery)
+      .flatMap((sparql) => [...sparql.matchAll(/<([^>]+-8b3f-[^>]+)>/g)].map(([, uri]) => uri));
+    expect(factWorks.sort()).toEqual(Array.from({ length: 100 }, (_, i) => work(i)).sort());
+  });
+
+  it('names every concept of a subject matching all 185 labels in a page query CELLAR accepts', async () => {
+    // As long as CELLAR's longest code (9 characters), each label holding "e".
+    const concepts = Array.from(
+      { length: 185 },
+      (_, i) => `${SUBJECT_MATTER}S${String(i).padStart(8, '0')}`,
+    );
+    mockQuery.mockImplementation(async (sparql: string) => {
+      if (sparql.includes('skos:inScheme')) {
+        return concepts.map((concept, i) => ({
+          concept: { type: 'uri', value: concept },
+          label: { type: 'literal', value: `Subject ${i}` },
+        }));
+      }
+      return [];
+    });
+
+    const result = await runToolContract(eurlex_get_cases, { subject: 'e', limit: 100 });
+
+    expect(result.isError).toBeFalsy();
+    const page = mockQuery.mock.calls
+      .map((call) => call[0] as string)
+      .find((sparql) => sparql.includes('GROUP BY ?celexNumber'));
+    expect(subjectValues(page ?? '')).toEqual([...concepts].sort());
+    expect(await wireBytes(page ?? '')).toBeLessThanOrEqual(BODY_LIMIT_BYTES);
   });
 });
