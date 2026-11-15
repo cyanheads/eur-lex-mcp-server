@@ -170,7 +170,63 @@ describe('eurlex_comparative_analysis', () => {
         eurlex_comparative_analysis.args!.parse({ domain: 'antitrust' }),
       );
 
-      expect(step(text, 5)).toContain('**courtlistener_search_opinions** with query "antitrust"');
+      expect(step(text, 7)).toContain('**courtlistener_search_opinions** with query "antitrust"');
+    });
+  });
+
+  // --- #203: the EU plan reaches CJEU case law ---
+
+  describe('EU case-law steps (#203)', () => {
+    const step = (text: string, n: number) =>
+      new RegExp(`^${n}\\. [\\s\\S]*?(?=^\\d+\\. |^### |^## )`, 'm').exec(text)?.[0] ?? '';
+
+    it('step 5 searches CJEU judgments by case-law subject, with the keyword fallback', async () => {
+      const text = await renderText(
+        eurlex_comparative_analysis.args!.parse({ domain: 'antitrust' }),
+      );
+      const fifth = step(text, 5);
+
+      expect(fifth).toContain('**eurlex_get_cases**');
+      for (const name of [
+        '`subject`',
+        '`case_type: "judgment"`',
+        '`date_from`',
+        '`query_echo.subject_labels`',
+        '`keyword`',
+      ]) {
+        expect(fifth).toContain(name);
+      }
+      expect(fifth).toContain('"competition"');
+      expect(fifth).toContain('"personal data"');
+      expect(fifth).toMatch(/"competition law"[^.]*match no/);
+    });
+
+    it('step 6 reads the rulings interpreting the key acts and the treaty articles', async () => {
+      const text = await renderText(
+        eurlex_comparative_analysis.args!.parse({ domain: 'antitrust' }),
+      );
+      const sixth = step(text, 6);
+
+      expect(sixth).toContain('**eurlex_get_relations**');
+      expect(sixth).toContain('`interpreted_by`');
+      expect(sixth).toContain('`legal_basis`');
+      expect(sixth).toContain('`12016E101`');
+      expect(sixth).toContain('`12016E102`');
+    });
+
+    it('keeps the US steps last and the EU legislation steps unchanged', async () => {
+      const text = await renderText(
+        eurlex_comparative_analysis.args!.parse({ domain: 'antitrust' }),
+      );
+
+      expect(text.indexOf('### US Side')).toBeGreaterThan(text.indexOf(step(text, 6)));
+      expect(step(text, 4)).toContain('**eurlex_get_relations** on key acts');
+      expect(step(text, 8)).toContain('federal statutes or regulations');
+    });
+
+    it('names the case-law tools in the prompt description', () => {
+      expect(eurlex_comparative_analysis.description).toContain('eurlex_get_cases');
+      expect(eurlex_comparative_analysis.description).toContain('eurlex_get_relations');
     });
   });
 

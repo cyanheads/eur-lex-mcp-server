@@ -77,7 +77,7 @@ function matchFocusToAxis(focus: string): AxisKey | null {
 
 export const eurlex_comparative_analysis = prompt('eurlex_comparative_analysis', {
   description:
-    'Frame a comparative legal analysis of a policy domain across EU and US law, driving eurlex_search_documents and eurlex_get_document for the EU side and courtlistener_search_opinions for the US counterpart.',
+    'Frame a comparative legal analysis of a policy domain across EU and US law, driving eurlex_search_documents, eurlex_get_document, eurlex_get_cases, and eurlex_get_relations for the EU side and courtlistener_search_opinions for the US counterpart.',
   args: z.object({
     domain: z
       .string()
@@ -134,10 +134,12 @@ export const eurlex_comparative_analysis = prompt('eurlex_comparative_analysis',
    - For a landmark act you already know by citation (e.g. "Regulation (EU) 2016/679"), call **eurlex_lookup_celex** to resolve it to its CELEX number.
 3. Call **eurlex_get_document** on the most significant act(s) to retrieve full text and metadata.
 4. Call **eurlex_get_relations** on key acts to understand the legislative history and amendments.
+5. Call **eurlex_get_cases** for the Court of Justice's case law: \`subject\` set to a short case-law subject label for the field ("competition", "personal data", "food safety", "state aid"), \`case_type: "judgment"\`, and \`date_from\` five years back, then read \`query_echo.subject_labels\` for the subjects the phrase covered. The case-law classification is coarser than EuroVoc: "competition law", "rules on competition", "food law", and "artificial intelligence" match no label and return an empty page. When no label fits, search case titles with \`keyword\` instead; an empty result in a new field can mean the Court has not ruled there yet.
+6. Call **eurlex_get_relations** with \`interpreted_by\` in \`relation_types\` for the rulings that interpret the key acts from step 2, the treaty articles their \`legal_basis\` relation returns (e.g. \`12012E016\` for the GDPR), and, in a field the Treaties govern directly, those articles themselves (\`12016E101\` and \`12016E102\` for Articles 101 and 102 TFEU).
 
 ### US Side
-5. Call **courtlistener_search_opinions** with query "${domain}" to find significant US court decisions.
-6. Supplement with relevant federal statutes or regulations where applicable.
+7. Call **courtlistener_search_opinions** with query "${domain}" to find significant US court decisions.
+8. Supplement with relevant federal statutes or regulations where applicable.
 
 ## Analysis Framework
 
