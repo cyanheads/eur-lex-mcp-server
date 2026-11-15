@@ -46,7 +46,7 @@ CELLAR stores most relations one way only. The reverse-named predicates (`…ame
 | What `?act` repeals, explicitly or implicitly | `?act cdm:resource_legal_repeals_resource_legal ?old` · `?act cdm:resource_legal_implicitly_repeals_resource_legal ?old` |
 | Consolidated texts of `?act` | `?cons cdm:act_consolidated_based_on_resource_legal ?act ; cdm:act_consolidated_date ?asOf` |
 | Corrigenda of `?act` | `?corr cdm:resource_legal_corrects_resource_legal ?act` |
-| Rulings interpreting `?act` | `?ruling cdm:case-law_interpretes_resource_legal ?act` |
+| Rulings interpreting `?act` | `?ruling cdm:case-law_interpretes_resource_legal ?act`. For a treaty provision, query all four version works (`VALUES ?act { … }`), since rulings sit mostly on the 2007 and 2008 versions |
 | Legal basis of `?act` | `?act cdm:resource_legal_based_on_resource_legal ?basis` |
 | The proposal `?act` adopts | `?act cdm:resource_legal_adopts_resource_legal ?proposal` |
 | National measures transposing `?dir` | `?measure cdm:measure_national_implementing_implements_resource_legal ?dir` |
