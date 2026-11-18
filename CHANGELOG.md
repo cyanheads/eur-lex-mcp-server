@@ -4,7 +4,7 @@ All notable changes to this project. Each entry links to its full per-version fi
 
 ## [0.21.0](changelog/0.21.x/0.21.0.md) — 2026-11-17 · ⚠️ Breaking
 
-eurlex_lookup_celex resolves treaty-article citations such as Article 102 TFEU, both document resources read a percent-encoded CELEX, and a request over CELLAR's 8,192-byte limit fails as request_too_large without being sent. Breaking: a typed eurlex_search_documents with no date bound has less room for keyword.
+eurlex_lookup_celex resolves treaty-article citations such as Article 102 TFEU, both document resources read a percent-encoded CELEX, and a request over CELLAR's 8,192-byte limit fails as request_too_large without being sent. Breaking: a typed eurlex_search_documents with no date bound has less room for keyword and author_institution.
 
 ## [0.20.3](changelog/0.20.x/0.20.3.md) — 2026-11-14
 
