@@ -935,7 +935,7 @@ export const eurlex_get_document = tool('eurlex_get_document', {
     {
       reason: 'not_found',
       code: JsonRpcErrorCode.NotFound,
-      when: 'The CELEX, ELI, or work URI resolves to no fetchable work — the work is absent from the corpus, or the CELLAR work (for an expression or manifestation URI, the work it belongs to) carries no CELEX number. A celex_number one numbering convention away from a CELEX CELLAR holds — a consolidated CELEX with no date or a date no version carries, a (nn) suffix missing or extra, a number not zero-padded to four digits — fails with each held CELEX named in the message and in data.held_celex, unless resolve "current_consolidated" serves one.',
+      when: 'The CELEX, ELI, or work URI resolves to no fetchable work — the work is absent from the corpus, or the CELLAR work (for an expression or manifestation URI, the work it belongs to) carries no CELEX number. A celex_number one numbering convention away from a CELEX CELLAR holds — a consolidated CELEX with no date or a date no version carries, a (nn) suffix missing or extra, a number not zero-padded to four digits, or to three for a Lisbon treaty article — fails with each held CELEX named in the message and in data.held_celex, unless resolve "current_consolidated" serves one.',
       recovery:
         'Verify the identifier with eurlex_lookup_celex; a CELLAR work with no CELEX cannot be fetched as a document.',
     },
@@ -961,6 +961,14 @@ export const eurlex_get_document = tool('eurlex_get_document', {
       when: "A query this call sent to CELLAR ran past the time budget the call's queries share (retryable: CELLAR's response time varies, so a later call can finish), or CELLAR refused it as too costly to run (not retryable: the same query is refused again). Neither is retried within the call, apart from one re-send, inside the same budget, of a lookup CELLAR leaves unanswered for 20 s.",
       recovery:
         "When the error is retryable, call again shortly: whether the call's queries finish inside their time budget turns on CELLAR's response time, not on the request.",
+      thrownBy: 'service',
+    },
+    {
+      reason: 'request_too_large',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A query built from celex_number, eli_uri, or work_uri is over the 8,192 bytes CELLAR accepts in one request, which only a value thousands of characters long reaches. It is refused before it is sent.',
+      recovery:
+        "Pass celex_number, eli_uri, or work_uri as CELLAR writes it: no CELEX, ELI, or work URI is long enough to reach CELLAR's 8,192-byte request limit, so a value this long names no work.",
       thrownBy: 'service',
     },
   ],

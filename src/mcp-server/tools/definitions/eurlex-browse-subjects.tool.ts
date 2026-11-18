@@ -160,6 +160,14 @@ export const eurlex_browse_subjects = tool('eurlex_browse_subjects', {
         'Use a longer, more specific keyword so fewer labels match, or a smaller limit, then search again.',
       thrownBy: 'service',
     },
+    {
+      reason: 'request_too_large',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'The thesaurus query, which repeats keyword about a dozen times, is over the 8,192 bytes CELLAR accepts in one request: about 550 characters of words in keyword reach it, and fewer of punctuation or non-ASCII, which take three bytes or more each. It is refused before it is sent.',
+      recovery:
+        'Shorten keyword to the term itself: the thesaurus query repeats it about a dozen times, and CELLAR refuses a request over 8,192 bytes.',
+      thrownBy: 'service',
+    },
   ],
 
   async handler(input, ctx) {

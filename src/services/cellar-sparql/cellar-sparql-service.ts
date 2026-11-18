@@ -1,7 +1,7 @@
 /**
  * @fileoverview CellarSparqlService — HTTP client for the EU Publications Office CELLAR
- * Virtuoso SPARQL endpoint. Handles POST queries, LIMIT enforcement, and classification
- * of Virtuoso error bodies on any HTTP status.
+ * Virtuoso SPARQL endpoint. Handles POST queries, LIMIT enforcement, the endpoint's
+ * request-size limit, and classification of Virtuoso error bodies on any HTTP status.
  * @module services/cellar-sparql/cellar-sparql-service
  */
 
@@ -11,13 +11,12 @@ import { McpError, serviceUnavailable, validationError } from '@cyanheads/mcp-ts
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { defaultIsTransient, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import type { ServerConfig } from '@/config/server-config.js';
+import {
+  CELLAR_REQUEST_LIMIT_BYTES,
+  sparqlRequestBody,
+  withSparqlPrefixes,
+} from './sparql-request-body.js';
 import type { SparqlBinding, SparqlResultsJson } from './types.js';
-
-/** Required PREFIX declarations for CELLAR CDM ontology queries. */
-const SPARQL_PREFIXES = `PREFIX cdm: <http://publications.europa.eu/ontology/cdm#>
-PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
-PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
-`;
 
 /**
  * A Virtuoso error body (`Virtuoso <SQLSTATE> Error <code>: …`), capturing a
@@ -341,6 +340,9 @@ export class CellarSparqlService {
    * POST a SPARQL query to CELLAR and return the parsed SPARQL-results JSON
    * envelope (`head` + `results`) alongside whether the `maxResults` ceiling
    * rewrote the query. Shared by `query`, `queryWithContinuation`, and `queryWithVars`.
+   *
+   * @throws `ValidationError` with `reason: 'request_too_large'`, and nothing sent,
+   *   when the request body is over {@link CELLAR_REQUEST_LIMIT_BYTES}.
    */
   private async execute(
     rawQuery: string,
@@ -348,6 +350,30 @@ export class CellarSparqlService {
     timeoutMs: number | undefined,
     { boundOuterResult, limitCeiling, resendStalled }: ExecuteOptions,
   ): Promise<{ parsed: SparqlResultsJson; limitEnforced: boolean }> {
+    const { query: cappedQuery, enforced: limitEnforced } = enforceLimitInQuery(
+      withSparqlPrefixes(rawQuery),
+      limitCeiling,
+      boundOuterResult,
+    );
+    const body = sparqlRequestBody(cappedQuery);
+    /*
+     * CELLAR refuses a longer body with HTTP 403 on every attempt (#206), so it is never
+     * sent. Checked before the time budget: a refusal that every call meets is reported
+     * as itself, never as a spent budget a later call could clear. The recovery is the
+     * calling tool's, naming the input that sized the query.
+     */
+    if (body.length > CELLAR_REQUEST_LIMIT_BYTES) {
+      throw validationError(
+        `CELLAR accepts a SPARQL request of at most ${CELLAR_REQUEST_LIMIT_BYTES.toLocaleString('en-US')} bytes; this one is ${body.length.toLocaleString('en-US')} bytes form-encoded, so it was not sent.`,
+        {
+          reason: 'request_too_large',
+          retryable: false,
+          requestBytes: body.length,
+          limitBytes: CELLAR_REQUEST_LIMIT_BYTES,
+        },
+      );
+    }
+
     const effectiveTimeoutMs = timeoutMs ?? this.timeoutMs;
     // A per-query timeout above the configured one (eurlex_query_sparql's
     // timeout_hint on a deployment that lowered it) sizes the budget, never the reverse.
@@ -364,13 +390,6 @@ export class CellarSparqlService {
       );
     const callBudgetMs = deadline - Date.now();
     if (callBudgetMs <= 0) throw budgetSpent();
-
-    const withPrefixes = rawQuery.includes('PREFIX cdm:') ? rawQuery : SPARQL_PREFIXES + rawQuery;
-    const { query: cappedQuery, enforced: limitEnforced } = enforceLimitInQuery(
-      withPrefixes,
-      limitCeiling,
-      boundOuterResult,
-    );
 
     let firstAttempt = true;
     const parsed = await withRetry(
@@ -390,10 +409,6 @@ export class CellarSparqlService {
         firstAttempt = false;
         const stallTimer = stall && setTimeout(() => stall.abort(), STALL_RESEND_MS);
         const sentAt = Date.now();
-        const body = new URLSearchParams({
-          query: cappedQuery,
-          format: 'application/sparql-results+json',
-        });
         let response: Response;
         let text: string;
         // The body read sits inside the try too: the fetch signal still bounds it, so
@@ -405,7 +420,7 @@ export class CellarSparqlService {
               'Content-Type': 'application/x-www-form-urlencoded',
               Accept: 'application/sparql-results+json',
             },
-            body: body.toString(),
+            body,
             // The caller's cancellation (ctx.signal, carried by withRetry) aborts the
             // request in flight; without it a cancelled call ran to completion (#122).
             signal: AbortSignal.any([
@@ -451,7 +466,7 @@ export class CellarSparqlService {
           if (response.status === 400) throw sparqlError(text);
           // CELLAR answers compile and sort-window errors with HTTP 500. Those fail the
           // same way on every attempt; a gateway page, an empty body, or a Virtuoso
-          // state that can clear stays a retryable outage.
+          // state that can clear stays a retryable outage (a 403 is sent once; see isTransient).
           const failure = virtuosoFailure(text);
           if (failure?.deterministic) throw failure.error;
           throw serviceUnavailable(`CELLAR SPARQL HTTP ${response.status}`, {
@@ -478,12 +493,20 @@ export class CellarSparqlService {
         baseDelayMs: 1500,
         signal: ctx.signal,
         deadlineMs: callBudgetMs,
-        // One attempt per query for every `sparql_timeout`: a retryable one is the
-        // caller's to retry, never this ladder's (#78). A stalled first request is
-        // sent again (#193); outages keep the default.
+        /*
+         * One attempt per query for every `sparql_timeout`: a retryable one is the
+         * caller's to retry, never this ladder's (#78). One for an HTTP 403 too: it is
+         * CELLAR's load balancer refusing the request, and no refusal seen there has
+         * cleared on a re-send seconds later (#206). It stays an outage with no reason,
+         * since its page names no cause. A stalled first request is sent again (#193);
+         * other outages keep the default.
+         */
         isTransient: (error) =>
           error instanceof StalledRequest ||
-          (!(error instanceof McpError && error.data?.reason === 'sparql_timeout') &&
+          (!(
+            error instanceof McpError &&
+            (error.data?.reason === 'sparql_timeout' || error.data?.status === 403)
+          ) &&
             defaultIsTransient(error)),
       },
     ).catch((error: unknown) => {

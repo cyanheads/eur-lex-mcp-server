@@ -256,7 +256,7 @@ export const eurlex_query_sparql = tool('eurlex_query_sparql', {
       .string()
       .min(10)
       .describe(
-        'A read-only SPARQL SELECT query. Leading comments and PREFIX/BASE declarations are allowed; the cdm:, skos:, and xsd: prefixes are auto-injected. LIMIT is injected at the server row cap (100 unless the deployment configures a lower one) if absent, or capped to it; to read past the cap, add ORDER BY and repeat the query with OFFSET raised by the cap (a sorted query reaches row 10,000 at most). Key CDM predicates: cdm:resource_legal_id_celex (CELEX), cdm:work_date_document (date), cdm:work_has_resource-type (type), cdm:work_is_about_concept_eurovoc (EuroVoc subject), cdm:work_cites_work (citation). CELEX is an xsd:string literal — match it as a typed triple, ?work cdm:resource_legal_id_celex "32016R0679"^^xsd:string (an untyped literal matches nothing, in a triple or in FILTER(?celex = "…"), and a FILTER(STR(…)) comparison scans every CELEX). For text, use bif:contains with a single-quoted phrase.',
+        'A read-only SPARQL SELECT query. Leading comments and PREFIX/BASE declarations are allowed; the cdm:, skos:, and xsd: prefixes are auto-injected. LIMIT is injected at the server row cap (100 unless the deployment configures a lower one) if absent, or capped to it; to read past the cap, add ORDER BY and repeat the query with OFFSET raised by the cap (a sorted query reaches row 10,000 at most). CELLAR accepts a request of at most 8,192 bytes form-encoded, the injected prefixes and LIMIT included, which leaves the query about 7,900: a letter, digit, space, or -._* takes one byte, any other ASCII character three, and a non-ASCII one six or more. A longer request fails as request_too_large without being sent. Key CDM predicates: cdm:resource_legal_id_celex (CELEX), cdm:work_date_document (date), cdm:work_has_resource-type (type), cdm:work_is_about_concept_eurovoc (EuroVoc subject), cdm:work_cites_work (citation). CELEX is an xsd:string literal — match it as a typed triple, ?work cdm:resource_legal_id_celex "32016R0679"^^xsd:string (an untyped literal matches nothing, in a triple or in FILTER(?celex = "…"), and a FILTER(STR(…)) comparison scans every CELEX). For text, use bif:contains with a single-quoted phrase.',
       ),
     timeout_hint: z
       .number()
@@ -343,6 +343,14 @@ export const eurlex_query_sparql = tool('eurlex_query_sparql', {
       when: "The query ran past the client-side timeout (timeout_hint, default 55 s; retryable: CELLAR's response time varies, so a later run can finish, though a query slower than its timeout fails every run), or Virtuoso refused it as over its estimated-cost limit (not retryable: the same query is refused again). Neither is retried within the call, which fails inside the configured bound.",
       recovery:
         'Narrow the query with more specific FILTER conditions or a smaller LIMIT: Virtuoso refuses a too-costly query every time, and a query slower than its timeout fails every run. When the error is retryable, a later run can also finish once CELLAR answers faster.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'request_too_large',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'The form-encoded request, the injected prefixes and LIMIT included, is over the 8,192 bytes CELLAR accepts. It is refused before it is sent, and the same query is refused again.',
+      recovery:
+        "Shorten the query until its form-encoded request fits CELLAR's 8,192-byte limit: drop comments and indentation, or split a long VALUES list across several queries.",
       thrownBy: 'service',
     },
   ],

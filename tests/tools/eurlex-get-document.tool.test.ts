@@ -687,6 +687,7 @@ describe('eurlex_get_document', () => {
       'content_challenge',
       'sparql_error',
       'sparql_timeout',
+      'request_too_large',
     ]);
   });
 

@@ -714,6 +714,41 @@ describe('CellarSparqlService non-200 bodies (#145)', () => {
     expect(error.data?.reason).toBeUndefined();
   });
 
+  /*
+   * CELLAR's load balancer answers a refused request with this page (captured
+   * 2026-11-17), and a re-send of the same request is refused the same way (#206).
+   * A request over the size limit never reaches it; one within the limit is sent once.
+   */
+  it('sends a request CELLAR answers with HTTP 403 once, reporting the outage with its status', async () => {
+    const fetchMock = stubStatus(
+      403,
+      '<html>\r\n<head><title>403 Forbidden</title></head>\r\n<body>\r\n<center><h1>403 Forbidden</h1></center>\r\n</body>\r\n</html>\r\n',
+    );
+
+    const error = await rejectionOfQuery();
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+    expect(error.message).toBe('CELLAR SPARQL HTTP 403');
+    // No reason, no retryAttempts, and no retryable flag: a later call may be answered.
+    expect(error.data).toEqual({ status: 403 });
+  });
+
+  it('ends the retry ladder at a 403 that answers a retried outage', async () => {
+    const statuses = [502, 403];
+    const fetchMock = vi.fn(async () => {
+      const status = statuses.shift() ?? 200;
+      return { ok: false, status, text: async () => (status === 502 ? GATEWAY_PAGE : '') };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const error = await rejectionOfQuery();
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(error.message).toBe('CELLAR SPARQL HTTP 403');
+    expect(error.data).toEqual({ status: 403 });
+  });
+
   it('stops retrying an outage once the next backoff would outlast the budget, reporting the outage', async () => {
     const fetchMock = stubStatus(502, GATEWAY_PAGE);
 
@@ -1328,5 +1363,174 @@ describe('CellarSparqlService stalled lookup re-send (#193)', () => {
     const text = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
     expect(text).toContain(BUDGET_SPENT.message);
     expect(text.trimEnd().endsWith('(reason sparql_timeout · retryable)')).toBe(true);
+  });
+});
+
+// --- #206: CELLAR refuses a request body over 8,192 bytes, so none is sent ---
+//
+// CELLAR's load balancer answers a form-encoded POST body over 8,192 bytes with HTTP
+// 403, counting the whole body. The service measures the body it would send — the
+// PREFIX block it prepends and the LIMIT it appends or rewrites included — and
+// refuses a longer one before any request, as a typed input error.
+
+describe('CellarSparqlService request size limit (#206)', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  /** A fetch answering every request with no rows; `bodies` holds each body sent. */
+  function stubRecording(): { fetchMock: ReturnType<typeof vi.fn>; bodies: string[] } {
+    const bodies: string[] = [];
+    const fetchMock = vi.fn(async (_url: string, init: { body: string }) => {
+      bodies.push(init.body);
+      return { ok: true, status: 200, text: async () => JSON.stringify(rowsPayload(0)) };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return { fetchMock, bodies };
+  }
+
+  /*
+   * A query every entry point sends as written: its top-level LIMIT 1 is under every
+   * ceiling, and a comment line takes the padding. Form-encoded behind the 222-byte
+   * PREFIX block the service prepends, inside the 49-byte `query=…&format=…` frame, it
+   * takes 325 bytes, so 7,867 single-byte characters of padding make 8,192.
+   */
+  const BOUNDED = 'SELECT ?s WHERE { ?s ?p ?o } LIMIT 1\n#';
+  const BOUNDED_ROOM = 7_867;
+
+  const REFUSAL = {
+    code: JsonRpcErrorCode.ValidationError,
+    data: { reason: 'request_too_large', retryable: false, requestBytes: 8_193, limitBytes: 8_192 },
+  };
+
+  type EntryPoint = (svc: CellarSparqlService, query: string, ctx: Context) => Promise<unknown>;
+  const ENTRY_POINTS: [string, EntryPoint][] = [
+    ['query', (svc, query, ctx) => svc.query(query, ctx)],
+    ['queryWithContinuation', (svc, query, ctx) => svc.queryWithContinuation(query, ctx)],
+    ['queryWithVars', (svc, query, ctx) => svc.queryWithVars(query, ctx)],
+  ];
+
+  it.each(ENTRY_POINTS)('%s sends a request of exactly 8,192 bytes', async (_name, send) => {
+    const { bodies } = stubRecording();
+
+    await send(makeService(), BOUNDED + 'x'.repeat(BOUNDED_ROOM), createMockContext());
+
+    expect(bodies.map((body) => body.length)).toEqual([8_192]);
+  });
+
+  it.each(ENTRY_POINTS)(
+    '%s refuses a request of 8,193 bytes without sending it, naming both sizes',
+    async (_name, send) => {
+      const { fetchMock } = stubRecording();
+
+      const error = (await send(
+        makeService(),
+        BOUNDED + 'x'.repeat(BOUNDED_ROOM + 1),
+        createMockContext(),
+      ).catch((e: unknown) => e)) as { code?: number; message: string; data?: unknown };
+
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(error).toMatchObject({ code: REFUSAL.code });
+      // Exactly these fields: the calling tool's contract supplies the recovery hint.
+      expect(error.data).toEqual(REFUSAL.data);
+      expect(error.message).toContain('8,193 bytes');
+      expect(error.message).toContain('8,192 bytes');
+    },
+  );
+
+  /*
+   * Form encoding sends a letter, digit, space, or `-._*` as one byte, other ASCII as
+   * three (`%23`), and each UTF-8 byte of anything else as three: six for `é`, twelve
+   * for `𝄞`. A query of a few thousand characters can pass the limit.
+   */
+  it.each([
+    ['#', 3],
+    ['é', 6],
+    ['𝄞', 12],
+  ] as const)('counts %s as %i bytes of the body sent', async (char, bytes) => {
+    const count = Math.floor(BOUNDED_ROOM / bytes);
+    const fill = char.repeat(count) + 'x'.repeat(BOUNDED_ROOM - count * bytes);
+    const { fetchMock, bodies } = stubRecording();
+    const service = makeService();
+
+    await service.query(BOUNDED + fill, createMockContext());
+    await expect(service.query(`${BOUNDED + fill}x`, createMockContext())).rejects.toMatchObject(
+      REFUSAL,
+    );
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(bodies[0]).toHaveLength(8_192);
+  });
+
+  it('leaves out the PREFIX block a query that declares cdm: is sent without', async () => {
+    // 181 bytes form-encoded, frame included, before the padding.
+    const declared =
+      'PREFIX cdm: <http://publications.europa.eu/ontology/cdm#>\nSELECT ?s WHERE { ?s ?p ?o } LIMIT 1\n#';
+    const { fetchMock, bodies } = stubRecording();
+    const service = makeService();
+
+    await service.query(declared + 'x'.repeat(8_011), createMockContext());
+    await expect(
+      service.query(declared + 'x'.repeat(8_012), createMockContext()),
+    ).rejects.toMatchObject(REFUSAL);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(bodies[0]).toHaveLength(8_192);
+    expect(bodies[0]).not.toContain('skos');
+  });
+
+  /*
+   * Issue #206's boundary on the raw path: a query with no PREFIX cdm: and no top-level
+   * LIMIT gains the 222-byte block and a 12-byte `\nLIMIT 100`, so it is sent at 7,909
+   * bytes of its own form encoding and refused at 7,910.
+   */
+  it('measures a raw query after the LIMIT the raw path appends', async () => {
+    const unbounded = 'SELECT ?s WHERE { ?s ?p ?o }\n#'; // 46 bytes form-encoded
+    const { fetchMock, bodies } = stubRecording();
+    const service = makeService();
+
+    await service.queryWithVars(unbounded + 'x'.repeat(7_909 - 46), createMockContext());
+    await expect(
+      service.queryWithVars(unbounded + 'x'.repeat(7_910 - 46), createMockContext()),
+    ).rejects.toMatchObject(REFUSAL);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(bodies[0]).toHaveLength(8_192);
+    expect(bodies[0]).toContain('%0ALIMIT+100&format=');
+  });
+
+  it('measures a query after the ceiling rewrites its LIMIT down', async () => {
+    // LIMIT 1000 is sent as LIMIT 100, one byte shorter: 8,193 bytes as written, 8,192 sent.
+    const { bodies } = stubRecording();
+
+    await makeService().query(
+      `SELECT ?s WHERE { ?s ?p ?o } LIMIT 1000\n#${'x'.repeat(7_865)}`,
+      createMockContext(),
+    );
+
+    expect(bodies.map((body) => body.length)).toEqual([8_192]);
+    expect(bodies[0]).toContain('LIMIT+100%0A%23');
+  });
+
+  /*
+   * A request over the limit is refused on every call, so a call whose time budget is
+   * also spent reports the size, not a timeout a later call could clear.
+   */
+  it('refuses an oversized request as request_too_large when the call’s budget is spent', async () => {
+    const start = new Date('2026-11-17T12:00:00Z').getTime();
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(start);
+    const { fetchMock } = stubRecording();
+    const service = makeService();
+    const ctx = createMockContext();
+
+    await service.query(BOUNDED, ctx);
+    vi.setSystemTime(start + 5_000);
+
+    await expect(service.query(BOUNDED + 'x'.repeat(BOUNDED_ROOM + 1), ctx)).rejects.toMatchObject(
+      REFUSAL,
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
