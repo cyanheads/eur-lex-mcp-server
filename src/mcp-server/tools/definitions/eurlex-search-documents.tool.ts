@@ -33,7 +33,11 @@ import {
   getCellarSparqlService,
 } from '@/services/cellar-sparql/cellar-sparql-service.js';
 import { isSafeSparqlIri, isValidCalendarDate } from '@/services/cellar-sparql/eli-resolution.js';
-import { keywordMatchPattern, keywordTitlePhrase } from '@/services/cellar-sparql/keyword-match.js';
+import {
+  type CelexSector,
+  keywordMatchPattern,
+  keywordTitlePhrase,
+} from '@/services/cellar-sparql/keyword-match.js';
 import { isConsolidatedCelex } from '@/services/cellar-sparql/relation-traversal.js';
 import {
   cellarDate,
@@ -44,7 +48,12 @@ import {
   windowEndRoute,
   windowedLimit,
 } from '@/services/cellar-sparql/sort-window.js';
-import { resolveCelexWorks } from '@/services/cellar-sparql/work-resolution.js';
+import {
+  aliasRivalPattern,
+  columnValues,
+  type PerWorkColumns,
+  resolveCelexWorkRows,
+} from '@/services/cellar-sparql/work-resolution.js';
 
 const RESOURCE_TYPE_BASE = 'http://publications.europa.eu/resource/authority/resource-type/';
 
@@ -68,6 +77,12 @@ const DOCUMENT_TYPES = [
 type DocumentType = (typeof DOCUMENT_TYPES)[number];
 
 /**
+ * A member of a document category: a CELLAR authority code, or a code admitted only
+ * on works of one CELEX sector, for a code CELLAR gives to two kinds of document.
+ */
+type FamilyMember = string | { readonly code: string; readonly sector: CelexSector };
+
+/**
  * Exact CELLAR authority codes admitted by each public document category.
  *
  * The resource-type authority scheme exposes these as separate top concepts, so
@@ -75,18 +90,24 @@ type DocumentType = (typeof DOCUMENT_TYPES)[number];
  * regulation/directive/decision/recommendation concepts describe proposals and
  * are deliberately excluded from the corresponding adopted-act families.
  *
- * AGREE leaves out `PROT`, mostly protocols annexed to the Treaties (agreement
- * protocols since 2020 are typed `AGREE_PROT`), and `AGREE`, `AGREE_EUMS`,
- * `AGREE_INTERINSTIT`, and `AGREE_INTERNAL`, agreements within the EU. REPORT leaves
- * out `OWNINI_REPORT`, which marks European Parliament resolutions, and
- * `VERBATIM_REPORT`; COMMUNIC leaves out `INFO_COMMUNIC` ("Information"); no family
- * takes `WORK_DOC` (#201).
+ * CELLAR types the protocols and declarations annexed to the Treaties (CELEX sector
+ * 1) `TREATY` or `PROT`/`DECLAR` by no rule, and the protocols and declarations to
+ * international agreements (sector 2) `PROT` and `DECLAR` too. TREATY therefore takes
+ * `PROT` and `DECLAR` on sector-1 works only, and AGREE takes `PROT` on sector-2
+ * works only, beside `AGREE_PROT`, which types agreement protocols since 2020 (#205).
+ * The sector scopes a listed code; it never adds a code to a family. A consolidated
+ * text is scoped by its basic act.
+ *
+ * AGREE leaves out `AGREE`, `AGREE_EUMS`, `AGREE_INTERINSTIT`, and `AGREE_INTERNAL`,
+ * agreements within the EU. REPORT leaves out `OWNINI_REPORT`, which marks European
+ * Parliament resolutions, and `VERBATIM_REPORT`; COMMUNIC leaves out `INFO_COMMUNIC`
+ * ("Information"); no family takes `WORK_DOC` (#201).
  */
 const DOCUMENT_TYPE_FAMILIES = {
   REG: ['REG', 'REG_ADOPT_INTERNATION', 'REG_DEL', 'REG_FINANC', 'REG_IMPL'],
   DIR: ['DIR', 'DIR_DEL', 'DIR_IMPL'],
   DEC: ['DEC', 'DEC_ADOPT_INTERNATION', 'DEC_DEL', 'DEC_ENTSCHEID', 'DEC_FRAMW', 'DEC_IMPL'],
-  TREATY: ['TREATY'],
+  TREATY: ['TREATY', { code: 'PROT', sector: '1' }, { code: 'DECLAR', sector: '1' }],
   JUDG: ['JUDG'],
   OPIN_AG: ['OPIN_AG', 'VIEW_AG'],
   PROP: [
@@ -144,8 +165,9 @@ const DOCUMENT_TYPE_FAMILIES = {
     'ARRANG',
     'MEMORANDUM_UNDERST',
     'WITHD_AGREE',
+    { code: 'PROT', sector: '2' },
   ],
-} as const satisfies Record<DocumentType, readonly string[]>;
+} as const satisfies Record<DocumentType, readonly FamilyMember[]>;
 
 /**
  * CDM resource-type URI for consolidated texts. A point-in-time consolidation of
@@ -154,6 +176,87 @@ const DOCUMENT_TYPE_FAMILIES = {
  * `cdm:act_consolidated_based_on_resource_legal`, not from this generic type.
  */
 const CONS_TEXT_URI = `${RESOURCE_TYPE_BASE}CONS_TEXT`;
+
+/**
+ * The patterns admitting a document category's works. `match` lists its types in a
+ * `VALUES` block, matched on the work, or with include_consolidated also on a
+ * consolidated text's basic act. A family with a sector-scoped member pairs each type
+ * with its sector (`UNDEF` for an unscoped one) and tests the sector in one FILTER
+ * after the type match, outside its UNION, against the basic act's CELEX for a
+ * consolidated text and the work's own otherwise. On CELLAR the FILTER returns no row
+ * inside a UNION arm, where ?celexNumber is not yet bound, and `""` as the unscoped
+ * members' prefix drops their rows, hence `UNDEF` and `!BOUND`. A family with none
+ * emits no sector test.
+ *
+ * `guard`, the resolved-work guard (#204), follows `match` wherever a query decides
+ * which CELEX match: a work's match stands unless another work holding its CELEX
+ * carries the CELEX alias, so is the work the CELEX resolves to (#97), and carries no
+ * type of the family. A row therefore matches a family only through that work, or
+ * through a copy when that work is in the family too, so every other filter still
+ * matches on any work of the CELEX, as it does without a type. The rival holds the
+ * work's CELEX, so it is in the work's sector: the guard lists the same members under
+ * the same sector test on ?celexNumber. It sits outside the UNION for the reason the
+ * sector test does; a consolidated text's CELEX is held by one work, so it has no
+ * rival. The guard names its codes as literals matched through one `IRI(CONCAT(…))`,
+ * not as IRIs, which keeps it near half the request bytes of a second IRI list:
+ * CELLAR refuses a request over 8,192 bytes.
+ */
+function documentTypeFamilyClause(
+  family: readonly FamilyMember[],
+  includeConsolidated: boolean,
+): { guard: string; match: string } {
+  const members: { code: string; sector?: CelexSector }[] = family.map((member) =>
+    typeof member === 'string' ? { code: member } : member,
+  );
+  const scoped = members.some((member) => member.sector);
+  const familyValues = (
+    typeVar: string,
+    sectorVar: string,
+    term: (code: string) => string,
+  ): string =>
+    scoped
+      ? `VALUES (${typeVar} ${sectorVar}) { ${members
+          .map(({ code, sector }) => `(${term(code)} ${sector ? `"${sector}"` : 'UNDEF'})`)
+          .join(' ')} }`
+      : `VALUES ${typeVar} { ${members.map(({ code }) => term(code)).join(' ')} }`;
+  const sectorTest = (sectorVar: string, celex: string) =>
+    `FILTER(!BOUND(${sectorVar}) || STRSTARTS(STR(${celex}), ${sectorVar}))`;
+  const guard = `FILTER NOT EXISTS {
+    ${aliasRivalPattern('?work', '?celexNumber')}
+    FILTER NOT EXISTS {
+      ${familyValues('?canonCode', '?canonSector', (code) => `"${code}"`)}
+      ?aliasRival cdm:work_has_resource-type ?canonType .
+      FILTER(?canonType = IRI(CONCAT("${RESOURCE_TYPE_BASE}", ?canonCode)))${
+        scoped ? `\n      ${sectorTest('?canonSector', '?celexNumber')}` : ''
+      }
+    }
+  }`;
+  const typeMatch = includeConsolidated
+    ? `{
+    ?work cdm:work_has_resource-type ?selectedType .
+  } UNION {
+    ?work cdm:work_has_resource-type <${CONS_TEXT_URI}> ;
+      cdm:act_consolidated_based_on_resource_legal ?basicAct .
+    ?basicAct cdm:work_has_resource-type ?selectedType .${
+      scoped ? '\n    OPTIONAL { ?basicAct cdm:resource_legal_id_celex ?basicCelex . }' : ''
+    }
+  }`
+    : '?work cdm:work_has_resource-type ?selectedType .';
+  /*
+   * The work's own CELEX is read through COALESCE too: beside the guard, CELLAR drops
+   * every row a bare STRSTARTS(STR(?celexNumber), …) admits through a scoped member
+   * (TREATY with "subsidiarity": 3 rows of 14; live, 2026-11-17).
+   */
+  const celex = includeConsolidated
+    ? 'COALESCE(?basicCelex, ?celexNumber)'
+    : 'COALESCE(?celexNumber)';
+  const match = [
+    familyValues('?selectedType', '?selectedSector', (code) => `<${RESOURCE_TYPE_BASE}${code}>`),
+    typeMatch,
+    ...(scoped ? [sectorTest('?selectedSector', celex)] : []),
+  ].join('\n  ');
+  return { match, guard };
+}
 
 /**
  * CDM resource-type URI for corrigenda. A corrigendum is a separate CELLAR work
@@ -166,6 +269,27 @@ const CONS_TEXT_URI = `${RESOURCE_TYPE_BASE}CONS_TEXT`;
  * derivative records.
  */
 const CORRIGENDUM_URI = `${RESOURCE_TYPE_BASE}CORRIGENDUM`;
+
+/** The works' resource types, as the page query and the resolution follow-up read them. */
+const TYPE_COLUMN = 'OPTIONAL { ?work cdm:work_has_resource-type ?type . }';
+
+/**
+ * What a row reads from the work its CELEX resolves to, in the page's resolution
+ * follow-up (#204): its resource types and English titles. Titles live on
+ * expressions, not works: ?expr cdm:expression_belongs_to_work ?work (inverse of
+ * cdm:work_has_expression), in English, carrying cdm:expression_title.
+ */
+const SEARCH_WORK_COLUMNS: PerWorkColumns = {
+  variables: ['?type', '?title'],
+  patterns: [
+    TYPE_COLUMN,
+    `OPTIONAL {
+    ?expr cdm:expression_belongs_to_work ?work .
+    ?expr cdm:expression_uses_language <${ENG_LANGUAGE_URI}> .
+    ?expr cdm:expression_title ?title .
+  }`,
+  ],
+};
 
 /**
  * Empty-page guidance for a EuroVoc search of `JUDG` or `OPIN_AG` (#176). CELLAR tags
@@ -212,12 +336,12 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
           z
             .enum(DOCUMENT_TYPES)
             .describe(
-              'Document type: REG=Regulation, DIR=Directive, DEC=Decision, TREATY=Treaty, JUDG=Judgment, OPIN_AG=AG Opinion, PROP=Proposal, REC=Recommendation, COMMUNIC=Communication, REPORT=Report, SWD=Staff Working Document, AGREE=International Agreement.',
+              'Document type: REG=Regulation, DIR=Directive, DEC=Decision, TREATY=Treaty (protocols and declarations annexed to the Treaties included), JUDG=Judgment, OPIN_AG=AG Opinion, PROP=Proposal, REC=Recommendation, COMMUNIC=Communication, REPORT=Report, SWD=Staff Working Document, AGREE=International Agreement.',
             ),
         ])
         .optional()
         .describe(
-          'Document category: REG=Regulations, DIR=Directives, DEC=Decisions, TREATY=Treaties, JUDG=Judgments, OPIN_AG=AG Opinions, PROP=Proposals, REC=Recommendations, COMMUNIC=Communications, REPORT=Reports (special and annual reports included), SWD=Staff working documents (impact assessments, evaluations, fitness checks, and their summaries included), AGREE=International agreements (protocols, amendments, conventions, exchanges of letters, arrangements, memoranda of understanding). Each category includes its explicit CELLAR authority variants (for example, delegated and implementing regulations, joint communications). Omit to search all types. Consolidated texts are excluded unless include_consolidated is true. Search case law by court, case number, or subject with eurlex_get_cases.',
+          'Document category: REG=Regulations, DIR=Directives, DEC=Decisions, TREATY=Treaties (with their annexed protocols and declarations), JUDG=Judgments, OPIN_AG=AG Opinions, PROP=Proposals, REC=Recommendations, COMMUNIC=Communications, REPORT=Reports (special and annual reports included), SWD=Staff working documents (impact assessments, evaluations, fitness checks, and their summaries included), AGREE=International agreements (protocols, amendments, conventions, exchanges of letters, arrangements, memoranda of understanding). Each category includes its explicit CELLAR authority variants (for example, delegated and implementing regulations, joint communications). Omit to search all types. Consolidated texts are excluded unless include_consolidated is true. Search case law by court, case number, or subject with eurlex_get_cases.',
         ),
     ),
     include_consolidated: z
@@ -469,7 +593,15 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: "The search ran past its time budget (retryable: CELLAR's response time varies, so a later search can finish), or CELLAR refused it as too costly to run (not retryable: the same search is refused again). Neither is retried within the call, apart from one re-send, inside the same budget, of a lookup CELLAR leaves unanswered for 20 s.",
       recovery:
-        'Narrow the search with a closer date_from/date_to range or a more specific keyword, then search again.',
+        'Narrow the search with a closer date_from/date_to range or a more specific keyword, then search again. A partial CELEX keyword that opens with type letters needs more of its number (R0679, not R0): its lookups take as long whatever else the search sets.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'request_too_large',
+      code: JsonRpcErrorCode.ValidationError,
+      when: "A search query is over the 8,192 bytes CELLAR accepts in one request, so it is refused before it is sent. It carries keyword, author_institution, and eurovoc_concept beside the other filters, document_type's types among them, so how long a keyword fits depends on what else the search sets. A partial CELEX keyword that opens with type letters (R0) is completed into one term per sector, year, and type code that holds it, so a short one can reach too many to fit.",
+      recovery:
+        'Shorten keyword, author_institution, or eurovoc_concept to the words, name, or concept URI itself, or drop a filter the search can do without. Give a partial CELEX keyword that opens with type letters more of its number (R0679, not R0), or pass the whole CELEX. CELLAR refuses a request over 8,192 bytes.',
       thrownBy: 'service',
     },
   ],
@@ -519,24 +651,18 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
     }
 
     const filters: string[] = [];
-    let documentTypeClause = '';
-    if (input.document_type) {
-      const typeValues = DOCUMENT_TYPE_FAMILIES[input.document_type]
-        .map((code) => `<${RESOURCE_TYPE_BASE}${code}>`)
-        .join(' ');
-      documentTypeClause = `VALUES ?selectedType { ${typeValues} }
-  ${
-    input.include_consolidated
-      ? `{
-    ?work cdm:work_has_resource-type ?selectedType .
-  } UNION {
-    ?work cdm:work_has_resource-type <${CONS_TEXT_URI}> ;
-      cdm:act_consolidated_based_on_resource_legal ?basicAct .
-    ?basicAct cdm:work_has_resource-type ?selectedType .
-  }`
-      : '?work cdm:work_has_resource-type ?selectedType .'
-  }`;
-    }
+    const familyClause = input.document_type
+      ? documentTypeFamilyClause(
+          DOCUMENT_TYPE_FAMILIES[input.document_type],
+          input.include_consolidated,
+        )
+      : undefined;
+    /**
+     * The family match with its resolved-work guard (#204), in the query that decides
+     * which CELEX match: the flat query, or a dated search's page subquery. The outer
+     * query of a dated search matches no type.
+     */
+    const guardedTypeClause = familyClause ? `${familyClause.match}\n  ${familyClause.guard}` : '';
     filters.push(...dateRangeFilters(dateFrom, dateTo));
     /**
      * In-force filter, applied for either polarity. CELLAR expresses the negative:
@@ -677,8 +803,10 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
      * survives over a bare duplicate's absent one; MAX(?titledWork) likewise prefers
      * the work URI that carries a title — ?titledWork binds to ?work only inside the
      * title OPTIONAL — and the handler falls back to SAMPLE(?work) when no work in the
-     * group is titled. Both are fallbacks: the row's work_uri is the CELEX's canonical
-     * work, resolved for the whole page after this query (#97). The row date uses
+     * group is titled. The types, title, and work URI aggregated here are fallbacks:
+     * a row reads the work_uri, types, and title of the CELEX's canonical work,
+     * resolved for the whole page after this query (#97, #204), and these aggregates
+     * only for a CELEX that follow-up does not return. The row date uses
      * SAMPLE, NOT MAX, at every level: under ORDER BY DESC(?docDate) a MAX over the
      * ordered column lets Virtuoso pick a date-index TOP-k plan that bypasses the
      * date-range upper-bound FILTER whenever no selective graph pattern is present (a
@@ -699,32 +827,17 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
   (GROUP_CONCAT(DISTINCT STR(?type); SEPARATOR=" ") AS ?types)
   (SAMPLE(${dateVar}) AS ?docDate)
   (MAX(?title) AS ?docTitle)`;
-    const rowPattern = (
-      authorPart: string,
-      keywordPart: string,
-    ) => `?work cdm:resource_legal_id_celex ?celexNumber .
-  ${documentTypeClause}
-  OPTIONAL { ?work cdm:work_has_resource-type ?type . }
-  OPTIONAL { ?work cdm:work_date_document ?date . }
-  OPTIONAL {
+    // The grouped works' English titles, the column the aggregate reads.
+    const titleColumn = `OPTIONAL {
     ?expr cdm:expression_belongs_to_work ?work .
     ?expr cdm:expression_uses_language <${ENG_LANGUAGE_URI}> .
     ?expr cdm:expression_title ?title .
     BIND(?work AS ?titledWork)
-  }
-  ${eurovocClause}
-  ${authorPart}
-  ${keywordPart}
-  ${inForceClause}
-  ${filters.join('\n  ')}`;
+  }`;
     // One sentinel row past the page, cut to CELLAR's sort window.
     const paging = `LIMIT ${windowedLimit(input.offset, pageLimit)} OFFSET ${input.offset}`;
-    const onPageWorks = (...patterns: string[]) => {
-      const pattern = patterns.filter(Boolean).join('\n  ');
-      return pattern && `FILTER EXISTS {\n    ${pattern}\n  }`;
-    };
 
-    // The keyword's one CELLAR lookup runs only once the input has passed validation.
+    // The keyword's CELLAR lookups run only once the input has passed validation.
     const keywordClause = keywordInput ? await keywordMatchPattern(svc, keywordInput, ctx) : '';
 
     /**
@@ -732,21 +845,20 @@ export const eurlex_search_documents = tool('eurlex_search_documents', {
      * eurlex_get_cases, for the same reason (#105). The flat query groups and
      * aggregates every matching document before ORDER BY and LIMIT pick the page, so
      * a date range, even a single day, passed the client timeout. The subquery holds
-     * the match pattern alone — the CELEX, the document type, the date, the subject,
-     * the author, the keyword, the in-force flag, and every filter — and pages in the
-     * same total order the outer query uses. The outer query repeats the whole row
-     * pattern, so each CELEX groups the same works, types, and titles as the flat
-     * form, and takes the row date from the subquery's ?pageDate so a document sorts
-     * where it was paged. The page LIMIT sits inside the subquery, below the outer
-     * level the service's LIMIT ceiling rewrites, so pageLimit stays the only clamp.
+     * the whole match pattern — the CELEX, the document type with its resolved-work
+     * guard, the date, the subject, the author, the keyword, the in-force flag, and
+     * every filter — and pages in the same total order the outer query uses. The page
+     * LIMIT sits inside the subquery, below the outer level the service's LIMIT
+     * ceiling rewrites, so pageLimit stays the only clamp.
      *
-     * The outer query tests the author and the keyword as FILTER EXISTS rather than
-     * joining them again: the grouped works are the same, but a join re-drives their
-     * full-text and CELEX arms over the whole corpus. With ?work already bound,
-     * EXISTS checks the page's works alone. When both are set they share one FILTER
-     * EXISTS (#144): two separate blocks, the keyword's a lone title arm, fail to
-     * compile on CELLAR (SQ156). The two patterns share only ?work, so one block
-     * admits exactly the works the two did.
+     * The outer query joins the page's CELEX to their works for the type and title
+     * columns alone, and repeats no part of the match: a row's work URI, types, and
+     * title come from the resolution follow-up (#204), and its date from the
+     * subquery's ?pageDate, so a document sorts where it was paged. Its aggregates
+     * therefore group every work of the CELEX, not only the works matching the
+     * filters, and a row reads them only when the follow-up misses its CELEX. The
+     * match is sent once, which leaves the room under CELLAR's 8,192-byte request
+     * limit to the keyword and the other filters.
      *
      * A date-less search keeps the flat form: finding a broad browse's page keys
      * costs about as much as the whole query, and a keyword-only search ran faster
@@ -759,7 +871,7 @@ ${projection('?pageDate')} WHERE {
   {
     SELECT ?celexNumber (SAMPLE(?date) AS ?pageDate) WHERE {
       ?work cdm:resource_legal_id_celex ?celexNumber .
-      ${documentTypeClause}
+      ${guardedTypeClause}
       OPTIONAL { ?work cdm:work_date_document ?date . }
       ${eurovocClause}
       ${authorClause}
@@ -768,15 +880,22 @@ ${projection('?pageDate')} WHERE {
       ${filters.join('\n      ')}
     } GROUP BY ?celexNumber ORDER BY DESC(?pageDate) ?celexNumber ${paging}
   }
-  ${
-    authorClause && keywordClause
-      ? rowPattern(onPageWorks(authorClause, keywordClause), '')
-      : rowPattern(onPageWorks(authorClause), onPageWorks(keywordClause))
-  }
+  ?work cdm:resource_legal_id_celex ?celexNumber .
+  ${TYPE_COLUMN}
+  ${titleColumn}
 } GROUP BY ?celexNumber ORDER BY DESC(?docDate) ?celexNumber`
         : `
 ${projection('?date')} WHERE {
-  ${rowPattern(authorClause, keywordClause)}
+  ?work cdm:resource_legal_id_celex ?celexNumber .
+  ${guardedTypeClause}
+  ${TYPE_COLUMN}
+  OPTIONAL { ?work cdm:work_date_document ?date . }
+  ${titleColumn}
+  ${eurovocClause}
+  ${authorClause}
+  ${keywordClause}
+  ${inForceClause}
+  ${filters.join('\n  ')}
 } GROUP BY ?celexNumber ORDER BY DESC(?docDate) ?celexNumber ${paging}`;
 
     const queryEcho = {
@@ -852,20 +971,32 @@ ${projection('?date')} WHERE {
     const { hasMore, atWindowEnd } = readWindowedPage(bindings.length, input.offset, pageLimit);
     const page = bindings.slice(0, pageLimit);
     // A CELEX held by several works resolves to its canonical work (#97), in one
-    // follow-up query for the page — the alias match never binds inside the
-    // grouped query above.
-    const resolvedWorks = await resolveCelexWorks(
+    // follow-up query for the page that also reads each work's types and English
+    // titles, so a row reports that work's (#204).
+    const resolvedWorks = await resolveCelexWorkRows(
       svc,
       page.map((b) => CellarSparqlService.bindingValue(b, 'celex') ?? ''),
       ctx,
+      SEARCH_WORK_COLUMNS,
     );
     const documents = page.map((b) => {
       const celexNumber = CellarSparqlService.bindingValue(b, 'celex') ?? '';
-      // GROUP_CONCAT delivers every resource-type of the work as one space-separated
-      // string, so membership is tested against the split list — a substring test
-      // would also match a longer code sharing the prefix. Unbound for older works
-      // that carry no type, which makes the tag a definite false rather than absent.
-      const types = CellarSparqlService.bindingValue(b, 'types');
+      const resolved = resolvedWorks.get(celexNumber);
+      /**
+       * Every field but the date is the resolved work's, as eurlex_get_cases and
+       * eurlex_get_document report it: its types, and the greatest of its English
+       * titles, else of any work's, so an untitled canonical work keeps a copy's
+       * (#146). The date stays the page's, the value the row was sorted on. The page's
+       * CELEX came from the triple the follow-up joins on, so a miss means CELLAR
+       * changed between the two queries, and that row reads the search's aggregates.
+       */
+      const types = resolved
+        ? columnValues(resolved.workRows, 'type')
+        : (CellarSparqlService.bindingValue(b, 'types')?.split(/\s+/) ?? []);
+      const title = resolved
+        ? (columnValues(resolved.workRows, 'title').at(-1) ??
+          columnValues(resolved.celexRows, 'title').at(-1))
+        : CellarSparqlService.bindingValue(b, 'docTitle');
       const doc: {
         work_uri: string;
         celex_number: string;
@@ -876,19 +1007,20 @@ ${projection('?date')} WHERE {
         title?: string;
       } = {
         work_uri:
-          resolvedWorks.get(celexNumber) ??
+          resolved?.work ??
           CellarSparqlService.bindingValue(b, 'titledWork') ??
           CellarSparqlService.bindingValue(b, 'work') ??
           '',
         celex_number: celexNumber,
         is_consolidated: isConsolidatedCelex(celexNumber),
-        is_corrigendum: types?.split(/\s+/).includes(CORRIGENDUM_URI) ?? false,
+        // Membership in the type list, not a substring test, which would also match a
+        // longer code sharing the prefix. A work with no type is a definite false.
+        is_corrigendum: types.includes(CORRIGENDUM_URI),
       };
-      const resourceType = resolveResourceTypeLabels(types);
+      const resourceType = resolveResourceTypeLabels(types.join(' '));
       if (resourceType) doc.resource_type = resourceType;
       const date = cellarDate(CellarSparqlService.bindingValue(b, 'docDate'));
       if (date) doc.date = date;
-      const title = CellarSparqlService.bindingValue(b, 'docTitle');
       if (title) doc.title = title;
       return doc;
     });

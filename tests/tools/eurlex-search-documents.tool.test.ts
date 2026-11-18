@@ -12,17 +12,33 @@ import {
 import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_search_documents } from '@/mcp-server/tools/definitions/eurlex-search-documents.tool.js';
-import { canonicalWork, celexWorkRows, fixtureWork } from '../fixtures/cellar-works.js';
+import {
+  CELLAR_REQUEST_LIMIT_BYTES,
+  sparqlRequestBytes,
+} from '@/services/cellar-sparql/sparql-request-body.js';
+import {
+  CASE_LAW_WORKS,
+  CELLAR,
+  canonicalWork,
+  caseWorkRows,
+  celexWorkRows,
+  type FixtureCaseWork,
+  fixtureWork,
+  isResolutionQuery,
+  requestedCelex,
+} from '../fixtures/cellar-works.js';
+import { cellarOnTheWire } from '../helpers/cellar-wire.js';
 import { readCommonMark } from '../helpers/commonmark.js';
 import { assertInSortWindow, pageSpan, pagingClauses } from '../helpers/sort-window.js';
 
 const RESOURCE_TYPE_BASE = 'http://publications.europa.eu/resource/authority/resource-type/';
 
+/** Each category's members: a CELLAR authority code, or `CODE@S` for one admitted only in CELEX sector S. */
 const EXPECTED_DOCUMENT_TYPE_FAMILIES = {
   REG: ['REG', 'REG_ADOPT_INTERNATION', 'REG_DEL', 'REG_FINANC', 'REG_IMPL'],
   DIR: ['DIR', 'DIR_DEL', 'DIR_IMPL'],
   DEC: ['DEC', 'DEC_ADOPT_INTERNATION', 'DEC_DEL', 'DEC_ENTSCHEID', 'DEC_FRAMW', 'DEC_IMPL'],
-  TREATY: ['TREATY'],
+  TREATY: ['TREATY', 'PROT@1', 'DECLAR@1'],
   JUDG: ['JUDG'],
   OPIN_AG: ['OPIN_AG', 'VIEW_AG'],
   PROP: [
@@ -80,8 +96,52 @@ const EXPECTED_DOCUMENT_TYPE_FAMILIES = {
     'ARRANG',
     'MEMORANDUM_UNDERST',
     'WITHD_AGREE',
+    'PROT@2',
   ],
 } as const;
+
+/**
+ * The members a query's family `VALUES` block admits, in `EXPECTED_DOCUMENT_TYPE_FAMILIES`
+ * form: `VALUES ?selectedType { … }` lists codes, `VALUES (?selectedType ?selectedSector)
+ * { … }` pairs each code with a sector literal or `UNDEF`. `vars` names the type and
+ * sector variables: the work's match, whose codes are IRIs, or the resolved-work
+ * guard's (`canonCode`, `canonSector`, #204), whose codes are literals.
+ */
+function familyMembers(
+  sparql: string,
+  [typeVar, sectorVar] = ['selectedType', 'selectedSector'],
+): string[] {
+  const code = String.raw`(?:<[^>]*resource-type\/([^>]+)>|"([^"]+)")`;
+  const scoped = new RegExp(`VALUES \\(\\?${typeVar} \\?${sectorVar}\\) \\{([^}]*)\\}`).exec(
+    sparql,
+  )?.[1];
+  if (scoped !== undefined) {
+    return [...scoped.matchAll(new RegExp(`\\(${code} (?:UNDEF|"([^"]*)")\\)`, 'g'))].map(
+      ([, iri, literal, sector]) =>
+        sector === undefined ? `${iri ?? literal}` : `${iri ?? literal}@${sector}`,
+    );
+  }
+  const plain = new RegExp(`VALUES \\?${typeVar} \\{([^}]*)\\}`).exec(sparql)?.[1] ?? '';
+  return [...plain.matchAll(new RegExp(code, 'g'))].map(([, iri, literal]) => `${iri ?? literal}`);
+}
+
+/**
+ * The resolved-work guard following an unscoped family's match where the page is
+ * decided (#204): a work's match stands unless another work holding its CELEX carries
+ * the CELEX alias and no type of the family, its codes listed as literals.
+ */
+function resolvedWorkGuard(codes: readonly string[]): string {
+  return `FILTER NOT EXISTS {
+    ?aliasRival cdm:resource_legal_id_celex ?celexNumber .
+    ?aliasRival <http://www.w3.org/2002/07/owl#sameAs> ?rivalAlias .
+    FILTER(?aliasRival != ?work && ?rivalAlias = IRI(CONCAT("http://publications.europa.eu/resource/celex/", ENCODE_FOR_URI(STR(?celexNumber)))))
+    FILTER NOT EXISTS {
+      VALUES ?canonCode { ${codes.map((code) => `"${code}"`).join(' ')} }
+      ?aliasRival cdm:work_has_resource-type ?canonType .
+      FILTER(?canonType = IRI(CONCAT("${RESOURCE_TYPE_BASE}", ?canonCode)))
+    }
+  }`;
+}
 
 // --- Service mock ---
 const mockQuery = vi.fn();
@@ -140,22 +200,6 @@ function searchQueries(): string[] {
   return mockQuery.mock.calls
     .map((c) => c[0] as string)
     .filter((q) => q.includes('GROUP BY ?celexNumber'));
-}
-
-/** `sparql` with every balanced `FILTER EXISTS { … }` block cut out: the patterns it joins. */
-function withoutFilterExists(sparql: string): string {
-  let rest = sparql;
-  for (let start = rest.indexOf('FILTER EXISTS {'); start !== -1; ) {
-    let depth = 0;
-    let end = rest.indexOf('{', start);
-    for (; end < rest.length; end++) {
-      if (rest[end] === '{') depth++;
-      else if (rest[end] === '}' && --depth === 0) break;
-    }
-    rest = rest.slice(0, start) + rest.slice(end + 1);
-    start = rest.indexOf('FILTER EXISTS {');
-  }
-  return rest;
 }
 
 describe('eurlex_search_documents', () => {
@@ -235,7 +279,7 @@ describe('eurlex_search_documents', () => {
 
   it.each(Object.entries(EXPECTED_DOCUMENT_TYPE_FAMILIES))(
     'applies the verified %s authority-type family with exact VALUES membership',
-    async (documentType, expectedCodes) => {
+    async (documentType, expectedMembers) => {
       const ctx = createMockContext({ errors: eurlex_search_documents.errors });
       mockQuery.mockResolvedValue([makeDocBinding('32016L0680')]);
 
@@ -243,13 +287,245 @@ describe('eurlex_search_documents', () => {
       await eurlex_search_documents.handler(input, ctx);
 
       const sparql = mockQuery.mock.calls[0]?.[0] as string;
-      const valuesBlock = /VALUES \?selectedType \{([^}]*)\}/.exec(sparql)?.[1] ?? '';
-      const actualCodes = [...valuesBlock.matchAll(/resource-type\/([^>]+)>/g)].map(
-        ([, code]) => code,
-      );
-      expect(actualCodes).toEqual(expectedCodes);
+      expect(familyMembers(sparql)).toEqual(expectedMembers);
+      // The resolved-work guard tests the same members (#204).
+      expect(familyMembers(sparql, ['canonCode', 'canonSector'])).toEqual(expectedMembers);
     },
   );
+
+  describe('a family with a sector-scoped member (#205)', () => {
+    const TREATY_VALUES = `VALUES (?selectedType ?selectedSector) { (<${RESOURCE_TYPE_BASE}TREATY> UNDEF) (<${RESOURCE_TYPE_BASE}PROT> "1") (<${RESOURCE_TYPE_BASE}DECLAR> "1") }`;
+    /**
+     * The resolved-work guard (#204) of a family with a scoped member: the rival holds
+     * the work's CELEX, so it is tested against the same sector as the work.
+     */
+    const TREATY_GUARD = `FILTER NOT EXISTS {
+    ?aliasRival cdm:resource_legal_id_celex ?celexNumber .
+    ?aliasRival <http://www.w3.org/2002/07/owl#sameAs> ?rivalAlias .
+    FILTER(?aliasRival != ?work && ?rivalAlias = IRI(CONCAT("http://publications.europa.eu/resource/celex/", ENCODE_FOR_URI(STR(?celexNumber)))))
+    FILTER NOT EXISTS {
+      VALUES (?canonCode ?canonSector) { ("TREATY" UNDEF) ("PROT" "1") ("DECLAR" "1") }
+      ?aliasRival cdm:work_has_resource-type ?canonType .
+      FILTER(?canonType = IRI(CONCAT("${RESOURCE_TYPE_BASE}", ?canonCode)))
+      FILTER(!BOUND(?canonSector) || STRSTARTS(STR(?celexNumber), ?canonSector))
+    }
+  }`;
+
+    /**
+     * The work's own CELEX is read through COALESCE: beside the resolved-work guard,
+     * CELLAR drops every row a bare `STRSTARTS(STR(?celexNumber), …)` admits through a
+     * sector-scoped member (TREATY with "subsidiarity": 3 rows of 14; live, 2026-11-17).
+     */
+    it('tests the work’s own CELEX after the type match', async () => {
+      mockQuery.mockResolvedValue([makeDocBinding('12016E/PRO/02')]);
+
+      await runToolContract(eurlex_search_documents, { document_type: 'TREATY' });
+
+      const sparql = searchQueries()[0] ?? '';
+      expect(sparql).toContain(`?work cdm:resource_legal_id_celex ?celexNumber .
+  ${TREATY_VALUES}
+  ?work cdm:work_has_resource-type ?selectedType .
+  FILTER(!BOUND(?selectedSector) || STRSTARTS(STR(COALESCE(?celexNumber)), ?selectedSector))
+  ${TREATY_GUARD}
+  OPTIONAL { ?work cdm:work_has_resource-type ?type . }`);
+      // No consolidated arm, so nothing binds a basic act's CELEX.
+      expect(sparql).not.toContain('?basicCelex');
+    });
+
+    it('tests the work’s own CELEX the same way in the page subquery of a dated search', async () => {
+      mockQuery.mockResolvedValue([makeDocBinding('12016E/PRO/02', { date: '2016-06-07' })]);
+
+      await runToolContract(eurlex_search_documents, {
+        document_type: 'TREATY',
+        date_from: '2016-01-01',
+      });
+
+      const sparql = searchQueries()[0] ?? '';
+      const clause = `${TREATY_VALUES}
+  ?work cdm:work_has_resource-type ?selectedType .
+  FILTER(!BOUND(?selectedSector) || STRSTARTS(STR(COALESCE(?celexNumber)), ?selectedSector))
+  ${TREATY_GUARD}`;
+      expect(sparql.split(clause)).toHaveLength(2);
+      expect(sparql.indexOf(clause)).toBeLessThan(
+        sparql.indexOf('GROUP BY ?celexNumber ORDER BY DESC(?pageDate)'),
+      );
+    });
+
+    it('scopes the guard’s AGREE protocol to sector 2, as the work’s match is (#204)', async () => {
+      mockQuery.mockResolvedValue([makeDocBinding('22016A1001(01)')]);
+
+      await runToolContract(eurlex_search_documents, { document_type: 'AGREE' });
+
+      const sparql = searchQueries()[0] ?? '';
+      expect(familyMembers(sparql, ['canonCode', 'canonSector'])).toEqual(
+        EXPECTED_DOCUMENT_TYPE_FAMILIES.AGREE,
+      );
+      const guardTail = `      FILTER(?canonType = IRI(CONCAT("${RESOURCE_TYPE_BASE}", ?canonCode)))
+      FILTER(!BOUND(?canonSector) || STRSTARTS(STR(?celexNumber), ?canonSector))
+    }
+  }`;
+      expect(sparql).toContain(guardTail);
+    });
+
+    it('tests a consolidated text on its basic act’s CELEX, outside every UNION arm, in the page subquery alone', async () => {
+      mockQuery.mockResolvedValue([makeDocBinding('02016E/TXT-20160901', { date: '2016-09-01' })]);
+
+      await runToolContract(eurlex_search_documents, {
+        document_type: 'TREATY',
+        include_consolidated: true,
+        date_from: '2016-01-01',
+        date_to: '2026-12-31',
+      });
+
+      const sparql = searchQueries()[0] ?? '';
+      const clause = `${TREATY_VALUES}
+  {
+    ?work cdm:work_has_resource-type ?selectedType .
+  } UNION {
+    ?work cdm:work_has_resource-type <${RESOURCE_TYPE_BASE}CONS_TEXT> ;
+      cdm:act_consolidated_based_on_resource_legal ?basicAct .
+    ?basicAct cdm:work_has_resource-type ?selectedType .
+    OPTIONAL { ?basicAct cdm:resource_legal_id_celex ?basicCelex . }
+  }
+  FILTER(!BOUND(?selectedSector) || STRSTARTS(STR(COALESCE(?basicCelex, ?celexNumber)), ?selectedSector))`;
+      // Page-first form: the paging subquery carries the clause, closed by the
+      // resolved-work guard (#204); the outer query matches no type.
+      expect(sparql.split(clause)).toHaveLength(2);
+      expect(sparql.split(`${clause}\n  ${TREATY_GUARD}`)).toHaveLength(2);
+      expect(sparql.indexOf(clause)).toBeLessThan(
+        sparql.indexOf('GROUP BY ?celexNumber ORDER BY DESC(?pageDate)'),
+      );
+      expect(sparql.match(/STRSTARTS\(STR\(COALESCE/g)).toHaveLength(1);
+      // The guard's own sector test, once.
+      expect(sparql.match(/STRSTARTS\(STR\(/g)).toHaveLength(2);
+    });
+
+    it('holds PROT in no family without a CELEX sector (#201)', async () => {
+      for (const documentType of Object.keys(EXPECTED_DOCUMENT_TYPE_FAMILIES)) {
+        mockQuery.mockReset();
+        mockQuery.mockResolvedValue([makeDocBinding('22016A1001(01)')]);
+        await eurlex_search_documents.handler(
+          eurlex_search_documents.input.parse({ document_type: documentType }),
+          createMockContext({ errors: eurlex_search_documents.errors }),
+        );
+        expect(familyMembers(mockQuery.mock.calls[0]?.[0] as string)).not.toContain('PROT');
+      }
+    });
+
+    it('says in both document_type descriptions that TREATY takes the protocols and declarations annexed to the Treaties', () => {
+      const { properties } = z.toJSONSchema(eurlex_search_documents.input, { io: 'input' });
+      const descriptions = [
+        ...JSON.stringify(properties?.document_type).matchAll(/"description":"((?:[^"\\]|\\.)*)"/g),
+      ].map(([, text]) => text ?? '');
+      const categoryDescriptions = descriptions.filter((text) => text.includes('REG='));
+      expect(categoryDescriptions).toHaveLength(2);
+      for (const text of categoryDescriptions) {
+        expect(text).toMatch(/TREATY=Treat(?:y|ies) \([^)]*protocols and declarations[^)]*\)/);
+      }
+    });
+  });
+
+  describe.each([false, true])('with include_consolidated %s', (includeConsolidated) => {
+    it.each(
+      Object.entries(EXPECTED_DOCUMENT_TYPE_FAMILIES).filter(([, members]) =>
+        members.every((member) => !member.includes('@')),
+      ),
+    )(
+      'emits the %s family clause, which has no sector-scoped member, with no sector test (#205), closed by the resolved-work guard outside every UNION arm (#204)',
+      async (documentType, codes) => {
+        mockQuery.mockResolvedValue([makeDocBinding('32016L0680')]);
+
+        await eurlex_search_documents.handler(
+          eurlex_search_documents.input.parse({
+            document_type: documentType,
+            include_consolidated: includeConsolidated,
+          }),
+          createMockContext({ errors: eurlex_search_documents.errors }),
+        );
+
+        const sparql = mockQuery.mock.calls[0]?.[0] as string;
+        const values = `VALUES ?selectedType { ${codes.map((code) => `<${RESOURCE_TYPE_BASE}${code}>`).join(' ')} }`;
+        const typeMatch = includeConsolidated
+          ? `{
+    ?work cdm:work_has_resource-type ?selectedType .
+  } UNION {
+    ?work cdm:work_has_resource-type <${RESOURCE_TYPE_BASE}CONS_TEXT> ;
+      cdm:act_consolidated_based_on_resource_legal ?basicAct .
+    ?basicAct cdm:work_has_resource-type ?selectedType .
+  }`
+          : '?work cdm:work_has_resource-type ?selectedType .';
+        // The lines on either side pin that nothing else is added before or after the clause.
+        expect(sparql).toContain(`?work cdm:resource_legal_id_celex ?celexNumber .
+  ${values}
+  ${typeMatch}
+  ${resolvedWorkGuard(codes)}
+  OPTIONAL { ?work cdm:work_has_resource-type ?type . }`);
+        expect(sparql).not.toContain('?selectedSector');
+        expect(sparql).not.toContain('?canonSector');
+        expect(sparql).not.toContain('?basicCelex');
+      },
+    );
+  });
+
+  describe('the resolved-work guard on a document_type match (#204)', () => {
+    const REPORT_GUARD = resolvedWorkGuard(EXPECTED_DOCUMENT_TYPE_FAMILIES.REPORT);
+
+    it.each([
+      ['the flat query', {}, 'GROUP BY ?celexNumber ORDER BY DESC(?docDate)'],
+      [
+        'the page subquery alone, not the outer row pattern',
+        { date_from: '1987-01-01' },
+        'GROUP BY ?celexNumber ORDER BY DESC(?pageDate)',
+      ],
+    ])(
+      'tests a work’s family match on the work its CELEX resolves to in %s',
+      async (_, dates, decidingGroup) => {
+        mockQuery.mockResolvedValue([makeDocBinding('51988DC0239')]);
+
+        await runToolContract(eurlex_search_documents, { document_type: 'REPORT', ...dates });
+
+        const sparql = searchQueries()[0] ?? '';
+        // Once, inside the query that decides which CELEX make the page.
+        expect(sparql.split(REPORT_GUARD)).toHaveLength(2);
+        expect(sparql.match(/\?aliasRival cdm:resource_legal_id_celex/g)).toHaveLength(1);
+        expect(sparql.indexOf(REPORT_GUARD)).toBeLessThan(sparql.indexOf(decidingGroup));
+        // Required, never OPTIONAL: the alias triple must hold for a copy to be dropped.
+        expect(sparql).not.toMatch(/OPTIONAL \{\s*\?aliasRival/);
+      },
+    );
+
+    it('adds no guard to a search without document_type', async () => {
+      mockQuery.mockResolvedValue([makeDocBinding('51988DC0239')]);
+
+      await runToolContract(eurlex_search_documents, { date_from: '1987-01-01' });
+
+      expect(searchQueries()[0]).not.toContain('?aliasRival');
+    });
+
+    /**
+     * The guard lengthens every typed search, and CELLAR refuses a request over 8,192
+     * bytes. A consolidated, keyword, date-bounded search carries the most beside the
+     * guard; AGREE also has a sector-scoped member.
+     */
+    it('keeps a consolidated AGREE keyword search over a year within CELLAR’s request limit', async () => {
+      mockQuery.mockImplementation(async (q: string) =>
+        q.includes('GROUP BY ?celexNumber') ? [makeDocBinding('02002A0430(06)-20121022')] : [],
+      );
+
+      const result = await runToolContract(eurlex_search_documents, {
+        document_type: 'AGREE',
+        include_consolidated: true,
+        keyword: 'government procurement',
+        date_from: '2012-01-01',
+        date_to: '2012-12-31',
+      });
+
+      expect(result.isError).toBeFalsy();
+      expect(sparqlRequestBytes(searchQueries()[0] ?? '')).toBeLessThanOrEqual(
+        CELLAR_REQUEST_LIMIT_BYTES,
+      );
+    });
+  });
 
   it('keeps drafts and lookalike authority types outside finalized-act families', async () => {
     const ctx = createMockContext({ errors: eurlex_search_documents.errors });
@@ -267,7 +543,7 @@ describe('eurlex_search_documents', () => {
   });
 
   it.each(['COMMUNIC', 'REPORT', 'SWD', 'AGREE'] as const)(
-    'keeps Treaty protocols, intra-EU agreements, Parliament resolutions, and drafts out of %s (#201)',
+    'keeps intra-EU agreements, Parliament resolutions, and drafts out of %s (#201)',
     async (documentType) => {
       const ctx = createMockContext({ errors: eurlex_search_documents.errors });
       mockQuery.mockResolvedValue([makeDocBinding('52020DC0301')]);
@@ -277,13 +553,11 @@ describe('eurlex_search_documents', () => {
         ctx,
       );
 
-      const valuesBlock =
-        /VALUES \?selectedType \{([^}]*)\}/.exec(mockQuery.mock.calls[0]?.[0] as string)?.[1] ?? '';
-      for (const code of EXPECTED_DOCUMENT_TYPE_FAMILIES[documentType]) {
-        expect(valuesBlock).toContain(`resource-type/${code}>`);
-      }
+      const codes = familyMembers(mockQuery.mock.calls[0]?.[0] as string).map(
+        (member) => member.split('@')[0],
+      );
+      expect(codes.length).toBeGreaterThan(0);
       for (const excluded of [
-        'PROT',
         'AGREE',
         'AGREE_EUMS',
         'AGREE_INTERINSTIT',
@@ -293,9 +567,9 @@ describe('eurlex_search_documents', () => {
         'VERBATIM_REPORT',
         'WORK_DOC',
       ]) {
-        expect(valuesBlock).not.toContain(`resource-type/${excluded}>`);
+        expect(codes).not.toContain(excluded);
       }
-      expect(valuesBlock).not.toMatch(/_DRAFT>/);
+      expect(codes.filter((code) => code?.endsWith('_DRAFT'))).toEqual([]);
     },
   );
 
@@ -329,8 +603,11 @@ describe('eurlex_search_documents', () => {
       'Communication of the Commission on Council’s Position at 1st Reading',
     ],
     ['WITHD_AGREE', 'AGREE', 'Withdrawal Agreement'],
+    ['PROT', 'TREATY', 'Protocol'],
+    ['DECLAR', 'TREATY', 'Declaration'],
+    ['PROT', 'AGREE', 'Protocol'],
   ])(
-    'labels a %s row admitted by %s on both surfaces (#201)',
+    'labels a %s row admitted by %s on both surfaces (#201, #205)',
     async (code, documentType, label) => {
       const ctx = createMockContext({ errors: eurlex_search_documents.errors });
       mockQuery.mockResolvedValue([
@@ -564,14 +841,9 @@ describe('eurlex_search_documents', () => {
       expect(query).toMatch(/\}\s*UNION\s*\{\s*\?agent cdm:court_national_name/);
       expect(query).toContain('?agent skos:prefLabel ?agentLabel .');
       expect(query).toContain('FILTER(LANG(?agentLabel) = "en")');
-      // The dated inner selection and outer correlated check must use the same arm.
-      expect(query.split('cdm:court_national_name').length - 1).toBe('date_from' in dates ? 2 : 1);
-      if ('date_from' in dates) {
-        const outer = query.slice(query.indexOf('FILTER EXISTS'));
-        expect(outer).toContain('cdm:court_national_name');
-        expect(outer).toContain('cdm:expression_title ?kwTitle');
-        expect(outer.split('FILTER EXISTS').length - 1).toBe(1);
-      }
+      // Once, where the query decides which works match: a dated search's page subquery.
+      expect(query.split('cdm:court_national_name').length - 1).toBe(1);
+      expect(query).not.toContain('FILTER EXISTS');
     },
   );
 
@@ -1232,7 +1504,9 @@ describe('eurlex_search_documents', () => {
       const result = await eurlex_search_documents.handler(input, ctx);
 
       const sparql = mockQuery.mock.calls[0]?.[0] as string;
-      expect(sparql).not.toContain('FILTER NOT EXISTS');
+      // No clause names the corrigendum type; the FILTER NOT EXISTS left is the
+      // document_type family's resolved-work guard (#204).
+      expect(sparql).not.toContain(CORRIGENDUM_URI);
       expect(result.documents[0]?.celex_number).toBe('32024R2764R(01)');
       expect(result.query_echo.include_corrigenda).toBe(true);
     });
@@ -1872,9 +2146,8 @@ describe('eurlex_search_documents', () => {
 
       const sparql = mockQuery.mock.calls[0]?.[0] as string;
       expect(sparql).toContain('FILTER(?date <= "2020-01-01"^^xsd:date)');
-      // Its only lower bound is the floor under every stored date (#159).
+      // Its only lower bound is the floor under every stored date (#159), in the page subquery.
       expect(sparql.match(/FILTER\(\?date >= "([^"]+)"/g)).toEqual([
-        'FILTER(?date >= "1000-01-01"',
         'FILTER(?date >= "1000-01-01"',
       ]);
       expect(result.query_echo.date_to).toBe('2020-01-01');
@@ -1967,13 +2240,34 @@ describe('eurlex_search_documents', () => {
       const text = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
       expect(text).toContain(`**Work URI:** ${canonicalWork('51988DC0713')}`);
       expect(text).not.toContain(DC713_TWIN);
-      const resolution = mockQuery.mock.calls
-        .map((c) => c[0] as string)
-        .filter((q) => q.includes('owl#sameAs'));
+      // The search query reads owl:sameAs too, in its resolved-work guard (#204).
+      const resolution = mockQuery.mock.calls.map((c) => c[0] as string).filter(isResolutionQuery);
       expect(resolution).toHaveLength(1);
       expect(resolution[0]).toContain(
         'VALUES ?celexNumber { "51988DC0713"^^xsd:string "32016R0679"^^xsd:string }',
       );
+    });
+
+    it('resolves the page’s CELEX alone, never the row past it that proves has_more', async () => {
+      mockQuery.mockImplementation(async (q: string) =>
+        q.includes('GROUP BY ?celexNumber')
+          ? [
+              makeDocBinding('51988DC0713'),
+              makeDocBinding('32016R0679'),
+              makeDocBinding('32016R0680'),
+            ]
+          : celexWorkRows(q),
+      );
+
+      const result = await runToolContract(eurlex_search_documents, {
+        document_type: 'PROP',
+        limit: 2,
+      });
+
+      expect(result.structuredContent).toMatchObject({ has_more: true, next_offset: 2 });
+      const resolution = mockQuery.mock.calls.map((c) => c[0] as string).filter(isResolutionQuery);
+      expect(resolution).toHaveLength(1);
+      expect(requestedCelex(resolution[0] ?? '')).toEqual(['51988DC0713', '32016R0679']);
     });
 
     it('sends no resolution query for an empty page past the end', async () => {
@@ -1987,6 +2281,275 @@ describe('eurlex_search_documents', () => {
 
       expect(result.documents).toEqual([]);
       expect(mockQuery).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // --- #204: a row reads the work its CELEX resolves to ---
+
+  describe('rows read the work a CELEX held by several works resolves to (#204)', () => {
+    const CORRIGENDUM_URI = `${RESOURCE_TYPE_BASE}CORRIGENDUM`;
+    const RYANAIR_COPY_TITLE =
+      '__[no-tr-for:arret-t-10-g]__ of 17 February 2021.#Ryanair DAC v European Commission.#State aid – Air transport market in Sweden.#Case T-238/20.';
+    const RYANAIR_TITLE =
+      'Judgment of the General Court (Tenth Chamber, Extended Composition) of 17 February 2021.#Ryanair DAC v European Commission.#State aid – Air transport market in Sweden.#Case T-238/20.';
+
+    /**
+     * Works holding each CELEX with their types and English titles, the copy first as
+     * CELLAR may return it. 51987PC0204's works and types were read live on 2026-11-17;
+     * the other multi-work entries are shaped on live cases (a copy's types or titles
+     * differing from the canonical work's) around the fixture URIs.
+     */
+    const WORKS: Record<string, FixtureCaseWork[]> = {
+      '32016R0679': [
+        {
+          uri: canonicalWork('32016R0679'),
+          canonical: true,
+          types: ['REG'],
+          titles: ['Regulation (EU) 2016/679 (General Data Protection Regulation)'],
+        },
+      ],
+      '51987PC0204': [
+        {
+          uri: `${CELLAR}5c86cbc8-1e0f-11e7-aeb3-01aa75ed71a1`,
+          canonical: false,
+          types: ['PROP_DEC'],
+          titles: [],
+        },
+        {
+          uri: `${CELLAR}bc270448-175e-437d-8cd6-954e5cf3b4fd`,
+          canonical: true,
+          types: ['PROP_DEC_NO_ADDRESSEE'],
+          titles: [],
+        },
+      ],
+      '62018TJ0207': CASE_LAW_WORKS['62018TJ0207'] ?? [],
+      /** Only the copy carries CORRIGENDUM. */
+      '62012CJ0131': [
+        {
+          uri: fixtureWork('62012CJ0131', 0),
+          canonical: false,
+          types: ['JUDG', 'CORRIGENDUM'],
+          titles: [],
+        },
+        { uri: canonicalWork('62012CJ0131'), canonical: true, types: ['JUDG'], titles: [] },
+      ],
+      /** Only the canonical work carries CORRIGENDUM. */
+      '51988DC0713': [
+        { uri: fixtureWork('51988DC0713', 0), canonical: false, types: ['COMMUNIC'], titles: [] },
+        {
+          uri: canonicalWork('51988DC0713'),
+          canonical: true,
+          types: ['COMMUNIC', 'CORRIGENDUM'],
+          titles: [],
+        },
+      ],
+      /** The copy's untranslated title sorts above the canonical work's. */
+      '62020TJ0238': [
+        {
+          uri: `${CELLAR}00000000-copy-62020TJ0238`,
+          canonical: false,
+          types: ['JUDG'],
+          titles: [RYANAIR_COPY_TITLE],
+        },
+        {
+          uri: `${CELLAR}15f64f3d-712e-11eb-9ac9-01aa75ed71a1`,
+          canonical: true,
+          types: ['JUDG'],
+          titles: [RYANAIR_TITLE],
+        },
+      ],
+      /** The canonical work has no English title; the copy has one. */
+      '51990DC0001': [
+        {
+          uri: `${CELLAR}00000000-copy-51990DC0001`,
+          canonical: false,
+          types: ['COMMUNIC'],
+          titles: ['Copy title'],
+        },
+        { uri: `${CELLAR}ffffffff-51990DC0001`, canonical: true, types: ['COMMUNIC'], titles: [] },
+      ],
+      /**
+       * A copy, the canonical work, and an `_EXT` alias work; the canonical work
+       * carries two types and two titles, so the follow-up returns four rows for it,
+       * and the alias work's title sorts above both of its titles.
+       */
+      '62022TJ0181': [
+        {
+          uri: fixtureWork('62022TJ0181', 0),
+          canonical: false,
+          types: ['ORDER'],
+          titles: ['C copy title'],
+        },
+        {
+          uri: canonicalWork('62022TJ0181'),
+          canonical: true,
+          types: ['JUDG', 'JUDG_EXTRACT'],
+          titles: ['A first title', 'B second title'],
+        },
+        {
+          uri: fixtureWork('62022TJ0181', 2),
+          canonical: false,
+          types: ['JUDG'],
+          titles: ['Z alias work title'],
+        },
+      ],
+    };
+
+    /** The grouped search row for `celex`: CELLAR's aggregates over every work holding it. */
+    function groupRow(celex: string): ReturnType<typeof makeDocBinding> {
+      const works = WORKS[celex];
+      if (!works?.[0]) throw new Error(`No fixture works for ${celex}`);
+      const title = works
+        .flatMap((w) => w.titles)
+        .sort()
+        .at(-1);
+      const titledWork = works
+        .filter((w) => w.titles.length > 0)
+        .map((w) => w.uri)
+        .sort()
+        .at(-1);
+      return makeDocBinding(celex, {
+        workUri: works[0].uri,
+        types: [...new Set(works.flatMap((w) => w.types))]
+          .map((code) => `${RESOURCE_TYPE_BASE}${code}`)
+          .join(' '),
+        ...(titledWork ? { titledWork } : {}),
+        ...(title ? { title } : {}),
+      });
+    }
+
+    /** Answer the search with the rows of `celexNumbers` and the page's resolution from WORKS. */
+    function answer(celexNumbers: string[]): void {
+      mockQuery.mockImplementation(async (q: string) => {
+        if (q.includes('GROUP BY ?celexNumber')) return celexNumbers.map(groupRow);
+        if (isResolutionQuery(q)) return caseWorkRows(q, WORKS);
+        throw new Error(`Unexpected query: ${q}`);
+      });
+    }
+
+    async function search(celexNumbers: string[], input: Record<string, unknown> = {}) {
+      answer(celexNumbers);
+      const result = await runToolContract(eurlex_search_documents, {
+        date_from: '1987-01-01',
+        ...input,
+      });
+      expect(result.isError).toBeFalsy();
+      return {
+        documents: eurlex_search_documents.output.parse(result.structuredContent).documents,
+        text: readCommonMark(contentText(result)),
+      };
+    }
+
+    it('reads a single-work row’s type and title in one search and one resolution query', async () => {
+      const { documents, text } = await search(['32016R0679']);
+
+      expect(documents).toEqual([
+        {
+          work_uri: canonicalWork('32016R0679'),
+          celex_number: '32016R0679',
+          is_consolidated: false,
+          is_corrigendum: false,
+          resource_type: 'Regulation',
+          title: 'Regulation (EU) 2016/679 (General Data Protection Regulation)',
+        },
+      ]);
+      expect(text).toContain('⟨strong⟩Type:⟨/strong⟩ Regulation');
+      expect(mockQuery).toHaveBeenCalledTimes(2);
+    });
+
+    it('reports only the resolved work’s types where a copy carries one it lacks, on both surfaces, with no added query', async () => {
+      const { documents, text } = await search(['51987PC0204', '62018TJ0207', '62022TJ0181']);
+
+      expect(documents.map((d) => [d.celex_number, d.resource_type])).toEqual([
+        ['51987PC0204', 'Proposal for a Decision without Addressee'],
+        ['62018TJ0207', 'Judgment'],
+        ['62022TJ0181', 'Judgment, Judgment (Extracts)'],
+      ]);
+      for (const doc of documents) {
+        expect(text).toContain(`⟨strong⟩Type:⟨/strong⟩ ${doc.resource_type}`);
+      }
+      expect(text).not.toContain('Proposal for a Decision,');
+      expect(text).not.toContain('Order');
+      expect(mockQuery).toHaveBeenCalledTimes(2);
+      const [resolution] = mockQuery.mock.calls
+        .map((c) => c[0] as string)
+        .filter(isResolutionQuery);
+      expect(resolution).toContain('OPTIONAL { ?work cdm:work_has_resource-type ?type . }');
+      expect(resolution).toContain(
+        '?expr cdm:expression_uses_language <http://publications.europa.eu/resource/authority/language/ENG> .',
+      );
+    });
+
+    it('reads is_corrigendum from the resolved work’s types alone', async () => {
+      const { documents, text } = await search(['62012CJ0131', '51988DC0713'], {
+        include_corrigenda: true,
+      });
+
+      expect(documents.map((d) => [d.celex_number, d.is_corrigendum, d.resource_type])).toEqual([
+        ['62012CJ0131', false, 'Judgment'],
+        ['51988DC0713', true, 'Communication, Corrigendum'],
+      ]);
+      expect(text).toContain('⟨strong⟩Corrigendum:⟨/strong⟩ false');
+      expect(text).toContain('⟨strong⟩Corrigendum:⟨/strong⟩ true');
+      expect(groupRow('62012CJ0131').types?.value).toContain(CORRIGENDUM_URI);
+    });
+
+    it('takes the resolved work’s greatest English title, and another work’s only when it has none', async () => {
+      const { documents, text } = await search(['62020TJ0238', '62022TJ0181', '51990DC0001']);
+
+      expect(documents.map((d) => [d.celex_number, d.title])).toEqual([
+        ['62020TJ0238', RYANAIR_TITLE],
+        ['62022TJ0181', 'B second title'],
+        ['51990DC0001', 'Copy title'],
+      ]);
+      expect(text).toContain(RYANAIR_TITLE);
+      expect(text).not.toContain('no-tr-for');
+      expect(text).not.toContain('Z alias work title');
+    });
+
+    it('leaves the type out when the resolved work carries none, though a copy does, and takes the copy’s title when the resolved work has none', async () => {
+      const works: Record<string, FixtureCaseWork[]> = {
+        '51990DC0002': [
+          {
+            uri: `${CELLAR}00000000-copy-51990DC0002`,
+            canonical: false,
+            types: ['REPORT'],
+            titles: ['Report copy title'],
+          },
+          { uri: `${CELLAR}ffffffff-51990DC0002`, canonical: true, types: [], titles: [] },
+        ],
+      };
+      mockQuery.mockImplementation(async (q: string) =>
+        q.includes('GROUP BY ?celexNumber')
+          ? [makeDocBinding('51990DC0002', { types: `${RESOURCE_TYPE_BASE}REPORT` })]
+          : caseWorkRows(q, works),
+      );
+
+      const result = await runToolContract(eurlex_search_documents, { date_from: '1987-01-01' });
+
+      const [doc] = eurlex_search_documents.output.parse(result.structuredContent).documents;
+      expect(doc).toEqual({
+        work_uri: `${CELLAR}ffffffff-51990DC0002`,
+        celex_number: '51990DC0002',
+        is_consolidated: false,
+        is_corrigendum: false,
+        title: 'Report copy title',
+      });
+      expect(contentText(result)).not.toContain('**Type:**');
+      expect(contentText(result)).toContain('Report copy title');
+    });
+
+    it('reads a row the resolution misses from the search’s own aggregates', async () => {
+      mockQuery.mockImplementation(async (q: string) =>
+        q.includes('GROUP BY ?celexNumber') ? [groupRow('62018TJ0207')] : [],
+      );
+
+      const result = await runToolContract(eurlex_search_documents, { date_from: '1987-01-01' });
+
+      const [doc] = eurlex_search_documents.output.parse(result.structuredContent).documents;
+      // The titled work MAX(?titledWork) picks: here the copy, whose URI sorts higher.
+      expect(doc?.work_uri).toBe(WORKS['62018TJ0207']?.[0]?.uri);
+      expect(doc?.resource_type).toBe('Judgment, Judgment (Extracts)');
     });
   });
 
@@ -2412,6 +2975,55 @@ describe('eurlex_search_documents', () => {
   describe('page-first date-bounded search (#105)', () => {
     const PAGE_SUBQUERY = '{\n    SELECT ?celexNumber (SAMPLE(?date) AS ?pageDate) WHERE {';
 
+    /**
+     * The outer query of every page-first search, with each line's trailing blanks cut
+     * and the subquery cut out: the page's CELEX joined to all their works, and the
+     * type and title columns a row reads when the resolution follow-up misses its CELEX
+     * (#204). It holds no match pattern, so no input changes it.
+     */
+    const OUTER_QUERY = `
+SELECT
+  (SAMPLE(?celexNumber) AS ?celex)
+  (MAX(?titledWork) AS ?titledWork)
+  (SAMPLE(?work) AS ?work)
+  (GROUP_CONCAT(DISTINCT STR(?type); SEPARATOR=" ") AS ?types)
+  (SAMPLE(?pageDate) AS ?docDate)
+  (MAX(?title) AS ?docTitle) WHERE {
+
+  ?work cdm:resource_legal_id_celex ?celexNumber .
+  OPTIONAL { ?work cdm:work_has_resource-type ?type . }
+  OPTIONAL {
+    ?expr cdm:expression_belongs_to_work ?work .
+    ?expr cdm:expression_uses_language <http://publications.europa.eu/resource/authority/language/ENG> .
+    ?expr cdm:expression_title ?title .
+    BIND(?work AS ?titledWork)
+  }
+} GROUP BY ?celexNumber ORDER BY DESC(?docDate) ?celexNumber`;
+
+    /** `text` with each line's trailing blanks cut. */
+    function lineTrimmed(text: string): string {
+      return text.replace(/[ \t]+$/gm, '');
+    }
+
+    /** The author_institution pattern, as the flat query and the page subquery carry it. */
+    const AUTHOR_PATTERN = (phrase: string) => `?work cdm:work_created_by_agent ?agent .
+  {
+    ?agent skos:prefLabel ?agentLabel .
+    ?agentLabel bif:contains "'${phrase}'" .
+    FILTER(LANG(?agentLabel) = "en")
+  } UNION {
+    ?agent cdm:court_national_name ?courtName .
+    ?courtName bif:contains "'${phrase}'" .
+  }`;
+
+    /** The keyword's English-title arm, as the flat query and the page subquery carry it. */
+    const TITLE_KEYWORD_PATTERN = (phrase: string) => `{
+    ?kwExpr cdm:expression_title ?kwTitle .
+    ?kwTitle bif:contains "'${phrase}'" .
+    ?kwExpr cdm:expression_uses_language <http://publications.europa.eu/resource/authority/language/ENG> .
+    ?kwExpr cdm:expression_belongs_to_work ?work .
+  }`;
+
     /** Split a page-first query into its page subquery and the outer query around it. */
     function splitPageFirst(sparql: string): { inner: string; outer: string } {
       const start = sparql.indexOf(PAGE_SUBQUERY);
@@ -2459,7 +3071,7 @@ describe('eurlex_search_documents', () => {
     // date_to-only search gains a lower bound below every stored date.
     const FLOOR = 'FILTER(?date >= "1000-01-01"^^xsd:date)';
 
-    it('bounds a date_to-only search below at both levels, ahead of date_to (#159)', async () => {
+    it('bounds a date_to-only search below in the page subquery, ahead of date_to (#159)', async () => {
       mockQuery.mockImplementation(async (q: string) =>
         q.includes('GROUP BY ?celexNumber')
           ? [makeDocBinding('31997L0066', { date: '1997-12-15' })]
@@ -2472,13 +3084,13 @@ describe('eurlex_search_documents', () => {
       });
       const { inner, outer } = splitPageFirst(searchQueries()[0] ?? '');
 
-      for (const part of [inner, outer]) {
-        expect(part.match(/FILTER\(\?date >= /g)).toHaveLength(1);
-        expect(part).toContain(FLOOR);
-        expect(part.indexOf(FLOOR)).toBeLessThan(
-          part.indexOf('FILTER(?date <= "2005-12-31"^^xsd:date)'),
-        );
-      }
+      expect(inner.match(/FILTER\(\?date >= /g)).toHaveLength(1);
+      expect(inner).toContain(FLOOR);
+      expect(inner.indexOf(FLOOR)).toBeLessThan(
+        inner.indexOf('FILTER(?date <= "2005-12-31"^^xsd:date)'),
+      );
+      // The outer query reads the page's dates from the subquery and filters nothing.
+      expect(lineTrimmed(outer)).toBe(OUTER_QUERY);
       // The floor is the server's, not the caller's: query_echo reports date_to alone.
       const { query_echo } = eurlex_search_documents.output.parse(result.structuredContent);
       expect(query_echo).not.toHaveProperty('date_from');
@@ -2517,7 +3129,12 @@ describe('eurlex_search_documents', () => {
       }
     });
 
-    it('matches every filter at both levels, testing keyword and author on the page’s works alone', async () => {
+    /**
+     * A dated search's rows come from the page subquery and the resolution follow-up
+     * (#204), so every filter sits in the subquery alone: the outer query holds none of
+     * them and no FILTER EXISTS, and the page stays equal to the flat form's (#105).
+     */
+    it('matches every filter in the page subquery and none in the outer query', async () => {
       const { inner, outer } = splitPageFirst(
         await searchQuery({
           keyword: 'privacy',
@@ -2531,56 +3148,39 @@ describe('eurlex_search_documents', () => {
         }),
       );
 
-      for (const part of [inner, outer]) {
-        expect(part).toContain(`VALUES ?selectedType { <${RESOURCE_TYPE_BASE}REG>`);
-        expect(part).toContain(`?work cdm:work_has_resource-type <${RESOURCE_TYPE_BASE}CONS_TEXT>`);
-        expect(part).toContain(
-          '?work cdm:work_is_about_concept_eurovoc <http://eurovoc.europa.eu/2828> .',
-        );
-        expect(part).toContain(`?agentLabel bif:contains "'Council'" .`);
-        expect(part).toContain(`?kwTitle bif:contains "'privacy'"`);
-        expect(part).toContain('OPTIONAL { ?work cdm:resource_legal_in-force ?inForce . }');
-        expect(part).toContain('FILTER(?inForce = true)');
-        expect(part).toContain('FILTER(?date >= "2024-01-01"^^xsd:date)');
-        expect(part).toContain('FILTER(?date <= "2024-12-31"^^xsd:date)');
-        expect(part).toContain(
-          `FILTER NOT EXISTS { ?work cdm:work_has_resource-type <${RESOURCE_TYPE_BASE}CORRIGENDUM> . }`,
-        );
-      }
-      expect(inner).not.toContain('FILTER EXISTS');
-      // One FILTER EXISTS holds both patterns (#144): two separate blocks, the
-      // keyword's a lone title arm, fail to compile on CELLAR (SQ156).
-      expect(outer.match(/FILTER EXISTS \{/g)).toHaveLength(1);
-      expect(outer).toMatch(
-        /FILTER EXISTS \{\s*\?work cdm:work_created_by_agent \?agent[\s\S]*FILTER\(LANG\(\?agentLabel\) = "en"\)[\s\S]*\?courtName bif:contains[^\n]*\n\s*\}\s*\{\s*\?kwExpr cdm:expression_title \?kwTitle/,
+      expect(inner).toContain(`VALUES ?selectedType { <${RESOURCE_TYPE_BASE}REG>`);
+      expect(inner).toContain(`?work cdm:work_has_resource-type <${RESOURCE_TYPE_BASE}CONS_TEXT>`);
+      expect(inner).toContain(
+        '?work cdm:work_is_about_concept_eurovoc <http://eurovoc.europa.eu/2828> .',
       );
-      // Outside that test the outer query never joins the author or the keyword again.
-      const outerJoins = withoutFilterExists(outer);
-      for (const joined of [
-        'cdm:work_created_by_agent',
-        '?agentLabel bif:contains',
-        '?kwTitle bif:contains',
-        '?kwExpr',
-      ]) {
-        expect(outerJoins).not.toContain(joined);
-      }
+      expect(inner).toContain(
+        `      ${AUTHOR_PATTERN('Council')}\n      ${TITLE_KEYWORD_PATTERN('privacy')}`,
+      );
+      expect(inner).toContain('OPTIONAL { ?work cdm:resource_legal_in-force ?inForce . }');
+      expect(inner).toContain('FILTER(?inForce = true)');
+      expect(inner).toContain('FILTER(?date >= "2024-01-01"^^xsd:date)');
+      expect(inner).toContain('FILTER(?date <= "2024-12-31"^^xsd:date)');
+      expect(inner).toContain(
+        `FILTER NOT EXISTS { ?work cdm:work_has_resource-type <${RESOURCE_TYPE_BASE}CORRIGENDUM> . }`,
+      );
+      expect(inner).not.toContain('FILTER EXISTS');
+      expect(lineTrimmed(outer)).toBe(OUTER_QUERY);
     });
 
     it.each([
-      [
-        'author_institution alone',
-        { author_institution: 'Council' },
-        '?work cdm:work_created_by_agent',
-      ],
-      ['keyword alone', { keyword: 'privacy' }, '{\n    ?kwExpr cdm:expression_title ?kwTitle'],
-    ])('keeps its own outer FILTER EXISTS for %s (#144)', async (_label, filter, opening) => {
-      const { outer } = splitPageFirst(await searchQuery({ ...filter, date_from: '2015-01-01' }));
+      ['author_institution alone', { author_institution: 'Council' }, AUTHOR_PATTERN('Council')],
+      ['keyword alone', { keyword: 'privacy' }, TITLE_KEYWORD_PATTERN('privacy')],
+    ])('matches %s in the page subquery alone (#144)', async (_label, filter, pattern) => {
+      const { inner, outer } = splitPageFirst(
+        await searchQuery({ ...filter, date_from: '2015-01-01' }),
+      );
 
-      expect(outer.match(/FILTER EXISTS \{/g)).toHaveLength(1);
-      expect(outer).toContain(`FILTER EXISTS {\n    ${opening}`);
+      expect(inner).toContain(`      ${pattern}\n`);
+      expect(inner).not.toContain('FILTER EXISTS');
+      expect(lineTrimmed(outer)).toBe(OUTER_QUERY);
     });
 
-    it('merges author and title keyword into one outer FILTER EXISTS at offset 20 with document_type (#144)', async () => {
+    it('matches author and title keyword in the page subquery alone at offset 20 with document_type (#144)', async () => {
       const sparql = await searchQuery({
         keyword: 'data protection',
         author_institution: 'European Parliament',
@@ -2592,14 +3192,13 @@ describe('eurlex_search_documents', () => {
       const { inner, outer } = splitPageFirst(sparql);
 
       expect(inner).toContain('LIMIT 21 OFFSET 20');
-      expect(outer.match(/FILTER EXISTS \{/g)).toHaveLength(1);
-      const block = outer.slice(outer.indexOf('FILTER EXISTS {'));
-      expect(block).toContain(`?agentLabel bif:contains "'European Parliament'" .`);
-      expect(block).toContain(`?kwTitle bif:contains "'data protection'"`);
-      expect(withoutFilterExists(outer)).not.toMatch(/agentLabel|kwTitle/);
+      expect(inner).toContain(
+        `      ${AUTHOR_PATTERN('European Parliament')}\n      ${TITLE_KEYWORD_PATTERN('data protection')}`,
+      );
+      expect(lineTrimmed(outer)).toBe(OUTER_QUERY);
     });
 
-    it('merges author and a whole-CELEX keyword, its CELEX arm inside the one block (#144)', async () => {
+    it('matches author and a whole-CELEX keyword in the page subquery alone (#144)', async () => {
       mockQuery.mockImplementation(async (q: string) => {
         if (q.includes('GROUP BY ?celexNumber')) return [makeDocBinding('32016R0679')];
         return q.includes('VALUES ?kwCelex {')
@@ -2615,16 +3214,16 @@ describe('eurlex_search_documents', () => {
         }),
         createMockContext({ errors: eurlex_search_documents.errors }),
       );
-      const { outer } = splitPageFirst(searchQueries()[0] ?? '');
+      const { inner, outer } = splitPageFirst(searchQueries()[0] ?? '');
 
-      expect(outer.match(/FILTER EXISTS \{/g)).toHaveLength(1);
-      expect(outer).toMatch(
-        /FILTER EXISTS \{\s*\?work cdm:work_created_by_agent[\s\S]*\?work cdm:resource_legal_id_celex \?kwCelex \./,
+      expect(inner).toContain(
+        `      ${AUTHOR_PATTERN('European Parliament')}\n      ${TITLE_KEYWORD_PATTERN('32016R0679')} UNION {`,
       );
-      expect(withoutFilterExists(outer)).not.toMatch(/agentLabel|kwCelex/);
+      expect(inner).toContain('?work cdm:resource_legal_id_celex ?kwCelex .');
+      expect(lineTrimmed(outer)).toBe(OUTER_QUERY);
     });
 
-    it('tests a whole-CELEX keyword on the page’s works alone, never joining it in the outer query', async () => {
+    it('matches a whole-CELEX keyword in the page subquery alone', async () => {
       mockQuery.mockImplementation(async (q: string) => {
         if (q.includes('GROUP BY ?celexNumber')) return [makeDocBinding('32016R0679')];
         return q.includes('VALUES ?kwCelex {')
@@ -2638,27 +3237,19 @@ describe('eurlex_search_documents', () => {
       const { inner, outer } = splitPageFirst(searchQueries()[0] ?? '');
 
       expect(inner).toContain('?work cdm:resource_legal_id_celex ?kwCelex .');
-      expect(outer).toMatch(
-        /FILTER EXISTS \{[\s\S]*\?work cdm:resource_legal_id_celex \?kwCelex \./,
-      );
-      const outerJoins = withoutFilterExists(outer);
-      expect(outerJoins).not.toContain('?kwCelex');
-      expect(outerJoins).not.toContain('?kwBase');
+      expect(inner).toContain('?work cdm:resource_legal_corrects_resource_legal ?kwBase .');
+      expect(lineTrimmed(outer)).toBe(OUTER_QUERY);
     });
 
-    it('tests a partial-CELEX keyword in the page subquery and the outer FILTER EXISTS alone (#123)', async () => {
+    it('matches a partial-CELEX keyword in the page subquery alone (#123)', async () => {
       const { inner, outer } = splitPageFirst(
         await searchQuery({ keyword: '2016R0679', date_from: '2016-01-01' }),
       );
 
-      for (const part of [inner, outer]) {
-        expect(part).toContain(`?kwCelex bif:contains "'02016R0679*' OR '12016R0679*'`);
-        expect(part).toContain('FILTER(CONTAINS(STR(?kwCelex), "2016R0679"))');
-        expect(part).not.toContain('CONTAINS(LCASE(STR(?kwCelex))');
-      }
-      expect(inner).not.toContain('FILTER EXISTS');
-      expect(outer).toMatch(/FILTER EXISTS \{[\s\S]*\?kwCelex bif:contains/);
-      expect(withoutFilterExists(outer)).not.toContain('?kwCelex');
+      expect(inner).toContain(`?kwCelex bif:contains "'02016R0679*' OR '12016R0679*'`);
+      expect(inner).toContain('FILTER(CONTAINS(STR(?kwCelex), "2016R0679"))');
+      expect(inner).not.toContain('CONTAINS(LCASE(STR(?kwCelex))');
+      expect(lineTrimmed(outer)).toBe(OUTER_QUERY);
     });
 
     it('proves continuation from the page subquery’s extra row, on both surfaces', async () => {
@@ -2700,6 +3291,151 @@ describe('eurlex_search_documents', () => {
 
       expect(inner).toContain('LIMIT 3 OFFSET 0');
       expect(outer).not.toMatch(/\bLIMIT\b/);
+    });
+
+    /** Every year from `first` through `last`. */
+    const yearSpan = (first: number, last: number) =>
+      Array.from({ length: last - first + 1 }, (_, i) => first + i);
+
+    /**
+     * CELLAR's CELEX holding `C0001`, in the shape it answered the fragment lookups with
+     * (2026-11-17): 115 of the fragment's 1,540 completions start a word of one (#208),
+     * 50 `6…CC`, 32 `5…PC`, 13 `5…DC`, 11 `5…SC`, 6 `5…JC`, 2 `E…C`, and 1 `6…TC`. Each
+     * CELEX here is the completion itself.
+     */
+    const C0001_HOLDERS = [
+      ...yearSpan(1974, 2023).map((year) => `6${year}CC0001`),
+      ...yearSpan(1965, 1996).map((year) => `5${year}PC0001`),
+      ...yearSpan(1984, 1996).map((year) => `5${year}DC0001`),
+      ...yearSpan(2015, 2025).map((year) => `5${year}SC0001`),
+      ...yearSpan(2015, 2020).map((year) => `5${year}JC0001`),
+      'E1994C0001',
+      'E1995C0001',
+      '62020TC0001',
+    ];
+
+    it('carries a narrowed partial-CELEX arm once, within CELLAR’s request limit (#208)', async () => {
+      mockQuery.mockImplementation(async (q: string) => {
+        if (q.includes('GROUP BY ?celexNumber')) {
+          return [makeDocBinding('62019CC0001', { date: '2020-01-01' })];
+        }
+        // A fragment lookup answers the text before C0001 in each CELEX holding it.
+        const headLookup = 'SELECT DISTINCT (STRBEFORE(STR(?kwCelex), "C0001") AS ?kwHead)';
+        if (!q.includes(headLookup)) return [];
+        const terms = [...q.matchAll(/'(\w+)\*'/g)].map(([, term]) => term);
+        return C0001_HOLDERS.filter((celex) => terms.includes(celex)).map((celex) => ({
+          kwHead: { type: 'literal', value: celex.slice(0, -'C0001'.length) },
+        }));
+      });
+
+      const result = await runToolContract(eurlex_search_documents, {
+        keyword: 'C0001',
+        date_from: '2015-01-01',
+      });
+
+      expect(result.isError).toBeFalsy();
+      const page = searchQueries()[0] ?? '';
+      expect(C0001_HOLDERS).toHaveLength(115);
+      expect([...page.matchAll(/'(\w+)\*'/g)].map(([, term]) => term).sort()).toEqual(
+        [...C0001_HOLDERS].sort(),
+      );
+      expect(sparqlRequestBytes(page)).toBeLessThanOrEqual(CELLAR_REQUEST_LIMIT_BYTES);
+    });
+
+    it('carries a 500-character title keyword once on a consolidated PROP search with dates, within CELLAR’s request limit', async () => {
+      const keyword = 'privacy and data protection '.repeat(18).slice(0, 500);
+
+      const sparql = await searchQuery({
+        document_type: 'PROP',
+        include_consolidated: true,
+        keyword,
+        date_from: '2015-01-01',
+        date_to: '2020-12-31',
+      });
+
+      expect(keyword).toHaveLength(500);
+      expect(sparql.split(keyword)).toHaveLength(2);
+      expect(sparqlRequestBytes(sparql)).toBeLessThanOrEqual(CELLAR_REQUEST_LIMIT_BYTES);
+    });
+
+    /**
+     * Most bytes each family's dated page query may take with include_consolidated,
+     * keyword "data protection", and dates 2015-01-01 to 2020-12-31: the size release
+     * 0.20.3 sent for it. The resolved-work guard (#204) lengthens the page subquery,
+     * and the outer query carries no part of the match, which more than pays for it.
+     * TREATY is the exception: its three types, two of them scoped to sector 1 (#205),
+     * take 3,965 bytes, 159 more than the 3,806 of 0.20.3.
+     */
+    const DATED_FAMILY_CEILING_BYTES = {
+      REG: 4564,
+      DIR: 4166,
+      DEC: 4756,
+      TREATY: 3965,
+      JUDG: 3802,
+      OPIN_AG: 3990,
+      PROP: 7074,
+      REC: 4568,
+      COMMUNIC: 4202,
+      REPORT: 5208,
+      SWD: 5966,
+      AGREE: 5152,
+    } as const;
+
+    it.each(Object.entries(DATED_FAMILY_CEILING_BYTES))(
+      'sends the dated %s search in at most %i bytes',
+      async (documentType, ceilingBytes) => {
+        const sparql = await searchQuery({
+          document_type: documentType,
+          include_consolidated: true,
+          keyword: 'data protection',
+          date_from: '2015-01-01',
+          date_to: '2020-12-31',
+        });
+
+        expect(sparqlRequestBytes(sparql)).toBeLessThanOrEqual(ceilingBytes);
+      },
+    );
+
+    /**
+     * The typed, undated search's size at a measured input: the request with a
+     * 600-character keyword, 8,131 bytes, was answered by CELLAR on 2026-11-17; the one
+     * with 700 characters is 8,676 bytes and refused before it is sent.
+     */
+    it('sends an undated PROP search with include_consolidated and a 600-character Greek keyword, and refuses one of 700 unsent', async () => {
+      /** Ten title words, each Greek letter six bytes once form-encoded. */
+      const words =
+        'προστασία δεδομένων κανονισμός συμβούλιο ευρωπαϊκό κοινοβούλιο οδηγία τροποποίηση ενέργεια αγορά';
+      const keywordOf = (length: number) =>
+        `${words} `
+          .repeat(Math.ceil(length / words.length))
+          .slice(0, length)
+          .trim();
+      const search = (keyword: string) =>
+        cellarOnTheWire(
+          mockQuery,
+          () =>
+            runToolContract(eurlex_search_documents, {
+              document_type: 'PROP',
+              include_consolidated: true,
+              keyword,
+            }),
+          { rows: [] },
+        );
+
+      const sent = await search(keywordOf(600));
+
+      expect(keywordOf(600)).toHaveLength(600);
+      expect(sent.result.isError).toBeFalsy();
+      expect(sent.bodies.map((body) => body.length)).toEqual([8131]);
+
+      const refused = await search(keywordOf(700));
+
+      expect(keywordOf(700)).toHaveLength(700);
+      expect(refused.result.isError).toBe(true);
+      expect((refused.result.structuredContent as { error: unknown }).error).toMatchObject({
+        data: { reason: 'request_too_large', requestBytes: 8676, limitBytes: 8_192 },
+      });
+      expect(refused.bodies).toEqual([]);
     });
 
     it('returns an empty page with a notice on an empty first page, and a silent empty page past the end', async () => {
@@ -2821,13 +3557,24 @@ describe('eurlex_search_documents', () => {
       },
     );
 
-    it('completes a type-first fragment with every sector, year, and type code, sending no lookup (#123)', async () => {
-      answer([]);
+    it('completes a type-first fragment with every sector, year, and type code, then keeps the completions a CELEX holding it starts (#123, #208)', async () => {
+      mockQuery.mockImplementation(async (q: string) => {
+        if (q.includes('GROUP BY ?celexNumber')) return [makeDocBinding('32016R0679')];
+        if (q.includes('owl#sameAs')) return [];
+        // The text before R0679 in each CELEX holding it, returned by the lookup carrying
+        // its completion.
+        return ['02016R0679-20160504', '32016R0679']
+          .filter((c) => q.includes(`'${c.slice(0, 10)}*'`))
+          .map((c) => ({ kwHead: { type: 'literal', value: c.slice(0, 5) } }));
+      });
       const sparql = await run({ keyword: 'R0679' });
 
-      expect(lookupQueries()).toEqual([]);
-      expect(sparql).toContain(`?kwCelex bif:contains "'01951R0679*' OR '01952R0679*'`);
-      expect(sparql).toContain(`'32016R0679*'`);
+      const lookups = lookupQueries().join('\n');
+      expect(lookups).toContain('SELECT DISTINCT (STRBEFORE(STR(?kwCelex), "R0679") AS ?kwHead)');
+      expect(lookups).not.toContain('SELECT DISTINCT ?kwCelex');
+      expect(lookups).toContain(`?kwCelex bif:contains "'01951R0679*' OR '01952R0679*'`);
+      expect(lookups).toContain(`'32016R0679*'`);
+      expect(sparql).toContain(`?kwCelex bif:contains "'02016R0679*' OR '32016R0679*'" .`);
       expect(sparql).toContain('FILTER(CONTAINS(STR(?kwCelex), "R0679"))');
       expect(sparql).not.toContain('CONTAINS(LCASE(STR(?kwCelex))');
     });
@@ -3290,6 +4037,29 @@ describe('eurlex_search_documents CELLAR failure contract (#145)', () => {
     expect(searchQueries()).toEqual([]);
     expect(errorOf(result)?.data?.recovery?.hint).toBe(recoveryOf('sparql_timeout'));
   });
+
+  /**
+   * A two-character type-letter keyword's lookups can run out the budget (`R0`, live,
+   * 2026-11-17), and a date range or another filter sends the same lookups again.
+   */
+  it('tells a type-letter keyword whose lookups timed out to give more of its number', async () => {
+    mockQuery.mockRejectedValue(
+      serviceUnavailable(BUDGET_SPENT, { reason: 'sparql_timeout', retryable: true }),
+    );
+
+    const result = await runToolContract(eurlex_search_documents, { keyword: 'R0' });
+
+    // Its head lookups are what timed out: no page query was built.
+    const sent = mockQuery.mock.calls.map((c) => c[0] as string);
+    expect(sent).not.toEqual([]);
+    for (const query of sent) {
+      expect(query).toContain('SELECT DISTINCT (STRBEFORE(STR(?kwCelex), "R0") AS ?kwHead)');
+    }
+    expect(searchQueries()).toEqual([]);
+    const hint = errorOf(result)?.data?.recovery?.hint ?? '';
+    expect(hint).toContain('needs more of its number (R0679, not R0)');
+    expect(contentText(result)).toContain(hint);
+  });
 });
 
 // --- #154: pages stop at CELLAR's 10,000-row sort window ---
@@ -3640,5 +4410,66 @@ describe('eurlex_search_documents over-maximum limit (#151)', () => {
     const text = contentText(result);
     expect(text).toContain(CLAMP_LINE);
     expect(text).toContain(`> ${notice}`);
+  });
+});
+
+/**
+ * The keyword's lookups and the page through the actual CELLAR service, so each
+ * request is the body it posts: the shared splitter and the query builders are the
+ * production ones, CELLAR a stubbed endpoint.
+ */
+describe('keyword requests within CELLAR’s 8,192-byte request limit (#208)', () => {
+  const onTheWire = (
+    input: Record<string, unknown>,
+    cellar: { carried?: string[]; corpus?: string[]; rows: ReturnType<typeof makeDocBinding>[] },
+  ) => cellarOnTheWire(mockQuery, () => runToolContract(eurlex_search_documents, input), cellar);
+
+  it('splits a 27-character whole-CELEX family lookup in two and matches a sibling only the second carried', async () => {
+    const keyword = '32016R0679R(02)(01)';
+    const sibling = `${keyword}(20)_EXT`;
+    const { result, bodies, queries } = await onTheWire(
+      { keyword },
+      { carried: [keyword, sibling], rows: [makeDocBinding(sibling, { date: '2021-05-05' })] },
+    );
+
+    expect(result.isError).toBeFalsy();
+    for (const body of bodies) expect(body.length).toBeLessThanOrEqual(8192);
+    const family = queries.filter((q) => q.includes('VALUES ?kwCelex') && !q.includes('GROUP BY'));
+    expect(family).toHaveLength(2);
+    expect(family[1]).toContain(`"${sibling}"^^xsd:string`);
+    const page = queries.find((q) => q.includes('GROUP BY ?celexNumber')) ?? '';
+    expect(page).toContain(`VALUES ?kwCelex { "${keyword}"^^xsd:string "${sibling}"^^xsd:string }`);
+    const structured = eurlex_search_documents.output.parse(result.structuredContent);
+    expect(structured.documents.map((d) => d.celex_number)).toEqual([sibling]);
+    expect(readCommonMark(contentText(result))).toContain(sibling);
+  });
+
+  it('answers R0679 at limit 100 with every request within the limit, its page carrying the completions CELLAR holds', async () => {
+    const { result, bodies, queries } = await onTheWire(
+      { keyword: 'R0679', limit: 100 },
+      {
+        corpus: ['02016R0679-20160504', '31972R0679', '32016R0679', '32016R0680'],
+        rows: [
+          makeDocBinding('02016R0679-20160504', { date: '2016-05-04' }),
+          makeDocBinding('32016R0679', { date: '2016-04-27' }),
+        ],
+      },
+    );
+
+    expect(result.isError).toBeFalsy();
+    for (const body of bodies) expect(body.length).toBeLessThanOrEqual(8192);
+    const headLookup = 'SELECT DISTINCT (STRBEFORE(STR(?kwCelex), "R0679") AS ?kwHead)';
+    expect(queries.filter((q) => q.includes(headLookup)).length).toBeGreaterThan(1);
+    expect(queries.filter((q) => q.includes('SELECT DISTINCT ?kwCelex'))).toEqual([]);
+    const page = queries.find((q) => q.includes('GROUP BY ?celexNumber')) ?? '';
+    expect(page).toContain(
+      `?kwCelex bif:contains "'02016R0679*' OR '31972R0679*' OR '32016R0679*'" .`,
+    );
+    const structured = eurlex_search_documents.output.parse(result.structuredContent);
+    expect(structured.documents.map((d) => d.celex_number)).toEqual([
+      '02016R0679-20160504',
+      '32016R0679',
+    ]);
+    expect(readCommonMark(contentText(result))).toContain('02016R0679-20160504');
   });
 });
