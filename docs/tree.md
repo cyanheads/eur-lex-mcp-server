@@ -1,6 +1,6 @@
 # eur-lex-mcp-server - Directory Structure
 
-Generated on: 2026-11-09 21:04:30
+Generated on: 2026-11-18 06:14:07
 
 ```text
 eur-lex-mcp-server/
@@ -201,7 +201,9 @@ eur-lex-mcp-server/
 │   │   │   ├── oj-reference.ts
 │   │   │   ├── preparatory-reference.ts
 │   │   │   ├── relation-traversal.ts
+│   │   │   ├── request-chunks.ts
 │   │   │   ├── sort-window.ts
+│   │   │   ├── sparql-request-body.ts
 │   │   │   ├── types.ts
 │   │   │   ├── work-agents.ts
 │   │   │   └── work-resolution.ts
@@ -228,9 +230,11 @@ eur-lex-mcp-server/
 │   │   ├── eurlex-legacy-act.ts
 │   │   └── formex-zip.ts
 │   ├── helpers/
+│   │   ├── cellar-wire.ts
 │   │   ├── commonmark.ts
 │   │   ├── cpu-time.ts
 │   │   ├── query-roles.ts
+│   │   ├── resource-wire.ts
 │   │   └── sort-window.ts
 │   ├── prompts/
 │   │   └── eurlex-comparative-analysis.prompt.test.ts
@@ -255,6 +259,7 @@ eur-lex-mcp-server/
 │   │   ├── legislative-procedures.test.ts
 │   │   ├── oj-reference.test.ts
 │   │   ├── preparatory-reference.test.ts
+│   │   ├── request-chunks.test.ts
 │   │   ├── sort-window.test.ts
 │   │   ├── work-agents.test.ts
 │   │   └── work-resolution.test.ts
@@ -271,6 +276,7 @@ eur-lex-mcp-server/
 │   │   ├── eurlex-lookup-celex.tool.test.ts
 │   │   ├── eurlex-query-sparql.tool.test.ts
 │   │   ├── eurlex-search-documents.tool.test.ts
+│   │   ├── request-too-large.test.ts
 │   │   └── timeout-alternative.test.ts
 │   ├── published-skills.test.ts
 │   └── sparql-lexical-safety.test.ts

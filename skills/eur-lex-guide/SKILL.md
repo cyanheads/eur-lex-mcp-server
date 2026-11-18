@@ -1,10 +1,10 @@
 ---
 name: eur-lex-guide
-description: Identifier chains, conclusion gates, and CELLAR SPARQL vocabulary for the eurlex_* tools. Use when tracing an EU act's amendments, consolidated text, repeal, or national transposition; finding CJEU rulings on an article or by member state, procedure, outcome, or subject; resolving a CELEX, ELI, ECLI, case number, or Official Journal citation; filtering by EuroVoc subject; or writing an eurlex_query_sparql query.
+description: Identifier chains, conclusion gates, and CELLAR SPARQL vocabulary for the eurlex_* tools. Use when tracing an EU act's amendments, consolidated text, repeal, or national transposition; finding CJEU rulings on an article or by member state, procedure, outcome, or subject; resolving a CELEX, ELI, ECLI, case number, Official Journal citation, or treaty-article citation; filtering by EuroVoc subject; or writing an eurlex_query_sparql query.
 license: Apache-2.0
 metadata:
   author: cyanheads
-  version: "1.3"
+  version: "1.4"
 ---
 
 ## Scope
@@ -21,7 +21,7 @@ Not covered:
 | Identifier | Shape | Comes from |
 |:--|:--|:--|
 | CELEX, legislation | `3` + year + type + number: `R` regulation, `L` directive, `D` decision (`32016R0679`) | `eurlex_lookup_celex` from a citation; every search and relation row |
-| CELEX, treaty or Charter article | sector `1` (`12012E016` TFEU Art. 16, `12007P008` Charter Art. 8). Each treaty exists in four Lisbon versions (TFEU `E` and TEU `M`: 2008, 2010, 2012, 2016; Charter `P`: 2007, 2010, 2012, 2016), and a CELEX of any of them returns the incoming edges of all four in `eurlex_get_relations`; `recorded_against` on a row names the versions the edge is recorded against | `legal_basis` and `interprets` rows |
+| CELEX, treaty or Charter article | sector `1` (`12012E016` TFEU Art. 16, `12007P008` Charter Art. 8). Each treaty exists in four Lisbon versions (TFEU `E` and TEU `M`: 2008, 2010, 2012, 2016; Charter `P`: 2007, 2010, 2012, 2016), and a CELEX of any of them returns the incoming edges of all four in `eurlex_get_relations`; `recorded_against` on a row names the versions the edge is recorded against | `legal_basis` and `interprets` rows; `eurlex_lookup_celex` on a citation such as "Article 102 TFEU" (`12016E102`) or "Article 47 of the Charter" (`12016P047`) |
 | CELEX, case law | `6` + year + court letter (`C` Court of Justice, `T` General Court, `F` Civil Service Tribunal) + document letter (`J` judgment, `O` order, `C` AG opinion, `P` AG view) + number. C-131/12 is `62012CJ0131`, its AG opinion `62012CC0131` | `eurlex_get_cases` |
 | CELEX, consolidated text | `0` + the base act's core + `-YYYYMMDD` (`02016R0679-20160504`). The base CELEX cannot always be derived from it: read `base_act_celex`. A consolidated CELEX with no date or a date no version carries fails `not_found` naming the act's current version and, for a dated one, the version in effect on that date (`data.held_celex`); `resolve: "current_consolidated"` serves the current one | `consolidated_version` rows; `current_consolidated_celex` |
 | CELEX, corrigendum | base CELEX + `R(nn)` (`32016R0679R(02)`) | `eurlex_search_documents` with `include_corrigenda` |
@@ -55,7 +55,7 @@ Not covered:
 
 **An act's amendment history to its current text.** Resolve the citation with `eurlex_lookup_celex`, then call `eurlex_get_relations` on the CELEX with `amended_by`, `repealed_by`, `implicitly_repealed_by`, and `consolidated_version`. Read the in-force text with `eurlex_get_document` and `resolve: "current_consolidated"`, adding `select` to read one article. Each amending act's row names the provisions it changes. For amendments of those amending acts, or any chain longer than one hop, use SPARQL.
 
-**The case law on a provision.** Call `eurlex_get_relations` with `interpreted_by` and `article`, then apply the article gate above. For a treaty provision, pass the CELEX of any version (`12016E102`, `12012E016`): the rulings of all four versions come back in one list. Read a ruling with `eurlex_get_document`: `outline: true` locates its operative part, and `select` reads just that part. To start from a case number instead, use `eurlex_get_cases`, which returns each record's CELEX, and the ECLI of each judgment, order, and AG opinion (notices carry none).
+**The case law on a provision.** Call `eurlex_get_relations` with `interpreted_by` and `article`, then apply the article gate above. For a treaty provision, pass the CELEX of any version (`12016E102`, `12012E016`): the rulings of all four versions come back in one list. A citation such as "Article 102 TFEU" resolves to that CELEX with `eurlex_lookup_celex`. Read a ruling with `eurlex_get_document`: `outline: true` locates its operative part, and `select` reads just that part. To start from a case number instead, use `eurlex_get_cases`, which returns each record's CELEX, and the ECLI of each judgment, order, and AG opinion (notices carry none).
 
 **Case law by member state, procedure, and subject.** Call `eurlex_get_cases` with any of `member_state` (`DEU` or `DE`), `procedure_type` (`preliminary_ruling`, `annulment`, `failure_to_fulfil_obligations`, `appeal`, `staff_case`, …), `outcome` (`successful`, `unfounded`, `inadmissible`, `decision_unnecessary`; with `procedure_type` both hold on the same procedure, so `annulment` with `successful` finds annulment actions that succeeded), and `subject`, a phrase matched against CELLAR's case-law subject labels ("data protection" reaches "Protection of personal data", "trade mark" "Trade marks"). Each row lists its own `countries`, `procedure_types` (outcome included), `subjects`, and `procedure_languages`; `procedure_languages` are the codes `eurlex_get_document` takes as `language`. A search matching more than 10,000 cases stops at row 10,000: follow the notice's date windows. Apply the two case-law gates above before reporting counts or absences.
 

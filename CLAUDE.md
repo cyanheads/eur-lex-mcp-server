@@ -153,6 +153,8 @@ For env booleans use `z.stringbool()`, never `z.coerce.boolean()` — `Boolean("
 
 `src/index.ts` declares `createApp({ sessionMode: 'stateless' })` — every tool is a single-shot read against CELLAR or EUR-Lex, and none asks the caller for input mid-handler. A deployment's `MCP_SESSION_MODE` still wins whenever it carries a meaningful value (an empty string and an unsubstituted `${…}` placeholder read as unset and fall through to the option). Add `require: 'stateful'` if a tool ever gates on `ctx.requestInput`: startup then fails with a `ConfigurationError` rather than serving a mode in which a 2025-era client can never answer the prompt. Stdio is never refused.
 
+`src/index.ts` also sets `createApp({ decodeResourceParams: true })`: each resource template variable reaches `params` percent-decoded once, so a handler never decodes it again. A CELEX holding `/` is read as `12016E%2FTXT`.
+
 `createApp({ teardown(core) })` is the `setup()` counterpart — release a watcher, socket, or non-`unref()`'d timer there. It runs after the transport stops and before the logger closes, on every shutdown path, and a signal-triggered shutdown then exits the process explicitly (0, or 1 if a step never settles within the framework's 10 s ceiling). Neither service here allocates one, so the hook is unset.
 
 ---
@@ -229,7 +231,7 @@ src/
     server-config.ts                    # Server-specific env vars (Zod schema)
   services/
     cellar-sparql/
-      cellar-sparql-service.ts          # CELLAR SPARQL POST client, binding mapper, LIMIT enforcement, per-call query budget
+      cellar-sparql-service.ts          # CELLAR SPARQL POST client, binding mapper, LIMIT enforcement, per-call query budget, the 8,192-byte request limit
       act-citation.ts                   # ELI, Official Journal reference, typed dates of effect, transposition deadlines of an act, and the amending acts that changed an article setting one of its dates
       case-law-facts.ts                 # Countries, procedure types, subjects, and procedure languages of a case-law work
       cdm-labels.ts                     # CDM authority URI → label maps, case-law procedure/outcome tables and subject matcher, case-law title parser
@@ -240,7 +242,9 @@ src/
       oj-reference.ts                   # Official Journal reference parser and resolution to the act's CELEX
       preparatory-reference.ts          # Commission document number and procedure reference parser and resolution to a CELEX
       relation-traversal.ts             # Relation-type model, paged per-type traversal, and the per-member-state transposition count
+      request-chunks.ts                 # Shared splitter: keyed lookups split to CELLAR's 8,192-byte request limit, sent 6 at a time
       sort-window.ts                    # CELLAR's 10,000-row sort window (page sizing, window-end reading), the date_to-only date floor, and the no-date placeholders every date reader drops (cellarDate)
+      sparql-request-body.ts            # PREFIX block, form-encoded request body, its byte count, and CELLAR's request limit
       work-agents.ts                    # Institutions and Advocates General of a work
       work-resolution.ts                # CELEX → canonical work resolution
       types.ts                          # SPARQL binding types
