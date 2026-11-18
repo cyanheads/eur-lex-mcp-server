@@ -29,7 +29,7 @@ export const eurlex_document_relations_resource = resource(
   {
     name: 'EUR-Lex document relations',
     description:
-      'One-hop CDM relationship summary for a CELLAR work by CELEX number: amendment and repeal chain, consolidations, national transposition measures, legal basis and the works adopted under it, the proposal it adopts (or, for a proposal, the act that adopted it), interpreting rulings (or, for a ruling, what it interprets), and citations — the newest 25 per relation type and direction. Each related work carries its CELEX, its document date, and its English title where it has them. A TFEU, TEU, or Charter article reads its incoming edges in all four Lisbon versions, each such row naming in recorded_against the versions its edge is recorded against.',
+      'One-hop CDM relationship summary for a CELLAR work by CELEX number: amendment and repeal chain, consolidations, national transposition measures, legal basis and the works adopted under it, the proposal it adopts (or, for a proposal, the act that adopted it), interpreting rulings (or, for a ruling, what it interprets), and citations — the newest 25 per relation type and direction. Each related work carries its CELEX, its document date, and its English title where it has them. A TFEU, TEU, or Charter article or whole text reads its incoming edges in all four Lisbon versions, each such row naming in recorded_against the versions its edge is recorded against. A CELEX containing "/" is read with each "/" encoded as %2F: eurlex://document/12016P%2FTXT/relations.',
     mimeType: 'application/json',
     params: z.object({
       celexNumber: z
@@ -40,7 +40,7 @@ export const eurlex_document_relations_resource = resource(
           'celexNumber must be a CELEX identifier — a sector character followed by the year, type letters, and number (e.g. 32016R0679). Resolve a citation to its CELEX with eurlex_lookup_celex first.',
         )
         .describe(
-          'CELEX number of the EU act (e.g. 32016R0679 for GDPR). Surrounding whitespace is trimmed and the value is uppercased before validation. A CELEX containing "/" (e.g. 11957A/PRO/CJ/09) cannot be addressed here — the URI template stops at the path separator, so traverse it with the eurlex_get_relations tool instead.',
+          'CELEX number of the EU act (e.g. 32016R0679 for GDPR), percent-decoded once, then trimmed and uppercased before validation. A CELEX containing "/" is sent with each "/" encoded as %2F (12016E/TXT as 12016E%2FTXT), since a literal "/" ends the template variable.',
         ),
     }),
 
@@ -48,7 +48,7 @@ export const eurlex_document_relations_resource = resource(
       {
         reason: 'not_found',
         code: JsonRpcErrorCode.NotFound,
-        when: 'No CELLAR work holds the CELEX number. One numbering convention away from a CELEX CELLAR holds — a consolidated CELEX with no date or a date no version carries, a (nn) suffix missing or extra, a number not zero-padded to four digits — each held CELEX is named in the message and in data.held_celex.',
+        when: 'No CELLAR work holds the CELEX number. One numbering convention away from a CELEX CELLAR holds — a consolidated CELEX with no date or a date no version carries, a (nn) suffix missing or extra, a number not zero-padded to four digits, or to three for a Lisbon treaty article — each held CELEX is named in the message and in data.held_celex.',
         recovery:
           'Confirm the CELEX number with eurlex_lookup_celex, then read the resource again with the CELEX it returns.',
       },

@@ -9,7 +9,6 @@ import {
   validationError,
 } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
-import { createWorkerHandler } from '@cyanheads/mcp-ts-core/worker';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { eurlex_document_resource } from '@/mcp-server/resources/definitions/eurlex-document.resource.js';
 import { escapeSparqlLiteral } from '@/services/cellar-sparql/eli-resolution.js';
@@ -28,17 +27,14 @@ import {
   celexWorkRows,
   fixtureWork,
   isResolutionQuery,
+  requestedCelex,
   resolutionRows,
 } from '../fixtures/cellar-works.js';
 import { queryRoles, roles } from '../helpers/query-roles.js';
+import { resourceReader } from '../helpers/resource-wire.js';
 
 /** The metadata queries every read sends after resolution (#96, #173). */
 const READ_ROLES = ['core', 'citation', 'agents', 'legal_basis', 'eurovoc'] as const;
-
-// Reserved per-request `_meta` keys of MCP protocol revision 2026-07-28.
-const PROTOCOL_VERSION_META_KEY = 'io.modelcontextprotocol/protocolVersion';
-const CLIENT_CAPABILITIES_META_KEY = 'io.modelcontextprotocol/clientCapabilities';
-const CLIENT_INFO_META_KEY = 'io.modelcontextprotocol/clientInfo';
 
 // --- Service mock ---
 const mockQuery = vi.fn();
@@ -102,60 +98,7 @@ function mockAgents(creators: [code: string, label?: string][]): void {
   });
 }
 
-/** A resources/read response: the read's contents, or the error a client receives. */
-interface WireRead {
-  error?: {
-    code: number;
-    data?: { reason?: string; celexNumber?: string; recovery?: { hint?: string } };
-  };
-  result?: { contents: { text: string }[] };
-}
-
-const worker = createWorkerHandler({
-  name: 'eur-lex-mcp-server',
-  title: 'eur-lex-mcp-server',
-  resources: [eurlex_document_resource],
-});
-
-/**
- * Read `uri` the way a client does: one resources/read request to the resource
- * served by the framework, which parses the URI's variables and fills a declared
- * `errors[]` entry's recovery into the error — neither of which a direct handler
- * call does.
- */
-async function readOverWire(uri: string): Promise<WireRead> {
-  const revision = '2026-07-28';
-  const request = new Request('http://localhost/mcp', {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      accept: 'application/json, text/event-stream',
-      'mcp-protocol-version': revision,
-      'mcp-method': 'resources/read',
-      'mcp-name': uri,
-    },
-    body: JSON.stringify({
-      jsonrpc: '2.0',
-      id: 1,
-      method: 'resources/read',
-      params: {
-        uri,
-        _meta: {
-          [PROTOCOL_VERSION_META_KEY]: revision,
-          [CLIENT_CAPABILITIES_META_KEY]: {},
-          [CLIENT_INFO_META_KEY]: { name: 'test-client', version: '1.0.0' },
-        },
-      },
-    }),
-  });
-  type FetchArgs = Parameters<typeof worker.fetch>;
-  const response = await worker.fetch(
-    request,
-    {} as FetchArgs[1],
-    { waitUntil: () => {}, passThroughOnException: () => {} } as unknown as FetchArgs[2],
-  );
-  return (await response.json()) as WireRead;
-}
+const readOverWire = resourceReader(eurlex_document_resource);
 
 describe('eurlex_document_resource', () => {
   beforeEach(() => {
@@ -756,18 +699,18 @@ describe('eurlex_document_resource', () => {
     });
 
     /**
-     * Slash-bearing CELEX values (11957A/PRO/CJ/09, C/2026/01104) are deliberately
-     * absent: the SDK expands `{celexNumber}` to `([^/]+)`, so `eurlex://document/
-     * 11957A/PRO/CJ/09` can never match this template regardless of what the schema
-     * accepts. Those values stay on the eurlex_get_document tool's table, which is
-     * the reachable surface for them.
+     * The schema checks the decoded value, so a slash-bearing CELEX passes it here;
+     * on the wire it travels with each "/" as %2F, since the SDK expands
+     * `{celexNumber}` to `([^/]+)` (the #210 reads below).
      */
     it.each([
       ['sector 0, consolidated version', '02016R0679-20160504'],
+      ['sector 1, treaty text', '12016E/TXT'],
       ['sector 3, regulation', '32016R0679'],
       ['sector 3, corrigendum marker', '32016R0679R(02)'],
       ['sector 6, case law', '62024CJ0629'],
       ['sector 7, national implementing measure', '72014L0056FIN_240353'],
+      ['sector C, act-by-act OJ C publication', 'C/2026/01099'],
       ['sector E, EFTA document', 'E2016C0186'],
     ])('accepts a real %s', (_label, celex) => {
       expect(() => eurlex_document_resource.params!.parse({ celexNumber: celex })).not.toThrow();
@@ -823,6 +766,123 @@ describe('eurlex_document_resource', () => {
       expect(mockQuery.mock.calls[0]?.[0] as string).toContain(
         'VALUES ?celexNumber { "32016R0679"^^xsd:string }',
       );
+    });
+  });
+
+  // --- #210: a percent-encoded celexNumber, decoded once before the CELEX check ---
+
+  /**
+   * A literal "/" ends the template variable, so a CELEX holding one (a treaty text,
+   * a protocol, an act-by-act OJ C publication) travels as RFC 6570 simple expansion
+   * writes it, each "/" as %2F. The served app sets createApp({ decodeResourceParams:
+   * true }), as this harness's worker does, so the variable reaches `params` decoded
+   * once and the schema normalizes and checks the CELEX it spells.
+   */
+  describe('percent-encoded celexNumber (#210)', () => {
+    /** Read `eurlex://document/{path}` against a CELLAR that resolves every CELEX. */
+    const read = async (path: string) => {
+      mockQuery.mockImplementation(async (q: string) =>
+        isResolutionQuery(q) ? resolutionRows(q) : [],
+      );
+      return readOverWire(`eurlex://document/${path}`);
+    };
+
+    /** The CELEX a successful read served, and the one its resolution query sent. */
+    const served = async (path: string) => {
+      const { result, error } = await read(path);
+      expect(error).toBeUndefined();
+      const body = JSON.parse(result?.contents[0]?.text ?? '{}') as Record<string, unknown>;
+      return {
+        celex_number: body.celex_number,
+        work_uri: body.work_uri,
+        resolved: requestedCelex((mockQuery.mock.calls[0]?.[0] as string | undefined) ?? ''),
+      };
+    };
+
+    it.each([
+      ['a plain CELEX', '32016R0679', '32016R0679'],
+      ['a CELEX with literal parentheses', '62015TO0235(01)', '62015TO0235(01)'],
+      ['a lowercase CELEX', '32016r0679r(02)', '32016R0679R(02)'],
+      ['an encoded "/" behind the CELEX%3A prefix', 'CELEX%3A12016E%2FTXT', '12016E/TXT'],
+    ])('reads %s as before', async (_label, path, celex) => {
+      expect(await served(path)).toEqual({
+        celex_number: celex,
+        work_uri: `${CELLAR}${celex}`,
+        resolved: [celex],
+      });
+    });
+
+    it('still matches no template when the CELEX carries a literal "/"', async () => {
+      const { error, result } = await read('12020W/PRO/01');
+
+      expect(result).toBeUndefined();
+      expect(error?.code).toBe(JsonRpcErrorCode.InvalidParams);
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['a protocol with each "/" encoded', '12020W%2FPRO%2F01', '12020W/PRO/01'],
+      ['a treaty text', '12016E%2FTXT', '12016E/TXT'],
+      ['an act-by-act OJ C publication', 'C%2F2026%2F01099', 'C/2026/01099'],
+      ['lowercase escapes and letters', '12020w%2fpro%2f01', '12020W/PRO/01'],
+      ['encoded parentheses', '62015TO0235%2801%29', '62015TO0235(01)'],
+      ['an encoded corrigendum marker', '32016R0679R%2802%29', '32016R0679R(02)'],
+    ])('reads %s as the CELEX it spells', async (_label, path, celex) => {
+      expect(await served(path)).toEqual({
+        celex_number: celex,
+        work_uri: `${CELLAR}${celex}`,
+        resolved: [celex],
+      });
+    });
+
+    it.each([
+      ['an escape with no hex digits', '%ZZ32016R0679'],
+      ['a trailing "%"', '32016R0679%'],
+    ])(
+      'refuses %s as a params rejection naming celexNumber, before any CELLAR request',
+      async (_label, path) => {
+        const { error, result } = await read(path);
+
+        expect(result).toBeUndefined();
+        expect(error?.code).toBe(JsonRpcErrorCode.ValidationError);
+        expect(error?.data?.issues).toEqual([
+          expect.objectContaining({
+            path: ['celexNumber'],
+            message: expect.stringContaining('Invalid percent-encoding'),
+          }),
+        ]);
+        expect(mockQuery).not.toHaveBeenCalled();
+      },
+    );
+
+    // Decoded once, a double-encoded value still holds "%"; "<" and '"' are no CELEX character.
+    it.each([
+      ['a double-encoded "/"', '12020W%252FPRO%252F01'],
+      ['double-encoded parentheses', '62015TO0235%252801%2529'],
+      ['an encoded "<"', '%3C32016R0679'],
+      ['an encoded quote', '32016R0679%22'],
+    ])('fails %s on the CELEX check, before any CELLAR request', async (_label, path) => {
+      const { error, result } = await read(path);
+
+      expect(result).toBeUndefined();
+      expect(error?.code).toBe(JsonRpcErrorCode.ValidationError);
+      expect(error?.message).toContain('celexNumber must be a CELEX identifier');
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    it('reads a double-encoded CELEX behind the CELEX%3A prefix, whose normalizer decodes what follows it', async () => {
+      expect(await served('CELEX%3A12016E%252FTXT')).toEqual({
+        celex_number: '12016E/TXT',
+        work_uri: `${CELLAR}12016E/TXT`,
+        resolved: ['12016E/TXT'],
+      });
+    });
+
+    it('names the %2F form in the template description and the celexNumber describe', () => {
+      expect(eurlex_document_resource.description).toContain('eurlex://document/12016E%2FTXT');
+      const celexDescribe = eurlex_document_resource.params!.shape.celexNumber.description;
+      expect(celexDescribe).toContain('%2F');
+      expect(celexDescribe).not.toContain('cannot be addressed');
     });
   });
 
