@@ -467,6 +467,7 @@ describe('eurlex_lookup_celex', () => {
       ],
       ['62009CJ0197(01)', { held: ['62009CJ0197'] }, `CELLAR holds 62009CJ0197. ${ONE}`],
       ['32023R138', { held: ['32023R0138'] }, `CELLAR holds 32023R0138. ${ONE}`],
+      ['12016E35', { held: ['12016E035'] }, `CELLAR holds 12016E035. ${ONE}`],
     ])(
       'keeps found: false for %s and names what CELLAR holds in the notice on both surfaces',
       async (identifier, cellar, named) => {
@@ -1986,6 +1987,266 @@ describe('eurlex_lookup_celex', () => {
       expect(hint).toContain('"COM(2021) 206 final"');
       expect(hint).toContain('"2021/0106(COD)"');
     });
+  });
+
+  // --- #207: treaty-article citations ---
+
+  describe('treaty-article citations (#207)', () => {
+    /** One lookup through the contract: both surfaces and every query sent. */
+    async function lookup(identifier: string, identifierType?: 'auto' | 'celex' | 'eli' | 'ecli') {
+      const result = await runToolContract(eurlex_lookup_celex, {
+        identifier,
+        ...(identifierType ? { identifier_type: identifierType } : {}),
+      });
+      const structured = result.structuredContent as Record<string, unknown> & {
+        error?: { data?: { reason?: string; recovery?: { hint?: string } } };
+      };
+      const text = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+      return { result, structured, text, queries: mockQuery.mock.calls.map((c) => c[0] as string) };
+    }
+
+    it.each([
+      'Articles 101 and 102 TFEU',
+      'Article 267 TFEU, third paragraph',
+      'the third paragraph of Article 267 TFEU',
+      'Art 82 EC',
+      'Article 82 TEC',
+      'Article 6 EU',
+      'Article 0 TFEU',
+      'Article 6a TEU',
+      'Article 1234 TFEU',
+      'Article 2(1) of Regulation (EU) 2016/679',
+      'Art. 102 AEUV',
+      'Article 31 Euratom',
+      'Article 1 of Protocol No 2',
+      'Article 4(3)(a)(i)(1) TEU',
+      'Article 102 TFEU..',
+      // The abbreviation-first form bounds its number and designators the same way.
+      'TFEU Article 0',
+      'TFEU Article 1234',
+      'TFEU Article 4(3)(a)(i)(1)',
+    ])('raises ambiguous_identifier for %j with no CELLAR call', async (identifier) => {
+      mockQuery.mockResolvedValue([]);
+      const { result, structured, queries } = await lookup(identifier);
+
+      expect(result.isError).toBe(true);
+      expect(structured.error?.data?.reason).toBe('ambiguous_identifier');
+      expect(queries).toEqual([]);
+    });
+
+    it('keeps a citation-shaped CELEX (ART102TFEU) a CELEX lookup', async () => {
+      mockQuery.mockResolvedValue([]);
+      const { structured, queries } = await lookup('ART102TFEU');
+
+      expect(structured.found).toBe(false);
+      expect(structured.notice).toContain('No CELLAR work matches CELEX ART102TFEU.');
+      expect(queries).toHaveLength(1);
+      expect(queries[0]).toContain('?work cdm:resource_legal_id_celex "ART102TFEU"^^xsd:string .');
+    });
+
+    it.each([
+      ['celex', 'CELEX ARTICLE 102 TFEU (parsed from "Article 102 TFEU").', '"ARTICLE 102 TFEU"'],
+      ['eli', 'ELI Article 102 TFEU.', '"Article 102 TFEU"'],
+      ['ecli', 'ECLI Article 102 TFEU.', '"Article 102 TFEU"'],
+    ] as const)(
+      'looks a treaty-article citation up as given under identifier_type %s',
+      async (identifierType, tried, literal) => {
+        mockQuery.mockResolvedValue([]);
+        const { structured, text, queries } = await lookup('Article 102 TFEU', identifierType);
+
+        expect(structured.found).toBe(false);
+        expect(structured.notice).toContain(`No CELLAR work matches ${tried}`);
+        expect(readCommonMark(text)).toContain(`No CELLAR work matches ${tried}`);
+        expect(queries).toHaveLength(1);
+        expect(queries[0]).toContain(literal);
+        expect(queries.join('\n')).not.toContain('12016E102');
+      },
+    );
+
+    /** CELLAR holds exactly `celex`, a treaty article: the typed CELEX lookup answers only for it. */
+    function holdsArticle(celex: string): void {
+      mockQuery.mockImplementation(async (q: string) =>
+        q.includes(`"${celex}"^^xsd:string`)
+          ? [
+              makeBinding(celex, {
+                type: `${RESOURCE_TYPE}TREATY`,
+                date: '2016-06-07',
+                canonical: true,
+              }),
+            ]
+          : [],
+      );
+    }
+
+    it.each([
+      ['Article 102 TFEU', '12016E102'],
+      ['Art. 102 TFEU', '12016E102'],
+      ['Art 102 TFEU', '12016E102'],
+      ['Art.102 TFEU', '12016E102'],
+      ['article 102 tfeu', '12016E102'],
+      ['ARTICLE 102 TFEU', '12016E102'],
+      ['TFEU Article 102', '12016E102'],
+      ['TFEU Art. 102', '12016E102'],
+      ['Article 102 TFEU.', '12016E102'],
+      ['  Article\t102 \n TFEU  ', '12016E102'],
+      ['Article 102 of the TFEU', '12016E102'],
+      ['Article 102 of the Treaty on the Functioning of the European Union', '12016E102'],
+      ['Article 16(1) TFEU', '12016E016'],
+      ['Article 101(1)(a) TFEU', '12016E101'],
+      ['Article 4(3) TEU', '12016M004'],
+      ['Article 4 (3) (a) (i) TEU', '12016M004'],
+      ['TEU Art. 4(3)', '12016M004'],
+      ['Article 6 TEU', '12016M006'],
+      ['Article 6 of the Treaty on European Union', '12016M006'],
+      ['Article 47 of the Charter of Fundamental Rights', '12016P047'],
+      ['Article 47 of the Charter of Fundamental Rights of the European Union', '12016P047'],
+      ['Article 47 of the Charter', '12016P047'],
+      ['Article 47 Charter', '12016P047'],
+      ['Article 47 CFR', '12016P047'],
+      ['Article 47 CFREU', '12016P047'],
+      ['CFR Article 47', '12016P047'],
+      ['Article 999 TFEU', '12016E999'],
+    ])('resolves %j to %s with one CELEX query, on both surfaces', async (citation, celex) => {
+      holdsArticle(celex);
+      const { result, structured, text, queries } = await lookup(citation);
+
+      expect(result.isError).toBeFalsy();
+      expect(structured).toEqual({
+        found: true,
+        work_uri: `${CELLAR}${celex}`,
+        celex_number: celex,
+        resource_type: 'Treaty',
+        date: '2016-06-07',
+      });
+      expect(text).toContain(`**CELEX:** ${celex}`);
+      expect(text).toContain('**Type:** Treaty');
+      expect(text).not.toContain('No CELLAR work');
+      expect(queries).toHaveLength(1);
+      expect(queries[0]).toContain(`?work cdm:resource_legal_id_celex "${celex}"^^xsd:string .`);
+    });
+
+    it.each([
+      [
+        'Article 359 TFEU',
+        '12016E359',
+        'Article 359 of the current consolidated Treaty on the Functioning of the European Union (TFEU)',
+      ],
+      [
+        'Article 56 TEU',
+        '12016M056',
+        'Article 56 of the current consolidated Treaty on European Union (TEU)',
+      ],
+      [
+        'Article 55 of the Charter',
+        '12016P055',
+        'Article 55 of the current consolidated Charter of Fundamental Rights of the European Union',
+      ],
+    ])(
+      'returns found: false for %j after one query, the notice naming %s and the treaty',
+      async (citation, celex, article) => {
+        mockQuery.mockResolvedValue([]);
+        const { result, structured, text, queries } = await lookup(citation);
+        const notice = `No CELLAR work matches CELEX ${celex} (parsed from "${citation}"). CELLAR holds no ${article}. A treaty-article citation reads post-Lisbon article numbers only: a pre-Lisbon number (Article 82 EC) is not converted.`;
+
+        expect(result.isError).toBeFalsy();
+        expect(structured).toEqual({ found: false, notice });
+        expect(readCommonMark(text)).toContain(notice);
+        // The one CELEX query; the held-CELEX check is never sent for a treaty article.
+        expect(queries).toHaveLength(1);
+        expect(queries[0]).toContain(`?work cdm:resource_legal_id_celex "${celex}"^^xsd:string .`);
+      },
+    );
+
+    it('resolves under identifier_type "auto" given explicitly', async () => {
+      holdsArticle('12016E102');
+      const { structured } = await lookup('Article 102 TFEU', 'auto');
+
+      expect(structured).toMatchObject({ found: true, celex_number: '12016E102' });
+    });
+
+    it('keeps the contract sparql_timeout recovery: the CELEX query is the only step', async () => {
+      mockQuery.mockRejectedValue(
+        serviceUnavailable('CELLAR SPARQL queries for this request ran past the time budget', {
+          reason: 'sparql_timeout',
+          retryable: true,
+        }),
+      );
+      const { structured } = await lookup('Article 102 TFEU');
+
+      expect(structured.error?.data?.reason).toBe('sparql_timeout');
+      expect(structured.error?.data?.recovery?.hint).toBe(
+        eurlex_lookup_celex.errors?.find((e) => e.reason === 'sparql_timeout')?.recovery,
+      );
+    });
+
+    it('names the treaty-article form in the ambiguous_identifier recovery and when', async () => {
+      mockQuery.mockResolvedValue([]);
+      const { structured, text } = await lookup('Article 267 TFEU, third paragraph');
+      const hint = structured.error?.data?.recovery?.hint ?? '';
+      const contract = eurlex_lookup_celex.errors?.find((e) => e.reason === 'ambiguous_identifier');
+
+      expect(hint).toContain('"Article 102 TFEU"');
+      expect(text).toContain('"Article 102 TFEU"');
+      expect(contract?.when).toContain('treaty-article citation');
+    });
+
+    it('names the treaty-article form in the description and the input and output describes', () => {
+      const shape = eurlex_lookup_celex.input.shape;
+      const output = eurlex_lookup_celex.output.shape;
+
+      expect(eurlex_lookup_celex.description).toContain('"Article 102 TFEU"');
+      expect(shape.identifier.description).toContain('Article 102 TFEU');
+      expect(shape.identifier_type.description).toContain('treaty-article citation');
+      expect(output.found.description).toContain('treaty-article citation');
+      expect(eurlex_lookup_celex.enrichment?.notice?.description).toContain(
+        'treaty-article citation',
+      );
+    });
+
+    /**
+     * The citation grammar reads every auto identifier no other form reads, and an
+     * identifier has no length cap. Timed through the handler, which runs every
+     * auto-branch reader, in thread CPU at each doubling from 5k to 320k characters,
+     * one call per measurement, each size bounded before the next runs. The 5k baseline
+     * is timed again beside each larger size, and the full 64× span over the slowest
+     * baseline stays under 256×.
+     */
+    it.each<[string, (n: number) => string]>([
+      ['one long line ending in a break', (n) => `Article 102 ${'§1 x'.repeat(n / 4)}\ny`],
+      // Closed by a letter, so trimming leaves the whole run to the readers.
+      ['breaks throughout', (n) => `Article 102${'  \r\n'.repeat(n / 4)}x`],
+      ['a digit run as the article number', (n) => `Article ${'1'.repeat(n)} TFEU`],
+      ['repeated paragraph designators', (n) => `Article 102${'(1)'.repeat(n / 3)} TFEU`],
+      ['a repeated opener with no closer', (n) => `Article 102 ${'('.repeat(n)}`],
+      ['a repeated "of the"', (n) => `Article 102 ${'of the '.repeat(n / 7)}TFEU`],
+      ['abbreviation first, repeated designators', (n) => `TFEU Article 102${'(a)'.repeat(n / 3)}`],
+    ])(
+      'reads a treaty-article citation in linear time: %s',
+      async (_label, shape) => {
+        const ctx = createMockContext({ errors: eurlex_lookup_celex.errors });
+        const time = (size: number) => {
+          const input = eurlex_lookup_celex.input.parse({ identifier: shape(size) });
+          return bestCpuMs(() =>
+            Promise.resolve(eurlex_lookup_celex.handler(input, ctx)).catch(() => undefined),
+          );
+        };
+        const baselines: number[] = [];
+        const timings: number[] = [];
+        for (const size of [10_000, 20_000, 40_000, 80_000, 160_000, 320_000]) {
+          baselines.push(await time(5_000));
+          const cpu = await time(size);
+          expect(cpu, `${size} characters: ${cpu.toFixed(3)} ms CPU`).toBeLessThan(150);
+          timings.push(cpu);
+        }
+        const largest = timings.at(-1) ?? 0;
+        expect(
+          largest / Math.max(...baselines, 0.01),
+          JSON.stringify({ baselines, timings }),
+        ).toBeLessThan(256);
+        expect(mockQuery).not.toHaveBeenCalled();
+      },
+      CPU_TIMED_TEST_TIMEOUT_MS,
+    );
   });
 
   // --- Markdown safety of content[] ---

@@ -1,5 +1,5 @@
 /**
- * @fileoverview eurlex_lookup_celex — Resolve an EU legal citation (CELEX number, ELI URI, ECLI, OJ citation, Official Journal reference, Commission document number, or procedure reference) to a canonical CELLAR work.
+ * @fileoverview eurlex_lookup_celex — Resolve an EU legal citation (CELEX number, ELI URI, ECLI, OJ citation, Official Journal reference, Commission document number, procedure reference, or treaty-article citation) to a canonical CELLAR work.
  * @module mcp-server/tools/definitions/eurlex-lookup-celex
  */
 
@@ -44,6 +44,10 @@ import {
   preparatoryLabel,
   resolvePreparatoryReference,
 } from '@/services/cellar-sparql/preparatory-reference.js';
+import {
+  currentTreatyArticleCelex,
+  type LisbonTreaty,
+} from '@/services/cellar-sparql/relation-traversal.js';
 import { cellarDate, UNDATED_PLACEHOLDER } from '@/services/cellar-sparql/sort-window.js';
 import type { SparqlBinding } from '@/services/cellar-sparql/types.js';
 import {
@@ -175,6 +179,64 @@ function citationCelex(identifier: string): string | undefined {
   const ecsc = [domainBefore, domainAfter].some((domain) => domain?.toUpperCase() === 'ECSC');
   const letter = type === 'decision' && ecsc ? 'S' : CITATION_TYPE_LETTER[type];
   return `3${year}${letter}${number.padStart(4, '0')}`;
+}
+
+/**
+ * A treaty-article citation, its whitespace collapsed and one closing period dropped:
+ * `Article`, `Art.`, or `Art`, a number from 1 to 999, up to three parenthesized
+ * paragraph or point designators, then the treaty, optionally after `of` or `of the`;
+ * or a treaty abbreviation first (`TFEU Article 102`). Groups: the number and treaty
+ * of the article-first form, then the abbreviation and number of the
+ * abbreviation-first form. Anchored, with every quantifier bounded, so a value fails
+ * within its first characters however long it is.
+ */
+const TREATY_ARTICLE_CITATION =
+  /^(?:(?:article|art\.?) ?([1-9]\d{0,2})(?: ?\([0-9a-z]{1,4}\)){0,3} (?:of (?:the )?)?(tfeu|teu|cfreu|cfr|treaty on the functioning of the european union|treaty on european union|charter(?: of fundamental rights(?: of the european union)?)?)|(tfeu|teu|cfreu|cfr) (?:article|art\.?) ?([1-9]\d{0,2})(?: ?\([0-9a-z]{1,4}\)){0,3})$/i;
+
+/** The treaty each name or abbreviation {@link TREATY_ARTICLE_CITATION} reads names, keyed in lower case. */
+const TREATY_BY_NAME = new Map<string, LisbonTreaty>([
+  ['tfeu', 'E'],
+  ['treaty on the functioning of the european union', 'E'],
+  ['teu', 'M'],
+  ['treaty on european union', 'M'],
+  ['cfr', 'P'],
+  ['cfreu', 'P'],
+  ['charter', 'P'],
+  ['charter of fundamental rights', 'P'],
+  ['charter of fundamental rights of the european union', 'P'],
+]);
+
+/** Each treaty's name, for the notice of an article CELLAR does not hold. */
+const TREATY_TITLE: Record<LisbonTreaty, string> = {
+  E: 'Treaty on the Functioning of the European Union (TFEU)',
+  M: 'Treaty on European Union (TEU)',
+  P: 'Charter of Fundamental Rights of the European Union',
+};
+
+/** The article a treaty-article citation names, and that article's CELEX. */
+interface TreatyArticle {
+  article: number;
+  celex: string;
+  treaty: LisbonTreaty;
+}
+
+/**
+ * The article a treaty-article citation names (#207), or undefined when the identifier
+ * is none. The CELEX is that article in the current consolidated version of the TFEU,
+ * the TEU, or the Charter of Fundamental Rights; a paragraph or point designator is
+ * dropped, since CELLAR files no work below the article. Pre-Lisbon numbering
+ * (`Article 82 EC`) is not read: Amsterdam and Lisbon each renumbered the articles
+ * (Article 86 EEC became 82 EC, then 102 TFEU).
+ */
+function citedTreatyArticle(identifier: string): TreatyArticle | undefined {
+  const value = identifier.trim().replace(/\s+/g, ' ');
+  const match = TREATY_ARTICLE_CITATION.exec(value.endsWith('.') ? value.slice(0, -1) : value);
+  if (!match) return;
+  const [, number = '', name = '', abbreviation = '', abbreviatedNumber = ''] = match;
+  const treaty = TREATY_BY_NAME.get((name || abbreviation).toLowerCase());
+  if (!treaty) return;
+  const article = Number(number || abbreviatedNumber);
+  return { article, treaty, celex: currentTreatyArticleCelex(treaty, article) };
 }
 
 /** The identifier a miss notice names: the CELEX, ELI, or ECLI looked up. */
@@ -341,14 +403,14 @@ const CELEX_LOOKUP_ALTERNATIVE =
 export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
   title: 'Resolve EU Legal Citation',
   description:
-    'Resolve an EU legal citation — a CELEX number, ELI URI, ECLI, an OJ citation naming its act type and year (e.g. "Regulation (EU) 2016/679", "Directive 95/46/EC"), an Official Journal reference naming its issue, date, and first page (e.g. "OJ L 119, 4.5.2016, p. 1"), a Commission document number (e.g. "COM(2021) 206 final", also SEC, SWD, JOIN), or an interinstitutional procedure reference (e.g. "2021/0106(COD)", resolved to the act that initiated it) — to its canonical CELLAR work, confirming it exists before you fetch or traverse it. Returns the work URI, confirmed CELEX number, document type, date, English title, and the ECLI of a case that carries one. A CELEX that CELLAR holds under several works resolves to the one the EUR-Lex content resolver serves. An ECLI shared by several records (a judgment and its abstract or extract, or a joined AG opinion) resolves to the primary record with the lowest CELEX. An OJ reference whose first page starts several acts, a document number CELLAR holds in several parts, and a procedure with several initiating acts return found false, the notice naming each CELEX; a procedure with no initiating act returns found false, the notice naming the CELEX of each act it produced.',
+    'Resolve an EU legal citation — a CELEX number, ELI URI, ECLI, an OJ citation naming its act type and year (e.g. "Regulation (EU) 2016/679", "Directive 95/46/EC"), an Official Journal reference naming its issue, date, and first page (e.g. "OJ L 119, 4.5.2016, p. 1"), a Commission document number (e.g. "COM(2021) 206 final", also SEC, SWD, JOIN), an interinstitutional procedure reference (e.g. "2021/0106(COD)", resolved to the act that initiated it), or a treaty-article citation naming one article of the TFEU, the TEU, or the Charter of Fundamental Rights (e.g. "Article 102 TFEU", "Article 47 of the Charter", resolved to that article in the current consolidated version) — to its canonical CELLAR work, confirming it exists before you fetch or traverse it. Returns the work URI, confirmed CELEX number, document type, date, English title, and the ECLI of a case that carries one. A CELEX that CELLAR holds under several works resolves to the one the EUR-Lex content resolver serves. An ECLI shared by several records (a judgment and its abstract or extract, or a joined AG opinion) resolves to the primary record with the lowest CELEX. An OJ reference whose first page starts several acts, a document number CELLAR holds in several parts, and a procedure with several initiating acts return found false, the notice naming each CELEX; a procedure with no initiating act returns found false, the notice naming the CELEX of each act it produced.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     identifier: z
       .string()
       .min(1)
       .describe(
-        'The EU legal citation to resolve: a CELEX number (e.g. 32016R0679), a work-level ELI URI (e.g. http://data.europa.eu/eli/reg/2016/679, with or without the /oj suffix), an ECLI (e.g. ECLI:EU:C:2014:317), or an OJ citation that names its act type and year, resolved to the CELEX it names under identifier_type "auto": Regulation (EU) 2016/679, Regulation (EC) No 1049/2001, Directive 95/46/EC, Decision No 1313/2013/EU, Council Framework Decision 2002/584/JHA, Council Joint Action 2008/124/CFSP, Common Position 2003/444/CFSP. "No" before the numbers means number/year, otherwise year/number; a two-digit year is 19YY. A citation without its act type (95/46/EC) or year (Regulation No 17) is not parsed; one followed by its parenthesized OJ reference (Directive 95/46/EC (OJ L 281, 23.11.1995, p. 31)) or by the period closing a sentence resolves as the citation. An Official Journal reference resolves, also under "auto", to the act starting on the page it cites: OJ L 281, 23.11.1995, p. 31 (also "of 23.11.1995", a page range, a class letter as in OJ L 42I, OJ C, and before 1968 the series-less OJ 13, 21.2.1962, p. 204/62), the year-first OJ 1995 L 281, p. 31 or [1995] OJ L281/31, and the act-by-act OJ L, 2024/1689, 12.7.2024 or OJ C, C/2024/2664, 29.4.2024; the spellings OJ No L 281, O.J. L 281, a spaced date (23. 11. 1995), pp. 1-88, and OJ L 2024/1689 without its comma are read too, and the cited date must be the publication date. A reference without its year or first page (OJ L 281, OJ L 119/1) is not parsed. A Commission document number resolves, also under "auto", to the work carrying it: COM(2021) 206 final, also COM(2021)206, COM/2021/206, or COM (2021) 0206, final/2 for its second version, a two-digit year read as 19YY (COM(90) 314 final), and SEC, SWD, and JOIN numbers; a Commission decision number (C(2021) 4500 final) is not read. An interinstitutional procedure reference resolves to the act that initiated the procedure: 2021/0106(COD), also 2021/106 (COD) or 2021/0106/COD; one without its type (2021/0106) is not read. A CELEX is also read in lowercase, after a CELEX: prefix, from a EUR-Lex page URL carrying uri=CELEX:… (e.g. https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX:32016R0679), or from a publications.europa.eu/resource/celex/ URI; an ELI over https, on the eur-lex.europa.eu host, without a scheme, with a trailing slash, or with a language segment after /oj or a date (…/oj/eng). A case number (C-131/12) names several records rather than one work and returns found false with a pointer to eurlex_get_cases.',
+        'The EU legal citation to resolve: a CELEX number (e.g. 32016R0679), a work-level ELI URI (e.g. http://data.europa.eu/eli/reg/2016/679, with or without the /oj suffix), an ECLI (e.g. ECLI:EU:C:2014:317), or an OJ citation that names its act type and year, resolved to the CELEX it names under identifier_type "auto": Regulation (EU) 2016/679, Regulation (EC) No 1049/2001, Directive 95/46/EC, Decision No 1313/2013/EU, Council Framework Decision 2002/584/JHA, Council Joint Action 2008/124/CFSP, Common Position 2003/444/CFSP. "No" before the numbers means number/year, otherwise year/number; a two-digit year is 19YY. A citation without its act type (95/46/EC) or year (Regulation No 17) is not parsed; one followed by its parenthesized OJ reference (Directive 95/46/EC (OJ L 281, 23.11.1995, p. 31)) or by the period closing a sentence resolves as the citation. An Official Journal reference resolves, also under "auto", to the act starting on the page it cites: OJ L 281, 23.11.1995, p. 31 (also "of 23.11.1995", a page range, a class letter as in OJ L 42I, OJ C, and before 1968 the series-less OJ 13, 21.2.1962, p. 204/62), the year-first OJ 1995 L 281, p. 31 or [1995] OJ L281/31, and the act-by-act OJ L, 2024/1689, 12.7.2024 or OJ C, C/2024/2664, 29.4.2024; the spellings OJ No L 281, O.J. L 281, a spaced date (23. 11. 1995), pp. 1-88, and OJ L 2024/1689 without its comma are read too, and the cited date must be the publication date. A reference without its year or first page (OJ L 281, OJ L 119/1) is not parsed. A Commission document number resolves, also under "auto", to the work carrying it: COM(2021) 206 final, also COM(2021)206, COM/2021/206, or COM (2021) 0206, final/2 for its second version, a two-digit year read as 19YY (COM(90) 314 final), and SEC, SWD, and JOIN numbers; a Commission decision number (C(2021) 4500 final) is not read. An interinstitutional procedure reference resolves to the act that initiated the procedure: 2021/0106(COD), also 2021/106 (COD) or 2021/0106/COD; one without its type (2021/0106) is not read. A treaty-article citation resolves, also under "auto", to that article in the current consolidated TFEU, TEU, or Charter of Fundamental Rights: Article 102 TFEU, also Art. 102 TFEU, Art 102 TFEU, or TFEU Article 102; Article 4(3) TEU, its paragraph and point designators dropped; Article 102 of the Treaty on the Functioning of the European Union; Article 6 of the Treaty on European Union; and Article 47 of the Charter, also Article 47 CFR, CFREU, or of the Charter of Fundamental Rights. Several articles (Articles 101 and 102 TFEU), text after the treaty (Article 267 TFEU, third paragraph), and pre-Lisbon numbering (Art 82 EC, Article 6 EU) are not read. A CELEX is also read in lowercase, after a CELEX: prefix, from a EUR-Lex page URL carrying uri=CELEX:… (e.g. https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX:32016R0679), or from a publications.europa.eu/resource/celex/ URI; an ELI over https, on the eur-lex.europa.eu host, without a scheme, with a trailing slash, or with a language segment after /oj or a date (…/oj/eng). A case number (C-131/12) names several records rather than one work and returns found false with a pointer to eurlex_get_cases.',
       ),
     identifier_type: enumInput(
       IDENTIFIER_TYPES,
@@ -356,7 +418,7 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
         .enum(IDENTIFIER_TYPES)
         .default('auto')
         .describe(
-          'Format of the identifier. "auto" detects a CELEX, an ELI URI, an ECLI (by its ECLI: prefix, in any letter case), an OJ citation, an Official Journal reference, a Commission document number, or a procedure reference; "celex", "eli", or "ecli" forces that lookup. An OJ citation or reference, a Commission document number, and a procedure reference are recognized only under "auto".',
+          'Format of the identifier. "auto" detects a CELEX, an ELI URI, an ECLI (by its ECLI: prefix, in any letter case), an OJ citation, an Official Journal reference, a Commission document number, a procedure reference, or a treaty-article citation; "celex", "eli", or "ecli" forces that lookup. An OJ citation or reference, a Commission document number, a procedure reference, and a treaty-article citation are recognized only under "auto".',
         ),
     ),
   }),
@@ -377,7 +439,7 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
     found: z
       .boolean()
       .describe(
-        'True when the identifier resolves to a CELLAR work; false when a well-formed CELEX, ELI, ECLI, OJ citation, Official Journal reference, Commission document number, or procedure reference matches no work in the corpus, when an OJ reference\'s first page starts several acts, when a document number or procedure names several works, when a procedure has no initiating act with a CELEX (the notice then naming each act it produced), or when the identifier is a case number, with a notice naming what was tried. Only an identifier_type "auto" value that, after trimming, is neither an ECLI, an ELI, a CELEX in any accepted form, an OJ citation naming its act type and year, an OJ reference naming its issue, year, and first page, a Commission document number, nor a procedure reference with its type raises ambiguous_identifier instead.',
+        'True when the identifier resolves to a CELLAR work; false when a well-formed CELEX, ELI, ECLI, OJ citation, Official Journal reference, Commission document number, procedure reference, or treaty-article citation matches no work in the corpus, when an OJ reference\'s first page starts several acts, when a document number or procedure names several works, when a procedure has no initiating act with a CELEX (the notice then naming each act it produced), or when the identifier is a case number, with a notice naming what was tried. Only an identifier_type "auto" value that, after trimming, is neither an ECLI, an ELI, a CELEX in any accepted form, an OJ citation naming its act type and year, an OJ reference naming its issue, year, and first page, a Commission document number, a procedure reference with its type, nor a treaty-article citation naming one article raises ambiguous_identifier instead.',
       ),
     work_uri: z.string().optional().describe('CELLAR work URI (stable resource identifier).'),
     celex_number: z.string().optional().describe('Confirmed CELEX number for the resolved work.'),
@@ -413,7 +475,7 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
       .string()
       .optional()
       .describe(
-        'Present only when found is false: the CELEX, ELI, ECLI, OJ reference, Commission document number, or procedure looked up, the accepted forms, and the search to use instead; for a CELEX one numbering convention away from one CELLAR holds (a consolidated CELEX with no date or a date no version carries, a (nn) suffix missing or extra, a number not zero-padded to four digits), each held CELEX in place of the accepted forms; for an OJ reference whose first page starts several acts, or a document number or procedure naming several works, the CELEX of each; for a procedure with no initiating act, the CELEX of each act it produced.',
+        'Present only when found is false: the CELEX, ELI, ECLI, OJ reference, Commission document number, or procedure looked up, the accepted forms, and the search to use instead; for a treaty-article citation, the CELEX it names and the article and treaty, and that pre-Lisbon numbering is not converted; for a CELEX one numbering convention away from one CELLAR holds (a consolidated CELEX with no date or a date no version carries, a (nn) suffix missing or extra, a number not zero-padded to four digits, or to three for a treaty article), each held CELEX in place of the accepted forms; for an OJ reference whose first page starts several acts, or a document number or procedure naming several works, the CELEX of each; for a procedure with no initiating act, the CELEX of each act it produced.',
       ),
   },
   enrichmentTrailer: { notice: { render: (notice) => renderNoticeBlockquote(String(notice)) } },
@@ -422,9 +484,9 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
     {
       reason: 'ambiguous_identifier',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'identifier_type is "auto" and the identifier, after trimming, is neither an ECLI (ECLI: prefix), an ELI, a CELEX (bare, after a CELEX: prefix, or in a EUR-Lex URL), a prefixed case number, an OJ citation naming its act type and year (e.g. "Regulation No 17" names no year), an Official Journal reference naming its issue, year, and first page (e.g. "OJ L 281" names neither), a Commission document number (COM, SEC, SWD, or JOIN with its year and number; "C(2021) 4500 final" is none), nor a procedure reference with its type (e.g. "2021/0106(COD)"), so no lookup branch applies.',
+      when: 'identifier_type is "auto" and the identifier, after trimming, is neither an ECLI (ECLI: prefix), an ELI, a CELEX (bare, after a CELEX: prefix, or in a EUR-Lex URL), a prefixed case number, an OJ citation naming its act type and year (e.g. "Regulation No 17" names no year), an Official Journal reference naming its issue, year, and first page (e.g. "OJ L 281" names neither), a Commission document number (COM, SEC, SWD, or JOIN with its year and number; "C(2021) 4500 final" is none), a procedure reference with its type (e.g. "2021/0106(COD)"), nor a treaty-article citation naming one article of the TFEU, the TEU, or the Charter ("Articles 101 and 102 TFEU" names two, "Art 82 EC" a pre-Lisbon treaty), so no lookup branch applies.',
       recovery:
-        'Pass a CELEX (32016R0679), an ELI URI (http://data.europa.eu/eli/reg/2016/679), an ECLI (ECLI:EU:C:2014:317), an OJ citation with its act type and year ("Regulation (EU) 2016/679", "Directive 95/46/EC"), an OJ reference with its issue, date, and first page ("OJ L 119, 4.5.2016, p. 1"), a Commission document number ("COM(2021) 206 final"), or a procedure reference ("2021/0106(COD)"); to find an act by title words, use eurlex_search_documents with keyword.',
+        'Pass a CELEX (32016R0679), an ELI URI (http://data.europa.eu/eli/reg/2016/679), an ECLI (ECLI:EU:C:2014:317), an OJ citation with its act type and year ("Regulation (EU) 2016/679", "Directive 95/46/EC"), an OJ reference with its issue, date, and first page ("OJ L 119, 4.5.2016, p. 1"), a Commission document number ("COM(2021) 206 final"), a procedure reference ("2021/0106(COD)"), or one treaty article ("Article 102 TFEU", "Article 47 of the Charter"); to find an act by title words, use eurlex_search_documents with keyword.',
     },
     {
       reason: 'sparql_error',
@@ -440,6 +502,14 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
       when: "The lookup ran past its time budget (retryable: CELLAR's response time varies, so a later lookup can finish), or CELLAR refused a lookup query as too costly to run (not retryable: the same query is refused again). Neither is retried within the call, apart from one re-send, inside the same budget, of a lookup CELLAR leaves unanswered for 20 s.",
       recovery:
         "When the error is retryable, look the identifier up again shortly: whether the lookup finishes inside its time budget turns on CELLAR's response time, not on the identifier.",
+      thrownBy: 'service',
+    },
+    {
+      reason: 'request_too_large',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A lookup query built from the identifier is over the 8,192 bytes CELLAR accepts in one request, which only an identifier thousands of characters long reaches. It is refused before it is sent.',
+      recovery:
+        "Pass the identifier as its citation writes it: no CELEX, ECLI, or ELI is long enough to reach CELLAR's 8,192-byte request limit, so a value this long names no work.",
       thrownBy: 'service',
     },
   ],
@@ -459,6 +529,7 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
 
     let identifier = normalizeIdentifier(citation, input.identifier_type);
     let effectiveType: LookupType;
+    let treatyArticle: TreatyArticle | undefined;
 
     if (input.identifier_type === 'auto') {
       /**
@@ -475,6 +546,11 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
       // An OJ reference is tried last: every pattern opens on `OJ` (or `O.J.`, `[1995] OJ`), which no other form starts with.
       const ojReference =
         preparatory || detected || citedCelex ? undefined : parseOjReference(identifier);
+      // A treaty-article citation opens on Article, Art, or a treaty abbreviation, which no form above reads (#207).
+      treatyArticle =
+        preparatory || detected || citedCelex || ojReference
+          ? undefined
+          : citedTreatyArticle(citation);
       if (preparatory) {
         // One CELEX resolves through the CELEX branch; several, or none, is a result.
         const resolution = await withTimeoutAlternative(
@@ -515,6 +591,10 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
         }
         effectiveType = 'celex';
         identifier = resolution.celex;
+      } else if (treatyArticle) {
+        // The article's CELEX resolves through the CELEX branch, as an OJ citation's does.
+        effectiveType = 'celex';
+        identifier = treatyArticle.celex;
       } else {
         throw ctx.fail(
           'ambiguous_identifier',
@@ -604,6 +684,17 @@ export const eurlex_lookup_celex = tool('eurlex_lookup_celex', {
       const tried = `${IDENTIFIER_LABEL[effectiveType]} ${echoValue(identifier)}`;
       const parsedFrom = identifier === citation ? '' : ` (parsed from "${echoValue(citation)}")`;
       const missed = `No CELLAR work matches ${tried}${parsedFrom}.`;
+      if (treatyArticle) {
+        /**
+         * An article the treaty lacks (#207). The held-CELEX check is not sent: the CELEX
+         * computed from the citation already has the three-digit article number CELLAR
+         * writes, so none of that check's forms could name a held one.
+         */
+        ctx.enrich.notice(
+          `${missed} CELLAR holds no Article ${treatyArticle.article} of the current consolidated ${TREATY_TITLE[treatyArticle.treaty]}. A treaty-article citation reads post-Lisbon article numbers only: a pre-Lisbon number (Article 82 EC) is not converted.`,
+        );
+        return { found: false };
+      }
       const held: HeldCelex =
         effectiveType === 'celex' ? await findHeldCelex(svc, identifier, ctx) : { kind: 'none' };
       ctx.enrich.notice(

@@ -91,6 +91,9 @@ const PREFIXES = [
   'CELEX:',
 ];
 
+/** A partial CELEX opening with a type letter, its run carrying the marker. */
+const TYPE_LETTER_KEYWORD = 'R0679Zq7';
+
 const VARIANTS = [
   HOSTILE,
   // Opens with a quote, so an unguarded `<${value}>` starts with `<"`.
@@ -101,6 +104,12 @@ const VARIANTS = [
   ]),
   // CELEX characters only, so the routes gated on the CELEX charset see the marker.
   'Zq7(01)_X',
+  /*
+   * A type-letter keyword completed into more prefix terms than the page query carries,
+   * so the head lookups that narrow them, whose literals hold its leading [0-9A-Z] run,
+   * are lexed too.
+   */
+  TYPE_LETTER_KEYWORD,
   // Well-formed URIs carrying the marker, so the URI inputs provably reach a query.
   'http://eurovoc.europa.eu/zq7',
   'http://publications.europa.eu/resource/cellar/zq7-0000',
@@ -112,6 +121,12 @@ const VARIANTS = [
   'COM(2021) 206 final',
   '2021/0106(COD)',
   '2022/132A(COD)',
+  /*
+   * A treaty-article citation (#207), so the CELEX lookup it computes is lexed. Its
+   * grammar admits digits, fixed words, and dropped paragraph designators, so no
+   * caller character reaches that lookup.
+   */
+  'Article 102 TFEU',
 ];
 
 /**
@@ -429,6 +444,51 @@ describe('SPARQL lexical safety of caller input', () => {
     expect(count).toContain(`<${workUri}>`);
     expect(sparqlLexicalIssues(count)).toEqual([]);
   });
+
+  it.each([
+    ['Article 102 TFEU', '12016E102'],
+    // The marker sits in a paragraph designator, which the citation drops.
+    [`Article 102(${MARKER}) TFEU`, '12016E102'],
+    [`TEU Art. 4(3)(${MARKER})`, '12016M004'],
+  ])(
+    'lexes the CELEX lookup eurlex_lookup_celex computes from the treaty-article citation %j (#207)',
+    async (identifier, celex) => {
+      const target = targets.find((t) => t.name === 'eurlex_lookup_celex');
+      const parsed = target?.schema.safeParse({ identifier });
+      if (!target || !parsed?.success) throw new Error(`eurlex_lookup_celex takes ${identifier}`);
+      captured.length = 0;
+      await target.handler(
+        parsed.data as never,
+        createMockContext({ errors: target.errors } as never) as never,
+      );
+      expect(captured).toHaveLength(1);
+      expect(captured[0]).toContain(`"${celex}"^^xsd:string`);
+      expect(captured[0]?.toLowerCase()).not.toContain(MARKER);
+      expect(sparqlLexicalIssues(captured[0] ?? '')).toEqual([]);
+    },
+  );
+
+  it.each(['eurlex_search_documents', 'eurlex_get_cases'])(
+    '%s sends the head lookups of the type-letter keyword variant, the marker in each',
+    async (name) => {
+      const target = targets.find((t) => t.name === name);
+      const parsed = target?.schema.safeParse({ keyword: TYPE_LETTER_KEYWORD });
+      if (!target || !parsed?.success) throw new Error(`${name} takes ${TYPE_LETTER_KEYWORD}`);
+      captured.length = 0;
+      await target.handler(
+        parsed.data as never,
+        createMockContext({ errors: target.errors } as never) as never,
+      );
+      const lookups = captured.filter((query) =>
+        query.includes('SELECT DISTINCT (STRBEFORE(STR(?kwCelex), "R0679ZQ7") AS ?kwHead)'),
+      );
+      expect(lookups).not.toEqual([]);
+      for (const lookup of lookups) {
+        expect(lookup.toLowerCase()).toContain(MARKER);
+        expect(sparqlLexicalIssues(lookup)).toEqual([]);
+      }
+    },
+  );
 });
 
 /**
@@ -444,6 +504,7 @@ describe('#196 the held-CELEX query of a CELEX miss', () => {
     ['52026AG0012', '52026AG0012(01)'],
     ['62009CJ0197(01)', '62009CJ0197'],
     ['32023R138', '32023R0138'],
+    ['12016P47', '12016P047'],
   ];
   const READS: [name: string, build: (celex: string) => Record<string, unknown>][] = [
     ['eurlex_get_document', (celex) => ({ celex_number: celex, content_mode: 'metadata_only' })],

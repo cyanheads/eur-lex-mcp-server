@@ -214,6 +214,16 @@ describe('eurlex_comparative_analysis', () => {
       expect(sixth).toContain('`12016E102`');
     });
 
+    it('step 6 resolves any other treaty article from its citation with eurlex_lookup_celex (#207)', async () => {
+      const text = await renderText(
+        eurlex_comparative_analysis.args!.parse({ domain: 'data privacy' }),
+      );
+      const sixth = step(text, 6);
+
+      expect(sixth).toMatch(/other treaty article[^.]*\*\*eurlex_lookup_celex\*\*/);
+      expect(sixth).toContain('"Article 8 of the Charter"');
+    });
+
     it('keeps the US steps last and the EU legislation steps unchanged', async () => {
       const text = await renderText(
         eurlex_comparative_analysis.args!.parse({ domain: 'antitrust' }),
