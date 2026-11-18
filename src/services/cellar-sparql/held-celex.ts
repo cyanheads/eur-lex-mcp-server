@@ -2,8 +2,9 @@
  * @fileoverview The CELEX numbers CELLAR holds one numbering convention away from a
  * CELEX that names no work (#196): a consolidated CELEX with no date or a date no
  * version carries, a CELEX missing or carrying a `(nn)` sibling ordinal, and a number
- * not zero-padded to four digits. A miss sends one query of exact typed literals to
- * name them; a CELEX that names a work never reaches it.
+ * not zero-padded to four digits, or to three for a Lisbon treaty article. A miss
+ * sends one query of exact typed literals to name them; a CELEX that names a work
+ * never reaches it.
  * @module services/cellar-sparql/held-celex
  */
 
@@ -12,7 +13,7 @@ import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { CellarSparqlService } from './cellar-sparql-service.js';
 import { celexLiteral, escapeSparqlLiteral, isValidCalendarDate } from './eli-resolution.js';
 import { CELEX_TYPE_CODES, type CelexSector, FIRST_CELEX_YEAR } from './keyword-match.js';
-import type { ConsolidationBase } from './relation-traversal.js';
+import { type ConsolidationBase, treatyVersionCelex } from './relation-traversal.js';
 import type { SparqlBinding } from './types.js';
 
 /**
@@ -64,7 +65,9 @@ export type CelexMissReading =
  *   the type. The date must be a calendar date.
  * - **Any other sector**: `(01)`–`(99)` after a CELEX with no `(nn)` (`52026AG0012`),
  *   the CELEX without its `(nn)` (`62009CJ0197(01)`), and a number of one to three
- *   digits zero-padded to four (`32023R138`). Conventions are not composed:
+ *   digits zero-padded to four (`32023R138`). A Lisbon treaty version numbers its
+ *   articles with three digits, so under one a number of one or two digits is also
+ *   padded to three (`12016E35` → `12016E035`). Conventions are not composed:
  *   `32023R138` gets no `(nn)` on its padded number.
  */
 export function readCelexMiss(celex: string): CelexMissReading | undefined {
@@ -86,6 +89,8 @@ export function readCelexMiss(celex: string): CelexMissReading | undefined {
   if (date) return;
   const stem = `${sector}${year}${type}${number}`;
   const forms = ordinal ? [stem] : SIBLING_ORDINALS.map((o) => `${stem}${o}`);
+  const article = `${sector}${year}${type}${number.padStart(3, '0')}`;
+  if (number.length < 3 && treatyVersionCelex(article)) forms.push(`${article}${ordinal}`);
   if (number.length < 4) forms.push(`${sector}${year}${type}${number.padStart(4, '0')}${ordinal}`);
   return { kind: 'act', forms };
 }

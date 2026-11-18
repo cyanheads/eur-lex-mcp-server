@@ -24,7 +24,10 @@ const CELLAR = 'http://publications.europa.eu/resource/cellar/';
 const siblings = (stem: string) =>
   Array.from({ length: 99 }, (_, i) => `${stem}(${String(i + 1).padStart(2, '0')})`);
 
-/** CELEX numbers CELLAR holds outside sector 0, as read live on 2026-11-09. */
+/**
+ * CELEX numbers CELLAR holds outside sector 0, as read live on 2026-11-09; the two
+ * treaty articles on 2026-11-17.
+ */
 const HELD = new Set([
   '32014R0833',
   '32006R1907',
@@ -32,6 +35,8 @@ const HELD = new Set([
   '52026AG0012(02)',
   '62009CJ0197',
   '32023R0138',
+  '12016E035',
+  '12016P047',
 ]);
 
 /**
@@ -193,6 +198,46 @@ describe('readCelexMiss', () => {
     ['the first year a CELEX carries', '31951R0001', siblings('31951R0001')],
     ['next year', '32027R0001', siblings('32027R0001')],
     ['sector E', 'E2003C0097', siblings('E2003C0097')],
+    [
+      'a three-digit article of a Lisbon treaty version: the siblings and the number zero-padded to four',
+      '12016E359',
+      [...siblings('12016E359'), '12016E0359'],
+    ],
+    [
+      'a short number under a treaty letter of a year no Lisbon version carries: four digits only',
+      '12007E35',
+      [...siblings('12007E35'), '12007E0035'],
+    ],
+    [
+      'a short number under a pre-Lisbon treaty: four digits only',
+      '11992M35',
+      [...siblings('11992M35'), '11992M0035'],
+    ],
+    [
+      'a short number under another sector-1 type: four digits only',
+      '12016A35',
+      [...siblings('12016A35'), '12016A0035'],
+    ],
+    [
+      'a two-digit TFEU article: the siblings, then the number zero-padded to three and to four',
+      '12016E35',
+      [...siblings('12016E35'), '12016E035', '12016E0035'],
+    ],
+    [
+      'a two-digit Charter article of its 2007 version',
+      '12007P47',
+      [...siblings('12007P47'), '12007P047', '12007P0047'],
+    ],
+    [
+      'a one-digit TEU article of its 2008 version',
+      '12008M4',
+      [...siblings('12008M4'), '12008M004', '12008M0004'],
+    ],
+    [
+      'a one-digit treaty article with a (nn): the CELEX without it, then each padded number with it',
+      '12016E5(01)',
+      ['12016E5', '12016E005(01)', '12016E0005(01)'],
+    ],
   ])('reads %s', (_label, celex, forms) => {
     expect(readCelexMiss(celex)).toEqual({ kind: 'act', forms });
   });
@@ -234,6 +279,8 @@ describe('findHeldCelex', () => {
     ['52026AG0012', ['52026AG0012(01)', '52026AG0012(02)']],
     ['62009CJ0197(01)', ['62009CJ0197']],
     ['32023R138', ['32023R0138']],
+    ['12016E35', ['12016E035']],
+    ['12016P47', ['12016P047']],
   ])('names the forms CELLAR holds one convention away from %s', async (celex, held) => {
     const result = await findHeldCelex(svc, celex, createMockContext());
     expect(result).toEqual({
