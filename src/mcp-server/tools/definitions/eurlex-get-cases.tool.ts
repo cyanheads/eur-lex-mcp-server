@@ -725,7 +725,15 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: "The search ran past its time budget (retryable: CELLAR's response time varies, so a later search can finish), or CELLAR refused it as too costly to run (not retryable: the same search is refused again). Neither is retried within the call, apart from one re-send, inside the same budget, of a lookup CELLAR leaves unanswered for 20 s.",
       recovery:
-        'Narrow the search with a closer date_from/date_to range or a more specific keyword, then search again.',
+        'Narrow the search with a closer date_from/date_to range or a more specific keyword, then search again. A partial CELEX keyword that opens with type letters needs more of its number (C0131, not C0): its lookups take as long whatever else the search sets.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'request_too_large',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A search query is over the 8,192 bytes CELLAR accepts in one request, so it is refused before it is sent. It carries keyword and case_number beside the other filters, so how long a keyword fits depends on what else the search sets. A partial CELEX keyword that opens with type letters (C0) is completed into one term per sector, year, and type code that holds it, so a short one can reach too many to fit.',
+      recovery:
+        'Shorten keyword or case_number to the party name, title words, or case number itself, or drop a filter the search can do without. Give a partial CELEX keyword that opens with type letters more of its number (C0131, not C0), or pass the whole CELEX. CELLAR refuses a request over 8,192 bytes.',
       thrownBy: 'service',
     },
   ],
@@ -920,7 +928,7 @@ export const eurlex_get_cases = tool('eurlex_get_cases', {
     }
 
     // Title arm on the full-text index, CELEX arm by the keyword's shape (#17, #105).
-    // Its one CELLAR lookup runs only once the input has passed validation.
+    // Its CELLAR lookups run only once the input has passed validation.
     const keywordClause = keywordInput ? await keywordMatchPattern(svc, keywordInput, ctx) : '';
 
     /**
@@ -1081,7 +1089,7 @@ SELECT
     const page = rows.slice(0, pageLimit);
     // A CELEX held by several works resolves to its canonical work (#97), in one
     // follow-up query for the page that also reads each work's types, ECLI, and
-    // English titles (#146) — the alias match never binds inside the grouped
+    // English titles (#146) — the alias match stays unbound inside the grouped
     // query above.
     const resolvedWorks = await resolveCelexWorkRows(
       svc,

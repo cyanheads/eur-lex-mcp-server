@@ -12,8 +12,10 @@ import { ENG_LANGUAGE_URI } from './cdm-labels.js';
 import { CellarSparqlService } from './cellar-sparql-service.js';
 import { celexLiteral, escapeSparqlLiteral, isSafeSparqlIri } from './eli-resolution.js';
 import type { CelexSector } from './keyword-match.js';
+import { queryRequestChunks } from './request-chunks.js';
 import { cellarDate, readWindowedPage, windowedLimit } from './sort-window.js';
 import type { SparqlBinding, WorkRelation } from './types.js';
+import { aliasRivalPattern } from './work-resolution.js';
 
 /** The relation types this server exposes over the CDM graph. */
 export const RELATION_TYPES = [
@@ -208,6 +210,20 @@ const LISBON_TREATY_YEARS = new Map<string, readonly string[]>([
   ['M', ['2008', '2010', '2012', '2016']],
   ['P', ['2007', '2010', '2012', '2016']],
 ]);
+
+/** A post-Lisbon treaty by its CELEX letter: the TFEU (`E`), the TEU (`M`), the Charter (`P`). */
+export type LisbonTreaty = 'E' | 'M' | 'P';
+
+/**
+ * The CELEX of article `article` (1–999) in the newest consolidated version of
+ * `treaty`: `1`, that version's year, the letter, and the number zero-padded to three
+ * digits, as CELLAR numbers each article's work (`12016E102`, #207).
+ */
+export function currentTreatyArticleCelex(treaty: LisbonTreaty, article: number): string {
+  // Every LisbonTreaty is a key of the table, so the fallback never fires.
+  const newest = LISBON_TREATY_YEARS.get(treaty)?.at(-1) ?? '';
+  return `1${newest}${treaty}${String(article).padStart(3, '0')}`;
+}
 
 /** A Lisbon treaty article (`12016E102`, three digits) or whole text (`12016E/TXT`). */
 const LISBON_TREATY_CELEX = /^1(\d{4})([EMP])(\d{3}|\/TXT)$/;
@@ -484,8 +500,25 @@ function celexFilters(variable: string, celex: CelexConstraint): string[] {
 }
 
 /**
+ * `FILTER NOT EXISTS` leaving out `related` when it is a copy (#209): a work holding a
+ * CELEX that another work carries the alias of ({@link aliasRivalPattern}), as the
+ * `cdm:do_not_index` copies of case law and preparatory acts do beside the work their
+ * CELEX resolves to (#97). Each such CELEX then reads as that one work, with its own
+ * title, date, and provisions. The filter binds the CELEX itself, so a related work
+ * with no CELEX passes. No copy was found carrying an edge, or a provision on one, that
+ * the work its CELEX resolves to lacks, and no national implementing measure shares a
+ * CELEX with another work (2026-11-17). On one line, since a window-end continuation
+ * query carrying it is handed to callers as one.
+ */
+function copyExclusion(related: string): string {
+  const rival = aliasRivalPattern(related, '?ownCelex').replace(/\n\s*/g, ' ');
+  return `FILTER NOT EXISTS { ${related} cdm:resource_legal_id_celex ?ownCelex . ${rival} }`;
+}
+
+/**
  * One direction's graph pattern for a relation predicate, tagged with its direction.
  * With `versions`, the edge reaches any of the version works rather than `workUri`.
+ * A related work that is a copy of another's CELEX is left out ({@link copyExclusion}).
  */
 function relationArm(
   workUri: string,
@@ -515,6 +548,7 @@ function relationArm(
   // related works without a document date still return (they sort last under DESC).
   return `${edge}
     ${celexTriple}${celexFilter}
+    ${copyExclusion('?relatedWork')}
     OPTIONAL { ?relatedWork cdm:work_date_document ?relatedDate . }${articleFilter}
     BIND("${direction}" AS ?direction)`;
 }
@@ -527,6 +561,11 @@ function relationArm(
  * heavily-related act (e.g. works citing the GDPR) returns thousands of rows, so
  * an unordered LIMIT dropped the newest. Newest-first keeps the most recent within
  * the cap; `OFFSET` reaches the rest.
+ *
+ * Each arm leaves copies out before grouping ({@link copyExclusion}, #209), so `LIMIT`,
+ * `OFFSET`, the sentinel row, and the 10,000-row window count one row per related
+ * CELEX, the work it resolves to. Dropping copies from a page already cut would return
+ * it short, and its sentinel could prove a row that is then dropped.
  *
  * The date is aggregated as `MAX(STR(?relatedDate))`. CELLAR evaluates `MAX` over the
  * OPTIONAL `xsd:date` wrongly in this grouped query, attaching dates of other works
@@ -878,8 +917,9 @@ export interface RelationWindowEnd {
  * Ungrouped by design: CELLAR evaluates a grouped `MAX` over the date wrongly (see
  * {@link buildRelationQuery}), so a work with several dates or CELEX numbers repeats
  * rather than being aggregated. The CELEX constraint of the relation type carries
- * over, `relatedSectors` included, and so does an `article` filter, so the rows are
- * the ones the traversal would have returned.
+ * over, `relatedSectors` included, and so do an `article` filter and the exclusion of
+ * copies ({@link copyExclusion}), so the rows are the ones the traversal would have
+ * returned.
  */
 function continuationQuery(
   workUri: string,
@@ -902,7 +942,7 @@ function continuationQuery(
           .map((filter) => ` ${filter}`)
           .join('')}`
       : 'OPTIONAL { ?work cdm:resource_legal_id_celex ?celex }'
-  }${article ? ` ${articleFilterClause(sourceTerm, '?work', predicate, direction, article)}` : ''}`;
+  } ${copyExclusion('?work')}${article ? ` ${articleFilterClause(sourceTerm, '?work', predicate, direction, article)}` : ''}`;
   return lastDate
     ? `${select} ?work ?celex ?date WHERE { ${edge} ?work cdm:work_date_document ?date . ${celexPattern} FILTER(?date <= "${lastDate}"^^xsd:date) } ORDER BY DESC(?date) ?work`
     : `${select} ?work ?celex WHERE { ${edge} ${celexPattern} FILTER NOT EXISTS { ?work cdm:work_date_document ?date } } ORDER BY ?work`;
@@ -972,7 +1012,7 @@ function continuationQuery(
  * `GROUP_CONCAT` inside the paged query fails once an edge's designators pass
  * about 4 KB (Virtuoso SR319, HTTP 500). The follow-up runs after the page query,
  * so it adds one round-trip to the call; its keys are split into as many requests as
- * CELLAR's body limit needs ({@link chunkKeys}), sent together. A follow-up CELLAR
+ * CELLAR's request limit needs ({@link queryRequestChunks}), sent together. A follow-up CELLAR
  * fails, in any of its requests, is reported in `provisionsUnavailable` and the type's
  * rows are returned without provisions; the caller's cancellation still ends the call.
  *
@@ -1302,65 +1342,24 @@ export async function summarizeTransposition(
   };
 }
 
-/** CELLAR refuses a SPARQL POST body over this many bytes, form-encoded (HTTP 403). */
-const CELLAR_BODY_LIMIT_BYTES = 8192;
-
 /**
- * The longest source CELEX and work URI a traversal is sent for. No CELLAR work holds
- * a longer one — its longest CELEX has 27 characters, its work URIs 82 (2026-11-14) —
- * and every query built from them stays within {@link CELLAR_BODY_LIMIT_BYTES}.
+ * The longest source CELEX and work URI a traversal is sent for, and the longest
+ * keyword the search tools look up as a whole CELEX. No CELLAR work holds a longer
+ * one — its longest CELEX has 27 characters, its work URIs 82 (2026-11-14) — and every
+ * query built from them stays within CELLAR's request limit, the keyword's family
+ * lookup split across requests.
  */
 export const SOURCE_CELEX_MAX_LENGTH = 100;
 export const SOURCE_WORK_URI_MAX_LENGTH = 256;
 
 /**
- * Room each body keeps for what the service sends around a query: the `query=` key,
- * its PREFIX block, and the results-format field, 271 encoded bytes (2026-11-14).
- */
-const SERVICE_BODY_ALLOWANCE_BYTES = 512;
-
-/**
- * The bytes `text` takes form-encoded, as the service posts a query. Encoding is per
- * character, so the size of a concatenation is the sum of its parts' sizes.
- */
-function encodedBytes(text: string): number {
-  return new URLSearchParams({ q: text }).toString().length - 'q='.length;
-}
-
-/**
- * `keys` split, in order, into the fewest runs whose query `queryFor` builds fits
- * CELLAR's body limit, each key counted at its encoded `<…>` and separating space.
- */
-function chunkKeys(
-  keys: readonly string[],
-  queryFor: (chunk: readonly string[]) => string,
-): string[][] {
-  const budget =
-    CELLAR_BODY_LIMIT_BYTES - SERVICE_BODY_ALLOWANCE_BYTES - encodedBytes(queryFor([]));
-  const chunks: string[][] = [];
-  let chunk: string[] = [];
-  let size = 0;
-  for (const key of keys) {
-    const cost = encodedBytes(` <${key}>`);
-    if (chunk.length > 0 && size + cost > budget) {
-      chunks.push(chunk);
-      chunk = [];
-      size = 0;
-    }
-    chunk.push(key);
-    size += cost;
-  }
-  if (chunk.length > 0) chunks.push(chunk);
-  return chunks;
-}
-
-/**
  * The compacted, de-duplicated, sorted designators each page row of an annotated
  * type records, by related work URI: ungrouped queries keyed on the rows, split so
- * each request fits CELLAR's body limit and sent together. Only a URI the IRI guard
- * accepts is keyed; CELLAR's own work URIs always pass. With `versions`, the axioms
- * are those of the edges reaching any version, each designator read from the version
- * its edge targets. Every request settles before a failure among them is thrown.
+ * each request fits CELLAR's request limit and sent together
+ * ({@link queryRequestChunks}). Only a URI the IRI guard accepts is keyed; CELLAR's
+ * own work URIs always pass. With `versions`, the axioms are those of the edges
+ * reaching any version, each designator read from the version its edge targets. Every
+ * request settles before a failure among them is thrown.
  */
 async function readProvisions(
   svc: Pick<CellarSparqlService, 'query'>,
@@ -1382,12 +1381,7 @@ async function readProvisions(
   const versionBlock = versions ? `${versionValues(versions)} ` : '';
   const queryFor = (chunk: readonly string[]) =>
     `SELECT DISTINCT ?relatedWork ?location WHERE { ${iriValues('?relatedWork', chunk)} ${versionBlock}${locationAxiom('?axiom', source, predicate, target, '?location')} }`;
-  const settled = await Promise.allSettled(
-    chunkKeys(keys, queryFor).map((chunk) => svc.query(queryFor(chunk), ctx)),
-  );
-  const failed = settled.find((result) => result.status === 'rejected');
-  if (failed) throw failed.reason;
-  const bindings = settled.flatMap((result) => (result.status === 'fulfilled' ? result.value : []));
+  const bindings = await queryRequestChunks(svc, keys, queryFor, ctx);
   const sets = new Map<string, Set<string>>();
   for (const binding of bindings) {
     const work = CellarSparqlService.bindingValue(binding, 'relatedWork');

@@ -8,6 +8,7 @@
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { describe, expect, it, vi } from 'vitest';
 import {
+  aliasRivalPattern,
   canonicalAliasPattern,
   pickResolvedWork,
   resolveCelexWorkRows,
@@ -44,6 +45,39 @@ describe('canonicalAliasPattern', () => {
 
   it('is an OPTIONAL, so works without the alias still return', () => {
     expect(canonicalAliasPattern('?c').trimStart().startsWith('OPTIONAL {')).toBe(true);
+  });
+});
+
+describe('aliasRivalPattern (#204)', () => {
+  it('matches another work holding the CELEX that carries its alias, bound as ?aliasRival', () => {
+    expect(aliasRivalPattern('?work', '?celexNumber')).toBe(
+      `?aliasRival cdm:resource_legal_id_celex ?celexNumber .
+    ?aliasRival <http://www.w3.org/2002/07/owl#sameAs> ?rivalAlias .
+    FILTER(?aliasRival != ?work && ?rivalAlias = IRI(CONCAT("http://publications.europa.eu/resource/celex/", ENCODE_FOR_URI(STR(?celexNumber)))))`,
+    );
+  });
+
+  it('names the work and CELEX variables it is given in every position', () => {
+    const pattern = aliasRivalPattern('?w', '?c');
+    expect(pattern).toContain('?aliasRival cdm:resource_legal_id_celex ?c .');
+    expect(pattern).toContain('?aliasRival != ?w &&');
+    expect(pattern).toContain('ENCODE_FOR_URI(STR(?c))');
+    expect(pattern).not.toMatch(/\?work|\?celexNumber/);
+  });
+
+  it('builds the alias IRI exactly as canonicalAliasPattern does, so both pick the same work', () => {
+    const iri = (pattern: string) => /IRI\(CONCAT\([^)]*\)\)\)\)/.exec(pattern)?.[0];
+    expect(iri(aliasRivalPattern('?work', '?celexNumber'))).toBe(
+      iri(canonicalAliasPattern('?celexNumber')),
+    );
+  });
+
+  it('requires the alias triple, never as an OPTIONAL, so it holds in a grouped query too', () => {
+    const pattern = aliasRivalPattern('?work', '?celexNumber');
+    expect(pattern).not.toContain('OPTIONAL');
+    expect(pattern.split('\n')[1]?.trim()).toBe(
+      '?aliasRival <http://www.w3.org/2002/07/owl#sameAs> ?rivalAlias .',
+    );
   });
 });
 

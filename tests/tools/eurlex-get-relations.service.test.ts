@@ -6,11 +6,21 @@
 import { createHash } from 'node:crypto';
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
-import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, expect, it, vi } from 'vitest';
 import { eurlex_get_relations } from '@/mcp-server/tools/definitions/eurlex-get-relations.tool.js';
 import { initCellarSparqlService } from '@/services/cellar-sparql/cellar-sparql-service.js';
-import { RELATION_TYPES } from '@/services/cellar-sparql/relation-traversal.js';
+import { CELEX_SECTORS } from '@/services/cellar-sparql/keyword-match.js';
+import {
+  MEMBER_STATE_CODES,
+  RELATION_TYPES,
+  SOURCE_WORK_URI_MAX_LENGTH,
+  traverseRelations,
+} from '@/services/cellar-sparql/relation-traversal.js';
+import {
+  CELLAR_REQUEST_LIMIT_BYTES,
+  sparqlRequestBytes,
+} from '@/services/cellar-sparql/sparql-request-body.js';
 import { CELLAR, isResolutionQuery, requestedCelex } from '../fixtures/cellar-works.js';
 import { readCommonMark } from '../helpers/commonmark.js';
 
@@ -279,6 +289,34 @@ async function relationQueriesFor(input: Record<string, unknown>): Promise<strin
   return sent.toSorted();
 }
 
+/**
+ * The exclusion of copies (#209) as a query applies it to `related`: a `FILTER NOT
+ * EXISTS` binding the related work's own CELEX to `variable`, then another work holding
+ * that CELEX and carrying its `owl:sameAs` alias, on one line.
+ */
+const copyExclusion = (related: string, variable: string) =>
+  `FILTER NOT EXISTS { ${related} cdm:resource_legal_id_celex ${variable} . ?aliasRival cdm:resource_legal_id_celex ${variable} . ?aliasRival <http://www.w3.org/2002/07/owl#sameAs> ?rivalAlias . FILTER(?aliasRival != ${related} && ?rivalAlias = IRI(CONCAT("http://publications.europa.eu/resource/celex/", ENCODE_FOR_URI(STR(${variable}))))) }`;
+
+/** The CELEX variable of each copy exclusion `text` applies to `related`, in order. */
+function copyExclusionVariables(text: string, related: string): string[] {
+  const opener = new RegExp(
+    `FILTER NOT EXISTS \\{ \\${related} cdm:resource_legal_id_celex (\\?\\w+) \\. `,
+    'g',
+  );
+  return [...text.matchAll(opener)].flatMap((match) => {
+    const variable = match[1] ?? '';
+    return text.startsWith(copyExclusion(related, variable), match.index) ? [variable] : [];
+  });
+}
+
+/** `query` with the copy exclusion (#209) cut from its relation arms, for assertions on the rest of an arm. */
+function withoutCopyExclusion(query: string): string {
+  return copyExclusionVariables(query, '?relatedWork').reduce(
+    (text, variable) => text.replaceAll(`\n    ${copyExclusion('?relatedWork', variable)}`, ''),
+    query,
+  );
+}
+
 const OUTGOING_TYPES = RELATION_TYPES.filter((type) =>
   ['amends', 'repeals', 'implicitly_repeals', 'legal_basis', 'interprets', 'adopts'].includes(type),
 );
@@ -317,7 +355,8 @@ it('sends the same relation queries as before the treaty version set outside its
   };
   const now: Record<string, { count: number; sha256: string }> = {};
   for (const [label, input] of Object.entries(cases)) {
-    const queries = await relationQueriesFor(input);
+    // The exclusion of copies every relation arm has carried since (#209) is taken out.
+    const queries = (await relationQueriesFor(input)).map(withoutCopyExclusion);
     now[label] = { count: queries.length, sha256: digest(queries) };
   }
   expect(now).toEqual(before);
@@ -804,4 +843,332 @@ it('lists a type without provisions when one of its follow-up requests fails (#1
   expect(page.relations.some((r) => r.provisions)).toBe(false);
   expect(page.notice).toContain('CELLAR did not return the provisions of interpreted_by');
   expect(text(result)).toContain('CELLAR did not return the provisions of interpreted_by');
+});
+
+// --- #209: a related CELEX CELLAR holds under several works ---
+
+/** A related work of a fixture graph; `alias` marks the work its CELEX resolves to. */
+interface RelatedWork {
+  alias?: true;
+  celex?: string;
+  date: string;
+  title?: string;
+  work: string;
+}
+
+/**
+ * CELLAR answering `interpreted_by` pages over `related`, every one an incoming edge
+ * of the source. An arm carrying the copy exclusion leaves out each work holding a
+ * CELEX another work carries the alias of; with `appliesExclusion: false` it answers
+ * as though the arm carried none. Pages are ordered newest first, then by work URI.
+ * The source CELEX resolves; every other query is answered with no rows.
+ */
+function copyCellar(related: RelatedWork[], { appliesExclusion = true } = {}) {
+  initService();
+  const pages: string[] = [];
+  const isCopy = (w: RelatedWork) =>
+    !w.alias && related.some((other) => other.alias && other.celex === w.celex);
+  const respond = (bindings: object[]) =>
+    new Response(JSON.stringify({ head: { vars: [] }, results: { bindings } }));
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (_url: string, init: RequestInit) => {
+      const query = new URLSearchParams(String(init.body)).get('query') ?? '';
+      if (isResolutionQuery(query)) {
+        return respond(
+          requestedCelex(query).map((celex) => ({
+            celexNumber: { type: 'literal', value: celex },
+            work: { type: 'uri', value: `${CELLAR}source-${celex}` },
+          })),
+        );
+      }
+      if (!query.includes('?relatedDateMax')) return respond([]);
+      pages.push(query);
+      const excludes = appliesExclusion && copyExclusionVariables(query, '?relatedWork').length > 0;
+      const [, limit = '0', offset = '0'] = /LIMIT (\d+) OFFSET (\d+)/.exec(query) ?? [];
+      return respond(
+        related
+          .filter((w) => !(excludes && isCopy(w)))
+          .toSorted((a, b) => b.date.localeCompare(a.date) || a.work.localeCompare(b.work))
+          .slice(Number(offset), Number(offset) + Number(limit))
+          .map((w) => ({
+            relatedWork: { type: 'uri', value: w.work },
+            direction: { type: 'literal', value: 'incoming' },
+            relatedDateMax: { type: 'literal', value: w.date },
+            ...(w.celex ? { relatedCelexSample: { type: 'literal', value: w.celex } } : {}),
+            ...(w.title ? { relatedTitleMax: { type: 'literal', value: w.title } } : {}),
+          })),
+      );
+    }),
+  );
+  return { pages };
+}
+
+/**
+ * Rulings on an act as CELLAR holds them: two CELEX each held by the work they resolve
+ * to and an untitled `do_not_index` copy carrying the same edge and date, whose work
+ * URI sorts first; and a related work with no CELEX.
+ */
+const COPIED_RULINGS: RelatedWork[] = [
+  {
+    work: `${CELLAR}ruling-one`,
+    celex: '62024CJ0001',
+    date: '2025-01-01',
+    title: 'One',
+    alias: true,
+  },
+  {
+    work: `${CELLAR}f30be32a`,
+    celex: '62023CJ0156',
+    date: '2024-06-01',
+    title: 'Two',
+    alias: true,
+  },
+  { work: `${CELLAR}0-copy-two`, celex: '62023CJ0156', date: '2024-06-01' },
+  {
+    work: `${CELLAR}5dbe6052`,
+    celex: '62023CJ0253',
+    date: '2024-01-01',
+    title: 'Three',
+    alias: true,
+  },
+  { work: `${CELLAR}0-copy-three`, celex: '62023CJ0253', date: '2024-01-01' },
+  {
+    work: `${CELLAR}ruling-four`,
+    celex: '62022CJ0001',
+    date: '2023-01-01',
+    title: 'Four',
+    alias: true,
+  },
+  { work: `${CELLAR}no-celex`, date: '2022-01-01', title: 'Five' },
+];
+
+type CopyPage = Page & {
+  relations: (Page['relations'][number] & { related_title?: string; related_work_uri: string })[];
+};
+
+/** Walk `interpreted_by` of 32016R0679 at `limit` until has_more is false, then once past the end. */
+async function walkRulings(limit: number) {
+  const rows: [string | undefined, string, string | undefined][] = [];
+  const hasMore: boolean[] = [];
+  const texts: string[] = [];
+  let offset = 0;
+  for (;;) {
+    const result = await runToolContract(eurlex_get_relations, {
+      celex_number: '32016R0679',
+      relation_types: ['interpreted_by'],
+      limit,
+      offset,
+    });
+    expect(result.isError).not.toBe(true);
+    const page = result.structuredContent as CopyPage;
+    for (const r of page.relations)
+      rows.push([r.related_celex_number, r.related_work_uri, r.related_title]);
+    hasMore.push(page.has_more);
+    texts.push(text(result));
+    if (page.next_offset === undefined) break;
+    offset = page.next_offset;
+  }
+  const past = await runToolContract(eurlex_get_relations, {
+    celex_number: '32016R0679',
+    relation_types: ['interpreted_by'],
+    limit,
+    offset: offset + limit,
+  });
+  return { rows, hasMore, texts, past: past.structuredContent as CopyPage };
+}
+
+it('returns every row CELLAR sends, two works of one CELEX included, so the query alone leaves copies out (#209)', async () => {
+  copyCellar(COPIED_RULINGS, { appliesExclusion: false });
+  const { rows } = await walkRulings(10);
+  expect(rows.map(([celex, work]) => [celex, work])).toEqual([
+    ['62024CJ0001', `${CELLAR}ruling-one`],
+    ['62023CJ0156', `${CELLAR}0-copy-two`],
+    ['62023CJ0156', `${CELLAR}f30be32a`],
+    ['62023CJ0253', `${CELLAR}0-copy-three`],
+    ['62023CJ0253', `${CELLAR}5dbe6052`],
+    ['62022CJ0001', `${CELLAR}ruling-four`],
+    [undefined, `${CELLAR}no-celex`],
+  ]);
+});
+
+it('pages one row per related CELEX, read from the work it resolves to, with copies straddling page boundaries (#209)', async () => {
+  const cellar = copyCellar(COPIED_RULINGS);
+  const { rows, hasMore, texts, past } = await walkRulings(2);
+  expect(rows).toEqual([
+    ['62024CJ0001', `${CELLAR}ruling-one`, 'One'],
+    ['62023CJ0156', `${CELLAR}f30be32a`, 'Two'],
+    ['62023CJ0253', `${CELLAR}5dbe6052`, 'Three'],
+    ['62022CJ0001', `${CELLAR}ruling-four`, 'Four'],
+    // No exclusion names a work with no CELEX a copy.
+    [undefined, `${CELLAR}no-celex`, 'Five'],
+  ]);
+  expect(hasMore).toEqual([true, true, false]);
+  expect(past.relations).toEqual([]);
+  expect(past.has_more).toBe(false);
+  // Three pages, then one past the end.
+  expect(cellar.pages).toHaveLength(4);
+  const rendered = texts.join('\n');
+  expect(rendered).not.toContain('0-copy-');
+  for (const [celex, work, title] of rows) {
+    expect(texts.filter((t) => t.includes(work))).toHaveLength(1);
+    if (celex) expect(rendered.split(celex)).toHaveLength(2);
+    expect(rendered).toContain(`${title}`);
+  }
+});
+
+it('leaves copies out of every relation arm before paging, each exclusion binding its own CELEX (#209)', async () => {
+  const cases: Record<string, unknown>[] = [
+    { celex_number: '32016R0679' },
+    {
+      celex_number: '32016L0680',
+      related_sectors: [...CELEX_SECTORS],
+      member_states: ['CZE'],
+      article: '17',
+    },
+    // A treaty article: every incoming arm reads its four versions.
+    { celex_number: '12016P047' },
+  ];
+  for (const input of cases) {
+    const pages = (await relationQueriesFor(input)).filter((q) => q.includes('?relatedDateMax'));
+    expect(pages).toHaveLength(RELATION_TYPES.length);
+    const arms = pages.flatMap((query) => query.split(' UNION '));
+    // cites reads both directions.
+    expect(arms).toHaveLength(RELATION_TYPES.length + 1);
+    for (const arm of arms) {
+      const [variable = '', ...more] = copyExclusionVariables(arm, '?relatedWork');
+      expect(more).toEqual([]);
+      expect(variable).toMatch(/^\?\w+$/);
+      expect(variable).not.toBe('?relatedCelex');
+      const at = arm.indexOf(copyExclusion('?relatedWork', variable));
+      expect(at).toBeGreaterThan(
+        arm.indexOf('?relatedWork cdm:resource_legal_id_celex ?relatedCelex'),
+      );
+      expect(at).toBeLessThan(arm.indexOf('GROUP BY ?relatedWork ?direction'));
+    }
+  }
+});
+
+/**
+ * CELLAR for `traverseRelations` itself: records every query and answers each relation
+ * page with one row per direction it reads, dated `date` when given. At offset 9,999
+ * that row ends the page at the sort window, so every direction carries a continuation
+ * query.
+ */
+function windowEndService(date?: string) {
+  const sent: string[] = [];
+  const answer = async (query: string) => {
+    sent.push(query);
+    const directions = ['outgoing', 'incoming'].filter((d) =>
+      query.includes(`BIND("${d}" AS ?direction)`),
+    );
+    return directions.map((direction) => ({
+      relatedWork: { type: 'uri', value: `${CELLAR}row-${direction}` },
+      direction: { type: 'literal', value: direction },
+      relatedCelexSample: { type: 'literal', value: '72016L0680CZE_1' },
+      ...(date ? { relatedDateMax: { type: 'literal', value: date } } : {}),
+    }));
+  };
+  return { sent, svc: { query: answer, queryWithContinuation: answer } };
+}
+
+it('carries the copy exclusion into every window-end continuation, constrained or not, dated or not (#209)', async () => {
+  const source = `${CELLAR}source`;
+  const cites = await traverseRelations(
+    windowEndService('2020-01-01').svc,
+    source,
+    ['cites'],
+    createMockContext(),
+    {
+      offset: 9_999,
+      perTypeLimit: 100,
+    },
+  );
+  const interpreted = await traverseRelations(
+    windowEndService().svc,
+    source,
+    ['interpreted_by'],
+    createMockContext(),
+    {
+      offset: 9_999,
+      perTypeLimit: 100,
+      relatedSectors: ['6'],
+      article: { number: '17' },
+    },
+  );
+  const continuations = [...cites.windowEnds, ...interpreted.windowEnds].map(
+    (w) => w.continuationQuery,
+  );
+  expect(continuations).toHaveLength(3);
+  for (const query of continuations) {
+    const [variable = '', ...more] = copyExclusionVariables(query, '?work');
+    expect(more).toEqual([]);
+    expect(variable).toMatch(/^\?\w+$/);
+    expect(variable).not.toBe('?celex');
+    expect(query.indexOf(copyExclusion('?work', variable))).toBeGreaterThan(
+      query.indexOf('?work cdm:resource_legal_id_celex ?celex'),
+    );
+  }
+  // The CELEX stays optional where no constraint requires it.
+  expect(
+    continuations
+      .slice(0, 2)
+      .every((q) => q.includes('OPTIONAL { ?work cdm:resource_legal_id_celex ?celex }')),
+  ).toBe(true);
+});
+
+it('keeps every relation page and continuation query within CELLAR’s 8,192-byte request limit at its longest inputs (#209)', async () => {
+  const long = (tag: string) => `${CELLAR}${tag}`.padEnd(SOURCE_WORK_URI_MAX_LENGTH, 'a');
+  // Longer than any CELLAR work URI (82 characters), so an upper bound.
+  const versions = ['12007P047', '12010P047', '12012P047', '12016P047'].map((celex) => ({
+    celex,
+    workUri: long(celex),
+  }));
+  const articles = [
+    { number: '9999' },
+    ...'abcdefghijklmnopqrstuvwxyz'.split('').map((letter) => ({ number: '9999', letter })),
+  ];
+  let largestPage = '';
+  const continuations: string[] = [];
+  for (const article of articles) {
+    // The tool never pairs article with versions; both together bound either.
+    const options = {
+      sourceCelex: '32016L0680',
+      relatedSectors: CELEX_SECTORS,
+      memberStates: MEMBER_STATE_CODES,
+      article,
+      versions,
+      interpretedByVersions: versions,
+      perTypeLimit: 100,
+    };
+    const page = windowEndService();
+    await traverseRelations(page.svc, long('source'), RELATION_TYPES, createMockContext(), {
+      ...options,
+      offset: 9_899,
+    });
+    for (const query of page.sent) {
+      if (sparqlRequestBytes(query) > sparqlRequestBytes(largestPage)) largestPage = query;
+    }
+    for (const date of ['2020-01-01', undefined]) {
+      const end = await traverseRelations(
+        windowEndService(date).svc,
+        long('source'),
+        RELATION_TYPES,
+        createMockContext(),
+        {
+          ...options,
+          offset: 9_999,
+        },
+      );
+      expect(end.windowEnds).toHaveLength(RELATION_TYPES.length + 1);
+      continuations.push(...end.windowEnds.map((w) => w.continuationQuery));
+    }
+  }
+  // The largest is cites, which carries the exclusion in both of its arms.
+  expect(largestPage).toContain('cdm:work_cites_work');
+  expect(copyExclusionVariables(largestPage, '?relatedWork')).toHaveLength(2);
+  expect(sparqlRequestBytes(largestPage)).toBeLessThanOrEqual(CELLAR_REQUEST_LIMIT_BYTES);
+  expect(Math.max(...continuations.map(sparqlRequestBytes))).toBeLessThanOrEqual(
+    CELLAR_REQUEST_LIMIT_BYTES,
+  );
 });

@@ -7,8 +7,12 @@
  * @module tests/services/keyword-match.test
  */
 
+import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
+import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { ServerConfig } from '@/config/server-config.js';
+import { CellarSparqlService } from '@/services/cellar-sparql/cellar-sparql-service.js';
 import {
   CELEX_TYPE_CODES,
   type CelexFragmentRoute,
@@ -386,7 +390,12 @@ describe('keywordMatchPattern partial-CELEX arm (#123)', () => {
   });
 
   it('completes a type-letter fragment through the type codes', async () => {
-    const pattern = await keywordMatchPattern(svc, 'j0131', createMockContext());
+    // The lookups resolving the completions find the case CELLAR holds the fragment in,
+    // 62013CJ0131, by the text before the fragment in it (#208).
+    const holding = {
+      query: vi.fn(async () => [{ kwHead: { type: 'literal', value: '62013C' } }]),
+    };
+    const pattern = await keywordMatchPattern(holding, 'j0131', createMockContext());
 
     const [expression] = celexFullTextExpressions(pattern);
     expect(expression).toContain(`'62013CJ0131*'`);
@@ -495,5 +504,556 @@ describe('keywordMatchPattern partial-CELEX arm (#123)', () => {
         1 + celexFullTextExpressions(pattern).length,
       );
     }
+  });
+});
+
+/** CELLAR's limit on a SPARQL request body, form-encoded (HTTP 403 past it). */
+const REQUEST_LIMIT_BYTES = 8192;
+
+/** The actual service, posting to a stubbed CELLAR endpoint. */
+function cellarService(): CellarSparqlService {
+  return new CellarSparqlService(
+    {} as AppConfig,
+    {} as StorageService,
+    {
+      cellarSparqlEndpoint: 'http://cellar.test/sparql',
+      sparqlQueryTimeoutMs: 5000,
+      maxSparqlResults: 100,
+    } as ServerConfig,
+  );
+}
+
+/** A result row: each variable it binds and that variable's literal value. */
+type CellarRow = Readonly<Record<string, string>>;
+
+/** A query's rows, a bare string binding `?kwCelex`, or the response that fails it. */
+type CellarAnswer = readonly (string | CellarRow)[] | Response;
+
+/**
+ * Stubs CELLAR's endpoint, recording each request body and the rows each query was
+ * answered with; `answer` gives a query's rows, or the response that fails it.
+ */
+function stubCellar(answer: (query: string) => CellarAnswer | Promise<CellarAnswer>) {
+  const bodies: string[] = [];
+  const answered: CellarRow[][] = [];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (_url: string, init: RequestInit) => {
+      const body = String(init.body);
+      bodies.push(body);
+      const values = await answer(new URLSearchParams(body).get('query') ?? '');
+      if (values instanceof Response) return values;
+      const rows = values.map((value) => (typeof value === 'string' ? { kwCelex: value } : value));
+      answered.push(rows);
+      const bindings = rows.map((row) =>
+        Object.fromEntries(
+          Object.entries(row).map(([name, value]) => [name, { type: 'literal', value }]),
+        ),
+      );
+      return new Response(JSON.stringify({ head: { vars: [] }, results: { bindings } }));
+    }),
+  );
+  return {
+    bodies,
+    answered,
+    queries: () => bodies.map((body) => new URLSearchParams(body).get('query') ?? ''),
+  };
+}
+
+/** The 125 forms of a whole CELEX the family lookup asks CELLAR about, in order. */
+function familyOf(celex: string): string[] {
+  const ordinals = Array.from({ length: 20 }, (_, i) => `(${String(i + 1).padStart(2, '0')})`);
+  return [
+    celex,
+    ...ordinals.map((ordinal) => `${celex}${ordinal}`),
+    ...ordinals.map((ordinal) => `${celex}R${ordinal}`),
+    ...['', ...ordinals].flatMap((ordinal) =>
+      ['_INF', '_RES', '_SUM', '_EXT'].map((suffix) => `${celex}${ordinal}${suffix}`),
+    ),
+  ];
+}
+
+/** The family lookup query for `members`, as the service receives it after its PREFIX block. */
+function familyLookup(members: readonly string[]): string {
+  return `SELECT DISTINCT ?kwCelex WHERE {
+  VALUES ?kwCelex { ${members.map((m) => `"${m}"^^xsd:string`).join(' ')} }
+  ?kwWork cdm:resource_legal_id_celex ?kwCelex .
+}`;
+}
+
+/** The typed literals of every `VALUES ?kwCelex { … }` list in a query. */
+function valuesLiterals(query: string): string[] {
+  return [...query.matchAll(/VALUES \?kwCelex \{ ([^}]*) \}/g)].flatMap((m) =>
+    [...(m[1] ?? '').matchAll(/"((?:[^"\\]|\\.)*)"\^\^xsd:string/g)].map((v) => v[1] ?? ''),
+  );
+}
+
+/** `celex` padded with zeros to `length` characters, a CELEX-shaped value no work carries. */
+const padded = (celex: string, length: number) => celex.padEnd(length, '0');
+
+/**
+ * The whole pattern of an uppercase partial keyword whose CELEX arm carries `terms`: the
+ * English-title arm on `phrase`, then the prefix terms and the confirming substring test.
+ */
+function partialPattern(keyword: string, terms: readonly string[], phrase = keyword): string {
+  return `{
+    ?kwExpr cdm:expression_title ?kwTitle .
+    ?kwTitle bif:contains "'${phrase}'" .
+    ?kwExpr cdm:expression_uses_language <http://publications.europa.eu/resource/authority/language/ENG> .
+    ?kwExpr cdm:expression_belongs_to_work ?work .
+  } UNION {
+    ?work cdm:resource_legal_id_celex ?kwCelex .
+    ?kwCelex bif:contains "${terms.map((term) => `'${term}*'`).join(' OR ')}" .
+    FILTER(CONTAINS(STR(?kwCelex), "${keyword}"))
+  }`;
+}
+
+/**
+ * A fragment lookup from its `SELECT` on: the distinct text before `run` in each CELEX
+ * holding `keyword` that one of `terms` starts.
+ */
+function headLookup(run: string, keyword: string, terms: readonly string[]): string {
+  return `SELECT DISTINCT (STRBEFORE(STR(?kwCelex), "${run}") AS ?kwHead) WHERE {
+  ?kwWork cdm:resource_legal_id_celex ?kwCelex .
+  ?kwCelex bif:contains "${terms.map((term) => `'${term}*'`).join(' OR ')}" .
+    FILTER(CONTAINS(STR(?kwCelex), "${keyword}"))
+}`;
+}
+
+/** The prefix terms a query's CELEX full-text expressions ask about, in order. */
+function askedTerms(query: string): string[] {
+  return celexFullTextExpressions(query).flatMap((expression) =>
+    [...expression.matchAll(/'([0-9A-Z]+)\*'/g)].map((m) => m[1] ?? ''),
+  );
+}
+
+describe('keyword lookups on the wire, through the actual service (#208)', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  /**
+   * Characterization: the requests each of these keywords sent before the family
+   * lookup was split. The byte counts are the bodies measured on the wire against
+   * live CELLAR (2026-11-17).
+   */
+  it.each([
+    ['32016R0679', 6091],
+    ['62023CO0097R(01)', 7341],
+    [padded('32016R0679', 26), 8091],
+  ])('sends the whole-CELEX keyword %s one family lookup of %i bytes', async (keyword, bytes) => {
+    const cellar = stubCellar(() => []);
+    await keywordMatchPattern(cellarService(), keyword, createMockContext());
+
+    expect(cellar.bodies.map((body) => body.length)).toEqual([bytes]);
+    expect(cellar.queries()).toEqual([expect.stringContaining(familyLookup(familyOf(keyword)))]);
+  });
+
+  it('matches a carried whole CELEX on the exact literals CELLAR returned, plus its corrigenda', async () => {
+    stubCellar(() => ['32016R0679', '32016R0679R(01)']);
+    const pattern = await keywordMatchPattern(cellarService(), '32016R0679', createMockContext());
+
+    expect(
+      pattern,
+    ).toContain(`{ VALUES ?kwCelex { "32016R0679"^^xsd:string "32016R0679R(01)"^^xsd:string }
+      ?work cdm:resource_legal_id_celex ?kwCelex . }
+    UNION
+    { ?kwBase cdm:resource_legal_id_celex "32016R0679"^^xsd:string .
+      ?work cdm:resource_legal_corrects_resource_legal ?kwBase . }`);
+  });
+
+  it.each([
+    ['CJ0362', 5591, Array.from({ length: YEARS }, (_, i) => `6${1951 + i}CJ0362`)],
+    ['2016R0679', 5966, SECTORS.map((s) => `${s}2016R0679`)],
+    [padded('32016R0679', 26), 8091, [padded('32016R0679', 26)]],
+  ])(
+    'puts the full term list of %s, which no work carries whole, in the arm after its one family lookup',
+    async (keyword, bytes, terms) => {
+      const cellar = stubCellar(() => []);
+      const pattern = await keywordMatchPattern(cellarService(), keyword, createMockContext());
+
+      expect(cellar.bodies.map((body) => body.length)).toEqual([bytes]);
+      expect(celexFullTextExpressions(pattern)).toEqual([
+        terms.map((term) => `'${term}*'`).join(' OR '),
+      ]);
+      expect(confirmingLiterals(pattern)).toEqual([keyword]);
+    },
+  );
+
+  it.each([
+    // 27 characters counted with `(` and `)` at three bytes: 8,216 bytes unsplit.
+    ['32016R0679R(02)(01)', 2],
+    // The heaviest CELEX CELLAR holds: 9,466 bytes unsplit.
+    ['52016TA1013(01)R(02)R(01)', 2],
+    [padded('32016R0679', 100), 3],
+    // 94 parentheses, each three bytes encoded: 40,841 bytes unsplit.
+    [`32016${'()'.repeat(47)}R`, 6],
+  ])(
+    'splits the family lookup of %s across %i requests within the limit, each member asked once, in order',
+    async (keyword, requests) => {
+      const cellar = stubCellar(() => []);
+      await keywordMatchPattern(cellarService(), keyword, createMockContext());
+
+      expect(cellar.bodies).toHaveLength(requests);
+      for (const body of cellar.bodies)
+        expect(body.length).toBeLessThanOrEqual(REQUEST_LIMIT_BYTES);
+      expect(cellar.queries().flatMap(valuesLiterals)).toEqual(familyOf(keyword));
+    },
+  );
+
+  it('merges the CELEX every family request carries into the arm, a sibling only the second request asked about included', async () => {
+    const keyword = '32016R0679R(02)(01)';
+    const lastSibling = `${keyword}(20)_EXT`;
+    const cellar = stubCellar((query) =>
+      [keyword, lastSibling].filter((celex) => valuesLiterals(query).includes(celex)),
+    );
+    const pattern = await keywordMatchPattern(cellarService(), keyword, createMockContext());
+
+    const [first = '', second = ''] = cellar.queries();
+    expect(valuesLiterals(first)).toContain(keyword);
+    expect(valuesLiterals(second)).toContain(lastSibling);
+    expect(valuesLiterals(pattern)).toEqual([keyword, lastSibling]);
+    expect(pattern).toContain(`?kwBase cdm:resource_legal_id_celex "${keyword}"^^xsd:string .`);
+  });
+
+  it('fails the call with a failed family request once every request has settled', async () => {
+    let answerFirst: (values: CellarAnswer) => void = () => {};
+    const first = new Promise<CellarAnswer>((resolve) => {
+      answerFirst = resolve;
+    });
+    let calls = 0;
+    stubCellar(() => {
+      calls += 1;
+      if (calls === 1) return first;
+      return new Response('Virtuoso 37000 Error SP030: SPARQL compiler, line 3: syntax error', {
+        status: 400,
+      });
+    });
+    let settled = false;
+    const call = keywordMatchPattern(cellarService(), '32016R0679R(02)(01)', createMockContext());
+    call.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+    await vi.waitFor(() => expect(calls).toBe(2));
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    answerFirst(['32016R0679R(02)(01)']);
+    await expect(call).rejects.toMatchObject({ data: { reason: 'sparql_error' } });
+  });
+
+  it('fails the call with a failed head lookup, after sending every lookup of its round, rather than matching titles alone', async () => {
+    const failure = 'Virtuoso 37000 Error SP030: SPARQL compiler, line 4: syntax error';
+    let calls = 0;
+    const cellar = stubCellar(() => {
+      calls += 1;
+      return calls === 2 ? new Response(failure, { status: 400 }) : [{ kwHead: '32016' }];
+    });
+
+    await expect(
+      keywordMatchPattern(cellarService(), 'R0679', createMockContext()),
+    ).rejects.toMatchObject({
+      message: `CELLAR SPARQL error: ${failure}`,
+      data: { reason: 'sparql_error', retryable: false },
+    });
+    // R0679 is no CELEX, so no family lookup: its four head lookups, all in one round.
+    expect(cellar.bodies).toHaveLength(4);
+    for (const query of cellar.queries()) {
+      expect(query).toContain('SELECT DISTINCT (STRBEFORE(STR(?kwCelex), "R0679") AS ?kwHead)');
+    }
+    expect(cellar.queries().flatMap(askedTerms)).toEqual(indexTerms('R0679'));
+  });
+
+  it('ends the call on cancellation instead of building the arm without the lookup', async () => {
+    const controller = new AbortController();
+    const bodies: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        (_url: string, init: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            bodies.push(String(init.body));
+            init.signal?.addEventListener('abort', () => reject(init.signal?.reason));
+          }),
+      ),
+    );
+    const call = keywordMatchPattern(
+      cellarService(),
+      '32016R0679R(02)(01)',
+      createMockContext({ signal: controller.signal }),
+    );
+    await vi.waitFor(() => expect(bodies).toHaveLength(2));
+    controller.abort();
+
+    await expect(call).rejects.toMatchObject({ name: 'AbortError' });
+    expect(bodies).toHaveLength(2);
+  });
+
+  it('looks up a CELEX-shaped keyword of 100 characters, and sends none for one of 101, which takes the partial arm', async () => {
+    const cellar = stubCellar(() => []);
+    await keywordMatchPattern(cellarService(), padded('32016R0679', 100), createMockContext());
+    expect(cellar.bodies.length).toBeGreaterThan(0);
+
+    const longer = padded('32016R0679', 101);
+    const after = stubCellar(() => []);
+    const pattern = await keywordMatchPattern(cellarService(), longer, createMockContext());
+
+    expect(after.bodies).toEqual([]);
+    expect(celexFullTextExpressions(pattern)).toEqual([`'${longer}*'`]);
+    expect(confirmingLiterals(pattern)).toEqual([longer]);
+  });
+
+  it('sends a type-letter fragment of 100 characters its head lookups, and one of 101 none, which matches titles alone', async () => {
+    /** The type codes ending in R, by sector in route order: 14 codes, each behind 77 years. */
+    const codesEndingInR: [sector: string, codes: string[]][] = [
+      ['0', ['R']],
+      ['1', ['AR', 'LR', 'MR', 'R', 'SPR', 'TR']],
+      ['3', ['R']],
+      ['5', ['AR', 'IR', 'XR']],
+      ['7', ['R']],
+      ['8', ['FR', 'HR']],
+    ];
+    const termsOf = (keyword: string) =>
+      codesEndingInR.flatMap(([sector, codes]) =>
+        codes.flatMap((code) =>
+          Array.from({ length: YEARS }, (_, i) => `${sector}${1951 + i}${code}${keyword.slice(1)}`),
+        ),
+      );
+    // CELLAR answers every lookup with one head, so a lookup that is sent shapes the arm.
+    const answer = () => [{ kwHead: '32016' }];
+
+    const keyword = 'R0679'.padEnd(100, '0');
+    const cellar = stubCellar(answer);
+    const pattern = await keywordMatchPattern(cellarService(), keyword, createMockContext());
+
+    for (const body of cellar.bodies) expect(body.length).toBeLessThanOrEqual(REQUEST_LIMIT_BYTES);
+    // CELEX-shaped, so its family is looked up first, in three requests, and carried by no work.
+    const family = cellar.queries().filter((query) => query.includes('VALUES ?kwCelex'));
+    expect(family.flatMap(valuesLiterals)).toEqual(familyOf(keyword));
+    expect(family).toHaveLength(3);
+    const lookups = cellar.queries().filter((query) => !query.includes('VALUES ?kwCelex'));
+    expect(lookups).toHaveLength(18);
+    expect(lookups.flatMap(askedTerms)).toEqual(termsOf(keyword));
+    expect(termsOf(keyword)).toHaveLength(1078);
+    for (const query of lookups) {
+      expect(query.slice(query.indexOf('SELECT'))).toBe(
+        headLookup(keyword, keyword, askedTerms(query)),
+      );
+    }
+    expect(pattern).toBe(partialPattern(keyword, [`32016${keyword}`]));
+
+    const longer = 'R0679'.padEnd(101, '0');
+    const after = stubCellar(answer);
+    const titlesOnly = await keywordMatchPattern(cellarService(), longer, createMockContext());
+
+    expect(after.bodies).toEqual([]);
+    expect(titlesOnly).not.toContain('?kwCelex');
+    expect(titlesOnly).not.toContain('UNION');
+    expect(titlesOnly).toContain(`?kwTitle bif:contains "'${longer}'"`);
+  });
+
+  /**
+   * CELLAR's CELEX full-text index over `corpus`, as the page and the lookups query it:
+   * a term `'X*'` hits a CELEX with a word starting with X, words split at every
+   * character outside `[0-9A-Z]`, and a hit must hold the confirming literal. A query
+   * projecting `(STRBEFORE(STR(?kwCelex), "R") AS ?kwHead)` under `SELECT DISTINCT` is
+   * answered as SPARQL does: one row per distinct text before the first `R` in a hit.
+   */
+  function indexOver(corpus: readonly string[]) {
+    return (query: string): CellarAnswer => {
+      const [expression = ''] = celexFullTextExpressions(query);
+      const terms = [...expression.matchAll(/'([0-9A-Z]+)\*'/g)].map((m) => m[1] ?? '');
+      const [literal = ''] = confirmingLiterals(query);
+      const hits = corpus.filter(
+        (celex) =>
+          celex.includes(literal) &&
+          celex.split(/[^0-9A-Z]+/).some((word) => terms.some((term) => word.startsWith(term))),
+      );
+      const before =
+        /^SELECT DISTINCT \(STRBEFORE\(STR\(\?kwCelex\), "([^"]*)"\) AS \?kwHead\)/m.exec(
+          query,
+        )?.[1];
+      if (before === undefined) return hits;
+      const heads = hits.map((celex) =>
+        celex.includes(before) ? celex.slice(0, celex.indexOf(before)) : '',
+      );
+      return [...new Set(heads)].map((kwHead) => ({ kwHead }));
+    };
+  }
+
+  it.each([
+    [
+      'R0679',
+      ['02002R0679-20020423', '02016R0679-20160504', '31972R0679', '31979R0679R(01)', '32016R0679'],
+      ['02002R0679', '02016R0679', '31972R0679', '31979R0679', '32016R0679'],
+    ],
+    [
+      'J0131',
+      ['61981CJ0131(01)', '61995CJ0131', '62013CJ0131', '62007FJ0131', '62016TJ0131_RES'],
+      ['61981CJ0131', '61995CJ0131', '62013CJ0131', '62007FJ0131', '62016TJ0131'],
+    ],
+    [
+      'C0001',
+      ['32010C0001(02)', '52020PC0001', '61977CC0001', 'E2003C0001', '52020DC0001R(01)'],
+      ['32010C0001', '52020DC0001', '52020PC0001', '61977CC0001', 'E2003C0001'],
+    ],
+    // A C-sector CELEX opens with the run itself, so its completion is the run.
+    [
+      'C2006',
+      ['C2006/123/01', '52006PC2006', '62006CC2006'],
+      ['C2006', '52006PC2006', '62006CC2006'],
+    ],
+  ])(
+    'resolves the type-letter fragment %s in lookups within the limit, and keeps only the terms a CELEX holding it starts',
+    async (keyword, corpus, live) => {
+      const unrelated = ['32016R0680', '62013CJ0132', '52020PC0002'];
+      const cellar = stubCellar(indexOver([...corpus, ...unrelated]));
+      const pattern = await keywordMatchPattern(cellarService(), keyword, createMockContext());
+
+      expect(cellar.bodies.length).toBeGreaterThan(1);
+      for (const body of cellar.bodies)
+        expect(body.length).toBeLessThanOrEqual(REQUEST_LIMIT_BYTES);
+      // Every term of the route is asked about once, in order, across the lookups.
+      const asked = cellar
+        .queries()
+        .flatMap((q) => celexFullTextExpressions(q))
+        .flatMap((e) => [...e.matchAll(/'([0-9A-Z]+)\*'/g)].map((m) => m[1] ?? ''));
+      expect(asked).toEqual(indexTerms(keyword));
+      for (const query of cellar.queries()) expect(confirmingLiterals(query)).toEqual([keyword]);
+
+      expect(celexFullTextExpressions(pattern)).toEqual([live.map((t) => `'${t}*'`).join(' OR ')]);
+      expect(confirmingLiterals(pattern)).toEqual([keyword]);
+      // The arm reaches the CELEX the full term list reached.
+      expect(indexOver([...corpus, ...unrelated])(pattern)).toEqual(corpus);
+    },
+  );
+
+  it('matches titles only for a type-letter fragment no CELEX holds', async () => {
+    const cellar = stubCellar(() => []);
+    const pattern = await keywordMatchPattern(cellarService(), 'R0679', createMockContext());
+
+    expect(cellar.bodies.length).toBeGreaterThan(1);
+    expect(pattern).not.toContain('?kwCelex');
+    expect(pattern).not.toContain('UNION');
+    expect(pattern).toContain(`?kwTitle bif:contains "'R0679'"`);
+  });
+
+  it.each([
+    [
+      'R0679',
+      ['02016R0679-20160504', '31972R0679', '32016R0679', '32016R0679R(01)'],
+      ['02016R0679', '31972R0679', '32016R0679'],
+    ],
+    [
+      'J0131',
+      ['61981CJ0131(01)', '62013CJ0131', '62013CJ0131_SUM', '62010TJ0131'],
+      ['61981CJ0131', '62013CJ0131', '62010TJ0131'],
+    ],
+    [
+      'C0001',
+      ['32010C0001(02)', '52020PC0001', '52020PC0001R(01)', 'E2003C0001'],
+      ['32010C0001', '52020PC0001', 'E2003C0001'],
+    ],
+  ])(
+    'builds the whole pattern of %s from the CELEX CELLAR holds it in',
+    async (keyword, corpus, live) => {
+      stubCellar(indexOver([...corpus, '32016R0680', '62013CJ0132', '52020PC0002']));
+      const pattern = await keywordMatchPattern(cellarService(), keyword, createMockContext());
+
+      expect(pattern).toBe(partialPattern(keyword, live));
+    },
+  );
+
+  it.each([
+    ['CJ0362', [] as string[]],
+    ['2016R0679', [] as string[]],
+    ['32016R0679', ['32016R0679', '32016R0679R(01)']],
+  ])('sends %s its family lookup and no fragment lookup', async (keyword, carried) => {
+    const cellar = stubCellar((query) =>
+      carried.filter((celex) => valuesLiterals(query).includes(celex)),
+    );
+    await keywordMatchPattern(cellarService(), keyword, createMockContext());
+
+    expect(cellar.queries()).toEqual([expect.stringContaining(familyLookup(familyOf(keyword)))]);
+  });
+
+  it.each([
+    ['R0679', 'R0679'],
+    // The confirming test holds the whole keyword; the head is read before its run.
+    ['R0679-2016', 'R0679'],
+    ['C2006', 'C2006'],
+  ])(
+    'asks each lookup of %s for the distinct text before %s in the CELEX it reaches, never for the CELEX',
+    async (keyword, run) => {
+      const cellar = stubCellar(() => []);
+      await keywordMatchPattern(cellarService(), keyword, createMockContext());
+
+      // A CELEX-shaped keyword (R0679-2016) is first looked up as a whole CELEX.
+      const queries = cellar.queries().filter((query) => !query.includes('VALUES ?kwCelex'));
+      expect(queries.length).toBeGreaterThan(1);
+      expect(queries.flatMap(askedTerms)).toEqual(indexTerms(keyword));
+      for (const query of queries) {
+        expect(query.slice(query.indexOf('SELECT'))).toBe(
+          headLookup(run, keyword, askedTerms(query)),
+        );
+      }
+      for (const body of cellar.bodies)
+        expect(body.length).toBeLessThanOrEqual(REQUEST_LIMIT_BYTES);
+    },
+  );
+
+  it('keeps exactly the terms the returned heads complete, in route order, and ignores a head completing none', async () => {
+    // '' + R0679, 99999R0679, 62013CJR0679, and 32016R0679R0679 are no completion of R0679.
+    const heads = ['32016', '99999', '02016', '', '62013CJ', '32016R0679', '31972'];
+    stubCellar(() => heads.map((kwHead) => ({ kwHead })));
+    const pattern = await keywordMatchPattern(cellarService(), 'R0679', createMockContext());
+
+    expect(pattern).toBe(partialPattern('R0679', ['02016R0679', '31972R0679', '32016R0679']));
+  });
+
+  it('matches titles only when every returned head completes no term', async () => {
+    stubCellar(() => [{ kwHead: '' }, { kwHead: '99999' }]);
+    const pattern = await keywordMatchPattern(cellarService(), 'R0679', createMockContext());
+
+    expect(pattern).not.toContain('?kwCelex');
+    expect(pattern).toContain(`?kwTitle bif:contains "'R0679'"`);
+  });
+
+  it('maps an empty head, a C or E and year run opening the CELEX, to the run itself', async () => {
+    stubCellar(() => [{ kwHead: '52006P' }, { kwHead: '' }]);
+    const pattern = await keywordMatchPattern(cellarService(), 'C2006', createMockContext());
+
+    expect(pattern).toBe(partialPattern('C2006', ['C2006', '52006PC2006']));
+  });
+
+  it('is answered with a row per head, not per CELEX, and keeps the terms those CELEX start', async () => {
+    const holding = [
+      '32016R0679',
+      '32016R0679R(01)',
+      '32016R0679R(02)',
+      '02016R0679-20160504',
+      '02016R0679-20180525',
+    ];
+    const cellar = stubCellar(indexOver([...holding, '32016R0680']));
+    const pattern = await keywordMatchPattern(cellarService(), 'R0679', createMockContext());
+
+    expect(cellar.answered.flat()).toHaveLength(2);
+    expect(cellar.answered.flat().map((row) => row.kwHead)).toEqual(
+      expect.arrayContaining(['02016', '32016']),
+    );
+    expect(pattern).toBe(partialPattern('R0679', ['02016R0679', '32016R0679']));
+  });
+
+  it('keeps the terms that start the CELEX holding a keyword that runs past its run', async () => {
+    const holding = ['02002R0679-20160101', '02016R0679-20160504'];
+    stubCellar(indexOver([...holding, '32016R0679', '02016R0679-20180525']));
+    const pattern = await keywordMatchPattern(cellarService(), 'R0679-2016', createMockContext());
+
+    expect(pattern).toBe(partialPattern('R0679-2016', ['02002R0679', '02016R0679'], 'R0679 2016'));
   });
 });

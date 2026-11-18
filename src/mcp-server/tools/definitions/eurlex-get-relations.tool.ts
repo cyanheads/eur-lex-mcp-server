@@ -81,7 +81,11 @@ const RelationsOutputSchema = z.object({
             .describe(
               'Direction: "outgoing" (this work → related) or "incoming" (related → this work).',
             ),
-          related_work_uri: z.string().describe('CELLAR URI of the related work.'),
+          related_work_uri: z
+            .string()
+            .describe(
+              'CELLAR URI of the related work; for a CELEX CELLAR holds under several works, the work it resolves to.',
+            ),
           related_celex_number: z
             .string()
             .optional()
@@ -444,7 +448,7 @@ export const eurlex_get_relations = tool('eurlex_get_relations', {
     {
       reason: 'not_found',
       code: JsonRpcErrorCode.NotFound,
-      when: 'The CELEX number, given directly or as a resource/celex/ work URI, is not found in CELLAR — resolve the identifier with eurlex_lookup_celex first. A celex_number one numbering convention away from a CELEX CELLAR holds — a consolidated CELEX with no date or a date no version carries, a (nn) suffix missing or extra, a number not zero-padded to four digits — fails with each held CELEX named in the message and in data.held_celex.',
+      when: 'The CELEX number, given directly or as a resource/celex/ work URI, is not found in CELLAR — resolve the identifier with eurlex_lookup_celex first. A celex_number one numbering convention away from a CELEX CELLAR holds — a consolidated CELEX with no date or a date no version carries, a (nn) suffix missing or extra, a number not zero-padded to four digits, or to three for a Lisbon treaty article — fails with each held CELEX named in the message and in data.held_celex.',
       recovery: 'Use eurlex_lookup_celex to confirm the CELEX number exists, then retry.',
     },
     {

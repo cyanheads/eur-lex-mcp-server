@@ -9,6 +9,9 @@ import type { Context } from '@cyanheads/mcp-ts-core';
 import { ENG_LANGUAGE_URI } from './cdm-labels.js';
 import { CellarSparqlService } from './cellar-sparql-service.js';
 import { CELEX_PATTERN, celexLiteral, escapeSparqlLiteral } from './eli-resolution.js';
+import { SOURCE_CELEX_MAX_LENGTH } from './relation-traversal.js';
+import { queryRequestChunks } from './request-chunks.js';
+import { sparqlRequestBytes } from './sparql-request-body.js';
 
 /** Every character a CELEX holds — the charset of {@link CELEX_PATTERN}. */
 const CELEX_CHARSET = /^[0-9A-Z()/_-]+$/;
@@ -86,6 +89,20 @@ export const FIRST_CELEX_YEAR = 1951;
 const MIN_PREFIX_TERM_LENGTH = 4;
 
 /**
+ * Most bytes, form-encoded, a partial CELEX arm carries into the page query with every
+ * prefix term its route gives; a longer one is first narrowed to the terms some CELEX
+ * holding the keyword starts ({@link fragmentTerms}). Every page query carries the arm
+ * once. Around it (2026-11-17), eurlex_get_cases with every filter but subject sends
+ * 2,273 bytes, and the largest typed eurlex_search_documents (`PROP` with
+ * include_consolidated and dates) 5,257, so this budget beside either stays within
+ * CELLAR's 8,192-byte request limit. It admits the two-letter case-law fragments, one
+ * sector of type codes (`CJ0362`, 1,849 bytes), and the year-led ones (`2016R0679`,
+ * 410), which keep the page query they had; a fragment completed through type codes of
+ * several sectors (`R0679`, 23,639 bytes; `C0001`, 33,726) is narrowed.
+ */
+const FRAGMENT_ARM_MAX_BYTES = 2048;
+
+/**
  * The keyword reduced to letters, digits, and single spaces: the phrase the title
  * arm quotes for `bif:contains`, which it cannot break out of. Empty when the
  * keyword holds no letter or digit — then no title matches it, and no CELEX either,
@@ -116,20 +133,26 @@ export function keywordTitlePhrase(keyword: string): string {
  *   carries, each an index lookup, plus the corrigenda that
  *   `cdm:resource_legal_corrects_resource_legal` links to the CELEX. Whether the
  *   keyword is whole is CELLAR's answer, not the pattern's: `02016R0679` and
- *   `72014L0056` are CELEX-shaped prefixes of real values that no work carries.
+ *   `72014L0056` are CELEX-shaped prefixes of real values that no work carries. A
+ *   keyword longer than {@link SOURCE_CELEX_MAX_LENGTH}, which no work carries, is
+ *   not looked up.
  * - **Partial** otherwise, routed by {@link celexFragmentRoute} (#123): prefix terms
  *   on the full-text index CELLAR keeps on CELEX literals, then a confirming
  *   substring test on the narrowed literals, so a partial CELEX (`2016R0679`,
  *   `R0679`) still reaches its consolidated versions from index hits, and a C-sector
  *   `[C/]{year}/{number}` fragment (`2024/01469`) is reached on its number word (#137).
- *   A fragment opening with letters no type code ends in, with letters not followed
- *   by a digit (`R(01)`), or with a year and `/` and fewer than four number
- *   characters (`2017/111`), keeps the substring test of every CELEX literal; one
- *   opening mid-year or mid-number (`016R0679`, `0679`), or a bare year, gets no
- *   CELEX arm and matches titles only.
+ *   A route whose terms pass {@link FRAGMENT_ARM_MAX_BYTES} (`R0679`, `J0131`) keeps
+ *   only the terms a CELEX holding the keyword starts, or no CELEX arm when none
+ *   holds it ({@link fragmentTerms}). A fragment opening with letters no type code
+ *   ends in, with letters not followed by a digit (`R(01)`), or with a year and `/`
+ *   and fewer than four number characters (`2017/111`), keeps the substring test of
+ *   every CELEX literal; one opening mid-year or mid-number (`016R0679`, `0679`), or
+ *   a bare year, gets no CELEX arm and matches titles only.
  *
- * The family lookup is the one CELLAR call made here; it propagates any failure,
- * cancellation included, rather than falling back to the partial arm.
+ * The family lookup and a fragment's term lookup are the CELLAR calls made here, each
+ * split across requests within CELLAR's request limit ({@link queryRequestChunks}). A
+ * failure of any request, cancellation included, fails the call rather than falling
+ * back to another arm.
  */
 export async function keywordMatchPattern(
   svc: Pick<CellarSparqlService, 'query'>,
@@ -178,10 +201,12 @@ async function celexKeywordArm(
   const upper = keyword.toUpperCase();
   if (!/\d/.test(upper) || !CELEX_CHARSET.test(upper)) return '';
 
-  if (CELEX_PATTERN.test(upper)) {
-    const carried = await svc.query(
-      `SELECT DISTINCT ?kwCelex WHERE {
-  VALUES ?kwCelex { ${celexFamily(upper).map(celexLiteral).join(' ')} }
+  if (upper.length <= SOURCE_CELEX_MAX_LENGTH && CELEX_PATTERN.test(upper)) {
+    const carried = await queryRequestChunks(
+      svc,
+      celexFamily(upper),
+      (members) => `SELECT DISTINCT ?kwCelex WHERE {
+  VALUES ?kwCelex { ${members.map(celexLiteral).join(' ')} }
   ?kwWork cdm:resource_legal_id_celex ?kwCelex .
 }`,
       ctx,
@@ -205,10 +230,66 @@ async function celexKeywordArm(
     case 'scan':
       return `?work cdm:resource_legal_id_celex ?kwCelex .
     FILTER(CONTAINS(STR(?kwCelex), "${escapeSparqlLiteral(upper)}"))`;
-    case 'index':
-      return `?work cdm:resource_legal_id_celex ?kwCelex .
-    ${celexPrefixMatch('?kwCelex', upper, route.terms)}`;
+    case 'index': {
+      const terms = await fragmentTerms(svc, upper, route.terms, ctx);
+      return terms.length > 0 ? indexArm(upper, terms) : '';
+    }
   }
+}
+
+/** The CELEX arm of a partial keyword reached through the CELEX full-text index. */
+function indexArm(upperKeyword: string, terms: readonly string[]): string {
+  return `?work cdm:resource_legal_id_celex ?kwCelex .
+    ${celexPrefixMatch('?kwCelex', upperKeyword, terms)}`;
+}
+
+/**
+ * The prefix terms the page query carries for a partial keyword on the `index` route:
+ * all of `terms` when their arm fits {@link FRAGMENT_ARM_MAX_BYTES}; otherwise the
+ * ones that start a CELEX holding the keyword, which reach every CELEX all of `terms`
+ * reach. A keyword longer than {@link SOURCE_CELEX_MAX_LENGTH} is in no CELEX, so it is
+ * not looked up.
+ *
+ * Every term of a route over that budget is the keyword's leading `[0-9A-Z]` run
+ * behind a head: a sector, a year, and the type-code letters before the run's own, or
+ * no head for the run of a `C`/`E`-and-year fragment, itself a term. A term only ever
+ * starts a CELEX, never a later word of it: no CELEX in CELLAR has a word after a
+ * separator opening with a sector digit, a year, and a letter, or with `C` or `E` and a
+ * year (live, 2026-11-17). The run first occurs in a CELEX right after the head of the
+ * term reaching it, since the run opens with its letters and a digit, which cannot
+ * start inside a head. So the lookups, `terms` split across requests within CELLAR's
+ * limit, ask for the distinct text before the run in each CELEX they reach: one row per
+ * term reaching a CELEX, where a row per CELEX had no bound (one lookup of a
+ * two-character fragment, 61,650 CELEX under 133 heads, 2026-11-17). A term is live
+ * when its head is among them. The head is read before the run, not the whole keyword,
+ * since the page query's confirming test, not its terms, holds the rest of the keyword:
+ * `R0679-2016` reaches `02016R0679-20160504` under `02016R0679`.
+ */
+async function fragmentTerms(
+  svc: Pick<CellarSparqlService, 'query'>,
+  upperKeyword: string,
+  terms: readonly string[],
+  ctx: Context,
+): Promise<readonly string[]> {
+  const armBytes = sparqlRequestBytes(indexArm(upperKeyword, terms)) - sparqlRequestBytes('');
+  if (armBytes <= FRAGMENT_ARM_MAX_BYTES) return terms;
+  if (upperKeyword.length > SOURCE_CELEX_MAX_LENGTH) return [];
+
+  const run = /^[0-9A-Z]*/.exec(upperKeyword)?.[0] ?? '';
+  const head = `(STRBEFORE(STR(?kwCelex), "${escapeSparqlLiteral(run)}") AS ?kwHead)`;
+  const rows = await queryRequestChunks(
+    svc,
+    terms,
+    (chunk) => `SELECT DISTINCT ${head} WHERE {
+  ?kwWork cdm:resource_legal_id_celex ?kwCelex .
+  ${celexPrefixMatch('?kwCelex', upperKeyword, chunk)}
+}`,
+    ctx,
+  );
+  const heads = new Set(
+    rows.flatMap((row) => CellarSparqlService.bindingValue(row, 'kwHead') ?? []),
+  );
+  return terms.filter((term) => heads.has(term.slice(0, term.length - run.length)));
 }
 
 /**

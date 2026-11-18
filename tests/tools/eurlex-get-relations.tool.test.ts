@@ -5883,6 +5883,9 @@ describe('eurlex_get_relations', () => {
       '{ SELECT ?relatedWork (SAMPLE(?relatedCelex) AS ?relatedCelexSample) ?direction (MAX(STR(?relatedDate)) AS ?relatedDateMax) WHERE {';
     const PAGING =
       '} GROUP BY ?relatedWork ?direction ORDER BY DESC(?relatedDateMax) ?relatedWork LIMIT 11 OFFSET 0 }';
+    /** Every arm's exclusion of a related work that is a copy of another's CELEX (#209). */
+    const COPY_EXCLUSION =
+      'FILTER NOT EXISTS { ?relatedWork cdm:resource_legal_id_celex ?ownCelex . ?aliasRival cdm:resource_legal_id_celex ?ownCelex . ?aliasRival <http://www.w3.org/2002/07/owl#sameAs> ?rivalAlias . FILTER(?aliasRival != ?relatedWork && ?rivalAlias = IRI(CONCAT("http://publications.europa.eu/resource/celex/", ENCODE_FOR_URI(STR(?ownCelex))))) }';
 
     it('sends every relation query unchanged without related_sectors', async () => {
       mockQuery.mockImplementation(routeQuery({ resolve: [makeResolveBinding(GDPR_WORK_URI)] }));
@@ -5897,11 +5900,13 @@ describe('eurlex_get_relations', () => {
   ${SELECT_ARM}
     <${GDPR_WORK_URI}> cdm:work_cites_work ?relatedWork .
     OPTIONAL { ?relatedWork cdm:resource_legal_id_celex ?relatedCelex . }
+    ${COPY_EXCLUSION}
     OPTIONAL { ?relatedWork cdm:work_date_document ?relatedDate . }
     BIND("outgoing" AS ?direction)
   ${PAGING} UNION ${SELECT_ARM}
     ?relatedWork cdm:work_cites_work <${GDPR_WORK_URI}> .
     OPTIONAL { ?relatedWork cdm:resource_legal_id_celex ?relatedCelex . }
+    ${COPY_EXCLUSION}
     OPTIONAL { ?relatedWork cdm:work_date_document ?relatedDate . }
     BIND("incoming" AS ?direction)
   ${PAGING}${TITLE_JOIN}`);
@@ -5909,6 +5914,7 @@ describe('eurlex_get_relations', () => {
   ${SELECT_ARM}
     ?relatedWork cdm:act_consolidated_based_on_resource_legal <${GDPR_WORK_URI}> .
     ?relatedWork cdm:resource_legal_id_celex ?relatedCelex .
+    ${COPY_EXCLUSION}
     OPTIONAL { ?relatedWork cdm:work_date_document ?relatedDate . }
     BIND("incoming" AS ?direction)
   ${PAGING}${TITLE_JOIN}`);
@@ -5919,6 +5925,7 @@ describe('eurlex_get_relations', () => {
     ?relatedWork cdm:measure_national_implementing_implements_resource_legal <${GDPR_WORK_URI}> .
     ?relatedWork cdm:resource_legal_id_celex ?relatedCelex .
     FILTER(REGEX(STR(?relatedCelex), "^72016R0679[A-Z]{3}"))
+    ${COPY_EXCLUSION}
     OPTIONAL { ?relatedWork cdm:work_date_document ?relatedDate . }
     BIND("incoming" AS ?direction)
   ${PAGING}${TITLE_JOIN}`);
@@ -6302,6 +6309,10 @@ describe('eurlex_get_relations CELLAR sort window (#154)', () => {
   /** The Merger Regulation: 14,567 works name it among their legal bases. */
   const MERGER_WORK_URI = `${CELLAR}merger-32004R0139`;
 
+  /** A continuation's exclusion of a work that is a copy of another's CELEX (#209). */
+  const COPY_EXCLUSION =
+    'FILTER NOT EXISTS { ?work cdm:resource_legal_id_celex ?ownCelex . ?aliasRival cdm:resource_legal_id_celex ?ownCelex . ?aliasRival <http://www.w3.org/2002/07/owl#sameAs> ?rivalAlias . FILTER(?aliasRival != ?work && ?rivalAlias = IRI(CONCAT("http://publications.europa.eu/resource/celex/", ENCODE_FOR_URI(STR(?ownCelex))))) }';
+
   /** The related date at sorted position `i` of a direction: one per day, newest first. */
   const dateAt = (i: number) =>
     new Date(Date.UTC(2026, 0, 1) - i * 86_400_000).toISOString().slice(0, 10);
@@ -6428,7 +6439,7 @@ describe('eurlex_get_relations CELLAR sort window (#154)', () => {
 
     const notice = (result.structuredContent as Record<string, unknown>).notice as string;
     const lastDate = dateAt(9_999);
-    const continuation = `SELECT ?work ?celex ?date WHERE { ?work cdm:resource_legal_based_on_resource_legal <${MERGER_WORK_URI}> . ?work cdm:work_date_document ?date . OPTIONAL { ?work cdm:resource_legal_id_celex ?celex } FILTER(?date <= "${lastDate}"^^xsd:date) } ORDER BY DESC(?date) ?work`;
+    const continuation = `SELECT ?work ?celex ?date WHERE { ?work cdm:resource_legal_based_on_resource_legal <${MERGER_WORK_URI}> . ?work cdm:work_date_document ?date . OPTIONAL { ?work cdm:resource_legal_id_celex ?celex } ${COPY_EXCLUSION} FILTER(?date <= "${lastDate}"^^xsd:date) } ORDER BY DESC(?date) ?work`;
     expect(notice).toContain(`basis_for (incoming): ${continuation}`);
     // A grouped MAX over the date attaches other works' dates in CELLAR.
     expect(notice).not.toMatch(/GROUP BY|MAX\(/);
@@ -6450,7 +6461,7 @@ describe('eurlex_get_relations CELLAR sort window (#154)', () => {
     expect(notice).toContain('basis_for (incoming)');
     expect(notice).not.toContain('last related_date');
     expect(notice).not.toContain('on or before');
-    const continuation = `SELECT ?work ?celex WHERE { ?work cdm:resource_legal_based_on_resource_legal <${MERGER_WORK_URI}> . OPTIONAL { ?work cdm:resource_legal_id_celex ?celex } FILTER NOT EXISTS { ?work cdm:work_date_document ?date } } ORDER BY ?work`;
+    const continuation = `SELECT ?work ?celex WHERE { ?work cdm:resource_legal_based_on_resource_legal <${MERGER_WORK_URI}> . OPTIONAL { ?work cdm:resource_legal_id_celex ?celex } ${COPY_EXCLUSION} FILTER NOT EXISTS { ?work cdm:work_date_document ?date } } ORDER BY ?work`;
     expect(notice).toContain(`basis_for (incoming): ${continuation}`);
     expect(notice).not.toContain('xsd:date');
     expect(readCommonMark(contentText(result))).toContain(continuation);
@@ -6469,7 +6480,7 @@ describe('eurlex_get_relations CELLAR sort window (#154)', () => {
       'FILTER(SUBSTR(STR(?relatedCelex), 1, 1) IN ("3", "C"))',
     );
     const notice = (result.structuredContent as Record<string, unknown>).notice as string;
-    const continuation = `SELECT ?work ?celex ?date WHERE { ?work cdm:resource_legal_based_on_resource_legal <${MERGER_WORK_URI}> . ?work cdm:work_date_document ?date . ?work cdm:resource_legal_id_celex ?celex . FILTER(SUBSTR(STR(?celex), 1, 1) IN ("3", "C")) FILTER(?date <= "${dateAt(9_999)}"^^xsd:date) } ORDER BY DESC(?date) ?work`;
+    const continuation = `SELECT ?work ?celex ?date WHERE { ?work cdm:resource_legal_based_on_resource_legal <${MERGER_WORK_URI}> . ?work cdm:work_date_document ?date . ?work cdm:resource_legal_id_celex ?celex . FILTER(SUBSTR(STR(?celex), 1, 1) IN ("3", "C")) ${COPY_EXCLUSION} FILTER(?date <= "${dateAt(9_999)}"^^xsd:date) } ORDER BY DESC(?date) ?work`;
     expect(notice).toContain(`basis_for (incoming): ${continuation}`);
     expect(readCommonMark(contentText(result))).toContain(continuation);
   });
@@ -6496,7 +6507,7 @@ describe('eurlex_get_relations CELLAR sort window (#154)', () => {
     expect(notice).not.toContain('last related_date');
     // Bounded by the placeholder the page sorted on: the undated-works continuation
     // would skip every placeholder-dated work past row 10,000.
-    const continuation = `SELECT ?work ?celex ?date WHERE { ?work cdm:resource_legal_based_on_resource_legal <${MERGER_WORK_URI}> . ?work cdm:work_date_document ?date . OPTIONAL { ?work cdm:resource_legal_id_celex ?celex } FILTER(?date <= "1001-01-01"^^xsd:date) } ORDER BY DESC(?date) ?work`;
+    const continuation = `SELECT ?work ?celex ?date WHERE { ?work cdm:resource_legal_based_on_resource_legal <${MERGER_WORK_URI}> . ?work cdm:work_date_document ?date . OPTIONAL { ?work cdm:resource_legal_id_celex ?celex } ${COPY_EXCLUSION} FILTER(?date <= "1001-01-01"^^xsd:date) } ORDER BY DESC(?date) ?work`;
     expect(notice).toContain(`basis_for (incoming): ${continuation}`);
     expect(readCommonMark(contentText(result))).toContain(continuation);
   });

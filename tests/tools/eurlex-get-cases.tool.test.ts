@@ -26,6 +26,7 @@ import {
   isResolutionQuery,
   requestedCelex,
 } from '../fixtures/cellar-works.js';
+import { cellarOnTheWire } from '../helpers/cellar-wire.js';
 import { readCommonMark } from '../helpers/commonmark.js';
 import { bestCpuMs, CPU_TIMED_TEST_TIMEOUT_MS } from '../helpers/cpu-time.js';
 import { assertInSortWindow, pageSpan, pagingClauses } from '../helpers/sort-window.js';
@@ -4654,6 +4655,27 @@ describe('eurlex_get_cases case-law facts (#178)', () => {
       expect(errorOf(result)?.data?.recovery?.hint).toBe(recoveryOf('sparql_timeout'));
     });
 
+    /**
+     * A two-character type-letter keyword's lookups can run out the budget, and a date
+     * range or another filter sends the same lookups again.
+     */
+    it('tells a type-letter keyword whose lookups timed out to give more of its number', async () => {
+      mockQuery.mockRejectedValue(
+        serviceUnavailable(BUDGET_SPENT, { reason: 'sparql_timeout', retryable: true }),
+      );
+
+      const result = await runToolContract(eurlex_get_cases, { keyword: 'C0' });
+
+      // Its head lookups are what timed out: no page query was built.
+      expect(sentQueries()).not.toEqual([]);
+      for (const query of sentQueries()) {
+        expect(query).toContain('SELECT DISTINCT (STRBEFORE(STR(?kwCelex), "C0") AS ?kwHead)');
+      }
+      const hint = errorOf(result)?.data?.recovery?.hint ?? '';
+      expect(hint).toContain('needs more of its number (C0131, not C0)');
+      expect(contentText(result)).toContain(hint);
+    });
+
     it('adds the filters an offset past the window left unset or blank, before any query', async () => {
       const result = await runToolContract(eurlex_get_cases, {
         court: 'CJEU',
@@ -5376,5 +5398,70 @@ describe('eurlex_get_cases request size', () => {
       .find((sparql) => sparql.includes('GROUP BY ?celexNumber'));
     expect(subjectValues(page ?? '')).toEqual([...concepts].sort());
     expect(await wireBytes(page ?? '')).toBeLessThanOrEqual(BODY_LIMIT_BYTES);
+  });
+});
+
+/**
+ * The keyword's lookups and the page through the actual CELLAR service, so each
+ * request is the body it posts: the shared splitter and the query builders are the
+ * production ones, CELLAR a stubbed endpoint.
+ */
+describe('keyword requests within CELLAR’s 8,192-byte request limit (#208)', () => {
+  // `rows` answer the page and, as the works holding each CELEX, its work resolution.
+  const onTheWire = (
+    input: Record<string, unknown>,
+    cellar: { carried?: string[]; corpus?: string[]; rows: Binding[] },
+  ) =>
+    cellarOnTheWire(mockQuery, () => runToolContract(eurlex_get_cases, input), {
+      ...cellar,
+      resolutionRows: cellar.rows.flatMap(caseRowAsWorkRows),
+    });
+
+  it('splits a 27-character whole-CELEX family lookup in two and matches a sibling only the second carried', async () => {
+    const keyword = '62023CO0097R(01)(02)';
+    const sibling = `${keyword}(20)_EXT`;
+    const { result, bodies, queries } = await onTheWire(
+      { keyword },
+      { carried: [keyword, sibling], rows: [makeCaseBinding(sibling, { date: '2024-03-12' })] },
+    );
+
+    expect(result.isError).toBeFalsy();
+    for (const body of bodies) expect(body.length).toBeLessThanOrEqual(8192);
+    const family = queries.filter((q) => q.includes('VALUES ?kwCelex') && !q.includes('GROUP BY'));
+    expect(family).toHaveLength(2);
+    expect(family[1]).toContain(`"${sibling}"^^xsd:string`);
+    const page = queries.find((q) => q.includes('GROUP BY ?celexNumber')) ?? '';
+    expect(page).toContain(`VALUES ?kwCelex { "${keyword}"^^xsd:string "${sibling}"^^xsd:string }`);
+    const structured = eurlex_get_cases.output.parse(result.structuredContent);
+    expect(structured.cases.map((c) => c.celex_number)).toEqual([sibling]);
+    expect(readCommonMark(contentText(result))).toContain(sibling);
+  });
+
+  it('answers J0131 with every request within the limit, returning the cases whose CELEX hold it', async () => {
+    const holding = ['61981CJ0131(01)', '62013CJ0131', '62010TJ0131'];
+    const { result, bodies, queries } = await onTheWire(
+      { keyword: 'J0131' },
+      {
+        corpus: [...holding, '62013CJ0132'],
+        rows: [
+          makeCaseBinding('62013CJ0131', { date: '2014-05-13' }),
+          makeCaseBinding('62010TJ0131', { date: '2012-01-01' }),
+        ],
+      },
+    );
+
+    expect(result.isError).toBeFalsy();
+    for (const body of bodies) expect(body.length).toBeLessThanOrEqual(8192);
+    const headLookup = 'SELECT DISTINCT (STRBEFORE(STR(?kwCelex), "J0131") AS ?kwHead)';
+    expect(queries.filter((q) => q.includes(headLookup)).length).toBeGreaterThan(1);
+    expect(queries.filter((q) => q.includes('SELECT DISTINCT ?kwCelex'))).toEqual([]);
+    const page = queries.find((q) => q.includes('GROUP BY ?celexNumber')) ?? '';
+    expect(page).toContain(
+      `?kwCelex bif:contains "'61981CJ0131*' OR '62013CJ0131*' OR '62010TJ0131*'" .`,
+    );
+    const structured = eurlex_get_cases.output.parse(result.structuredContent);
+    expect(structured.cases.map((c) => c.celex_number)).toEqual(['62013CJ0131', '62010TJ0131']);
+    expect(structured.cases.every((c) => c.celex_number.includes('J0131'))).toBe(true);
+    expect(readCommonMark(contentText(result))).toContain('62010TJ0131');
   });
 });

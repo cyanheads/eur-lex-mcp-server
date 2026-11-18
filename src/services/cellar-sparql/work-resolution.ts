@@ -22,13 +22,35 @@ import type { SparqlBinding } from './types.js';
  * CELLAR stores them (`62015TO0235%2801%29`); `encodeURIComponent` leaves them
  * literal. The filtered `OPTIONAL` shape is the one CELLAR evaluates correctly and
  * fast in an ungrouped query: a `VALUES` + `BIND(EXISTS …)` form returns the same
- * rows in ~20 s, and the same `OPTIONAL` inside a grouped query never binds.
+ * rows in ~20 s. Inside a grouped query the same `OPTIONAL` is unreliable: it bound
+ * under a grouped `COUNT` and stayed unbound in the search and case-law page
+ * queries, so those read the canonical work in a follow-up
+ * ({@link resolveCelexWorkRows}) and test for it with {@link aliasRivalPattern}.
  */
 export function canonicalAliasPattern(celexTerm: string): string {
   return `OPTIONAL {
     ?work <http://www.w3.org/2002/07/owl#sameAs> ?canonicalAlias .
     FILTER(?canonicalAlias = IRI(CONCAT("${CELEX_ALIAS_NAMESPACE}", ENCODE_FOR_URI(STR(${celexTerm})))))
   }`;
+}
+
+/**
+ * Patterns that match when a work other than `workVar` holds the CELEX `celexVar`
+ * binds and carries that CELEX's alias: `workVar` is then a copy, and the match,
+ * bound as `?aliasRival`, is the work the CELEX resolves to. For the body of a
+ * `FILTER NOT EXISTS`, which drops a copy and keeps the alias work itself and any
+ * work whose CELEX has no alias work; a further pattern on `?aliasRival` in the same
+ * body narrows which copies are dropped. `celexVar` must be bound where the filter
+ * is evaluated.
+ *
+ * The `owl:sameAs` triple is required here, not the `OPTIONAL` of
+ * {@link canonicalAliasPattern}, so it evaluates the same in a grouped query, a
+ * page-first subquery, and a flat one.
+ */
+export function aliasRivalPattern(workVar: string, celexVar: string): string {
+  return `?aliasRival cdm:resource_legal_id_celex ${celexVar} .
+    ?aliasRival <http://www.w3.org/2002/07/owl#sameAs> ?rivalAlias .
+    FILTER(?aliasRival != ${workVar} && ?rivalAlias = IRI(CONCAT("${CELEX_ALIAS_NAMESPACE}", ENCODE_FOR_URI(STR(${celexVar})))))`;
 }
 
 /** True when a row belongs to the work carrying its CELEX alias. */
